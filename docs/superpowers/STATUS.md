@@ -92,6 +92,15 @@
 10. **DeleteObjects 逐 key 细粒度授权**：用桶级 `s3:DeleteObject` 作粗粒度门；逐 key 检查 defer。
 11. **secret at-rest 加密**：MVP 明文存储（COMMENT 已标）；信封加密留后续，仅改 EctoStore 读写两点。
 
+### M3 独立 code-reviewer 补充非阻塞项（post-review，纳入 M4 开头修复）
+
+reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（当前无害，M4 前/中修）：
+
+1. **潜伏 bug（当前 inert，须在 M4 IAM identity policy 落地前修）**：`Maxio.S3.Authz.gather_statements/3` 硬编码调用 `Store.principal_policies(:anonymous)`，无视真实 principal。MVP 该函数恒返回 `[]` 故无害；一旦实现 identity policy，认证用户的身份策略会被静默丢弃 → 静默拒绝。**应把真实 principal 传入**。
+2. **`delete_objects` 桶级粗粒度门（fail-closed，可接受）**：批删用桶 ARN + `s3:DeleteObject` 鉴权，作用于 `arn:aws:s3:::bucket/*` 的对象级 policy 不会命中 → 批删被拒。**失败偏保守、无安全洞**，逐 key 鉴权已 defer。
+3. **CopyObject 不传播 `acl_canned`（正确但隐式）**：copy 覆盖会把目标 ACL 重置为 private——与 AWS 默认（copy 不保留 ACL，除非带 `x-amz-acl`）一致，仅为隐式行为。
+4. **Principal `{:aws, list}` 用 glob 匹配（轻微过权）**：AWS 视 Principal 为精确匹配（除非 policy variable）。`arn:aws:iam:::user/*` 会被通配命中。建议后续改 AWS principal 精确匹配。
+
 ## 工具链与环境（本机 Windows 11，关键教训）
 
 - **Elixir 1.20.0 / Erlang OTP 28** 在 `C:\Users\dyz\Documents\dev\usr\Elixir\bin`；mix / phx_new 1.8.5 / hex 已装；docker / git 可用；**psql 不在 PATH**（用 `docker exec maxio-db psql -U postgres -d maxio_dev -c "..."`）。
