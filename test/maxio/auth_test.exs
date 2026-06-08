@@ -37,7 +37,9 @@ defmodule Maxio.AuthTest do
   end
 
   test "正确签名（VECTOR A）通过并返回 root principal" do
-    material = vector_a_material("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+    material =
+      vector_a_material("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+
     assert {:ok, principal, _ctx} = Auth.authenticate(material)
     assert principal.type == :root
     assert principal.access_key == "AKIAIOSFODNN7EXAMPLE"
@@ -59,7 +61,9 @@ defmodule Maxio.AuthTest do
   end
 
   test "时钟偏移超 15min → RequestTimeTooSkewed 403" do
-    material = vector_a_material("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+    material =
+      vector_a_material("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+
     skewed = %{material | now: ~U[2013-05-24 00:20:00Z]}
 
     assert {:error, %Error{code: "RequestTimeTooSkewed", http_status: 403}} =

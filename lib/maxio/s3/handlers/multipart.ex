@@ -32,9 +32,14 @@ defmodule Maxio.S3.Handlers.Multipart do
     {:ok, upload} =
       Multipart.initiate(bucket, key, %{content_type: content_type, owner: owner})
 
-    Log.info("create multipart upload", action: :create_multipart_upload, bucket: bucket, key: key)
+    Log.info("create multipart upload",
+      action: :create_multipart_upload,
+      bucket: bucket,
+      key: key
+    )
 
-    body = InitiateMultipartUpload.render(%{bucket: bucket, key: key, upload_id: upload.upload_id})
+    body =
+      InitiateMultipartUpload.render(%{bucket: bucket, key: key, upload_id: upload.upload_id})
 
     conn
     |> put_resp_content_type("application/xml")
@@ -196,7 +201,12 @@ defmodule Maxio.S3.Handlers.Multipart do
 
     uploads =
       Enum.map(res.uploads, fn u ->
-        %{key: u.key, upload_id: u.upload_id, storage_class: u.storage_class, initiated: u.inserted_at}
+        %{
+          key: u.key,
+          upload_id: u.upload_id,
+          storage_class: u.storage_class,
+          initiated: u.inserted_at
+        }
       end)
 
     body =
@@ -252,7 +262,9 @@ defmodule Maxio.S3.Handlers.Multipart do
     end
   end
 
-  defp complete_error(:no_such_upload, b, k), do: Error.new(:no_such_upload, resource: "/#{b}/#{k}")
+  defp complete_error(:no_such_upload, b, k),
+    do: Error.new(:no_such_upload, resource: "/#{b}/#{k}")
+
   defp complete_error(:invalid_part, b, k), do: Error.new(:invalid_part, resource: "/#{b}/#{k}")
 
   defp complete_error(:invalid_part_order, b, k),

@@ -33,6 +33,7 @@ defmodule MaxioWeb.Router do
     live_session :console_authenticated,
       on_mount: [{MaxioWeb.ConsoleAuth.OnMount, :require_authenticated}] do
       live "/", DashboardLive, :index
+
       # 侧边栏导航目标路由（M5-2 装配 nav 链接需 ~p 编译期校验通过 + Phoenix 1.8
       # __checks__ 校验 LiveView 模块存在）。故此处先挂最小占位 LiveView，
       # 与 M5-1 的 DashboardLive 占位同模式；各自单元再「完整替换」：

@@ -4,8 +4,7 @@ defmodule Maxio.Repo.Migrations.CreateMultipartParts do
   def change do
     create table(:multipart_parts,
              primary_key: false,
-             comment:
-               "分段上传的已上传分块元数据：每个 (upload, part_number) 一行；分块字节归存储后端，本表只存元信息"
+             comment: "分段上传的已上传分块元数据：每个 (upload, part_number) 一行；分块字节归存储后端，本表只存元信息"
            ) do
       add :id, :binary_id, primary_key: true, comment: "分块元数据主键（UUID）"
 

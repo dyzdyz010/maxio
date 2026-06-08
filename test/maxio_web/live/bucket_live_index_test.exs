@@ -60,7 +60,10 @@ defmodule MaxioWeb.BucketLiveIndexTest do
 
   test "删除非空桶报错误，行保留", %{conn: conn} do
     {:ok, _b} = Maxio.Buckets.create("full-bucket", "arn:aws:iam:::root")
-    {:ok, _o} = Maxio.Objects.put_version_with_id("full-bucket", "k.txt", "null", %{size: 1, etag: "e"})
+
+    {:ok, _o} =
+      Maxio.Objects.put_version_with_id("full-bucket", "k.txt", "null", %{size: 1, etag: "e"})
+
     {:ok, view, _html} = live(conn, ~p"/buckets")
 
     html = view |> element("#delete-bucket-full-bucket") |> render_click()

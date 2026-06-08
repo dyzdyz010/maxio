@@ -24,7 +24,12 @@ defmodule MaxioWeb.DashboardLive do
         </.header>
 
         <div class="grid grid-cols-2 lg:grid-cols-5 gap-4">
-          <.stat_card id="stat-buckets" icon="hero-archive-box" label="桶" value={@stats.bucket_count} />
+          <.stat_card
+            id="stat-buckets"
+            icon="hero-archive-box"
+            label="桶"
+            value={@stats.bucket_count}
+          />
           <.stat_card
             id="stat-objects"
             icon="hero-document"
@@ -37,7 +42,12 @@ defmodule MaxioWeb.DashboardLive do
             label="总用量"
             value={format_bytes(@stats.total_size)}
           />
-          <.stat_card id="stat-keys" icon="hero-key" label="Access Keys" value={@stats.access_key_count} />
+          <.stat_card
+            id="stat-keys"
+            icon="hero-key"
+            label="Access Keys"
+            value={@stats.access_key_count}
+          />
           <.stat_card
             id="stat-multipart"
             icon="hero-arrow-up-tray"

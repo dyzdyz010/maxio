@@ -22,7 +22,13 @@ defmodule Maxio.S3.Handlers.Versioning do
       {:ok, %{status: status, mfa_delete: mfa}} ->
         # status 缺省（空 body）→ 不改状态（保留现状）；显式 Enabled/Suspended → 落库。
         :ok = Buckets.put_versioning(bucket, status, mfa)
-        Log.info("put bucket versioning", action: :put_bucket_versioning, bucket: bucket, reason: status)
+
+        Log.info("put bucket versioning",
+          action: :put_bucket_versioning,
+          bucket: bucket,
+          reason: status
+        )
+
         send_resp(conn, 200, "")
 
       {:error, :malformed_xml} ->
@@ -50,9 +56,14 @@ defmodule Maxio.S3.Handlers.Versioning do
 
   defp read_small_body!(conn) do
     case read_body(conn, length: @xml_limit, read_length: @xml_limit) do
-      {:ok, body, conn} -> {conn, body}
-      {:more, _partial, _conn} -> raise Error.new(:entity_too_large, message: "Versioning config too large")
-      {:error, _} -> raise Error.new(:malformed_xml)
+      {:ok, body, conn} ->
+        {conn, body}
+
+      {:more, _partial, _conn} ->
+        raise Error.new(:entity_too_large, message: "Versioning config too large")
+
+      {:error, _} ->
+        raise Error.new(:malformed_xml)
     end
   end
 end

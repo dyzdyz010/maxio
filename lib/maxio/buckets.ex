@@ -121,7 +121,8 @@ defmodule Maxio.Buckets do
   设置桶版本化状态（PutBucketVersioning）。status 为 nil（空 body）→ 不改 versioning；
   显式 "Enabled"/"Suspended" → 更新。mfa 非 nil → 更新 mfa_delete。桶不存在 → :not_found。
   """
-  @spec put_versioning(String.t(), String.t() | nil, String.t() | nil) :: :ok | {:error, :not_found}
+  @spec put_versioning(String.t(), String.t() | nil, String.t() | nil) ::
+          :ok | {:error, :not_found}
   def put_versioning(name, status, mfa) do
     case lookup(name) do
       {:ok, bucket} ->

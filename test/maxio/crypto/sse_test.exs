@@ -32,7 +32,12 @@ defmodule Maxio.Crypto.SSETest do
   test "篡改密文 → 解密 raise（GCM 认证失败，绝不静默）" do
     {cipher_stream, envelope} = SSE.wrap_stream(["data"])
     cipher = Enum.to_list(cipher_stream) |> IO.iodata_to_binary()
-    tampered = cipher |> :binary.bin_to_list() |> List.update_at(-1, &Bitwise.bxor(&1, 0xFF)) |> :erlang.list_to_binary()
+
+    tampered =
+      cipher
+      |> :binary.bin_to_list()
+      |> List.update_at(-1, &Bitwise.bxor(&1, 0xFF))
+      |> :erlang.list_to_binary()
 
     assert_raise RuntimeError, fn ->
       SSE.unwrap_stream([tampered], envelope) |> Enum.to_list()

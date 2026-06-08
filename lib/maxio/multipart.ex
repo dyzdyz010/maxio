@@ -11,7 +11,8 @@ defmodule Maxio.Multipart do
   @default_min_part_size 5_242_880
 
   @doc "发起分段上传：生成 UploadId（UUID hex），落会话元数据。"
-  @spec initiate(String.t(), String.t(), map()) :: {:ok, Upload.t()} | {:error, Ecto.Changeset.t()}
+  @spec initiate(String.t(), String.t(), map()) ::
+          {:ok, Upload.t()} | {:error, Ecto.Changeset.t()}
   def initiate(bucket_name, key, attrs \\ %{}) do
     upload_id = generate_upload_id()
 
@@ -221,7 +222,10 @@ defmodule Maxio.Multipart do
   end
 
   defp escape_like(str) do
-    str |> String.replace("\\", "\\\\") |> String.replace("%", "\\%") |> String.replace("_", "\\_")
+    str
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
   end
 
   defp min_part_size do

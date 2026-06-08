@@ -34,7 +34,8 @@ defmodule Maxio.Policy.ACL do
   """
   @spec canned_to_statements(String.t(), :bucket | :object, String.t(), String.t() | nil) ::
           [Statement.t()]
-  def canned_to_statements(canned, _level, _bucket, _key) when canned not in @public_canned, do: []
+  def canned_to_statements(canned, _level, _bucket, _key) when canned not in @public_canned,
+    do: []
 
   def canned_to_statements("public-read", :object, bucket, key) do
     [allow_stmt(:any, ["s3:GetObject", "s3:GetObjectVersion"], [Arn.object_arn(bucket, key)])]
@@ -61,7 +62,11 @@ defmodule Maxio.Policy.ACL do
   # authenticated-read：仅认证 principal。用内部条件键 "maxio:Authenticated"=="true" 表达，
   # Authz 构造 ctx 时把 authenticated? 写入该键；匿名缺键 → 条件不成立 → 不命中（详见 M3-8 注释）。
   def canned_to_statements("authenticated-read", :object, bucket, key) do
-    [allow_stmt(:authenticated, ["s3:GetObject", "s3:GetObjectVersion"], [Arn.object_arn(bucket, key)])]
+    [
+      allow_stmt(:authenticated, ["s3:GetObject", "s3:GetObjectVersion"], [
+        Arn.object_arn(bucket, key)
+      ])
+    ]
   end
 
   def canned_to_statements("authenticated-read", :bucket, bucket, _key) do
@@ -83,6 +88,12 @@ defmodule Maxio.Policy.ACL do
   end
 
   defp allow_stmt(:any, actions, resources) do
-    %Statement{effect: :allow, actions: actions, resources: resources, principals: :any, conditions: %{}}
+    %Statement{
+      effect: :allow,
+      actions: actions,
+      resources: resources,
+      principals: :any,
+      conditions: %{}
+    }
   end
 end

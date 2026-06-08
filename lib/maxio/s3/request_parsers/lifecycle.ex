@@ -40,7 +40,9 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
   end
 
   @impl true
-  def handle_event(:characters, c, %{text: t} = s) when is_binary(t), do: {:ok, %{s | text: t <> c}}
+  def handle_event(:characters, c, %{text: t} = s) when is_binary(t),
+    do: {:ok, %{s | text: t <> c}}
+
   def handle_event(:characters, _c, s), do: {:ok, s}
 
   @impl true
@@ -52,7 +54,14 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
         {:ok, %{s | rules: [cur | s.rules], cur: nil, path: tl_safe(s.path), in: nil}}
 
       l in leaf_tags() and is_map(cur) ->
-        {:ok, %{s | cur: store(cur, l, s.path, trim(s.text)), in: nil, text: nil, path: tl_safe(s.path)}}
+        {:ok,
+         %{
+           s
+           | cur: store(cur, l, s.path, trim(s.text)),
+             in: nil,
+             text: nil,
+             path: tl_safe(s.path)
+         }}
 
       true ->
         {:ok, %{s | in: nil, text: nil, path: tl_safe(s.path)}}
@@ -93,15 +102,31 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
 
   defp store(cur, "Prefix", path, v) do
     # Filter 内 Prefix → filter_prefix；Rule 直属（legacy） Prefix → prefix；And 内 Prefix → filter_prefix。
-    if "Filter" in path or "And" in path, do: %{cur | "filter_prefix" => v}, else: %{cur | "prefix" => v}
+    if "Filter" in path or "And" in path,
+      do: %{cur | "filter_prefix" => v},
+      else: %{cur | "prefix" => v}
   end
 
-  defp store(cur, "Days", path, v), do: if("Transition" in path, do: %{cur | "transition_days" => int(v)}, else: %{cur | "expiration_days" => int(v)})
+  defp store(cur, "Days", path, v),
+    do:
+      if("Transition" in path,
+        do: %{cur | "transition_days" => int(v)},
+        else: %{cur | "expiration_days" => int(v)}
+      )
+
   defp store(cur, "Date", _path, v), do: %{cur | "expiration_date" => v}
-  defp store(cur, "ExpiredObjectDeleteMarker", _p, v), do: %{cur | "expired_object_delete_marker" => v == "true"}
+
+  defp store(cur, "ExpiredObjectDeleteMarker", _p, v),
+    do: %{cur | "expired_object_delete_marker" => v == "true"}
+
   defp store(cur, "NoncurrentDays", _p, v), do: %{cur | "noncurrent_days" => int(v)}
-  defp store(cur, "NewerNoncurrentVersions", _p, v), do: %{cur | "newer_noncurrent_versions" => int(v)}
-  defp store(cur, "DaysAfterInitiation", _p, v), do: %{cur | "abort_days_after_initiation" => int(v)}
+
+  defp store(cur, "NewerNoncurrentVersions", _p, v),
+    do: %{cur | "newer_noncurrent_versions" => int(v)}
+
+  defp store(cur, "DaysAfterInitiation", _p, v),
+    do: %{cur | "abort_days_after_initiation" => int(v)}
+
   defp store(cur, "StorageClass", _p, v), do: %{cur | "transition_storage_class" => v}
   defp store(cur, "ObjectSizeGreaterThan", _p, v), do: %{cur | "filter_size_gt" => int(v)}
   defp store(cur, "ObjectSizeLessThan", _p, v), do: %{cur | "filter_size_lt" => int(v)}

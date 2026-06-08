@@ -25,14 +25,17 @@ defmodule Maxio.Storage.ErasureCoded do
 
   @impl true
   def put(bucket, key, version_id \\ "null", chunks, opts \\ [])
-  def put(bucket, key, version_id, chunks, opts), do: do_put(bucket, key, version_id, chunks, opts)
+
+  def put(bucket, key, version_id, chunks, opts),
+    do: do_put(bucket, key, version_id, chunks, opts)
 
   @impl true
   def get(bucket, key, version_id \\ "null", range \\ nil, opts \\ []),
     do: do_get(bucket, key, version_id, range, opts)
 
   @impl true
-  def stat(bucket, key, version_id \\ "null", opts \\ []), do: do_stat(bucket, key, version_id, opts)
+  def stat(bucket, key, version_id \\ "null", opts \\ []),
+    do: do_stat(bucket, key, version_id, opts)
 
   @impl true
   def delete(bucket, key, version_id \\ "null", opts \\ []),
@@ -100,7 +103,13 @@ defmodule Maxio.Storage.ErasureCoded do
       shard_len = acc.shard_len || 0
 
       meta =
-        build_part_meta(cfg, acc.size, etag, shard_len, Enum.map(acc.block_hashes, &Enum.reverse/1))
+        build_part_meta(
+          cfg,
+          acc.size,
+          etag,
+          shard_len,
+          Enum.map(acc.block_hashes, &Enum.reverse/1)
+        )
 
       _ = write_sidecars(dirs, meta)
       {:ok, %{size: acc.size, etag: etag, md5_raw: md5_raw}}
@@ -157,8 +166,17 @@ defmodule Maxio.Storage.ErasureCoded do
           {:ok, []}
         else
           {:ok,
-           stream_object(cfg, bucket, "#{upload_id}/#{part_number}", "null", dirs, meta, block_size,
-             0, size - 1)}
+           stream_object(
+             cfg,
+             bucket,
+             "#{upload_id}/#{part_number}",
+             "null",
+             dirs,
+             meta,
+             block_size,
+             0,
+             size - 1
+           )}
         end
 
       {:error, :enoent} ->
@@ -334,7 +352,9 @@ defmodule Maxio.Storage.ErasureCoded do
 
   # 流尽：写最后不满块（非空对象至少一个块；空对象 buffer="" 不写块）。
   defp flush_final(_cfg, %{buffer: <<>>} = acc), do: acc
-  defp flush_final(cfg, %{buffer: buffer} = acc), do: write_block(cfg, %{acc | buffer: <<>>}, buffer)
+
+  defp flush_final(cfg, %{buffer: buffer} = acc),
+    do: write_block(cfg, %{acc | buffer: <<>>}, buffer)
 
   # 编码一个 block：N 分片写各盘 fd，校验和按盘累积。
   #

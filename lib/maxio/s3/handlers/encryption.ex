@@ -23,15 +23,29 @@ defmodule Maxio.S3.Handlers.Encryption do
     case Parser.parse(xml) do
       {:ok, %{algorithm: "AES256", kms_key_id: kms, bucket_key_enabled: bk}} ->
         if kms not in [nil, ""] do
-          raise Error.new(:invalid_argument, message: "KMSMasterKeyID is only valid with aws:kms/aws:kms:dsse")
+          raise Error.new(:invalid_argument,
+                  message: "KMSMasterKeyID is only valid with aws:kms/aws:kms:dsse"
+                )
         end
 
-        :ok = BucketConfigs.put(bucket, :encryption, %{"algorithm" => "AES256", "bucket_key_enabled" => bk})
-        Log.info("put bucket encryption", action: :put_bucket_encryption, bucket: bucket, reason: "AES256")
+        :ok =
+          BucketConfigs.put(bucket, :encryption, %{
+            "algorithm" => "AES256",
+            "bucket_key_enabled" => bk
+          })
+
+        Log.info("put bucket encryption",
+          action: :put_bucket_encryption,
+          bucket: bucket,
+          reason: "AES256"
+        )
+
         send_resp(conn, 200, "")
 
       {:ok, %{algorithm: alg}} when alg in ["aws:kms", "aws:kms:dsse"] ->
-        raise Error.new(:not_implemented, message: "Only SSE-S3 (AES256) is supported; #{alg} not implemented")
+        raise Error.new(:not_implemented,
+                message: "Only SSE-S3 (AES256) is supported; #{alg} not implemented"
+              )
 
       {:ok, _other} ->
         raise Error.new(:malformed_xml, message: "Invalid SSEAlgorithm")
@@ -48,7 +62,12 @@ defmodule Maxio.S3.Handlers.Encryption do
 
     case BucketConfigs.get(bucket, :encryption) do
       {:ok, %{"algorithm" => alg} = cfg} ->
-        body = View.render(%{algorithm: alg, bucket_key_enabled: Map.get(cfg, "bucket_key_enabled", false)})
+        body =
+          View.render(%{
+            algorithm: alg,
+            bucket_key_enabled: Map.get(cfg, "bucket_key_enabled", false)
+          })
+
         conn |> put_resp_content_type("application/xml") |> send_resp(200, body)
 
       :none ->
@@ -74,9 +93,14 @@ defmodule Maxio.S3.Handlers.Encryption do
 
   defp read_small_body!(conn) do
     case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} -> {conn, body}
-      {:more, _partial, _conn} -> raise Error.new(:malformed_xml, message: "Encryption config too large")
-      {:error, _} -> raise Error.new(:malformed_xml)
+      {:ok, body, conn} ->
+        {conn, body}
+
+      {:more, _partial, _conn} ->
+        raise Error.new(:malformed_xml, message: "Encryption config too large")
+
+      {:error, _} ->
+        raise Error.new(:malformed_xml)
     end
   end
 end

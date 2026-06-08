@@ -8,6 +8,7 @@ defmodule Maxio.Cluster.ClusterE2ETest do
   setup do
     InProcess.setup!()
     base = Path.join(System.tmp_dir!(), "maxio_e2e_#{System.unique_integer([:positive])}")
+
     # 3 node，每 node 2 drive = N=6 端点；K=4 M=2 -> 杀 1 node（2 端点）= M，仍可读/写 quorum=4。
     endpoints =
       for i <- 0..5 do
@@ -30,10 +31,10 @@ defmodule Maxio.Cluster.ClusterE2ETest do
 
   test "一节点宕机仍可写（write quorum=4，宕 node2 的 2 端点 -> 4 成功）", ctx do
     o = opts(ctx)
-    InProcess.set_down(:"maxio@node2")
+    InProcess.set_down(:maxio@node2)
     body = :crypto.strong_rand_bytes(3000)
     assert {:ok, %{size: 3000}} = Distributed.put("b", "k", "null", [body], o)
-    InProcess.set_up(:"maxio@node2")
+    InProcess.set_up(:maxio@node2)
     {:ok, s} = Distributed.get("b", "k", "null", nil, o)
     assert IO.iodata_to_binary(Enum.to_list(s)) == body
   end
@@ -42,7 +43,7 @@ defmodule Maxio.Cluster.ClusterE2ETest do
     o = opts(ctx)
     body = :crypto.strong_rand_bytes(3000)
     {:ok, _} = Distributed.put("b", "k", "null", [body], o)
-    InProcess.set_down(:"maxio@node1")
+    InProcess.set_down(:maxio@node1)
     {:ok, s} = Distributed.get("b", "k", "null", nil, o)
     assert IO.iodata_to_binary(Enum.to_list(s)) == body
   end
@@ -50,10 +51,10 @@ defmodule Maxio.Cluster.ClusterE2ETest do
   test "节点返回后 heal 重建其分片", ctx do
     o = opts(ctx)
     body = :crypto.strong_rand_bytes(3000)
-    InProcess.set_down(:"maxio@node2")
+    InProcess.set_down(:maxio@node2)
     {:ok, _} = Distributed.put("b", "k", "null", [body], o)
     # node2 返回（带空盘）—— 其端点目录从未写过 -> heal 重建。
-    InProcess.set_up(:"maxio@node2")
+    InProcess.set_up(:maxio@node2)
     assert {:ok, %{healed: n}} = Heal.heal_object("b", "k", "null", o)
     assert n >= 1
     {:ok, s} = Distributed.get("b", "k", "null", nil, o)
@@ -64,8 +65,8 @@ defmodule Maxio.Cluster.ClusterE2ETest do
     o = opts(ctx)
     body = :crypto.strong_rand_bytes(3000)
     {:ok, _} = Distributed.put("b", "k", "null", [body], o)
-    InProcess.set_down(:"maxio@node1")
-    InProcess.set_down(:"maxio@node2")
+    InProcess.set_down(:maxio@node1)
+    InProcess.set_down(:maxio@node2)
     {:ok, s} = Distributed.get("b", "k", "null", nil, o)
     assert_raise InsufficientShardsError, fn -> Enum.to_list(s) end
   end

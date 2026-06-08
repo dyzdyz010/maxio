@@ -23,7 +23,10 @@ defmodule Maxio.Policy.StoreTest do
 
   test "put 覆盖（upsert）" do
     Store.put_bucket_policy("b3", @policy)
-    deny = ~s({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::b3","arn:aws:s3:::b3/*"]}})
+
+    deny =
+      ~s({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::b3","arn:aws:s3:::b3/*"]}})
+
     assert :ok = Store.put_bucket_policy("b3", deny)
     assert [%{effect: :deny}] = Store.statements_for_bucket("b3")
   end

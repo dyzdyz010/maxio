@@ -35,7 +35,7 @@ defmodule Maxio.Cluster.TopologyTest do
   end
 
   test "重复 set id -> raise" do
-    dup = %{id: 0, endpoints: for(i <- 0..5, do: {:"maxio@n", "/d#{i}"})}
+    dup = %{id: 0, endpoints: for(i <- 0..5, do: {:maxio@n, "/d#{i}"})}
 
     bad =
       [

@@ -34,7 +34,13 @@ defmodule Maxio.Objects.ListVersionsTest do
     assert res.next_version_id_marker == "01"
 
     # 续页
-    res2 = Objects.list_object_versions("vlb", %{max_keys: 2, key_marker: "a.txt", version_id_marker: "01"})
+    res2 =
+      Objects.list_object_versions("vlb", %{
+        max_keys: 2,
+        key_marker: "a.txt",
+        version_id_marker: "01"
+      })
+
     keys = Enum.map(res2.versions, & &1.key)
     assert keys == ["b.txt"]
     refute res2.is_truncated

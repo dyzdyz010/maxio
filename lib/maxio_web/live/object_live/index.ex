@@ -101,7 +101,12 @@ defmodule MaxioWeb.ObjectLive.Index do
           <progress class="progress progress-primary w-40" value={entry.progress} max="100">
             {entry.progress}%
           </progress>
-          <button type="button" phx-click="cancel_upload" phx-value-ref={entry.ref} aria-label="取消">
+          <button
+            type="button"
+            phx-click="cancel_upload"
+            phx-value-ref={entry.ref}
+            aria-label="取消"
+          >
             <.icon name="hero-x-mark" class="size-4" />
           </button>
           <p :for={err <- upload_errors(@uploads.object, entry)} class="text-error text-sm">
@@ -130,7 +135,12 @@ defmodule MaxioWeb.ObjectLive.Index do
         class="flex gap-2 items-end mb-6"
       >
         <div class="max-w-xs">
-          <.input field={@folder_form[:folder]} type="text" label="新建文件夹" placeholder="reports" />
+          <.input
+            field={@folder_form[:folder]}
+            type="text"
+            label="新建文件夹"
+            placeholder="reports"
+          />
         </div>
         <.button id="create-folder-submit" type="submit">
           <.icon name="hero-folder-plus" class="size-4" /> 创建文件夹
@@ -139,13 +149,21 @@ defmodule MaxioWeb.ObjectLive.Index do
 
       <table class="table table-zebra">
         <thead>
-          <tr><th>名称</th><th class="text-right">大小</th><th>修改时间</th><th class="w-0"></th></tr>
+          <tr>
+            <th>名称</th>
+            <th class="text-right">大小</th>
+            <th>修改时间</th>
+            <th class="w-0"></th>
+          </tr>
         </thead>
         <tbody>
           <%!-- 文件夹（common prefixes）非 stream，直接渲染 --%>
           <tr :for={cp <- @prefixes}>
             <td colspan="4">
-              <.link patch={~p"/buckets/#{@bucket}/browse?prefix=#{cp}"} class="link flex items-center gap-2">
+              <.link
+                patch={~p"/buckets/#{@bucket}/browse?prefix=#{cp}"}
+                class="link flex items-center gap-2"
+              >
                 <.icon name="hero-folder" class="size-4" /> {folder_label(cp, @prefix)}
               </.link>
             </td>

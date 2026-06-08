@@ -45,7 +45,12 @@ defmodule Maxio.Cluster.ShardServerTest do
     good1 = :crypto.strong_rand_bytes(256)
 
     :ok =
-      ShardServer.put_shard(obj, 0, <<bxor(0, 0)::8, :crypto.strong_rand_bytes(255)::binary>>, 256)
+      ShardServer.put_shard(
+        obj,
+        0,
+        <<bxor(0, 0)::8, :crypto.strong_rand_bytes(255)::binary>>,
+        256
+      )
 
     {:ok, 2} = ShardServer.heal_shard(obj, %{0 => good0, 1 => good1}, 256, %{"size" => 512})
     assert ShardServer.get_shard(obj, 0, 256) == good0

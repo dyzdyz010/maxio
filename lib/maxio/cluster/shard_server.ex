@@ -127,6 +127,7 @@ defmodule Maxio.Cluster.ShardServer do
 
       {:error, _} ->
         {:ok, fd} = :file.open(String.to_charlist(path), [:write, :binary, :raw])
+
         # 至少建空文件；具体偏移由后续 pwrite 拉伸（:raw 文件 pwrite 自动补零）。
         :file.close(fd)
         _ = shard_len

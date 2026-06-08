@@ -7,7 +7,12 @@ defmodule Maxio.S3.RequestParsers.Encryption do
   @behaviour Saxy.Handler
 
   @spec parse(binary()) ::
-          {:ok, %{algorithm: String.t() | nil, kms_key_id: String.t() | nil, bucket_key_enabled: boolean()}}
+          {:ok,
+           %{
+             algorithm: String.t() | nil,
+             kms_key_id: String.t() | nil,
+             bucket_key_enabled: boolean()
+           }}
           | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
     init = %{algorithm: nil, kms_key_id: nil, bucket_key_enabled: false, in: nil, text: nil}
@@ -35,16 +40,25 @@ defmodule Maxio.S3.RequestParsers.Encryption do
   end
 
   @impl true
-  def handle_event(:characters, c, %{text: t} = s) when is_binary(t), do: {:ok, %{s | text: t <> c}}
+  def handle_event(:characters, c, %{text: t} = s) when is_binary(t),
+    do: {:ok, %{s | text: t <> c}}
+
   def handle_event(:characters, _c, s), do: {:ok, s}
 
   @impl true
   def handle_event(:end_element, name, s) do
     case local(name) do
-      "SSEAlgorithm" -> {:ok, %{s | algorithm: trim(s.text), in: nil, text: nil}}
-      "KMSMasterKeyID" -> {:ok, %{s | kms_key_id: trim(s.text), in: nil, text: nil}}
-      "BucketKeyEnabled" -> {:ok, %{s | bucket_key_enabled: trim(s.text) == "true", in: nil, text: nil}}
-      _ -> {:ok, %{s | in: nil, text: nil}}
+      "SSEAlgorithm" ->
+        {:ok, %{s | algorithm: trim(s.text), in: nil, text: nil}}
+
+      "KMSMasterKeyID" ->
+        {:ok, %{s | kms_key_id: trim(s.text), in: nil, text: nil}}
+
+      "BucketKeyEnabled" ->
+        {:ok, %{s | bucket_key_enabled: trim(s.text) == "true", in: nil, text: nil}}
+
+      _ ->
+        {:ok, %{s | in: nil, text: nil}}
     end
   end
 

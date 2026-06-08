@@ -143,7 +143,9 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
         {:error, reason}
 
       {:ok, trailer_block, provided_sig, rest} ->
-        sts = trailer_string_to_sign(v.date, v.scope, v.prev_sig, Signer.hex_sha256(trailer_block))
+        sts =
+          trailer_string_to_sign(v.date, v.scope, v.prev_sig, Signer.hex_sha256(trailer_block))
+
         expected = Signer.signature(v.k_signing, sts)
 
         if Signer.secure_compare(expected, provided_sig) do

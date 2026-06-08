@@ -91,8 +91,7 @@ config :phoenix_live_view,
 # maxio S3：开发期对象数据目录与监听端口
 # 注：Windows 本机把 TCP 9000–9099 列入 OS 保留排除段（netsh int ipv4 show excludedportrange tcp），
 # 绑定 9000 报 :eacces。dev 用 9900 规避；prod 默认仍 9000（见 config.exs），可经 MAXIO_S3_PORT 覆盖。
-config :maxio, :s3,
-  data_dir: Path.expand("../priv/s3_data/dev", __DIR__)
+config :maxio, :s3, data_dir: Path.expand("../priv/s3_data/dev", __DIR__)
 
 config :maxio, Maxio.S3.Endpoint, port: 9900, ip: {127, 0, 0, 1}
 

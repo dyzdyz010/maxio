@@ -14,7 +14,8 @@ defmodule Maxio.Repo.Migrations.CreateBucketConfigs do
 
       add :cors, :map,
         null: true,
-        comment: "CORS 配置（jsonb 数组）：[CORSRule]，每 rule = %{id, allowed_methods, allowed_origins, allowed_headers, expose_headers, max_age_seconds}；nil=未配置"
+        comment:
+          "CORS 配置（jsonb 数组）：[CORSRule]，每 rule = %{id, allowed_methods, allowed_origins, allowed_headers, expose_headers, max_age_seconds}；nil=未配置"
 
       add :lifecycle, :map,
         null: true,
@@ -22,13 +23,12 @@ defmodule Maxio.Repo.Migrations.CreateBucketConfigs do
 
       add :encryption, :map,
         null: true,
-        comment: "默认加密配置（jsonb）：%{algorithm:AES256, kms_key_id, bucket_key_enabled}（MVP 仅 SSE-S3 AES256 生效）；nil=未配置"
+        comment:
+          "默认加密配置（jsonb）：%{algorithm:AES256, kms_key_id, bucket_key_enabled}（MVP 仅 SSE-S3 AES256 生效）；nil=未配置"
 
       timestamps(type: :utc_datetime_usec)
     end
 
-    create unique_index(:bucket_configs, [:bucket_name],
-             comment: "桶名唯一索引（每桶至多一行高级配置）"
-           )
+    create unique_index(:bucket_configs, [:bucket_name], comment: "桶名唯一索引（每桶至多一行高级配置）")
   end
 end

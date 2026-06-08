@@ -28,7 +28,11 @@ defmodule Maxio.S3.AuthzPrincipalTest do
       Application.put_env(:maxio, :policy_store, prev)
     end)
 
-    principal = %{type: :iam_user, access_key: "AKIATEST00000000TEST", arn: "arn:aws:iam:::user/AKIATEST00000000TEST"}
+    principal = %{
+      type: :iam_user,
+      access_key: "AKIATEST00000000TEST",
+      arn: "arn:aws:iam:::user/AKIATEST00000000TEST"
+    }
 
     conn =
       Plug.Test.conn(:get, "/somebucket/k.txt")

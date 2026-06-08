@@ -15,20 +15,26 @@ defmodule Maxio.Policy.StatementTest do
   end
 
   test "Statement 单对象（非数组）归一化为列表" do
-    json = ~s({"Version":"2012-10-17","Statement":{"Effect":"Deny","Principal":"*","Action":["s3:*"],"Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"]}})
+    json =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Deny","Principal":"*","Action":["s3:*"],"Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"]}})
+
     assert {:ok, [s]} = Statement.parse_policy(json)
     assert s.effect == :deny
     assert s.actions == ["s3:*"]
   end
 
   test "Action/Resource 数组" do
-    json = ~s({"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111:user/x"},"Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::b/*"]}]})
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111:user/x"},"Action":["s3:GetObject","s3:PutObject"],"Resource":["arn:aws:s3:::b/*"]}]})
+
     assert {:ok, [s]} = Statement.parse_policy(json)
     assert s.principals == {:aws, ["arn:aws:iam::111:user/x"]}
   end
 
   test "AWS:* 归一化为 :any" do
-    json = ~s({"Statement":{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+    json =
+      ~s({"Statement":{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
     assert {:ok, [s]} = Statement.parse_policy(json)
     assert s.principals == :any
   end
@@ -38,12 +44,16 @@ defmodule Maxio.Policy.StatementTest do
   end
 
   test "畸形：Effect 非法" do
-    json = ~s({"Statement":{"Effect":"Permit","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::b"}})
+    json =
+      ~s({"Statement":{"Effect":"Permit","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::b"}})
+
     assert {:error, :malformed} = Statement.parse_policy(json)
   end
 
   test "畸形：bucket policy 缺 Principal" do
-    json = ~s({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+    json =
+      ~s({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
     assert {:error, :malformed} = Statement.parse_policy(json)
   end
 
@@ -53,12 +63,16 @@ defmodule Maxio.Policy.StatementTest do
   end
 
   test "畸形：Version 未知" do
-    json = ~s({"Version":"1999-01-01","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::b"}})
+    json =
+      ~s({"Version":"1999-01-01","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::b"}})
+
     assert {:error, :malformed} = Statement.parse_policy(json)
   end
 
   test "Condition 透传为 map" do
-    json = ~s({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}})
+    json =
+      ~s({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}})
+
     assert {:ok, [s]} = Statement.parse_policy(json)
     assert s.conditions == %{"Bool" => %{"aws:SecureTransport" => "false"}}
   end

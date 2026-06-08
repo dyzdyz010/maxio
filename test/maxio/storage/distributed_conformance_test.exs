@@ -7,6 +7,7 @@ defmodule Maxio.Storage.DistributedConformanceTest do
   setup do
     InProcess.setup!()
     base = Path.join(System.tmp_dir!(), "maxio_dist_conf_#{System.unique_integer([:positive])}")
+
     # 1 pool, 1 set, N=6 端点 = 6 个独立临时目录（同机模拟 6 节点，3 个 node 名各 2 drive）。
     endpoints =
       for i <- 0..5 do

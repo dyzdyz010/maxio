@@ -102,7 +102,8 @@ defmodule Maxio.S3.MultipartIntegrationTest do
       "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"deadbeef\"</ETag></Part></CompleteMultipartUpload>"
 
     complete =
-      SigV4Request.signed_conn(:post, "/mpbk2/o", query: %{"uploadId" => uid}, body: xml) |> call()
+      SigV4Request.signed_conn(:post, "/mpbk2/o", query: %{"uploadId" => uid}, body: xml)
+      |> call()
 
     assert complete.status == 400
     assert complete.resp_body =~ "<Code>InvalidPart</Code>"

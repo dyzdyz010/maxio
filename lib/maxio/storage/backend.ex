@@ -16,7 +16,13 @@ defmodule Maxio.Storage.Backend do
   @type range :: nil | {non_neg_integer(), non_neg_integer()}
   @type put_result :: %{size: non_neg_integer(), etag: String.t(), sha256: String.t()}
 
-  @callback put(bucket(), key(), version_id :: String.t(), chunks :: Enumerable.t(), opts :: keyword()) ::
+  @callback put(
+              bucket(),
+              key(),
+              version_id :: String.t(),
+              chunks :: Enumerable.t(),
+              opts :: keyword()
+            ) ::
               {:ok, put_result()} | {:error, term()}
   @callback get(bucket(), key(), version_id :: String.t(), range()) ::
               {:ok, Enumerable.t()} | {:error, :enoent | term()}
@@ -33,7 +39,14 @@ defmodule Maxio.Storage.Backend do
   @type part_put_result :: %{size: non_neg_integer(), etag: String.t(), md5_raw: binary()}
 
   @doc "流式写入一个 part 的字节，返回该 part 的 size、MD5 hex etag（无引号）与 16 字节原始 MD5。"
-  @callback put_part(bucket(), key(), upload_id(), part_number(), chunks :: Enumerable.t(), opts :: keyword()) ::
+  @callback put_part(
+              bucket(),
+              key(),
+              upload_id(),
+              part_number(),
+              chunks :: Enumerable.t(),
+              opts :: keyword()
+            ) ::
               {:ok, part_put_result()} | {:error, term()}
 
   @doc "流式读取一个 part 的字节（组装时按 part number 升序拼接用）。"
@@ -41,9 +54,16 @@ defmodule Maxio.Storage.Backend do
               {:ok, Enumerable.t()} | {:error, :enoent | term()}
 
   @doc "按给定 part number 升序把各 part 字节拼成最终对象（落到对象路径），返回总大小。"
-  @callback assemble(bucket(), key(), upload_id(), part_numbers :: [part_number()], opts :: keyword()) ::
+  @callback assemble(
+              bucket(),
+              key(),
+              upload_id(),
+              part_numbers :: [part_number()],
+              opts :: keyword()
+            ) ::
               {:ok, %{size: non_neg_integer()}} | {:error, term()}
 
   @doc "删除该 upload 的所有 part 字节与临时目录（Abort / Complete 后清理）。幂等。"
-  @callback abort_upload(bucket(), key(), upload_id(), opts :: keyword()) :: :ok | {:error, term()}
+  @callback abort_upload(bucket(), key(), upload_id(), opts :: keyword()) ::
+              :ok | {:error, term()}
 end

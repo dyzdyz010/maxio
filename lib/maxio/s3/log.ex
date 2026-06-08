@@ -8,7 +8,18 @@ defmodule Maxio.S3.Log do
   """
   require Logger
 
-  @md_keys [:request_id, :bucket, :key, :action, :auth_type, :payload_mode, :reason, :code, :status, :size]
+  @md_keys [
+    :request_id,
+    :bucket,
+    :key,
+    :action,
+    :auth_type,
+    :payload_mode,
+    :reason,
+    :code,
+    :status,
+    :size
+  ]
 
   @doc "把关键字参数中已知的 S3 元数据键提取为 Logger metadata keyword 列表。"
   @spec context(keyword()) :: keyword()

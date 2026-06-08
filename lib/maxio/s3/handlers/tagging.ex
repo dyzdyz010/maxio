@@ -52,7 +52,12 @@ defmodule Maxio.S3.Handlers.Tagging do
 
     case Objects.put_tags(bucket, key, [], vid) do
       :ok ->
-        Log.info("delete object tagging", action: :delete_object_tagging, bucket: bucket, key: key)
+        Log.info("delete object tagging",
+          action: :delete_object_tagging,
+          bucket: bucket,
+          key: key
+        )
+
         conn |> maybe_vid(vid) |> send_resp(204, "")
 
       {:error, :not_found} ->
@@ -127,9 +132,14 @@ defmodule Maxio.S3.Handlers.Tagging do
 
   defp read_small_body!(conn) do
     case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} -> {conn, body}
-      {:more, _partial, _conn} -> raise Error.new(:entity_too_large, message: "Tagging document too large")
-      {:error, _} -> raise Error.new(:malformed_xml)
+      {:ok, body, conn} ->
+        {conn, body}
+
+      {:more, _partial, _conn} ->
+        raise Error.new(:entity_too_large, message: "Tagging document too large")
+
+      {:error, _} ->
+        raise Error.new(:malformed_xml)
     end
   end
 end

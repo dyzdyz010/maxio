@@ -14,8 +14,7 @@ defmodule Maxio.Repo.Migrations.AddAclToBucketsAndObjects do
       add :acl_canned, :string,
         null: false,
         default: "private",
-        comment:
-          "对象的 canned ACL 名（默认 private；PutObject 的 x-amz-acl 写入；授权时折叠为等价 statement）"
+        comment: "对象的 canned ACL 名（默认 private；PutObject 的 x-amz-acl 写入；授权时折叠为等价 statement）"
     end
   end
 end

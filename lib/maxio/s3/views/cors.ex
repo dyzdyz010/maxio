@@ -18,7 +18,10 @@ defmodule Maxio.S3.Views.Cors do
       |> many("AllowedOrigin", r["allowed_origins"])
       |> many("AllowedHeader", r["allowed_headers"])
       |> many("ExposeHeader", r["expose_headers"])
-      |> maybe_one("MaxAgeSeconds", r["max_age_seconds"] && Integer.to_string(r["max_age_seconds"]))
+      |> maybe_one(
+        "MaxAgeSeconds",
+        r["max_age_seconds"] && Integer.to_string(r["max_age_seconds"])
+      )
 
     element("CORSRule", [], children)
   end

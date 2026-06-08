@@ -12,6 +12,7 @@ defmodule Maxio.S3.VersioningObjectTest do
     File.mkdir_p!(@data_dir)
     prev = Application.get_env(:maxio, :s3)
     Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
+
     on_exit(fn ->
       Application.put_env(:maxio, :s3, prev)
       File.rm_rf(@data_dir)
@@ -24,7 +25,9 @@ defmodule Maxio.S3.VersioningObjectTest do
 
   defp enable_versioning(bucket) do
     body = ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
-    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"versioning" => ""}, body: body) |> call()
+
+    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"versioning" => ""}, body: body)
+    |> call()
   end
 
   test "未版本化桶：PUT 不回 x-amz-version-id；GET 取当前" do
@@ -83,7 +86,9 @@ defmodule Maxio.S3.VersioningObjectTest do
     [dm_vid] = get_resp_header(del, "x-amz-version-id")
 
     # 删 delete marker → 旧版本重现为 latest
-    deldm = SigV4Request.signed_conn(:delete, "/perv/k.txt", query: %{"versionId" => dm_vid}) |> call()
+    deldm =
+      SigV4Request.signed_conn(:delete, "/perv/k.txt", query: %{"versionId" => dm_vid}) |> call()
+
     assert deldm.status == 204
 
     get = SigV4Request.signed_conn(:get, "/perv/k.txt") |> call()

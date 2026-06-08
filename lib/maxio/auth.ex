@@ -50,7 +50,11 @@ defmodule Maxio.Auth do
         skew_ms = abs(DateTime.diff(now, req_time, :millisecond))
 
         if skew_ms > clock_skew_ms() do
-          Log.warn("request time too skewed", auth_type: :header, reason: :request_time_too_skewed)
+          Log.warn("request time too skewed",
+            auth_type: :header,
+            reason: :request_time_too_skewed
+          )
+
           {:error, Error.new(:request_time_too_skewed)}
         else
           :ok

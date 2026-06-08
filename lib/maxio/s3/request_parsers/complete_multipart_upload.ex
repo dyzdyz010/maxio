@@ -43,7 +43,9 @@ defmodule Maxio.S3.RequestParsers.CompleteMultipartUpload do
     case local_name(name) do
       "PartNumber" ->
         pn = parse_int(state.text)
-        {:ok, %{state | current: Map.put(state.current || %{}, :part_number, pn), in: nil, text: nil}}
+
+        {:ok,
+         %{state | current: Map.put(state.current || %{}, :part_number, pn), in: nil, text: nil}}
 
       "ETag" ->
         {:ok,

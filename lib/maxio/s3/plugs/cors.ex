@@ -84,6 +84,7 @@ defmodule Maxio.S3.Plugs.Cors do
   end
 
   defp put_allow_headers(conn, []), do: conn
+
   defp put_allow_headers(conn, req_headers),
     do: put_resp_header(conn, "access-control-allow-headers", Enum.join(req_headers, ", "))
 
@@ -98,7 +99,11 @@ defmodule Maxio.S3.Plugs.Cors do
   defp put_expose_headers(conn, _), do: conn
 
   defp put_vary_preflight(conn) do
-    put_resp_header(conn, "vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+    put_resp_header(
+      conn,
+      "vary",
+      "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+    )
   end
 
   defp reject_cors(conn) do

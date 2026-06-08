@@ -135,7 +135,8 @@ defmodule Maxio.Objects do
   end
 
   @doc "按 (bucket, key, version_id) 取特定版本行。"
-  @spec get_version(String.t(), String.t(), String.t()) :: {:ok, Object.t()} | {:error, :not_found}
+  @spec get_version(String.t(), String.t(), String.t()) ::
+          {:ok, Object.t()} | {:error, :not_found}
   def get_version(bucket_name, key, version_id) do
     case Repo.get_by(Object, bucket_name: bucket_name, key: key, version_id: version_id) do
       nil -> {:error, :not_found}
@@ -391,13 +392,33 @@ defmodule Maxio.Objects do
       true ->
         case common_prefix_of(obj.key, prefix, delimiter) do
           nil ->
-            do_collapse_versions(rest, prefix, delimiter, max, [obj | vers], seen, cps, obj.key, obj.version_id)
+            do_collapse_versions(
+              rest,
+              prefix,
+              delimiter,
+              max,
+              [obj | vers],
+              seen,
+              cps,
+              obj.key,
+              obj.version_id
+            )
 
           cp ->
             if MapSet.member?(seen, cp) do
               do_collapse_versions(rest, prefix, delimiter, max, vers, seen, cps, cp, nil)
             else
-              do_collapse_versions(rest, prefix, delimiter, max, vers, MapSet.put(seen, cp), [cp | cps], cp, nil)
+              do_collapse_versions(
+                rest,
+                prefix,
+                delimiter,
+                max,
+                vers,
+                MapSet.put(seen, cp),
+                [cp | cps],
+                cp,
+                nil
+              )
             end
         end
     end
@@ -427,7 +448,8 @@ defmodule Maxio.Objects do
     # 多版本模型：ListObjectsV2 只看当前版本（is_latest）且非删除标记（is_delete_marker=false）。
     base_query =
       from o in Object,
-        where: o.bucket_name == ^bucket_name and o.is_latest == true and o.is_delete_marker == false,
+        where:
+          o.bucket_name == ^bucket_name and o.is_latest == true and o.is_delete_marker == false,
         order_by: [asc: o.key]
 
     base_query =

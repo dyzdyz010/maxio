@@ -14,8 +14,13 @@ defmodule Maxio.Policy.ConditionTest do
   end
 
   test "Bool 字符串 vs 布尔" do
-    assert Condition.hold?(%{"Bool" => %{"aws:SecureTransport" => "true"}}, %{"aws:SecureTransport" => true})
-    refute Condition.hold?(%{"Bool" => %{"aws:SecureTransport" => "false"}}, %{"aws:SecureTransport" => true})
+    assert Condition.hold?(%{"Bool" => %{"aws:SecureTransport" => "true"}}, %{
+             "aws:SecureTransport" => true
+           })
+
+    refute Condition.hold?(%{"Bool" => %{"aws:SecureTransport" => "false"}}, %{
+             "aws:SecureTransport" => true
+           })
   end
 
   test "缺键 → false" do
@@ -23,8 +28,13 @@ defmodule Maxio.Policy.ConditionTest do
   end
 
   test "IpAddress 单 IP（/32）" do
-    assert Condition.hold?(%{"IpAddress" => %{"aws:SourceIp" => "10.0.0.1"}}, %{"aws:SourceIp" => "10.0.0.1"})
-    refute Condition.hold?(%{"IpAddress" => %{"aws:SourceIp" => "10.0.0.1"}}, %{"aws:SourceIp" => "10.0.0.2"})
+    assert Condition.hold?(%{"IpAddress" => %{"aws:SourceIp" => "10.0.0.1"}}, %{
+             "aws:SourceIp" => "10.0.0.1"
+           })
+
+    refute Condition.hold?(%{"IpAddress" => %{"aws:SourceIp" => "10.0.0.1"}}, %{
+             "aws:SourceIp" => "10.0.0.2"
+           })
   end
 
   test "DateGreaterThan" do
@@ -34,7 +44,11 @@ defmodule Maxio.Policy.ConditionTest do
   end
 
   test "多算子 AND" do
-    block = %{"Bool" => %{"aws:SecureTransport" => "true"}, "StringEquals" => %{"s3:prefix" => "home/"}}
+    block = %{
+      "Bool" => %{"aws:SecureTransport" => "true"},
+      "StringEquals" => %{"s3:prefix" => "home/"}
+    }
+
     assert Condition.hold?(block, %{"aws:SecureTransport" => true, "s3:prefix" => "home/"})
     refute Condition.hold?(block, %{"aws:SecureTransport" => true, "s3:prefix" => "away/"})
   end

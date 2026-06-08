@@ -53,7 +53,11 @@ defmodule Maxio.Storage.Erasure.CodecTest do
       |> List.update_at(2, fn <<b, rest::binary>> -> <<bxor(b, 0xFF), rest::binary>> end)
 
     assert_raise InsufficientShardsError, fn ->
-      Codec.restore_block(cfg(), bad, cks, byte_size(block), bucket: "b", key: "k", block_index: 0)
+      Codec.restore_block(cfg(), bad, cks, byte_size(block),
+        bucket: "b",
+        key: "k",
+        block_index: 0
+      )
     end
   end
 

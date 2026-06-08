@@ -43,7 +43,9 @@ defmodule Maxio.S3.RequestParsers.VersioningConfiguration do
   end
 
   @impl true
-  def handle_event(:characters, c, %{text: t} = s) when is_binary(t), do: {:ok, %{s | text: t <> c}}
+  def handle_event(:characters, c, %{text: t} = s) when is_binary(t),
+    do: {:ok, %{s | text: t <> c}}
+
   def handle_event(:characters, _c, s), do: {:ok, s}
 
   @impl true

@@ -57,7 +57,7 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
 
   @impl true
   def list_keys do
-    Repo.all(from a in AccessKey)
+    Repo.all(from(a in AccessKey))
     |> Enum.map(fn a ->
       %{
         access_key: a.access_key_id,

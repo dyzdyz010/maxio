@@ -3,7 +3,9 @@ defmodule Maxio.S3.RequestParsers.VersioningConfigurationTest do
   alias Maxio.S3.RequestParsers.VersioningConfiguration, as: P
 
   test "Enabled" do
-    xml = ~s(<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>)
+    xml =
+      ~s(<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>)
+
     assert {:ok, %{status: "Enabled", mfa_delete: nil}} = P.parse(xml)
   end
 
@@ -13,7 +15,9 @@ defmodule Maxio.S3.RequestParsers.VersioningConfigurationTest do
   end
 
   test "Enabled + MfaDelete" do
-    xml = ~s(<VersioningConfiguration><Status>Enabled</Status><MfaDelete>Enabled</MfaDelete></VersioningConfiguration>)
+    xml =
+      ~s(<VersioningConfiguration><Status>Enabled</Status><MfaDelete>Enabled</MfaDelete></VersioningConfiguration>)
+
     assert {:ok, %{status: "Enabled", mfa_delete: "Enabled"}} = P.parse(xml)
   end
 

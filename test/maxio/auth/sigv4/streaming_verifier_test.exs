@@ -37,7 +37,14 @@ defmodule Maxio.Auth.SigV4.StreamingVerifierTest do
 
   describe "chunk_string_to_sign/4（6 行，无尾换行）" do
     test "结构与 AWS 向量一致（line5 == 空串常量）" do
-      sts = StreamingVerifier.chunk_string_to_sign(@amz_date, @scope, @seed, Signer.hex_sha256(data1()))
+      sts =
+        StreamingVerifier.chunk_string_to_sign(
+          @amz_date,
+          @scope,
+          @seed,
+          Signer.hex_sha256(data1())
+        )
+
       lines = String.split(sts, "\n")
       assert length(lines) == 6
       assert Enum.at(lines, 0) == "AWS4-HMAC-SHA256-PAYLOAD"
@@ -45,7 +52,10 @@ defmodule Maxio.Auth.SigV4.StreamingVerifierTest do
       assert Enum.at(lines, 2) == @scope
       assert Enum.at(lines, 3) == @seed
       assert Enum.at(lines, 4) == @empty_sha
-      assert Enum.at(lines, 5) == "bf718b6f653bebc184e1479f1935b8da974d701b893afcf49e701f3e2f9f9c5a"
+
+      assert Enum.at(lines, 5) ==
+               "bf718b6f653bebc184e1479f1935b8da974d701b893afcf49e701f3e2f9f9c5a"
+
       refute String.ends_with?(sts, "\n")
     end
   end

@@ -22,7 +22,9 @@ defmodule Maxio.S3.Views.ListVersions do
         element("MaxKeys", [], characters(Integer.to_string(data.max_keys))),
         element("IsTruncated", [], characters(to_string(data.is_truncated)))
       ]
-      |> maybe(data.is_truncated && data.next_key_marker, fn t -> element("NextKeyMarker", [], characters(t)) end)
+      |> maybe(data.is_truncated && data.next_key_marker, fn t ->
+        element("NextKeyMarker", [], characters(t))
+      end)
       |> maybe(data.is_truncated && data.next_version_id_marker, fn t ->
         element("NextVersionIdMarker", [], characters(t))
       end)

@@ -6,7 +6,9 @@ defmodule Maxio.S3.Views.Encryption do
   @spec render(%{algorithm: String.t(), bucket_key_enabled: boolean()}) :: iodata()
   def render(%{algorithm: alg} = data) do
     apply_default =
-      element("ApplyServerSideEncryptionByDefault", [], [element("SSEAlgorithm", [], characters(alg))])
+      element("ApplyServerSideEncryptionByDefault", [], [
+        element("SSEAlgorithm", [], characters(alg))
+      ])
 
     rule_children =
       [apply_default]

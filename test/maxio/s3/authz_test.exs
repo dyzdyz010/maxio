@@ -13,7 +13,12 @@ defmodule Maxio.S3.AuthzTest do
     File.mkdir_p!(@data_dir)
     prev = Application.get_env(:maxio, :s3)
     Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
-    on_exit(fn -> Application.put_env(:maxio, :s3, prev); File.rm_rf(@data_dir) end)
+
+    on_exit(fn ->
+      Application.put_env(:maxio, :s3, prev)
+      File.rm_rf(@data_dir)
+    end)
+
     :ok
   end
 
@@ -85,7 +90,8 @@ defmodule Maxio.S3.AuthzTest do
     SigV4Request.signed_conn(:put, "/denyb") |> call()
     SigV4Request.signed_conn(:put, "/denyb/d.txt", body: "deny") |> call()
 
-    deny = ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::denyb/*"},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::denyb/*"}]})
+    deny =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::denyb/*"},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::denyb/*"}]})
 
     SigV4Request.signed_conn(:put, "/denyb",
       query: %{"policy" => ""},

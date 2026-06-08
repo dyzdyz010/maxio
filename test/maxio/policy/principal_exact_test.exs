@@ -30,12 +30,16 @@ defmodule Maxio.Policy.PrincipalExactTest do
   end
 
   test "通配 ARN 不再过度命中（精确匹配）" do
-    assert Evaluator.evaluate(ctx("arn:aws:iam:::user/AKIAALICE"), [allow_stmt("arn:aws:iam:::user/*")]) ==
+    assert Evaluator.evaluate(ctx("arn:aws:iam:::user/AKIAALICE"), [
+             allow_stmt("arn:aws:iam:::user/*")
+           ]) ==
              {:deny, :implicit_deny}
   end
 
   test "不同 ARN 不命中" do
-    assert Evaluator.evaluate(ctx("arn:aws:iam:::user/AKIABOB"), [allow_stmt("arn:aws:iam:::user/AKIAALICE")]) ==
+    assert Evaluator.evaluate(ctx("arn:aws:iam:::user/AKIABOB"), [
+             allow_stmt("arn:aws:iam:::user/AKIAALICE")
+           ]) ==
              {:deny, :implicit_deny}
   end
 end

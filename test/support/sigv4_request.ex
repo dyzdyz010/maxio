@@ -159,7 +159,12 @@ defmodule Maxio.Test.SigV4Request do
         data_hash = Signer.hex_sha256(data)
 
         chunk_sts =
-          Maxio.Auth.SigV4.StreamingVerifier.chunk_string_to_sign(amz_date, scope, prev, data_hash)
+          Maxio.Auth.SigV4.StreamingVerifier.chunk_string_to_sign(
+            amz_date,
+            scope,
+            prev,
+            data_hash
+          )
 
         sig = Signer.signature(key, chunk_sts)
         size_hex = Integer.to_string(byte_size(data), 16) |> String.downcase()
@@ -189,6 +194,8 @@ defmodule Maxio.Test.SigV4Request do
       |> Map.put(:host, @host)
       |> put_private(:maxio_now, DateTime.utc_now())
 
-    Enum.reduce(extra_headers, conn, fn {k, v}, acc -> put_req_header(acc, String.downcase(k), v) end)
+    Enum.reduce(extra_headers, conn, fn {k, v}, acc ->
+      put_req_header(acc, String.downcase(k), v)
+    end)
   end
 end

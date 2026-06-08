@@ -29,14 +29,17 @@ defmodule Maxio.Storage.Distributed do
 
   @impl true
   def put(bucket, key, version_id \\ "null", chunks, opts \\ [])
-  def put(bucket, key, version_id, chunks, opts), do: do_put(bucket, key, version_id, chunks, opts)
+
+  def put(bucket, key, version_id, chunks, opts),
+    do: do_put(bucket, key, version_id, chunks, opts)
 
   @impl true
   def get(bucket, key, version_id \\ "null", range \\ nil, opts \\ []),
     do: do_get(bucket, key, version_id, range, opts)
 
   @impl true
-  def stat(bucket, key, version_id \\ "null", opts \\ []), do: do_stat(bucket, key, version_id, opts)
+  def stat(bucket, key, version_id \\ "null", opts \\ []),
+    do: do_stat(bucket, key, version_id, opts)
 
   @impl true
   def delete(bucket, key, version_id \\ "null", opts \\ []),
@@ -151,7 +154,14 @@ defmodule Maxio.Storage.Distributed do
     shard_len = acc.shard_len || 0
 
     meta =
-      build_meta(c, acc.size, etag, sha256, shard_len, Enum.map(acc.block_hashes, &Enum.reverse/1))
+      build_meta(
+        c,
+        acc.size,
+        etag,
+        sha256,
+        shard_len,
+        Enum.map(acc.block_hashes, &Enum.reverse/1)
+      )
 
     ok_endpoints = write_sidecars(tx, dirs, meta)
 
@@ -190,7 +200,9 @@ defmodule Maxio.Storage.Distributed do
   defp drain_full_blocks(_cfg, acc), do: acc
 
   defp flush_final(_cfg, %{buffer: <<>>} = acc), do: acc
-  defp flush_final(cfg, %{buffer: buffer} = acc), do: write_block(cfg, %{acc | buffer: <<>>}, buffer)
+
+  defp flush_final(cfg, %{buffer: buffer} = acc),
+    do: write_block(cfg, %{acc | buffer: <<>>}, buffer)
 
   # 编码一个 block：N 分片经 transport 写各端点；校验和按端点累积（与 M6 write_block 逐字一致，
   # 仅落盘换成 transport.put_shard）。块零填充到 block_size 保证全对象 shard_len 一致（M6 不变量）。
@@ -580,8 +592,18 @@ defmodule Maxio.Storage.Distributed do
           {:ok, []}
         else
           {:ok,
-           stream_object(c, bucket, "#{upload_id}/#{part_number}", "null", tx, dirs, meta,
-             block_size, 0, size - 1)}
+           stream_object(
+             c,
+             bucket,
+             "#{upload_id}/#{part_number}",
+             "null",
+             tx,
+             dirs,
+             meta,
+             block_size,
+             0,
+             size - 1
+           )}
         end
 
       {:error, :enoent} ->
@@ -637,7 +659,14 @@ defmodule Maxio.Storage.Distributed do
     shard_len = acc.shard_len || 0
 
     meta =
-      build_meta(c, acc.size, etag, sha256, shard_len, Enum.map(acc.block_hashes, &Enum.reverse/1))
+      build_meta(
+        c,
+        acc.size,
+        etag,
+        sha256,
+        shard_len,
+        Enum.map(acc.block_hashes, &Enum.reverse/1)
+      )
 
     _ = write_sidecars(tx, dirs, meta)
     {:ok, %{size: acc.size}}

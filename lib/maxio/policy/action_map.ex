@@ -27,6 +27,7 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:get_object), do: {"s3:GetObject", :object}
   def for_action(:head_object), do: {"s3:GetObject", :object}
   def for_action(:delete_object), do: {"s3:DeleteObject", :object}
+
   # DeleteObjects 批删：Authz 用桶级 s3:DeleteObject 作粗粒度门（细粒度逐 key 检查 defer，文档化）。
   def for_action(:delete_objects), do: {"s3:DeleteObject", :bucket}
 

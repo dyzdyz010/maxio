@@ -10,6 +10,7 @@ defmodule Maxio.S3.ListVersionsE2ETest do
     File.mkdir_p!(@data_dir)
     prev = Application.get_env(:maxio, :s3)
     Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
+
     on_exit(fn ->
       Application.put_env(:maxio, :s3, prev)
       File.rm_rf(@data_dir)

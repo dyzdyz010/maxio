@@ -46,7 +46,11 @@ defmodule Maxio.Auth.CredentialStore.MemoryStore do
     ensure_table()
 
     principal =
-      Map.get(attrs, :principal, %{type: :iam_user, access_key: ak, arn: "arn:aws:iam:::user/#{ak}"})
+      Map.get(attrs, :principal, %{
+        type: :iam_user,
+        access_key: ak,
+        arn: "arn:aws:iam:::user/#{ak}"
+      })
 
     :ets.insert(@table, {ak, sk, principal})
     :ok

@@ -21,7 +21,9 @@ defmodule Maxio.S3.RequestParsers.DeleteTest do
   end
 
   test "带命名空间解析" do
-    xml = ~s(<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>k</Key></Object></Delete>)
+    xml =
+      ~s(<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>k</Key></Object></Delete>)
+
     assert {:ok, %{objects: [%{key: "k", version_id: nil}]}} = P.parse(xml)
   end
 

@@ -16,7 +16,7 @@ defmodule Maxio.Storage.FSPartsTest do
     :ok = FS.put_bucket("b", opts(dir))
     {:ok, r} = FS.put_part("b", "k", "uid1", 1, ["hel", "lo"], opts(dir))
     assert r.size == 5
-    assert r.etag == (:crypto.hash(:md5, "hello") |> Base.encode16(case: :lower))
+    assert r.etag == :crypto.hash(:md5, "hello") |> Base.encode16(case: :lower)
     assert r.md5_raw == :crypto.hash(:md5, "hello")
     assert byte_size(r.md5_raw) == 16
     refute String.contains?(r.etag, "\"")

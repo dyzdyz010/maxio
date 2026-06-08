@@ -31,7 +31,9 @@ defmodule Mix.Tasks.Maxio.Heal do
             )
 
           {:error, :enoent} ->
-            IO.puts("[maxio heal] #{bucket}/#{key}@#{version_id}: no sidecar found (object missing)")
+            IO.puts(
+              "[maxio heal] #{bucket}/#{key}@#{version_id}: no sidecar found (object missing)"
+            )
         end
 
       [bucket] ->

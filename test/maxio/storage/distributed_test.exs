@@ -32,8 +32,8 @@ defmodule Maxio.Storage.DistributedTest do
     body = :crypto.strong_rand_bytes(3000)
     {:ok, _} = Distributed.put("b", "k", "null", [body], o)
 
-    InProcess.set_down(:"maxio@d0")
-    InProcess.set_down(:"maxio@d2")
+    InProcess.set_down(:maxio@d0)
+    InProcess.set_down(:maxio@d2)
 
     {:ok, s} = Distributed.get("b", "k", "null", nil, o)
     assert IO.iodata_to_binary(Enum.to_list(s)) == body
@@ -44,9 +44,9 @@ defmodule Maxio.Storage.DistributedTest do
     body = :crypto.strong_rand_bytes(3000)
     {:ok, _} = Distributed.put("b", "k", "null", [body], o)
 
-    InProcess.set_down(:"maxio@d0")
-    InProcess.set_down(:"maxio@d2")
-    InProcess.set_down(:"maxio@d4")
+    InProcess.set_down(:maxio@d0)
+    InProcess.set_down(:maxio@d2)
+    InProcess.set_down(:maxio@d4)
 
     {:ok, s} = Distributed.get("b", "k", "null", nil, o)
     assert_raise InsufficientShardsError, fn -> Enum.to_list(s) end
@@ -54,9 +54,9 @@ defmodule Maxio.Storage.DistributedTest do
 
   test "PUT 时 3 端点宕机 -> 成功端点 < write_quorum=4 -> {:error,:write_quorum}", ctx do
     o = opts(ctx)
-    InProcess.set_down(:"maxio@d0")
-    InProcess.set_down(:"maxio@d1")
-    InProcess.set_down(:"maxio@d2")
+    InProcess.set_down(:maxio@d0)
+    InProcess.set_down(:maxio@d1)
+    InProcess.set_down(:maxio@d2)
 
     assert {:error, :write_quorum} = Distributed.put("b", "k", "null", ["hello world"], o)
   end

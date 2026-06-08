@@ -29,8 +29,13 @@ defmodule Maxio.S3.LifecycleE2ETest do
 
   test "Expiration 同时 Days+Date → 400" do
     SigV4Request.signed_conn(:put, "/lcb2") |> call()
-    bad = ~s(<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><Expiration><Days>7</Days><Date>2026-01-01T00:00:00.000Z</Date></Expiration></Rule></LifecycleConfiguration>)
-    res = SigV4Request.signed_conn(:put, "/lcb2", query: %{"lifecycle" => ""}, body: bad) |> call()
+
+    bad =
+      ~s(<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><Expiration><Days>7</Days><Date>2026-01-01T00:00:00.000Z</Date></Expiration></Rule></LifecycleConfiguration>)
+
+    res =
+      SigV4Request.signed_conn(:put, "/lcb2", query: %{"lifecycle" => ""}, body: bad) |> call()
+
     assert res.status == 400
   end
 end

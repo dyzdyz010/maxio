@@ -52,6 +52,7 @@ defmodule MaxioWeb.ConsoleAuthTest do
     test "清 session 跳 /login", %{conn: conn} do
       conn = conn |> log_in_console() |> delete(~p"/logout")
       assert redirected_to(conn) == ~p"/login"
+
       # drop: true 在响应发送时丢弃 session cookie；回收 conn 发起后续请求验证 session 真被清。
       conn = conn |> recycle() |> get(~p"/login")
       refute get_session(conn, "console_access_key")

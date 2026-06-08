@@ -39,6 +39,7 @@ defmodule Maxio.S3.Plugs.Dispatch do
 
   defp render_error(conn, %Error{} = err) do
     request_id = conn |> get_req_header("x-request-id") |> List.first()
+
     # resource 用原始解码路径（保留尾/连续/前导斜杠），与 SigV4 CanonicalURI 一致，不用 path_info。
     resource = RawPath.decoded_path(conn)
     err = %{err | request_id: request_id, resource: err.resource || resource}

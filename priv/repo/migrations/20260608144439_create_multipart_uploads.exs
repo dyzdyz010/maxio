@@ -4,8 +4,7 @@ defmodule Maxio.Repo.Migrations.CreateMultipartUploads do
   def change do
     create table(:multipart_uploads,
              primary_key: false,
-             comment:
-               "S3 分段上传会话：CreateMultipartUpload 建一行，Complete/Abort 后删除；part 字节归存储后端"
+             comment: "S3 分段上传会话：CreateMultipartUpload 建一行，Complete/Abort 后删除；part 字节归存储后端"
            ) do
       add :id, :binary_id, primary_key: true, comment: "分段上传主键（UUID）"
 

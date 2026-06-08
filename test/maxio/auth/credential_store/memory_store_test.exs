@@ -4,7 +4,9 @@ defmodule Maxio.Auth.CredentialStore.MemoryStoreTest do
   alias Maxio.Auth.CredentialStore.MemoryStore
 
   test "root 凭据从 config 引导可查到（test 配置的 AWS 示例密钥）" do
-    {:ok, %{secret_key: sk, principal: principal}} = MemoryStore.get_secret("AKIAIOSFODNN7EXAMPLE")
+    {:ok, %{secret_key: sk, principal: principal}} =
+      MemoryStore.get_secret("AKIAIOSFODNN7EXAMPLE")
+
     assert sk == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     assert principal.type == :root
     assert principal.arn == "arn:aws:iam:::root"

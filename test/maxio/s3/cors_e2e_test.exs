@@ -8,10 +8,16 @@ defmodule Maxio.S3.CorsE2ETest do
   @cors ~s(<CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><CORSRule><AllowedOrigin>http://www.example.com</AllowedOrigin><AllowedMethod>PUT</AllowedMethod><AllowedMethod>GET</AllowedMethod><AllowedHeader>*</AllowedHeader><MaxAgeSeconds>3000</MaxAgeSeconds><ExposeHeader>ETag</ExposeHeader></CORSRule></CORSConfiguration>)
 
   setup do
-    File.rm_rf(@data_dir); File.mkdir_p!(@data_dir)
+    File.rm_rf(@data_dir)
+    File.mkdir_p!(@data_dir)
     prev = Application.get_env(:maxio, :s3)
     Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
-    on_exit(fn -> Application.put_env(:maxio, :s3, prev); File.rm_rf(@data_dir) end)
+
+    on_exit(fn ->
+      Application.put_env(:maxio, :s3, prev)
+      File.rm_rf(@data_dir)
+    end)
+
     :ok
   end
 
@@ -36,7 +42,8 @@ defmodule Maxio.S3.CorsE2ETest do
 
     pre =
       SigV4Request.anon_conn(:options, "/cb2/obj.txt",
-        headers: [{"origin", "http://www.example.com"}, {"access-control-request-method", "PUT"}])
+        headers: [{"origin", "http://www.example.com"}, {"access-control-request-method", "PUT"}]
+      )
       |> call()
 
     assert pre.status == 200
@@ -51,7 +58,8 @@ defmodule Maxio.S3.CorsE2ETest do
 
     pre =
       SigV4Request.anon_conn(:options, "/cb3/obj.txt",
-        headers: [{"origin", "http://evil.com"}, {"access-control-request-method", "PUT"}])
+        headers: [{"origin", "http://evil.com"}, {"access-control-request-method", "PUT"}]
+      )
       |> call()
 
     assert pre.status == 403
@@ -63,7 +71,8 @@ defmodule Maxio.S3.CorsE2ETest do
 
     pre =
       SigV4Request.anon_conn(:options, "/cb5/obj.txt",
-        headers: [{"origin", "http://www.example.com"}, {"access-control-request-method", "PUT"}])
+        headers: [{"origin", "http://www.example.com"}, {"access-control-request-method", "PUT"}]
+      )
       |> call()
 
     assert pre.status == 403
@@ -76,7 +85,9 @@ defmodule Maxio.S3.CorsE2ETest do
     SigV4Request.signed_conn(:put, "/cb4/o.txt", body: "hello") |> call()
 
     get =
-      SigV4Request.signed_conn(:get, "/cb4/o.txt", headers: [{"origin", "http://www.example.com"}])
+      SigV4Request.signed_conn(:get, "/cb4/o.txt",
+        headers: [{"origin", "http://www.example.com"}]
+      )
       |> call()
 
     assert get.status == 200

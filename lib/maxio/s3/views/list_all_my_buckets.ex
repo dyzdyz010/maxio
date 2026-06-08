@@ -3,7 +3,8 @@ defmodule Maxio.S3.Views.ListAllMyBuckets do
   import Saxy.XML
   alias Maxio.S3.XML
 
-  @spec render(%{owner: %{id: String.t(), display_name: String.t()}, buckets: [map()]}) :: iodata()
+  @spec render(%{owner: %{id: String.t(), display_name: String.t()}, buckets: [map()]}) ::
+          iodata()
   def render(%{owner: owner, buckets: buckets}) do
     bucket_elems =
       Enum.map(buckets, fn b ->

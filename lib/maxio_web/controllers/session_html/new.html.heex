@@ -9,7 +9,14 @@
       {@error_message}
     </p>
 
-    <.form for={%{}} as={:creds} id="login-form" action={~p"/login"} method="post" class="space-y-3">
+    <.form
+      for={%{}}
+      as={:creds}
+      id="login-form"
+      action={~p"/login"}
+      method="post"
+      class="space-y-3"
+    >
       <.input
         name="creds[access_key]"
         value=""

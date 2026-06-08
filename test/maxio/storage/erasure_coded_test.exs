@@ -22,8 +22,8 @@ defmodule Maxio.Storage.ErasureCodedTest do
       ErasureCoded.put("b", "k.bin", "null", chunks, opts(drives))
 
     assert size == byte_size(body)
-    assert etag == (:crypto.hash(:md5, body) |> Base.encode16(case: :lower))
-    assert sha256 == (:crypto.hash(:sha256, body) |> Base.encode16(case: :lower))
+    assert etag == :crypto.hash(:md5, body) |> Base.encode16(case: :lower)
+    assert sha256 == :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
     refute String.contains?(etag, "\"")
   end
 
@@ -63,7 +63,7 @@ defmodule Maxio.Storage.ErasureCodedTest do
   test "空对象 round-trip", %{drives: drives} do
     :ok = ErasureCoded.put_bucket("b", opts(drives))
     {:ok, %{size: 0, etag: etag}} = ErasureCoded.put("b", "empty", "null", [], opts(drives))
-    assert etag == (:crypto.hash(:md5, "") |> Base.encode16(case: :lower))
+    assert etag == :crypto.hash(:md5, "") |> Base.encode16(case: :lower)
     {:ok, stream} = ErasureCoded.get("b", "empty", "null", nil, opts(drives))
     assert IO.iodata_to_binary(Enum.to_list(stream)) == ""
   end
@@ -95,7 +95,9 @@ defmodule Maxio.Storage.ErasureCodedTest do
 
   test "key 含 ../ 被拒", %{drives: drives} do
     :ok = ErasureCoded.put_bucket("b", opts(drives))
-    assert {:error, :invalid_key} = ErasureCoded.put("b", "../escape", "null", ["x"], opts(drives))
+
+    assert {:error, :invalid_key} =
+             ErasureCoded.put("b", "../escape", "null", ["x"], opts(drives))
   end
 
   test "put_bucket 建各盘目录；delete_bucket 删各盘空目录", %{drives: drives} do

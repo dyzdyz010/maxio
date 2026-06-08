@@ -39,7 +39,9 @@ defmodule Maxio.Auth.SigV4.Canonical do
   @spec canonical_query(map()) :: String.t()
   def canonical_query(query) when is_map(query) do
     query
-    |> Enum.map(fn {k, v} -> {uri_encode(to_string(k), :query), uri_encode(to_string(v), :query)} end)
+    |> Enum.map(fn {k, v} ->
+      {uri_encode(to_string(k), :query), uri_encode(to_string(v), :query)}
+    end)
     |> Enum.sort_by(fn {k, _v} -> k end)
     |> Enum.map(fn {k, v} -> k <> "=" <> v end)
     |> Enum.join("&")
@@ -77,9 +79,14 @@ defmodule Maxio.Auth.SigV4.Canonical do
 
   defp encode_byte(byte, mode) do
     cond do
-      unreserved?(byte) -> <<byte>>
-      byte == ?/ and mode == :path -> "/"
-      true -> "%" <> (byte |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(2, "0"))
+      unreserved?(byte) ->
+        <<byte>>
+
+      byte == ?/ and mode == :path ->
+        "/"
+
+      true ->
+        "%" <> (byte |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(2, "0"))
     end
   end
 

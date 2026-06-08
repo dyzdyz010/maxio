@@ -26,7 +26,9 @@ defmodule Maxio.S3.Views.ListBucket do
         element("CommonPrefixes", [], [element("Prefix", [], characters(cp))])
       end)
 
-    root = element("ListBucketResult", [{"xmlns", XML.namespace()}], children ++ contents ++ common)
+    root =
+      element("ListBucketResult", [{"xmlns", XML.namespace()}], children ++ contents ++ common)
+
     XML.encode(root)
   end
 

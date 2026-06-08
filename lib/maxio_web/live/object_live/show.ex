@@ -65,7 +65,10 @@ defmodule MaxioWeb.ObjectLive.Show do
           <.meta label="Content-Type" value={@object.content_type} />
           <.meta label="Storage Class" value={@object.storage_class} />
           <.meta label="Version ID" value={@object.version_id} />
-          <.meta label="修改时间" value={Calendar.strftime(@object.updated_at, "%Y-%m-%d %H:%M:%S")} />
+          <.meta
+            label="修改时间"
+            value={Calendar.strftime(@object.updated_at, "%Y-%m-%d %H:%M:%S")}
+          />
         </div>
 
         <%!-- tags 编辑 --%>
@@ -101,13 +104,19 @@ defmodule MaxioWeb.ObjectLive.Show do
               <td colspan="5" class="text-center text-base-content/60">无版本历史</td>
             </tr>
             <tr :for={{dom_id, v} <- @streams.versions} id={dom_id}>
-              <td class="font-mono text-xs">{v.version_id}{if v.is_latest, do: " (latest)", else: ""}</td>
+              <td class="font-mono text-xs">
+                {v.version_id}{if v.is_latest, do: " (latest)", else: ""}
+              </td>
               <td>
-                <span :if={v.is_delete_marker} class="badge badge-sm badge-warning">delete marker</span>
+                <span :if={v.is_delete_marker} class="badge badge-sm badge-warning">
+                  delete marker
+                </span>
                 <span :if={!v.is_delete_marker} class="badge badge-sm badge-ghost">version</span>
               </td>
               <td class="text-right">{v.size}</td>
-              <td class="text-sm text-base-content/70">{Calendar.strftime(v.updated_at, "%Y-%m-%d %H:%M")}</td>
+              <td class="text-sm text-base-content/70">
+                {Calendar.strftime(v.updated_at, "%Y-%m-%d %H:%M")}
+              </td>
               <td>
                 <div class="flex gap-2 justify-end">
                   <.link
@@ -156,8 +165,7 @@ defmodule MaxioWeb.ObjectLive.Show do
         end
 
       {:error, :invalid_tag} ->
-        {:noreply,
-         put_flash(socket, :error, "标签非法（对象 ≤10 个，键 1-128 / 值 0-256，不可 aws: 前缀）")}
+        {:noreply, put_flash(socket, :error, "标签非法（对象 ≤10 个，键 1-128 / 值 0-256，不可 aws: 前缀）")}
     end
   end
 

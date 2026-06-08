@@ -13,14 +13,17 @@ defmodule Maxio.Storage.FS do
 
   @impl true
   def put(bucket, key, version_id \\ "null", chunks, opts \\ [])
-  def put(bucket, key, version_id, chunks, opts), do: do_put(bucket, key, version_id, chunks, opts)
+
+  def put(bucket, key, version_id, chunks, opts),
+    do: do_put(bucket, key, version_id, chunks, opts)
 
   @impl true
   def get(bucket, key, version_id \\ "null", range \\ nil, opts \\ []),
     do: do_get(bucket, key, version_id, range, opts)
 
   @impl true
-  def stat(bucket, key, version_id \\ "null", opts \\ []), do: do_stat(bucket, key, version_id, opts)
+  def stat(bucket, key, version_id \\ "null", opts \\ []),
+    do: do_stat(bucket, key, version_id, opts)
 
   @impl true
   def delete(bucket, key, version_id \\ "null", opts \\ []),
@@ -236,7 +239,7 @@ defmodule Maxio.Storage.FS do
 
   defp data_dir(opts) do
     Keyword.get(opts, :data_dir) ||
-      (Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:data_dir))
+      Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:data_dir)
   end
 
   defp bucket_path(bucket, opts), do: Path.join(data_dir(opts), bucket)

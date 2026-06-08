@@ -136,7 +136,9 @@ defmodule MaxioWeb.BucketLiveSettingsTest do
     view |> form("#encryption-form", encryption: %{algorithm: "AES256"}) |> render_submit()
     assert {:ok, %{"algorithm" => "AES256"}} = Maxio.BucketConfigs.get("cfg-bucket", :encryption)
 
-    html = view |> form("#encryption-form", encryption: %{algorithm: "aws:kms"}) |> render_submit()
+    html =
+      view |> form("#encryption-form", encryption: %{algorithm: "aws:kms"}) |> render_submit()
+
     assert html =~ "尚未实现"
     # KMS 拒绝绝不静默当 AES256：仍保留前次 AES256，未被 KMS 覆写。
     assert {:ok, %{"algorithm" => "AES256"}} = Maxio.BucketConfigs.get("cfg-bucket", :encryption)

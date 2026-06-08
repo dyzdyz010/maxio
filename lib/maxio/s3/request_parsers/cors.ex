@@ -26,7 +26,8 @@ defmodule Maxio.S3.RequestParsers.Cors do
       "CORSRule" ->
         {:ok, %{s | cur: new_rule(), in: nil}}
 
-      tag when tag in ~w(ID AllowedMethod AllowedOrigin AllowedHeader ExposeHeader MaxAgeSeconds) ->
+      tag
+      when tag in ~w(ID AllowedMethod AllowedOrigin AllowedHeader ExposeHeader MaxAgeSeconds) ->
         {:ok, %{s | in: tag, text: ""}}
 
       _ ->
@@ -35,7 +36,9 @@ defmodule Maxio.S3.RequestParsers.Cors do
   end
 
   @impl true
-  def handle_event(:characters, c, %{text: t} = s) when is_binary(t), do: {:ok, %{s | text: t <> c}}
+  def handle_event(:characters, c, %{text: t} = s) when is_binary(t),
+    do: {:ok, %{s | text: t <> c}}
+
   def handle_event(:characters, _c, s), do: {:ok, s}
 
   @impl true
@@ -48,16 +51,40 @@ defmodule Maxio.S3.RequestParsers.Cors do
         {:ok, %{s | cur: %{cur | id: trim(s.text)}, in: nil, text: nil}}
 
       {"AllowedMethod", cur} when is_map(cur) ->
-        {:ok, %{s | cur: %{cur | allowed_methods: [trim(s.text) | cur.allowed_methods]}, in: nil, text: nil}}
+        {:ok,
+         %{
+           s
+           | cur: %{cur | allowed_methods: [trim(s.text) | cur.allowed_methods]},
+             in: nil,
+             text: nil
+         }}
 
       {"AllowedOrigin", cur} when is_map(cur) ->
-        {:ok, %{s | cur: %{cur | allowed_origins: [trim(s.text) | cur.allowed_origins]}, in: nil, text: nil}}
+        {:ok,
+         %{
+           s
+           | cur: %{cur | allowed_origins: [trim(s.text) | cur.allowed_origins]},
+             in: nil,
+             text: nil
+         }}
 
       {"AllowedHeader", cur} when is_map(cur) ->
-        {:ok, %{s | cur: %{cur | allowed_headers: [trim(s.text) | cur.allowed_headers]}, in: nil, text: nil}}
+        {:ok,
+         %{
+           s
+           | cur: %{cur | allowed_headers: [trim(s.text) | cur.allowed_headers]},
+             in: nil,
+             text: nil
+         }}
 
       {"ExposeHeader", cur} when is_map(cur) ->
-        {:ok, %{s | cur: %{cur | expose_headers: [trim(s.text) | cur.expose_headers]}, in: nil, text: nil}}
+        {:ok,
+         %{
+           s
+           | cur: %{cur | expose_headers: [trim(s.text) | cur.expose_headers]},
+             in: nil,
+             text: nil
+         }}
 
       {"MaxAgeSeconds", cur} when is_map(cur) ->
         {:ok, %{s | cur: %{cur | max_age_seconds: parse_int(trim(s.text))}, in: nil, text: nil}}
@@ -70,7 +97,15 @@ defmodule Maxio.S3.RequestParsers.Cors do
   @impl true
   def handle_event(:end_document, _d, s), do: {:ok, s}
 
-  defp new_rule, do: %{id: nil, allowed_methods: [], allowed_origins: [], allowed_headers: [], expose_headers: [], max_age_seconds: nil}
+  defp new_rule,
+    do: %{
+      id: nil,
+      allowed_methods: [],
+      allowed_origins: [],
+      allowed_headers: [],
+      expose_headers: [],
+      max_age_seconds: nil
+    }
 
   # 反转累积列表（SAX 头插），输出 string-key map（jsonb 存储）。
   defp finalize(r) do

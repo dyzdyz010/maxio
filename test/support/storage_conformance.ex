@@ -16,8 +16,8 @@ defmodule Maxio.Test.StorageConformance do
         body = :crypto.strong_rand_bytes(2500)
         {:ok, r} = @backend.put("b", "k", "null", [body], o)
         assert r.size == byte_size(body)
-        assert r.etag == (:crypto.hash(:md5, body) |> Base.encode16(case: :lower))
-        assert r.sha256 == (:crypto.hash(:sha256, body) |> Base.encode16(case: :lower))
+        assert r.etag == :crypto.hash(:md5, body) |> Base.encode16(case: :lower)
+        assert r.sha256 == :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
         {:ok, stream} = @backend.get("b", "k", "null", nil, o)
         assert IO.iodata_to_binary(Enum.to_list(stream)) == body
       end
@@ -65,7 +65,7 @@ defmodule Maxio.Test.StorageConformance do
         assert p1.size == 3
         assert p1.md5_raw == :crypto.hash(:md5, "ABC")
         assert byte_size(p1.md5_raw) == 16
-        assert p2.etag == (:crypto.hash(:md5, "DEF") |> Base.encode16(case: :lower))
+        assert p2.etag == :crypto.hash(:md5, "DEF") |> Base.encode16(case: :lower)
 
         {:ok, ps} = @backend.get_part_stream("b", "big", "u1", 1, o)
         assert IO.iodata_to_binary(Enum.to_list(ps)) == "ABC"

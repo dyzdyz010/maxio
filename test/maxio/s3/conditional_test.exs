@@ -64,12 +64,16 @@ defmodule Maxio.S3.ConditionalTest do
 
   test "If-Unmodified-Since 已修改 → 412" do
     headers = [{"if-unmodified-since", "Mon, 01 Jan 2001 00:00:00 GMT"}]
-    assert {:error, :precondition_failed} = Conditional.evaluate(headers, %{etag: @etag, last_modified: @lm}, "GET")
+
+    assert {:error, :precondition_failed} =
+             Conditional.evaluate(headers, %{etag: @etag, last_modified: @lm}, "GET")
   end
 
   test "If-Modified-Since 未修改 → 304（GET）" do
     headers = [{"if-modified-since", "Sat, 01 Jan 2050 00:00:00 GMT"}]
-    assert {:respond, 304} = Conditional.evaluate(headers, %{etag: @etag, last_modified: @lm}, "GET")
+
+    assert {:respond, 304} =
+             Conditional.evaluate(headers, %{etag: @etag, last_modified: @lm}, "GET")
   end
 
   test "不可解析的日期被忽略（条件不应用）" do

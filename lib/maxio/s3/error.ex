@@ -87,8 +87,7 @@ defmodule Maxio.S3.Error do
        "You did not provide the number of bytes specified by the Content-Length HTTP header."},
     malformed_policy:
       {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'."},
-    no_such_bucket_policy:
-      {"NoSuchBucketPolicy", 404, "The bucket policy does not exist."},
+    no_such_bucket_policy: {"NoSuchBucketPolicy", 404, "The bucket policy does not exist."},
     access_forbidden:
       {"AccessForbidden", 403,
        "CORSResponse: This CORS request is not allowed. This is usually because the evaluation of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted."},

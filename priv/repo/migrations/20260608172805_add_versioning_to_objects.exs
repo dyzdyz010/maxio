@@ -17,7 +17,8 @@ defmodule Maxio.Repo.Migrations.AddVersioningToObjects do
       add :is_delete_marker, :boolean,
         null: false,
         default: false,
-        comment: "是否为删除标记（无字节、无 ACL；当前版本为删除标记时 GET 返回 404 + x-amz-delete-marker，ListObjectsV2 不返回）"
+        comment:
+          "是否为删除标记（无字节、无 ACL；当前版本为删除标记时 GET 返回 404 + x-amz-delete-marker，ListObjectsV2 不返回）"
     end
 
     # 去掉旧的 (bucket_id,key) 唯一索引，改为 (bucket_id,key,version_id) 唯一（多版本）。

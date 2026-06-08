@@ -47,7 +47,12 @@ defmodule MaxioWeb.Layouts do
         </div>
 
         <nav class="flex-1 px-3 py-4 space-y-1">
-          <.nav_link id="nav-dashboard" navigate={~p"/"} icon="hero-chart-bar-square" label="Dashboard" />
+          <.nav_link
+            id="nav-dashboard"
+            navigate={~p"/"}
+            icon="hero-chart-bar-square"
+            label="Dashboard"
+          />
           <.nav_link id="nav-buckets" navigate={~p"/buckets"} icon="hero-archive-box" label="Buckets" />
           <.nav_link
             id="nav-access-keys"

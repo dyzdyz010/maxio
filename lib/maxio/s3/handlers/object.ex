@@ -33,7 +33,9 @@ defmodule Maxio.S3.Handlers.Object do
     # 版本字节路径对齐：先按桶 versioning 算 version_id（Enabled→新 ULID，否则 "null"），
     # 字节流式写入该 version_id 路径；落库用同一 version_id（铁律 4：不缓冲重写）。
     versioning = bucket_versioning(bucket)
-    version_id = if versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
+
+    version_id =
+      if versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
 
     # x-amz-tagging 头（PutObject）→ jsonb tag map（校验失败 → InvalidTag 400，铁律 3）。
     tags_map = parse_tagging_header!(conn)
@@ -141,7 +143,10 @@ defmodule Maxio.S3.Handlers.Object do
 
             case range do
               :invalid ->
-                raise Error.new(:invalid_range, resource: "/#{bucket}/#{key}", extra: %{total: total})
+                raise Error.new(:invalid_range,
+                        resource: "/#{bucket}/#{key}",
+                        extra: %{total: total}
+                      )
 
               _ when object.sse_algorithm == "AES256" ->
                 # SSE-S3 加密对象：整对象解密返回明文（密文是帧化的，对密文做 byte-range 会取错字节，
@@ -251,7 +256,9 @@ defmodule Maxio.S3.Handlers.Object do
 
             conn
             |> put_resp_header("x-amz-version-id", version_id)
-            |> then(fn c -> if dm?, do: put_resp_header(c, "x-amz-delete-marker", "true"), else: c end)
+            |> then(fn c ->
+              if dm?, do: put_resp_header(c, "x-amz-delete-marker", "true"), else: c
+            end)
             |> send_resp(204, "")
 
           {:error, :not_found} ->
@@ -338,11 +345,11 @@ defmodule Maxio.S3.Handlers.Object do
     # 自拷贝守卫：src==dest 且 COPY 且无元数据变化 → 400 InvalidRequest。
     if src_bucket == dest_bucket and src_key == dest_key and directive == "COPY" do
       raise Error.new(:invalid_request,
-        message:
-          "This copy request is illegal because it is trying to copy an object to itself " <>
-            "without changing the object's metadata, storage class, website redirect location " <>
-            "or encryption attributes."
-      )
+              message:
+                "This copy request is illegal because it is trying to copy an object to itself " <>
+                  "without changing the object's metadata, storage class, website redirect location " <>
+                  "or encryption attributes."
+            )
     end
 
     content_type =
@@ -604,7 +611,9 @@ defmodule Maxio.S3.Handlers.Object do
 
   # 仅当版本非 "null" 时回显 x-amz-version-id（Unversioned 桶不带该头，对齐 AWS）。
   defp maybe_put_version_id(conn, "null"), do: conn
-  defp maybe_put_version_id(conn, version_id), do: put_resp_header(conn, "x-amz-version-id", version_id)
+
+  defp maybe_put_version_id(conn, version_id),
+    do: put_resp_header(conn, "x-amz-version-id", version_id)
 
   # 决定 SSE：请求头优先；其次桶默认加密配置。非 AES256/SSE-C → 501（绝不静默，铁律 3）。
   defp resolve_sse!(conn, bucket) do
@@ -619,7 +628,9 @@ defmodule Maxio.S3.Handlers.Object do
         "AES256"
 
       alg when alg in ["aws:kms", "aws:kms:dsse"] ->
-        raise Error.new(:not_implemented, message: "Only SSE-S3 (AES256) is supported; #{alg} not implemented")
+        raise Error.new(:not_implemented,
+                message: "Only SSE-S3 (AES256) is supported; #{alg} not implemented"
+              )
 
       nil ->
         bucket_default_sse(bucket)
@@ -657,8 +668,8 @@ defmodule Maxio.S3.Handlers.Object do
             Log.warn("decoded length mismatch", reason: :incomplete_body)
 
             raise Error.new(:incomplete_body,
-              message: "decoded length #{actual_size} != declared #{declared}"
-            )
+                    message: "decoded length #{actual_size} != declared #{declared}"
+                  )
 
           _ ->
             :ok
@@ -687,8 +698,8 @@ defmodule Maxio.S3.Handlers.Object do
             Log.warn("content sha256 mismatch", reason: :bad_digest)
 
             raise Error.new(:x_amz_content_sha256_mismatch,
-              message: "declared #{declared} != computed #{actual_sha256}"
-            )
+                    message: "declared #{declared} != computed #{actual_sha256}"
+                  )
         end
     end
   end

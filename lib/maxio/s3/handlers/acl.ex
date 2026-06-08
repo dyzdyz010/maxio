@@ -53,7 +53,13 @@ defmodule Maxio.S3.Handlers.Acl do
 
     case Objects.put_acl(bucket, key, canned) do
       :ok ->
-        Log.info("put object acl", action: :put_object_acl, bucket: bucket, key: key, reason: canned)
+        Log.info("put object acl",
+          action: :put_object_acl,
+          bucket: bucket,
+          key: key,
+          reason: canned
+        )
+
         send_resp(conn, 200, "")
 
       {:error, :not_found} ->
@@ -85,7 +91,10 @@ defmodule Maxio.S3.Handlers.Acl do
 
       grant_headers?(conn) ->
         # x-amz-grant-* 头细粒度评估 defer：接受但退化为 private（不静默放行更多权限）。
-        Log.warn("x-amz-grant-* headers not fully evaluated; treated as private", action: :put_acl)
+        Log.warn("x-amz-grant-* headers not fully evaluated; treated as private",
+          action: :put_acl
+        )
+
         {conn, "private"}
 
       true ->
@@ -117,9 +126,14 @@ defmodule Maxio.S3.Handlers.Acl do
 
   defp read_small_body!(conn) do
     case read_body(conn, length: @acl_limit, read_length: @acl_limit) do
-      {:ok, body, conn} -> {conn, body}
-      {:more, _partial, _conn} -> raise Error.new(:entity_too_large, message: "ACL document too large")
-      {:error, _} -> raise Error.new(:malformed_xml)
+      {:ok, body, conn} ->
+        {conn, body}
+
+      {:more, _partial, _conn} ->
+        raise Error.new(:entity_too_large, message: "ACL document too large")
+
+      {:error, _} ->
+        raise Error.new(:malformed_xml)
     end
   end
 

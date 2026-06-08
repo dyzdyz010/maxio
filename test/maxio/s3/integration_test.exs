@@ -67,7 +67,9 @@ defmodule Maxio.S3.IntegrationTest do
     SigV4Request.signed_conn(:put, "/data") |> call()
     SigV4Request.signed_conn(:put, "/data/r.txt", body: "0123456789") |> call()
 
-    get = SigV4Request.signed_conn(:get, "/data/r.txt", headers: [{"range", "bytes=2-5"}]) |> call()
+    get =
+      SigV4Request.signed_conn(:get, "/data/r.txt", headers: [{"range", "bytes=2-5"}]) |> call()
+
     assert get.status == 206
     assert get_resp_header(get, "content-range") == ["bytes 2-5/10"]
     assert get.resp_body == "2345"
@@ -309,7 +311,9 @@ defmodule Maxio.S3.IntegrationTest do
 
     xml = "<Delete><Object><Key>a</Key></Object><Object><Key>ghost</Key></Object></Delete>"
 
-    del = SigV4Request.signed_conn(:post, "/batchdel", query: %{"delete" => ""}, body: xml) |> call()
+    del =
+      SigV4Request.signed_conn(:post, "/batchdel", query: %{"delete" => ""}, body: xml) |> call()
+
     assert del.status == 200
     assert del.resp_body =~ "<Deleted><Key>a</Key></Deleted>"
     assert del.resp_body =~ "<Deleted><Key>ghost</Key></Deleted>"
@@ -325,7 +329,10 @@ defmodule Maxio.S3.IntegrationTest do
     SigV4Request.signed_conn(:put, "/quietdel/a", body: "1") |> call()
 
     xml = "<Delete><Quiet>true</Quiet><Object><Key>a</Key></Object></Delete>"
-    del = SigV4Request.signed_conn(:post, "/quietdel", query: %{"delete" => ""}, body: xml) |> call()
+
+    del =
+      SigV4Request.signed_conn(:post, "/quietdel", query: %{"delete" => ""}, body: xml) |> call()
+
     assert del.status == 200
     refute del.resp_body =~ "<Deleted>"
   end
@@ -339,7 +346,10 @@ defmodule Maxio.S3.IntegrationTest do
       |> Enum.join()
 
     xml = "<Delete>" <> objects <> "</Delete>"
-    del = SigV4Request.signed_conn(:post, "/bigdel", query: %{"delete" => ""}, body: xml) |> call()
+
+    del =
+      SigV4Request.signed_conn(:post, "/bigdel", query: %{"delete" => ""}, body: xml) |> call()
+
     assert del.status == 400
     assert del.resp_body =~ "<Code>MalformedXML</Code>"
   end
@@ -350,7 +360,8 @@ defmodule Maxio.S3.IntegrationTest do
     [etag] = get_resp_header(put, "etag")
 
     get =
-      SigV4Request.signed_conn(:get, "/condbk/c.txt", headers: [{"if-none-match", etag}]) |> call()
+      SigV4Request.signed_conn(:get, "/condbk/c.txt", headers: [{"if-none-match", etag}])
+      |> call()
 
     assert get.status == 304
     assert get.resp_body == ""
@@ -361,7 +372,8 @@ defmodule Maxio.S3.IntegrationTest do
     SigV4Request.signed_conn(:put, "/condbk2/c.txt", body: "hello") |> call()
 
     get =
-      SigV4Request.signed_conn(:get, "/condbk2/c.txt", headers: [{"if-match", "\"nope\""}]) |> call()
+      SigV4Request.signed_conn(:get, "/condbk2/c.txt", headers: [{"if-match", "\"nope\""}])
+      |> call()
 
     assert get.status == 412
     assert get.resp_body =~ "<Code>PreconditionFailed</Code>"
@@ -372,7 +384,8 @@ defmodule Maxio.S3.IntegrationTest do
     SigV4Request.signed_conn(:put, "/multirange/r.txt", body: "0123456789") |> call()
 
     get =
-      SigV4Request.signed_conn(:get, "/multirange/r.txt", headers: [{"range", "bytes=0-2,5-7"}]) |> call()
+      SigV4Request.signed_conn(:get, "/multirange/r.txt", headers: [{"range", "bytes=0-2,5-7"}])
+      |> call()
 
     assert get.status == 200
     assert get.resp_body == "0123456789"

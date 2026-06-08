@@ -16,7 +16,8 @@ defmodule Maxio.Crypto.SSE do
 
   @doc "把明文 chunks 流加密为密文帧流，并返回随元数据存的信封头 map。"
   @spec wrap_stream(Enumerable.t()) ::
-          {Enumerable.t(), %{wrapped_dek_b64: String.t(), dek_iv_b64: String.t(), dek_tag_b64: String.t()}}
+          {Enumerable.t(),
+           %{wrapped_dek_b64: String.t(), dek_iv_b64: String.t(), dek_tag_b64: String.t()}}
   def wrap_stream(chunks) do
     dek = :crypto.strong_rand_bytes(32)
     {wrapped, wrap_iv, wrap_tag} = wrap_dek(dek)
@@ -55,7 +56,11 @@ defmodule Maxio.Crypto.SSE do
   # 大对象的逐帧流式解密留后续优化，本 MVP 正确性优先且密文与明文同量级，文档化）。
   defp decrypt_frames(<<>>, _dek, acc), do: Enum.reverse(acc)
 
-  defp decrypt_frames(<<ct_len::32, iv::binary-size(12), tag::binary-size(16), rest::binary>>, dek, acc) do
+  defp decrypt_frames(
+         <<ct_len::32, iv::binary-size(12), tag::binary-size(16), rest::binary>>,
+         dek,
+         acc
+       ) do
     <<ct::binary-size(^ct_len), tail::binary>> = rest
 
     case :crypto.crypto_one_time_aead(:aes_256_gcm, dek, iv, ct, @aad, tag, false) do
@@ -64,7 +69,8 @@ defmodule Maxio.Crypto.SSE do
     end
   end
 
-  defp decrypt_frames(_garbage, _dek, _acc), do: raise("SSE-S3 decryption failed: malformed ciphertext frame")
+  defp decrypt_frames(_garbage, _dek, _acc),
+    do: raise("SSE-S3 decryption failed: malformed ciphertext frame")
 
   # ── DEK 包裹/解裹（主密钥 AES-256-GCM）──
   defp wrap_dek(dek) do
@@ -96,8 +102,11 @@ defmodule Maxio.Crypto.SSE do
     cfg = Application.get_env(:maxio, :sse, [])
 
     case Keyword.get(cfg, :master_key) do
-      nil -> raise "maxio SSE master key not configured (config :maxio, :sse, master_key: <base64 32B>)"
-      b64 -> Base.decode64!(b64)
+      nil ->
+        raise "maxio SSE master key not configured (config :maxio, :sse, master_key: <base64 32B>)"
+
+      b64 ->
+        Base.decode64!(b64)
     end
   end
 

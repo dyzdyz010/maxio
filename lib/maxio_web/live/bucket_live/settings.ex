@@ -79,7 +79,6 @@ defmodule MaxioWeb.BucketLive.Settings do
               />
               <.button variant="primary" id="versioning-submit" type="submit">保存</.button>
             </.form>
-
           <% "policy" -> %>
             <.form for={@policy_form} id="policy-form" phx-submit="save_policy" class="space-y-3">
               <p class="text-sm text-base-content/60">桶策略 JSON（留空保存 = 删除策略）。</p>
@@ -91,7 +90,6 @@ defmodule MaxioWeb.BucketLive.Settings do
               />
               <.button variant="primary" id="policy-submit" type="submit">保存策略</.button>
             </.form>
-
           <% "acl" -> %>
             <.form for={@acl_form} id="acl-form" phx-submit="save_acl" class="space-y-3">
               <.input
@@ -107,7 +105,6 @@ defmodule MaxioWeb.BucketLive.Settings do
               />
               <.button variant="primary" id="acl-submit" type="submit">保存 ACL</.button>
             </.form>
-
           <% "tags" -> %>
             <.form
               for={@tags_form}
@@ -119,7 +116,6 @@ defmodule MaxioWeb.BucketLive.Settings do
               <.input field={@tags_form[:raw]} type="textarea" rows="8" placeholder="env=prod" />
               <.button variant="primary" id="bucket-tags-submit" type="submit">保存标签</.button>
             </.form>
-
           <% "cors" -> %>
             <.form for={@cors_form} id="cors-form" phx-submit="save_cors" class="space-y-3">
               <p class="text-sm text-base-content/60">
@@ -138,7 +134,6 @@ defmodule MaxioWeb.BucketLive.Settings do
               />
               <.button variant="primary" id="cors-submit" type="submit">保存 CORS</.button>
             </.form>
-
           <% "lifecycle" -> %>
             <div class="space-y-3">
               <div id="lifecycle-defer-alert" class="alert alert-warning text-sm">
@@ -160,7 +155,6 @@ defmodule MaxioWeb.BucketLive.Settings do
                 <.button variant="primary" id="lifecycle-submit" type="submit">保存生命周期</.button>
               </.form>
             </div>
-
           <% "encryption" -> %>
             <.form
               for={@encryption_form}
@@ -244,12 +238,14 @@ defmodule MaxioWeb.BucketLive.Settings do
     end
   end
 
-  defp tags_raw(tag_list), do: tag_list |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join("\n")
+  defp tags_raw(tag_list),
+    do: tag_list |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join("\n")
 
   # ── handle_event ──
   @impl true
   def handle_event("save_versioning", %{"versioning" => %{"status" => status}}, socket) do
     bucket = socket.assigns.bucket
+
     # "Unversioned" 不是 PutBucketVersioning 合法 status；映射为 Suspended（AWS 无法回退到 never-set）。
     arg = if status == "Unversioned", do: "Suspended", else: status
     :ok = Buckets.put_versioning(bucket, arg, nil)

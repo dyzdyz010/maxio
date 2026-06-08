@@ -73,7 +73,8 @@ defmodule Maxio.Cluster.PeerClusterTest do
             File.rm_rf(base)
           end)
 
-          {:ok, base: base, topology: topology, peers: [p1, p2], nodes: nodes, peer_nodes: [n1, n2]}
+          {:ok,
+           base: base, topology: topology, peers: [p1, p2], nodes: nodes, peer_nodes: [n1, n2]}
 
         :error ->
           {:ok, skip: :no_peer}

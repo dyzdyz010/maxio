@@ -27,7 +27,12 @@ defmodule Maxio.Policy.Statement do
           conditions: map()
         }
 
-  defstruct sid: nil, effect: :allow, actions: [], resources: [], principals: :any, conditions: %{}
+  defstruct sid: nil,
+            effect: :allow,
+            actions: [],
+            resources: [],
+            principals: :any,
+            conditions: %{}
 
   @allowed_versions ["2012-10-17", "2008-10-17"]
 

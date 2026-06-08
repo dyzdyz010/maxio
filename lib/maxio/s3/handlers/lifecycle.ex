@@ -28,7 +28,8 @@ defmodule Maxio.S3.Handlers.Lifecycle do
         :ok = validate!(rules)
         :ok = BucketConfigs.put(bucket, :lifecycle, rules)
 
-        Log.warn("put bucket lifecycle (config stored; expiration execution NOT implemented — defer)",
+        Log.warn(
+          "put bucket lifecycle (config stored; expiration execution NOT implemented — defer)",
           action: :put_bucket_lifecycle,
           bucket: bucket,
           reason: :execution_deferred
@@ -67,9 +68,14 @@ defmodule Maxio.S3.Handlers.Lifecycle do
   # ── 校验 ──
   defp validate!(rules) do
     cond do
-      length(rules) > 1000 -> raise Error.new(:invalid_request, message: "Too many lifecycle rules (max 1000)")
-      Enum.all?(rules, &valid_rule?/1) -> :ok
-      true -> raise Error.new(:malformed_xml, message: "Invalid lifecycle rule")
+      length(rules) > 1000 ->
+        raise Error.new(:invalid_request, message: "Too many lifecycle rules (max 1000)")
+
+      Enum.all?(rules, &valid_rule?/1) ->
+        :ok
+
+      true ->
+        raise Error.new(:malformed_xml, message: "Invalid lifecycle rule")
     end
   end
 
@@ -96,9 +102,14 @@ defmodule Maxio.S3.Handlers.Lifecycle do
 
   defp read_small_body!(conn) do
     case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} -> {conn, body}
-      {:more, _partial, _conn} -> raise Error.new(:malformed_xml, message: "Lifecycle config too large")
-      {:error, _} -> raise Error.new(:malformed_xml)
+      {:ok, body, conn} ->
+        {conn, body}
+
+      {:more, _partial, _conn} ->
+        raise Error.new(:malformed_xml, message: "Lifecycle config too large")
+
+      {:error, _} ->
+        raise Error.new(:malformed_xml)
     end
   end
 end
