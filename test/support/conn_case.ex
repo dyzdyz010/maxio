@@ -31,6 +31,14 @@ defmodule MaxioWeb.ConnCase do
     end
   end
 
+  @doc """
+  返回一个已登录 Console 的 conn：session 里塞 "console_access_key"。
+  默认用 test 环境 MemoryStore 引导的 root（access_key=AKIAIOSFODNN7EXAMPLE，见 config/test.exs）。
+  """
+  def log_in_console(conn, access_key \\ "AKIAIOSFODNN7EXAMPLE") do
+    Plug.Test.init_test_session(conn, %{"console_access_key" => access_key})
+  end
+
   setup tags do
     Maxio.DataCase.setup_sandbox(tags)
     {:ok, conn: Phoenix.ConnTest.build_conn()}

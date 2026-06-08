@@ -1,6 +1,8 @@
 defmodule MaxioWeb.Router do
   use MaxioWeb, :router
 
+  import MaxioWeb.ConsoleAuthPlug
+
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
@@ -8,16 +10,30 @@ defmodule MaxioWeb.Router do
     plug :put_root_layout, html: {MaxioWeb.Layouts, :root}
     plug :protect_from_forgery
     plug :put_secure_browser_headers
+    plug :fetch_current_principal
   end
 
   pipeline :api do
     plug :accepts, ["json"]
   end
 
+  # ── 公共：登录页（plain controller）+ 会话 controller ──
   scope "/", MaxioWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    get "/login", SessionController, :new
+    post "/login", SessionController, :create
+    delete "/logout", SessionController, :delete
+  end
+
+  # ── 受保护：Console 主体（LiveView）──
+  scope "/", MaxioWeb do
+    pipe_through :browser
+
+    live_session :console_authenticated,
+      on_mount: [{MaxioWeb.ConsoleAuth.OnMount, :require_authenticated}] do
+      live "/", DashboardLive, :index
+    end
   end
 
   # Other scopes may use custom stacks.

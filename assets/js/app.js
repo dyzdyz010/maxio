@@ -46,6 +46,14 @@ liveSocket.connect()
 // >> liveSocket.disableLatencySim()
 window.liveSocket = liveSocket
 
+// [maxio][Console] 前端可调试钩子（AGENTS.md §4.5）：暴露 window.__maxio 供浏览器活体取证。
+window.__maxio = {
+  liveSocket,
+  log: (...args) => console.log("[maxio][Console]", ...args),
+  version: "M5",
+}
+window.__maxio.log("console booted", { url: window.location.pathname })
+
 // The lines below enable quality of life phoenix_live_reload
 // development features:
 //

@@ -1,0 +1,34 @@
+<div class="min-h-screen flex items-center justify-center bg-base-200 px-4">
+  <div class="w-full max-w-sm space-y-6 rounded-box bg-base-100 p-8 shadow-lg">
+    <div class="text-center space-y-1">
+      <h1 class="text-xl font-semibold">maxio Console</h1>
+      <p class="text-sm text-base-content/70">使用 Access Key 登录</p>
+    </div>
+
+    <p :if={@error_message} id="login-error" class="text-error text-sm text-center" role="alert">
+      {@error_message}
+    </p>
+
+    <.form for={%{}} as={:creds} id="login-form" action={~p"/login"} method="post" class="space-y-3">
+      <.input
+        name="creds[access_key]"
+        value=""
+        type="text"
+        label="Access Key"
+        autocomplete="username"
+        required
+      />
+      <.input
+        name="creds[secret_key]"
+        value=""
+        type="password"
+        label="Secret Key"
+        autocomplete="current-password"
+        required
+      />
+      <.button variant="primary" id="login-submit" type="submit" class="btn btn-primary w-full">
+        登录
+      </.button>
+    </.form>
+  </div>
+</div>
