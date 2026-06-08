@@ -35,40 +35,78 @@ defmodule MaxioWeb.Layouts do
 
   def app(assigns) do
     ~H"""
-    <header class="navbar px-4 sm:px-6 lg:px-8">
-      <div class="flex-1">
-        <a href="/" class="flex-1 flex w-fit items-center gap-2">
-          <img src={~p"/images/logo.svg"} width="36" />
-          <span class="text-sm font-semibold">v{Application.spec(:phoenix, :vsn)}</span>
-        </a>
-      </div>
-      <div class="flex-none">
-        <ul class="flex flex-column px-1 space-x-4 items-center">
-          <li>
-            <a href="https://phoenixframework.org/" class="btn btn-ghost">Website</a>
-          </li>
-          <li>
-            <a href="https://github.com/phoenixframework/phoenix" class="btn btn-ghost">GitHub</a>
-          </li>
-          <li>
-            <.theme_toggle />
-          </li>
-          <li>
-            <a href="https://hexdocs.pm/phoenix/overview.html" class="btn btn-primary">
-              Get Started <span aria-hidden="true">&rarr;</span>
-            </a>
-          </li>
-        </ul>
-      </div>
-    </header>
+    <div class="min-h-screen flex bg-base-200">
+      <aside
+        id="console-sidebar"
+        class="w-60 shrink-0 bg-base-100 border-r border-base-300 flex flex-col"
+      >
+        <div class="h-16 flex items-center gap-2 px-5 border-b border-base-300">
+          <.icon name="hero-cube" class="size-6 text-primary" />
+          <span class="font-semibold tracking-tight">maxio</span>
+          <span class="text-xs text-base-content/50">Console</span>
+        </div>
 
-    <main class="px-4 py-20 sm:px-6 lg:px-8">
-      <div class="mx-auto max-w-2xl space-y-4">
-        {render_slot(@inner_block)}
+        <nav class="flex-1 px-3 py-4 space-y-1">
+          <.nav_link id="nav-dashboard" navigate={~p"/"} icon="hero-chart-bar-square" label="Dashboard" />
+          <.nav_link id="nav-buckets" navigate={~p"/buckets"} icon="hero-archive-box" label="Buckets" />
+          <.nav_link
+            id="nav-access-keys"
+            navigate={~p"/access-keys"}
+            icon="hero-key"
+            label="Access Keys"
+          />
+        </nav>
+
+        <div class="px-3 py-3 border-t border-base-300 text-xs text-base-content/50">
+          M5 Console · S3 :9900
+        </div>
+      </aside>
+
+      <div class="flex-1 flex flex-col min-w-0">
+        <header class="h-16 shrink-0 flex items-center justify-end gap-4 px-6 border-b border-base-300 bg-base-100">
+          <span :if={@current_scope} id="current-identity" class="text-sm text-base-content/70">
+            <.icon name="hero-user-circle" class="size-4 inline" />
+            {@current_scope.access_key}
+          </span>
+          <.theme_toggle />
+          <.link
+            :if={@current_scope}
+            id="logout-link"
+            href={~p"/logout"}
+            method="delete"
+            class="btn btn-ghost btn-sm"
+          >
+            <.icon name="hero-arrow-right-on-rectangle" class="size-4" /> 登出
+          </.link>
+        </header>
+
+        <main class="flex-1 overflow-auto px-6 py-6">
+          <div class="mx-auto max-w-6xl">
+            {render_slot(@inner_block)}
+          </div>
+        </main>
       </div>
-    </main>
+    </div>
 
     <.flash_group flash={@flash} />
+    """
+  end
+
+  attr :id, :string, required: true
+  attr :navigate, :string, required: true
+  attr :icon, :string, required: true
+  attr :label, :string, required: true
+
+  defp nav_link(assigns) do
+    ~H"""
+    <.link
+      id={@id}
+      navigate={@navigate}
+      class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-base-content/80 hover:bg-base-200 hover:text-base-content transition-colors"
+    >
+      <.icon name={@icon} class="size-5" />
+      {@label}
+    </.link>
     """
   end
 
