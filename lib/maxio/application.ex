@@ -8,16 +8,17 @@ defmodule Maxio.Application do
   @impl true
   def start(_type, _args) do
     children =
-      [
-        MaxioWeb.Telemetry,
-        Maxio.Repo,
-        {DNSCluster, query: Application.get_env(:maxio, :dns_cluster_query) || :ignore},
-        {Phoenix.PubSub, name: Maxio.PubSub},
-        # Start a worker by calling: Maxio.Worker.start_link(arg)
-        # {Maxio.Worker, arg},
-        # Start to serve requests, typically the last entry
-        MaxioWeb.Endpoint
-      ] ++ s3_children()
+      cluster_children() ++
+        [
+          MaxioWeb.Telemetry,
+          Maxio.Repo,
+          {DNSCluster, query: Application.get_env(:maxio, :dns_cluster_query) || :ignore},
+          {Phoenix.PubSub, name: Maxio.PubSub},
+          # Start a worker by calling: Maxio.Worker.start_link(arg)
+          # {Maxio.Worker, arg},
+          # Start to serve requests, typically the last entry
+          MaxioWeb.Endpoint
+        ] ++ s3_children()
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
@@ -31,6 +32,18 @@ defmodule Maxio.Application do
 
       other ->
         other
+    end
+  end
+
+  # M7：libcluster 节点发现 supervisor。仅当配置了非空 topologies 才起（多节点 prod）；
+  # 单节点 dev/test（无 topologies）跳过——Maxio.Cluster.nodes/0 退化为 [Node.self()]，同一代码路径。
+  defp cluster_children do
+    topologies = Application.get_env(:maxio, Maxio.Cluster, [])[:topologies] || []
+
+    if topologies == [] do
+      []
+    else
+      [{Cluster.Supervisor, [topologies, [name: Maxio.Cluster.ClusterSupervisor]]}]
     end
   end
 

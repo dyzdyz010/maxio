@@ -67,7 +67,9 @@ defmodule Maxio.MixProject do
       # S3 XML 出站构造 + 入站 SAX 解析（一依赖两用）
       {:saxy, "~> 1.6"},
       # 纠删码 Rust NIF（reed-solomon-simd + blake3）；use Rustler 宏在 mix compile 期驱动 cargo
-      {:rustler, "~> 0.36"}
+      {:rustler, "~> 0.36"},
+      # M7 多节点：libcluster 节点发现（dev gossip / prod epmd env host list）
+      {:libcluster, "~> 3.5"}
     ]
   end
 

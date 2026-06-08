@@ -45,3 +45,6 @@ config :maxio, Maxio.S3.Endpoint, server: false, port: 0
 # 凭据后端：test 用 MemoryStore（ETS，无需 DB 引导，root 从 config :maxio, :s3 引导，
 # 与 Maxio.Test.SigV4Request 的 root key 对齐）。EctoStore 由其专属测试单独覆盖。
 config :maxio, :credential_store, Maxio.Auth.CredentialStore.MemoryStore
+
+# M7：test 不起 libcluster（进程内 transport 注入即可覆盖分布式逻辑）；:peer 集成测试自行起节点。
+config :maxio, Maxio.Cluster, topologies: []

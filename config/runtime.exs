@@ -39,6 +39,26 @@ if s3_port = System.get_env("MAXIO_S3_PORT") do
   config :maxio, Maxio.S3.Endpoint, port: String.to_integer(s3_port)
 end
 
+# ── M7 多节点：prod 从 MAXIO_PEERS（逗号分隔 node 名）静态 epmd 组网。──
+# 例：MAXIO_PEERS="maxio@10.0.0.1,maxio@10.0.0.2,maxio@10.0.0.3"
+# 每节点须以 --name maxio@<ip> --cookie <同一 cookie> 启动（分布式 Erlang 前提）。
+if config_env() == :prod do
+  peers =
+    System.get_env("MAXIO_PEERS", "")
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.to_atom/1)
+
+  if peers != [] do
+    config :maxio, Maxio.Cluster,
+      topologies: [
+        maxio_epmd: [
+          strategy: Cluster.Strategy.Epmd,
+          config: [hosts: peers]
+        ]
+      ]
+  end
+end
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||

@@ -95,3 +95,14 @@ config :maxio, :s3,
   data_dir: Path.expand("../priv/s3_data/dev", __DIR__)
 
 config :maxio, Maxio.S3.Endpoint, port: 9900, ip: {127, 0, 0, 1}
+
+# ── M7 多节点：dev 用 gossip 策略（UDP 多播，单机多 iex --sname 自发现）。──
+# 单节点 `iex -S mix` 时 topologies 仍存在但无 peer，Cluster.Supervisor 空转无害。
+# 仅当真的起多节点（见 STATUS「工具链与环境」的三节点 iex 命令）才形成 mesh。
+config :maxio, Maxio.Cluster,
+  topologies: [
+    maxio_gossip: [
+      strategy: Cluster.Strategy.Gossip,
+      config: [port: 45_892, multicast_addr: "230.1.1.251", multicast_ttl: 1]
+    ]
+  ]
