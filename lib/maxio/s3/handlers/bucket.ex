@@ -9,8 +9,9 @@ defmodule Maxio.S3.Handlers.Bucket do
   def create(conn) do
     bucket = conn.assigns.s3_bucket
     owner = conn.assigns.principal.arn
+    acl = bucket_canned(conn |> get_req_header("x-amz-acl") |> List.first())
 
-    case Buckets.create(bucket, owner, region: region()) do
+    case Buckets.create(bucket, owner, region: region(), acl_canned: acl) do
       {:ok, _b} ->
         :ok = Storage.put_bucket(bucket)
         Log.info("create bucket", action: :create_bucket, bucket: bucket)
@@ -140,4 +141,9 @@ defmodule Maxio.S3.Handlers.Bucket do
   end
 
   defp region, do: Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:region)
+
+  # CreateBucket 的 x-amz-acl：对象专属 canned（bucket-owner-*）在桶级被静默忽略（官方），落 private。
+  defp bucket_canned(nil), do: "private"
+  defp bucket_canned(c) when c in ~w(bucket-owner-read bucket-owner-full-control), do: "private"
+  defp bucket_canned(c), do: c
 end

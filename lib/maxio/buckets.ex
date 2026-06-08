@@ -54,9 +54,10 @@ defmodule Maxio.Buckets do
           {:ok, Bucket.t()} | {:error, :invalid_bucket_name | :already_owned | Ecto.Changeset.t()}
   def create(name, owner, opts \\ []) do
     region = Keyword.get(opts, :region, default_region())
+    acl = Keyword.get(opts, :acl_canned, "private")
 
     with :ok <- validate_name(name) do
-      attrs = %{name: name, owner: owner, region: region}
+      attrs = %{name: name, owner: owner, region: region, acl_canned: acl}
 
       case %Bucket{} |> Bucket.changeset(attrs) |> Repo.insert() do
         {:ok, bucket} ->
@@ -78,6 +79,19 @@ defmodule Maxio.Buckets do
     case Repo.get_by(Bucket, name: name) do
       nil -> {:error, :not_found}
       bucket -> {:ok, bucket}
+    end
+  end
+
+  @doc "更新桶的 canned ACL（PutBucketAcl）。桶不存在 → :not_found。"
+  @spec put_acl(String.t(), String.t()) :: :ok | {:error, :not_found}
+  def put_acl(name, canned) do
+    case lookup(name) do
+      {:ok, bucket} ->
+        bucket |> Bucket.changeset(%{acl_canned: canned}) |> Repo.update!()
+        :ok
+
+      {:error, :not_found} ->
+        {:error, :not_found}
     end
   end
 

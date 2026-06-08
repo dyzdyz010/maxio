@@ -41,16 +41,31 @@ defmodule Maxio.Objects do
         etag: Map.fetch!(attrs, :etag),
         content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
         metadata: Map.get(attrs, :metadata, %{}),
-        storage_class: Map.get(attrs, :storage_class, "STANDARD")
+        storage_class: Map.get(attrs, :storage_class, "STANDARD"),
+        acl_canned: Map.get(attrs, :acl_canned, "private")
       }
 
       %Object{}
       |> Object.changeset(base)
       |> Repo.insert(
         on_conflict:
-          {:replace, [:size, :etag, :content_type, :metadata, :storage_class, :updated_at]},
+          {:replace,
+           [:size, :etag, :content_type, :metadata, :storage_class, :acl_canned, :updated_at]},
         conflict_target: [:bucket_id, :key]
       )
+    end
+  end
+
+  @doc "更新对象的 canned ACL（PutObjectAcl）。对象不存在 → :not_found。"
+  @spec put_acl(String.t(), String.t(), String.t()) :: :ok | {:error, :not_found}
+  def put_acl(bucket_name, key, canned) do
+    case get_metadata(bucket_name, key) do
+      {:ok, obj} ->
+        obj |> Object.changeset(%{acl_canned: canned}) |> Repo.update!()
+        :ok
+
+      {:error, :not_found} ->
+        {:error, :not_found}
     end
   end
 

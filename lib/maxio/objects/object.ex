@@ -15,6 +15,7 @@ defmodule Maxio.Objects.Object do
     field :content_type, :string, default: "binary/octet-stream"
     field :metadata, :map, default: %{}
     field :storage_class, :string, default: "STANDARD"
+    field :acl_canned, :string, default: "private"
 
     belongs_to :bucket, Maxio.Buckets.Bucket
 
@@ -22,7 +23,7 @@ defmodule Maxio.Objects.Object do
   end
 
   @required [:bucket_id, :bucket_name, :key, :size, :etag]
-  @optional [:content_type, :metadata, :storage_class]
+  @optional [:content_type, :metadata, :storage_class, :acl_canned]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(object, attrs) do

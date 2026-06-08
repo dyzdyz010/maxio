@@ -11,12 +11,13 @@ defmodule Maxio.Buckets.Bucket do
     field :name, :string
     field :region, :string, default: "us-east-1"
     field :owner, :string
+    field :acl_canned, :string, default: "private"
 
     timestamps(type: :utc_datetime_usec)
   end
 
   @required [:name, :owner]
-  @optional [:region]
+  @optional [:region, :acl_canned]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(bucket, attrs) do

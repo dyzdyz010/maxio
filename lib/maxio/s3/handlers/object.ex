@@ -42,7 +42,8 @@ defmodule Maxio.S3.Handlers.Object do
               size: size,
               etag: etag,
               content_type: content_type,
-              storage_class: "STANDARD"
+              storage_class: "STANDARD",
+              acl_canned: header(conn, "x-amz-acl") || "private"
             })
         rescue
           err ->
