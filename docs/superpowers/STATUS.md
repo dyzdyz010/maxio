@@ -168,6 +168,15 @@ reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（均已文档化
 - **ConnCase 不 import `Phoenix.LiveViewTest`**：所有 M5 Console 测试文件各自 `import Phoenix.LiveViewTest`（一致约定）。
 - **M5-9 治本的潜伏并发 bug（MemoryStore 惰性建表竞态，架构级修复非 hack）**：`Maxio.Auth.CredentialStore.MemoryStore` 惰性建 `:public, :named_table` ETS 表——建表进程在 `:ets.new` 与 `bootstrap_root` 之间存在窗口，并发 reader 可读到「表已存在但 root 行未注入」→ root `get_secret` 误返回 `:error`（Console 鉴权 mount 误判未登录 → 全程 redirect /login，e2e 矩阵首个 `live(~p"/buckets")` 偶发失败）。M5 e2e 矩阵作为早期 async 测试首次稳定暴露此竞态。修复（铁律 3，绝不静默丢失 root）：`get_secret` 对 root key 的空查询走 `maybe_bootstrap_root_for/1` 幂等补 `bootstrap_root` 再重查；新增私有 `root_access_key/0` 读 config。全量 412 测试在原失败 seed 790436 + seed 0 + 随机 seed 下稳定全绿。
 
+### M5 独立 code-reviewer 补充非阻塞项（post-review，纳入 M6 backlog）
+
+reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（无崩溃/安全洞）：
+
+1. **Console 的 CORS/Lifecycle 保存跳过 S3 handler 的语义 `validate!`（最值得跟进，S3 行为 parity）**：`bucket_live/settings.ex` 的 `save_cors`/`save_lifecycle` 直接 `Jason.decode` → `BucketConfigs.put`，绕过 `Maxio.S3.Handlers.{Cors,Lifecycle}.validate!`（method 白名单 / 至多一个 `*` / 规则数上限 / Status 取值 / Days+Date 互斥）。故运营者可经 Console 存入 S3 `PutBucketCors/Lifecycle` 会拒的配置，再经 S3 `Get*` 回放。无崩溃（matcher/view 防御性读）。建议把 `validate!` 抽到上下文/共享模块，Console 与 S3 handler 共用 + 加负例测试。
+2. **`create_folder` 在 Enabled 桶硬编码 version_id "null"**（同 M4 note #2 类，仅文件夹标记）。
+3. **`save_upload` 在 `Storage.put` 成功后用 `{:ok, obj} =` 硬匹配 `put_version_with_id`**：元数据插入若非 `{:ok}` 会崩 LV 进程且留孤儿字节（robustness，非鉴权关键路径）。
+4. **`download_controller` 用 `{:ok, stream} = Storage.get(...)` 硬匹配**：元数据存在但字节缺失（divergence）时会 500，建议映射结构化 404/500。
+
 ## 工具链与环境（本机 Windows 11，关键教训）
 
 - **Elixir 1.20.0 / Erlang OTP 28** 在 `C:\Users\dyz\Documents\dev\usr\Elixir\bin`；mix / phx_new 1.8.5 / hex 已装；docker / git 可用；**psql 不在 PATH**（用 `docker exec maxio-db psql -U postgres -d maxio_dev -c "..."`）。
@@ -187,8 +196,9 @@ reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（均已文档化
 
 ## 下一步（续作入口）
 
-- **M5 Console**（下一里程碑）：LiveView 管理台（`MaxioWeb.Endpoint`:4000）。在 M0–M4 完整 S3 + IAM/策略 + 高级特性之上做可视化管理（桶/对象浏览、IAM key 管理、bucket policy/ACL/versioning/tagging/cors/lifecycle/encryption 配置编辑、上传/下载）。物理隔离于 S3 Endpoint，CORS 仅作用于 S3 端不影响 Console。
-- M4 续作/可选硬化（非阻塞，已文档化于「M4 已知非阻塞项 / 显式 defer」）：lifecycle 后台过期 sweeper 执行、SSE 密钥轮转/KMS、SSE 大对象逐帧流式解密 + Range、multipart 版本化逐版本字节路径、MFA Delete 强制校验。
+- **M6 纠删码 / 分布式**（下一里程碑，最大新子系统）：Reed-Solomon 纠删码存储后端（经 `Maxio.Storage.Backend` behaviour 接入，Rustler NIF，铁律 2 后端即插件）+ 多盘/多节点分布 + 读写 quorum + bitrot 检测 + 自愈/scrub。这是 MinIO 最难的部分，体量大、需 Rust NIF（参考 huanxi 的 `h3o` Rustler 模式）与分布式一致性，宜单独聚焦推进。
+- **Console 浏览器活体取证（待补）**：M5 经 `Phoenix.LiveViewTest`（412 测试，含跨页 e2e 矩阵）确定性验证；真实浏览器活体取证（Claude-in-Chrome 启动 dev server + 登录走全链路）需先 `mix ecto.setup` + `mix phx.server`（dev S3 端口 9900）+ Chrome，留作后续确认（前端已埋 `window.__maxio` + `[maxio][Console]` 日志钩子）。
+- 续作/可选硬化（非阻塞，已分别文档化于各里程碑「已知非阻塞项」）：M5 note#1 CORS/Lifecycle Console 校验对齐 S3、lifecycle 后台 sweeper、SSE 大对象逐帧流式 GET+Range、multipart 版本化逐版本字节、identity policy、MFA Delete 强制。
 - M3 续作/可选硬化（非阻塞）：presigned 与 STS 完整化、identity policy（`principal_policies/1` 当前恒 `[]`，M4-1 已修为传真实 principal，接口就绪）、完整条件算子、secret at-rest 加密。
 - 每完成一里程碑：独立 reviewer/verifier 取证 + 更新本 STATUS + 提交。
 - 已建立的成功模式：研究核验（官方文档/向量）→ opus planner 产出 gold-standard 计划 → 有界串行 executor（每单元强制 StructuredOutput，避免过大）→ 独立 verifier → 有界 fix → 独立 code-reviewer。通用实现 workflow 在 `.omc/workflows/implement-milestone.js`（参数化 milestone/plan_path/baseline/units）。
