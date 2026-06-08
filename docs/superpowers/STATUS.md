@@ -126,6 +126,15 @@ reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（当前无害，
 8. **lifecycle `Date`（绝对时间）与 `Transition` 执行**：仅存储/校验。
 9. **沿用 M3 全部 defer**：跨账户/多租户、完整条件算子、identity policy（`principal_policies/1` 恒 `[]`，M4-1 已修为传真实 principal——接口就绪，实现仍 defer）、STS/session token、email grantee、`x-amz-grant-*` 细粒度、Block Public Access、checksum trailer 重算、DeleteObjects 逐 key 授权。
 
+### M4 独立 code-reviewer 补充非阻塞项（post-review，纳入 M5 backlog）
+
+reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（均已文档化 defer、无静默失败）：
+
+1. **SSE 对象 GET 全缓冲 + Range 降级（轻微违铁律 4，opt-in）**：加密对象 GET 把整密文读入内存解密（`unwrap_stream` `Enum.to_list`），Range 降级为完整 200。建议后续做逐帧流式 GET + 分帧 Range。
+2. **Multipart-complete / CopyObject 在 Enabled 桶仍写 `version_id:"null"`/`is_latest:true`**：内部一致（字节走 null 路径），但 Enabled 桶若已有 ULID 版本，会 unset 它们的 latest 并让 null 行成 latest。已 defer #6，待 MPU 逐版本字节路径时修。
+3. **`delete_version` 的 promote_latest 按 `version_id DESC`**：混合 null+ULID 历史下可能把 "null" 当最新提升（源于 #2 的 edge）。
+4. **装饰性**：CORS 实际响应设了 `Access-Control-Allow-Methods` 且 `Vary` 仅 `Origin`（AWS 实际响应通常省 ACAM）；`lifecycle valid_rule?` 允许有 Status 无 action 的规则（AWS 要求 ≥1 action）。无害。
+
 ## 工具链与环境（本机 Windows 11，关键教训）
 
 - **Elixir 1.20.0 / Erlang OTP 28** 在 `C:\Users\dyz\Documents\dev\usr\Elixir\bin`；mix / phx_new 1.8.5 / hex 已装；docker / git 可用；**psql 不在 PATH**（用 `docker exec maxio-db psql -U postgres -d maxio_dev -c "..."`）。
