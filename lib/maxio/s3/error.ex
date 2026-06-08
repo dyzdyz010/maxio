@@ -39,6 +39,9 @@ defmodule Maxio.S3.Error do
     bucket_not_empty:
       {"BucketNotEmpty", 409, "The bucket that you tried to delete is not empty."},
     invalid_argument: {"InvalidArgument", 400, "Invalid Argument"},
+    invalid_tag:
+      {"InvalidTag", 400,
+       "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation."},
     invalid_bucket_name: {"InvalidBucketName", 400, "The specified bucket is not valid."},
     entity_too_small:
       {"EntityTooSmall", 400,

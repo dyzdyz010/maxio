@@ -95,6 +95,28 @@ defmodule Maxio.Buckets do
     end
   end
 
+  @doc "读桶 tag。返回 [{Key,Value}]。桶不存在 → {:error, :not_found}。"
+  @spec get_tags(String.t()) :: {:ok, [{String.t(), String.t()}]} | {:error, :not_found}
+  def get_tags(name) do
+    case lookup(name) do
+      {:ok, b} -> {:ok, Maxio.Tags.map_to_list(b.tags || %{})}
+      {:error, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  @doc "写桶 tag（覆盖整集）。桶不存在 → {:error, :not_found}。"
+  @spec put_tags(String.t(), [{String.t(), String.t()}]) :: :ok | {:error, :not_found}
+  def put_tags(name, tags) do
+    case lookup(name) do
+      {:ok, b} ->
+        b |> Bucket.changeset(%{tags: Maxio.Tags.list_to_map(tags)}) |> Repo.update!()
+        :ok
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
   @doc """
   设置桶版本化状态（PutBucketVersioning）。status 为 nil（空 body）→ 不改 versioning；
   显式 "Enabled"/"Suspended" → 更新。mfa 非 nil → 更新 mfa_delete。桶不存在 → :not_found。

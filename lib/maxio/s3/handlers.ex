@@ -3,7 +3,7 @@ defmodule Maxio.S3.Handlers do
   Handler 分发门面：按 Dispatcher 解析出的 action 调对应 Service/Bucket/Object handler。
   M1 授权 stub：principal.type == :root 全权放行（非 root 当前不会出现，留接口）。
   """
-  alias Maxio.S3.Handlers.{Service, Bucket, Object, Multipart, BucketPolicy, Acl, Versioning}
+  alias Maxio.S3.Handlers.{Service, Bucket, Object, Multipart, BucketPolicy, Acl, Versioning, Tagging}
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
   def dispatch(:list_buckets, conn), do: Service.list_buckets(conn)
@@ -39,4 +39,11 @@ defmodule Maxio.S3.Handlers do
 
   def dispatch(:put_bucket_versioning, conn), do: Versioning.put(conn)
   def dispatch(:get_bucket_versioning, conn), do: Versioning.get(conn)
+
+  def dispatch(:put_object_tagging, conn), do: Tagging.put_object_tagging(conn)
+  def dispatch(:get_object_tagging, conn), do: Tagging.get_object_tagging(conn)
+  def dispatch(:delete_object_tagging, conn), do: Tagging.delete_object_tagging(conn)
+  def dispatch(:put_bucket_tagging, conn), do: Tagging.put_bucket_tagging(conn)
+  def dispatch(:get_bucket_tagging, conn), do: Tagging.get_bucket_tagging(conn)
+  def dispatch(:delete_bucket_tagging, conn), do: Tagging.delete_bucket_tagging(conn)
 end

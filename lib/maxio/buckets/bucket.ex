@@ -14,12 +14,13 @@ defmodule Maxio.Buckets.Bucket do
     field :acl_canned, :string, default: "private"
     field :versioning, :string, default: "Unversioned"
     field :mfa_delete, :string
+    field :tags, :map, default: %{}
 
     timestamps(type: :utc_datetime_usec)
   end
 
   @required [:name, :owner]
-  @optional [:region, :acl_canned, :versioning, :mfa_delete]
+  @optional [:region, :acl_canned, :versioning, :mfa_delete, :tags]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(bucket, attrs) do

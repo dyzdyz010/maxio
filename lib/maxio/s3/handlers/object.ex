@@ -35,6 +35,9 @@ defmodule Maxio.S3.Handlers.Object do
     versioning = bucket_versioning(bucket)
     version_id = if versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
 
+    # x-amz-tagging 头（PutObject）→ jsonb tag map（校验失败 → InvalidTag 400，铁律 3）。
+    tags_map = parse_tagging_header!(conn)
+
     case Storage.put(bucket, key, version_id, chunks) do
       {:ok, %{size: size, etag: etag, sha256: sha256}} ->
         # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
@@ -48,7 +51,8 @@ defmodule Maxio.S3.Handlers.Object do
               etag: etag,
               content_type: content_type,
               storage_class: "STANDARD",
-              acl_canned: header(conn, "x-amz-acl") || "private"
+              acl_canned: header(conn, "x-amz-acl") || "private",
+              tags: tags_map
             })
           rescue
             err ->
@@ -463,7 +467,15 @@ defmodule Maxio.S3.Handlers.Object do
     |> put_resp_header("last-modified", http_date(object.updated_at))
     |> put_resp_header("accept-ranges", "bytes")
     |> put_resp_header("content-length", Integer.to_string(content_length))
+    |> maybe_tagging_count(object)
   end
+
+  # GET/HEAD object：tag 数 > 0 才出现 x-amz-tagging-count（对齐 AWS）。
+  defp maybe_tagging_count(conn, %{tags: tags}) when is_map(tags) and map_size(tags) > 0 do
+    put_resp_header(conn, "x-amz-tagging-count", Integer.to_string(map_size(tags)))
+  end
+
+  defp maybe_tagging_count(conn, _object), do: conn
 
   # Range: bytes=a-b | bytes=a- | bytes=-suffix → {first,last} | nil | :full | :invalid
   # 多区间（含逗号）对齐 S3 返回完整 200（不实现 multipart/byteranges）→ :full。
@@ -606,6 +618,29 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   defp verify_content_sha256!(_conn, _mode, _sha256), do: :ok
+
+  # x-amz-tagging 头（PutObject）→ jsonb map；无头/空 → %{}；非法 → InvalidTag 400。
+  defp parse_tagging_header!(conn) do
+    case header(conn, "x-amz-tagging") do
+      nil ->
+        %{}
+
+      "" ->
+        %{}
+
+      raw ->
+        case Maxio.Tags.parse_header(raw) do
+          {:ok, list} ->
+            case Maxio.Tags.validate(list, :object) do
+              :ok -> Maxio.Tags.list_to_map(list)
+              {:error, :invalid_tag} -> raise Error.new(:invalid_tag)
+            end
+
+          {:error, :invalid_tag} ->
+            raise Error.new(:invalid_tag)
+        end
+    end
+  end
 
   defp header(conn, name), do: conn |> get_req_header(name) |> List.first()
 

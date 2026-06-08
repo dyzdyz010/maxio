@@ -91,6 +91,40 @@ defmodule Maxio.Objects do
     end
   end
 
+  @doc "读对象 tag（current 或指定版本）。返回 [{Key,Value}]（空集 → []）。对象不存在 → {:error, :not_found}。"
+  @spec get_tags(String.t(), String.t(), String.t() | nil) ::
+          {:ok, [{String.t(), String.t()}]} | {:error, :not_found}
+  def get_tags(bucket_name, key, version_id \\ nil) do
+    fetch =
+      if version_id,
+        do: get_version(bucket_name, key, version_id),
+        else: get_metadata(bucket_name, key)
+
+    case fetch do
+      {:ok, obj} -> {:ok, Maxio.Tags.map_to_list(obj.tags || %{})}
+      {:error, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  @doc "写对象 tag（覆盖整集）。对象不存在 → {:error, :not_found}。"
+  @spec put_tags(String.t(), String.t(), [{String.t(), String.t()}], String.t() | nil) ::
+          :ok | {:error, :not_found}
+  def put_tags(bucket_name, key, tags, version_id \\ nil) do
+    fetch =
+      if version_id,
+        do: get_version(bucket_name, key, version_id),
+        else: get_metadata(bucket_name, key)
+
+    case fetch do
+      {:ok, obj} ->
+        obj |> Object.changeset(%{tags: Maxio.Tags.list_to_map(tags)}) |> Repo.update!()
+        :ok
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
   @doc "按 (bucket, key) 取当前版本（is_latest=true）的对象元数据。delete marker 也会返回（调用方判 is_delete_marker）。"
   @spec get_metadata(String.t(), String.t()) :: {:ok, Object.t()} | {:error, :not_found}
   def get_metadata(bucket_name, key) do
