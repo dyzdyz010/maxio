@@ -66,6 +66,8 @@ config :maxio, :s3,
   root_password: "minioadmin"
 
 # 独立 S3 Endpoint（Bandit child）监听配置。
+# prod/默认 9000（对齐 MinIO）；dev 因 Windows 9000–9099 保留段改用 9900（见 dev.exs）；
+# 可经 MAXIO_S3_PORT 运行时覆盖（runtime.exs）。
 config :maxio, Maxio.S3.Endpoint, port: 9000, ip: :any
 
 # 后端 behaviour 绑定（铁律 1/2：换后端只改这里）。

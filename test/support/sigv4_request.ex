@@ -38,7 +38,9 @@ defmodule Maxio.Test.SigV4Request do
     amz_date = Calendar.strftime(now, "%Y%m%dT%H%M%SZ")
     scope_date = Calendar.strftime(now, "%Y%m%d")
     scope = "#{scope_date}/#{@region}/#{@service}/aws4_request"
-    payload_hash = Signer.hex_sha256(body)
+
+    payload_hash =
+      Keyword.get(opts, :content_sha256_override) || Signer.hex_sha256(body)
 
     base_headers =
       [

@@ -14,7 +14,7 @@ defmodule Maxio.Storage.Backend do
   @type bucket :: String.t()
   @type key :: String.t()
   @type range :: nil | {non_neg_integer(), non_neg_integer()}
-  @type put_result :: %{size: non_neg_integer(), etag: String.t()}
+  @type put_result :: %{size: non_neg_integer(), etag: String.t(), sha256: String.t()}
 
   @callback put(bucket(), key(), chunks :: Enumerable.t(), opts :: keyword()) ::
               {:ok, put_result()} | {:error, term()}

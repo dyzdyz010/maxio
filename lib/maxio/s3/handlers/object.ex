@@ -18,16 +18,32 @@ defmodule Maxio.S3.Handlers.Object do
     chunks = BodyReader.stream(conn, payload_mode)
 
     case Storage.put(bucket, key, chunks) do
-      {:ok, %{size: size, etag: etag}} ->
-        :ok = verify_decoded_length!(conn, payload_mode, size)
+      {:ok, %{size: size, etag: etag, sha256: sha256}} ->
+        # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
+        try do
+          :ok = verify_decoded_length!(conn, payload_mode, size)
+          :ok = verify_content_sha256!(conn, payload_mode, sha256)
 
-        {:ok, _obj} =
-          Objects.put_metadata(bucket, key, %{
-            size: size,
-            etag: etag,
-            content_type: content_type,
-            storage_class: "STANDARD"
-          })
+          {:ok, _obj} =
+            Objects.put_metadata(bucket, key, %{
+              size: size,
+              etag: etag,
+              content_type: content_type,
+              storage_class: "STANDARD"
+            })
+        rescue
+          err ->
+            _ = Storage.delete(bucket, key)
+
+            Log.warn("put object rolled back orphan bytes",
+              action: :put_object,
+              bucket: bucket,
+              key: key,
+              reason: :incomplete_body
+            )
+
+            reraise(err, __STACKTRACE__)
+        end
 
         Log.info("put object",
           action: :put_object,
@@ -71,11 +87,18 @@ defmodule Maxio.S3.Handlers.Object do
   def head(conn) do
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
-    {object, total} = object_or_raise(bucket, key)
 
-    conn
-    |> put_common_object_headers(object, total)
-    |> send_resp(200, "")
+    with {:ok, _b} <- Buckets.lookup(bucket),
+         {:ok, object} <- Objects.get_metadata(bucket, key) do
+      conn
+      |> put_common_object_headers(object, object.size)
+      |> send_resp(200, "")
+    else
+      {:error, :not_found} ->
+        # HEAD 无 body：缺失桶/对象只回状态 + 头，绝不发 XML body（与 head_bucket 一致）。
+        Log.info("head object miss", action: :head_object, bucket: bucket, key: key)
+        send_resp(conn, 404, "")
+    end
   end
 
   @spec delete(Plug.Conn.t()) :: Plug.Conn.t()
@@ -201,6 +224,33 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   defp verify_decoded_length!(_conn, _mode, _size), do: :ok
+
+  # :single 模式：声明的 x-amz-content-sha256 必须等于实际字节 SHA256（铁律 3/5）。
+  # UNSIGNED-PAYLOAD / STREAMING-* 不在此校验（前者声明 unsigned，后者由 StreamingVerifier 验）。
+  defp verify_content_sha256!(conn, :single, actual_sha256) do
+    case header(conn, "x-amz-content-sha256") do
+      nil ->
+        :ok
+
+      declared ->
+        cond do
+          declared in ["UNSIGNED-PAYLOAD", ""] ->
+            :ok
+
+          String.downcase(declared) == actual_sha256 ->
+            :ok
+
+          true ->
+            Log.warn("content sha256 mismatch", reason: :bad_digest)
+
+            raise Error.new(:x_amz_content_sha256_mismatch,
+              message: "declared #{declared} != computed #{actual_sha256}"
+            )
+        end
+    end
+  end
+
+  defp verify_content_sha256!(_conn, _mode, _sha256), do: :ok
 
   defp header(conn, name), do: conn |> get_req_header(name) |> List.first()
 

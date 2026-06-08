@@ -35,16 +35,18 @@ defmodule Maxio.Storage.FS do
       {:ok, fd} = File.open(path, [:write, :binary, :raw])
 
       try do
-        ctx0 = :crypto.hash_init(:md5)
+        md5_0 = :crypto.hash_init(:md5)
+        sha_0 = :crypto.hash_init(:sha256)
 
-        {ctx, size} =
-          Enum.reduce(chunks, {ctx0, 0}, fn chunk, {ctx, acc} ->
+        {md5_ctx, sha_ctx, size} =
+          Enum.reduce(chunks, {md5_0, sha_0, 0}, fn chunk, {m, s, acc} ->
             :ok = IO.binwrite(fd, chunk)
-            {:crypto.hash_update(ctx, chunk), acc + byte_size(chunk)}
+            {:crypto.hash_update(m, chunk), :crypto.hash_update(s, chunk), acc + byte_size(chunk)}
           end)
 
-        etag = ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
-        {:ok, %{size: size, etag: etag}}
+        etag = md5_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        sha256 = sha_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        {:ok, %{size: size, etag: etag, sha256: sha256}}
       after
         File.close(fd)
       end

@@ -203,4 +203,31 @@ defmodule Maxio.S3.IntegrationTest do
     assert out.status == 403
     assert out.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
   end
+
+  test "HeadObject 缺失 key → 404 且响应体为空（HEAD 无 body）" do
+    SigV4Request.signed_conn(:put, "/headmiss") |> call()
+    head = SigV4Request.signed_conn(:head, "/headmiss/nope") |> call()
+    assert head.status == 404
+    assert head.resp_body == ""
+  end
+
+  test "HeadObject 缺失桶 → 404 且响应体为空" do
+    head = SigV4Request.signed_conn(:head, "/no-such-bucket-head/x") |> call()
+    assert head.status == 404
+    assert head.resp_body == ""
+  end
+
+  test "PutObject :single 声明 sha256 与实际不符 → 400 XAmzContentSHA256Mismatch" do
+    SigV4Request.signed_conn(:put, "/digestbk") |> call()
+
+    bad =
+      SigV4Request.signed_conn(:put, "/digestbk/x.txt",
+        body: "real-bytes",
+        content_sha256_override: String.duplicate("a", 64)
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "<Code>XAmzContentSHA256Mismatch</Code>"
+  end
 end

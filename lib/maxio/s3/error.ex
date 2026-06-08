@@ -76,6 +76,9 @@ defmodule Maxio.S3.Error do
     bad_digest:
       {"BadDigest", 400,
        "The Content-MD5 or checksum value that you specified did not match what the server received."},
+    x_amz_content_sha256_mismatch:
+      {"XAmzContentSHA256Mismatch", 400,
+       "The provided 'x-amz-content-sha256' header does not match what was computed."},
     incomplete_body:
       {"IncompleteBody", 400,
        "You did not provide the number of bytes specified by the Content-Length HTTP header."}
