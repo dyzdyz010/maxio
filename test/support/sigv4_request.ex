@@ -82,5 +82,91 @@ defmodule Maxio.Test.SigV4Request do
     |> put_req_header("authorization", auth)
   end
 
+  @doc """
+  自签一个 aws-chunked（STREAMING-AWS4-HMAC-SHA256-PAYLOAD）流式请求。
+  用项目自己的 Signer 算 seed 与逐块签名，拼合法 chunk-signed body（"我们签→我们验"闭环）。
+  opts：:chunk_size（默认整 body 一块）、:headers、:tamper（fn binary -> binary，
+  对最终 chunked body 做篡改，用于负向测试）、:decoded_length_override（覆盖声明长度）。
+  """
+  def signed_chunked_conn(method, path, body, opts \\ []) do
+    chunk_size = Keyword.get(opts, :chunk_size, max(byte_size(body), 1))
+    extra_headers = Keyword.get(opts, :headers, [])
+
+    now = DateTime.utc_now()
+    amz_date = Calendar.strftime(now, "%Y%m%dT%H%M%SZ")
+    scope_date = Calendar.strftime(now, "%Y%m%d")
+    scope = "#{scope_date}/#{@region}/#{@service}/aws4_request"
+    decoded_len = byte_size(body)
+    decoded_len_header = Keyword.get(opts, :decoded_length_override, decoded_len)
+
+    data_chunks = chunk_body(body, chunk_size)
+
+    base_headers =
+      [
+        {"host", @host},
+        {"content-encoding", "aws-chunked"},
+        {"x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
+        {"x-amz-date", amz_date},
+        {"x-amz-decoded-content-length", Integer.to_string(decoded_len_header)}
+      ] ++ Enum.map(extra_headers, fn {k, v} -> {String.downcase(k), v} end)
+
+    canonical_req = %{
+      method: to_string(method) |> String.upcase(),
+      path: path,
+      query: %{},
+      headers: base_headers,
+      payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+    }
+
+    canonical = Canonical.canonical_request(canonical_req)
+    sts = Signer.string_to_sign(amz_date, scope, canonical, "AWS4-HMAC-SHA256")
+    key = Signer.derive_signing_key(@secret, scope_date, @region, @service)
+    seed_sig = Signer.signature(key, sts)
+    signed_headers = Canonical.signed_headers(base_headers)
+
+    auth =
+      "AWS4-HMAC-SHA256 Credential=#{@access_key}/#{scope}," <>
+        "SignedHeaders=#{signed_headers},Signature=#{seed_sig}"
+
+    chunked_body = build_chunked_body(data_chunks, key, amz_date, scope, seed_sig)
+    chunked_body = if t = Keyword.get(opts, :tamper), do: t.(chunked_body), else: chunked_body
+
+    conn =
+      conn(method, path, chunked_body)
+      |> Map.put(:host, @host)
+      |> put_private(:maxio_now, now)
+
+    base_headers
+    |> Enum.reject(fn {k, _v} -> k == "host" end)
+    |> Enum.reduce(conn, fn {k, v}, acc -> put_req_header(acc, k, v) end)
+    |> put_req_header("authorization", auth)
+  end
+
+  defp chunk_body("", _size), do: []
+
+  defp chunk_body(body, size) do
+    body
+    |> :binary.bin_to_list()
+    |> Enum.chunk_every(size)
+    |> Enum.map(&:erlang.list_to_binary/1)
+  end
+
+  defp build_chunked_body(data_chunks, key, amz_date, scope, seed_sig) do
+    {frames, _last} =
+      Enum.reduce(data_chunks ++ [""], {[], seed_sig}, fn data, {acc, prev} ->
+        data_hash = Signer.hex_sha256(data)
+
+        chunk_sts =
+          Maxio.Auth.SigV4.StreamingVerifier.chunk_string_to_sign(amz_date, scope, prev, data_hash)
+
+        sig = Signer.signature(key, chunk_sts)
+        size_hex = Integer.to_string(byte_size(data), 16) |> String.downcase()
+        frame = "#{size_hex};chunk-signature=#{sig}\r\n" <> data <> "\r\n"
+        {[frame | acc], sig}
+      end)
+
+    frames |> Enum.reverse() |> IO.iodata_to_binary()
+  end
+
   def access_key, do: @access_key
 end

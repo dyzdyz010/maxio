@@ -3,16 +3,20 @@ defmodule Maxio.S3.BodyReader do
   把 Plug.Conn 的请求 body 包成产出**纯净对象字节块**的 Stream（绝不全缓冲，铁律 4）。
 
   - :single / :unsigned —— 直接逐块产出 read_body 的 chunk。
-  - :streaming（aws-chunked）—— 边读边解帧，剥去每个 chunk 的
-    `<hexsize>;chunk-signature=<sig>\\r\\n` 头与尾随 \\r\\n，输出纯净 data；遇 size=0 终止块停止。
-    M2-3 起逐块签名链由 Maxio.Auth.SigV4.StreamingVerifier 验证（接入见 M2-3）。
+  - :streaming（aws-chunked）—— 由 Maxio.Auth.SigV4.StreamingVerifier 显式状态机驱动：
+    边读边解帧、逐块复算 chunk-signature 常数时间比对（坏块硬停 SignatureDoesNotMatch）、
+    剥去 `<hexsize>;chunk-signature=<sig>\\r\\n` 头与尾随 \\r\\n 输出纯净 data；遇 size=0 终止块停止；
+    读尽后过 finalize 校验 decoded 长度（不符 → IncompleteBody）。
+    flavor（:signed / :signed_trailer / :unsigned_trailer）由 x-amz-content-sha256 决定；
+    kSigning/scope/seed/amz_date 经 conn.assigns.sigv4_context 由 SigV4 plug 透传（不重推，铁律 2）。
 
-  解帧帧头解析见 parse_chunk_header/1：区分真正的 0 终止块（帧头数值 "0"）与
-  非 hex 垃圾帧头（→ IncompleteBody，绝不静默当 0，铁律 3）。
+  parse_chunk_header/1：解析 aws-chunked 帧头，区分真正的 0 终止块（帧头数值 "0"）与
+  非 hex 垃圾帧头（→ :error，绝不静默当 0，铁律 3）；纯函数，供单测直接调。
 
   返回逐块产出纯净对象字节的 Stream；调用方 Enum 消费（如交 Storage.put/4）。
   注意：因 read_body 会推进 conn，stream 内部持有并推进 conn——消费必须在同一进程内一次性完成。
   """
+  alias Maxio.Auth.SigV4.StreamingVerifier
   alias Maxio.S3.{Error, Log}
 
   @read_opts [length: 1_048_576, read_length: 1_048_576, read_timeout: 30_000]
@@ -20,17 +24,31 @@ defmodule Maxio.S3.BodyReader do
   @doc "返回逐块产出纯净对象字节的 Stream.resource。"
   @spec stream(Plug.Conn.t(), :single | :unsigned | :streaming) :: Enumerable.t()
   def stream(conn, :streaming) do
-    # 铁律 3：M2-3 起逐块签名验证由 StreamingVerifier 完成；本路径在 verifier 接入前
-    # 仅做解帧（非 hex 帧头硬失败，不静默截断）。
-    Log.warn("aws-chunked de-frame (per-chunk sig verify wired in M2-3)",
-      payload_mode: :streaming,
-      reason: :m2_3_streaming_verify_pending
-    )
+    # 铁律 3：aws-chunked 逐块签名验证由 StreamingVerifier 显式状态机驱动；
+    # 坏块/截断/长度不符在 emit 前硬 raise Maxio.S3.Error（绝不把半验证字节交下游）。
+    ctx = conn.assigns[:sigv4_context]
+    content_sha = req_header(conn, "x-amz-content-sha256") || ""
+    flavor = flavor_of(content_sha)
+    decoded_len = parse_int(req_header(conn, "x-amz-decoded-content-length"))
+    trailer_names = parse_trailer_names(req_header(conn, "x-amz-trailer"))
+
+    verifier =
+      StreamingVerifier.init(
+        k_signing: ctx.k_signing,
+        date: ctx.amz_date,
+        scope: ctx.scope,
+        seed_signature: ctx.seed_signature,
+        expected_decoded_len: decoded_len,
+        flavor: flavor,
+        trailer_names: trailer_names
+      )
+
+    Log.info("aws-chunked streaming verify start", payload_mode: :streaming, reason: flavor)
 
     Stream.resource(
-      fn -> {conn, ""} end,
-      &deframe_step/1,
-      fn _acc -> :ok end
+      fn -> {conn, verifier, :reading} end,
+      &verify_step/1,
+      fn _ -> :ok end
     )
   end
 
@@ -52,51 +70,59 @@ defmodule Maxio.S3.BodyReader do
     )
   end
 
-  # ── aws-chunked 解帧状态机 ──
-  defp deframe_step(:done), do: {:halt, :done}
-
-  defp deframe_step({conn, buffer}) do
-    case parse_chunk(buffer) do
-      {:chunk, data, rest} ->
-        {[data], {conn, rest}}
-
-      :terminator ->
-        {:halt, :done}
-
-      :need_more ->
-        case Plug.Conn.read_body(conn, @read_opts) do
-          {:ok, "", _conn2} -> {:halt, :done}
-          {:ok, more, conn2} -> deframe_step({conn2, buffer <> more})
-          {:more, more, conn2} -> deframe_step({conn2, buffer <> more})
-          {:error, _} -> {:halt, :done}
-        end
+  # ── aws-chunked 逐块签名验证驱动（StreamingVerifier 状态机）──
+  # body 读尽后切到 {:done, v2}，下一迭代过 finalize 校验终止块 + decoded 长度再 :halt。
+  defp verify_step({:done, verifier}) do
+    case StreamingVerifier.finalize(verifier) do
+      :ok -> {:halt, :ok}
+      {:error, reason} -> raise streaming_error(reason)
     end
   end
 
-  # 解析一个 chunk 帧。返回 {:chunk, data, rest} | :terminator | :need_more。
-  # 帧头非法（非 hex、空）→ raise IncompleteBody（铁律 3，不静默当 0）。
-  defp parse_chunk(buffer) do
-    case :binary.split(buffer, "\r\n") do
-      [header, after_header] ->
-        case parse_chunk_header(header) do
-          {:ok, 0} ->
-            :terminator
-
-          {:ok, size} when byte_size(after_header) >= size + 2 ->
-            <<data::binary-size(^size), "\r\n", rest::binary>> = after_header
-            {:chunk, data, rest}
-
-          {:ok, _size} ->
-            :need_more
-
-          :error ->
-            Log.warn("aws-chunked malformed frame header", reason: :incomplete_body)
-            raise Error.new(:incomplete_body, message: "malformed aws-chunked frame header")
+  defp verify_step({conn, verifier, :reading}) do
+    case Plug.Conn.read_body(conn, @read_opts) do
+      {:ok, more, _conn2} ->
+        case StreamingVerifier.feed(verifier, more) do
+          {:ok, chunks, v2} -> {chunks, {:done, v2}}
+          {:error, reason} -> raise streaming_error(reason)
         end
 
-      [_only] ->
-        :need_more
+      {:more, more, conn2} ->
+        case StreamingVerifier.feed(verifier, more) do
+          {:ok, chunks, v2} -> {chunks, {conn2, v2, :reading}}
+          {:error, reason} -> raise streaming_error(reason)
+        end
+
+      {:error, _} ->
+        raise streaming_error(:incomplete_body)
     end
+  end
+
+  defp streaming_error(:signature_does_not_match), do: Error.new(:signature_does_not_match)
+  defp streaming_error(:incomplete_body), do: Error.new(:incomplete_body)
+  defp streaming_error(_), do: Error.new(:incomplete_body, message: "invalid aws-chunked frame")
+
+  # flavor 由 x-amz-content-sha256 决定（调用方未声明流式时默认 :signed）。
+  defp flavor_of("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"), do: :signed
+  defp flavor_of("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"), do: :signed_trailer
+  defp flavor_of("STREAMING-UNSIGNED-PAYLOAD-TRAILER"), do: :unsigned_trailer
+  defp flavor_of(_), do: :signed
+
+  defp req_header(conn, name), do: conn |> Plug.Conn.get_req_header(name) |> List.first()
+
+  defp parse_int(nil), do: nil
+
+  defp parse_int(str) do
+    case Integer.parse(str) do
+      {n, ""} -> n
+      _ -> nil
+    end
+  end
+
+  defp parse_trailer_names(nil), do: []
+
+  defp parse_trailer_names(str) do
+    str |> String.split(",", trim: true) |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
   end
 
   @doc """

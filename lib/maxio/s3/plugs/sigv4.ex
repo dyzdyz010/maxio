@@ -25,17 +25,35 @@ defmodule Maxio.S3.Plugs.SigV4 do
   @impl true
   def call(conn, _opts) do
     conn = fetch_query_params(conn)
+    content_sha = header(conn, "x-amz-content-sha256") || ""
 
+    # SigV4A（ECDSA P-256）流式变体早拒 501：它非 HMAC，无法用 kSigning 验 seed/逐块签名。
+    if sigv4a_streaming?(content_sha) do
+      reject(conn, Error.new(:not_implemented, message: "SigV4A streaming (ECDSA P-256) not supported"))
+    else
+      do_authenticate(conn)
+    end
+  end
+
+  defp sigv4a_streaming?(v) do
+    v in [
+      "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+      "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER"
+    ]
+  end
+
+  defp do_authenticate(conn) do
     case detect_and_parse(conn) do
       {:ok, signed_request} ->
         material = build_material(conn, signed_request)
 
         case Auth.authenticate(material) do
-          {:ok, principal} ->
+          {:ok, principal, sig_context} ->
             conn
             |> assign(:principal, principal)
             |> assign(:auth_type, signed_request.auth_type)
             |> assign(:payload_mode, signed_request.payload_mode)
+            |> assign(:sigv4_context, sig_context)
 
           {:error, %Error{} = err} ->
             reject(conn, err)

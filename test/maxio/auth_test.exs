@@ -38,7 +38,7 @@ defmodule Maxio.AuthTest do
 
   test "正确签名（VECTOR A）通过并返回 root principal" do
     material = vector_a_material("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
-    assert {:ok, principal} = Auth.authenticate(material)
+    assert {:ok, principal, _ctx} = Auth.authenticate(material)
     assert principal.type == :root
     assert principal.access_key == "AKIAIOSFODNN7EXAMPLE"
   end
@@ -129,7 +129,7 @@ defmodule Maxio.AuthTest do
       now: ~U[2013-05-24 01:00:00Z]
     }
 
-    assert {:ok, principal} = Auth.authenticate(material)
+    assert {:ok, principal, _ctx} = Auth.authenticate(material)
     assert principal.type == :root
   end
 end

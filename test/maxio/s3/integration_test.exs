@@ -230,4 +230,75 @@ defmodule Maxio.S3.IntegrationTest do
     assert bad.status == 400
     assert bad.resp_body =~ "<Code>XAmzContentSHA256Mismatch</Code>"
   end
+
+  test "aws-chunked PutObject（单块）→ GET 取回 + ETag 为 MD5（解帧后）" do
+    SigV4Request.signed_conn(:put, "/chunkbk") |> call()
+
+    body = "Welcome to Amazon S3."
+    put = SigV4Request.signed_chunked_conn(:put, "/chunkbk/c.txt", body) |> call()
+    assert put.status == 200
+    expected = "\"" <> (:crypto.hash(:md5, body) |> Base.encode16(case: :lower)) <> "\""
+    assert get_resp_header(put, "etag") == [expected]
+
+    get = SigV4Request.signed_conn(:get, "/chunkbk/c.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == body
+  end
+
+  test "aws-chunked PutObject（多块）→ 解帧后内容完整" do
+    SigV4Request.signed_conn(:put, "/chunkmb") |> call()
+
+    body = String.duplicate("z", 20)
+    put = SigV4Request.signed_chunked_conn(:put, "/chunkmb/m.txt", body, chunk_size: 7) |> call()
+    assert put.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/chunkmb/m.txt") |> call()
+    assert get.resp_body == body
+  end
+
+  test "aws-chunked 篡改某块 data → 403 SignatureDoesNotMatch（硬停，绝不落盘）" do
+    SigV4Request.signed_conn(:put, "/chunkbad") |> call()
+
+    tamper = fn chunked -> String.replace(chunked, "abcdefghij", "abcdefghiZ") end
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/chunkbad/x.txt", "abcdefghij",
+        chunk_size: 10,
+        tamper: tamper
+      )
+      |> call()
+
+    assert bad.status == 403
+    assert bad.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
+
+    get = SigV4Request.signed_conn(:get, "/chunkbad/x.txt") |> call()
+    assert get.status == 404
+  end
+
+  test "aws-chunked 声明 decoded-content-length 与实际不符 → 400 IncompleteBody" do
+    SigV4Request.signed_conn(:put, "/chunklen") |> call()
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/chunklen/x.txt", "abcdefghij",
+        decoded_length_override: 999
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "<Code>IncompleteBody</Code>"
+  end
+
+  test "SigV4A 流式（ECDSA）→ 501 NotImplemented" do
+    SigV4Request.signed_conn(:put, "/sigv4a") |> call()
+    # 直接发一个声明 SigV4A 流式的 PUT（不必合法签名，plug 早拒 501）
+    conn =
+      SigV4Request.signed_conn(:put, "/sigv4a/x.txt",
+        headers: [{"x-amz-content-sha256", "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD"}],
+        content_sha256_override: "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD"
+      )
+      |> call()
+
+    assert conn.status == 501
+    assert conn.resp_body =~ "<Code>NotImplemented</Code>"
+  end
 end

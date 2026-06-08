@@ -20,13 +20,13 @@ defmodule Maxio.Auth do
 
   @algorithm "AWS4-HMAC-SHA256"
 
-  @spec authenticate(map()) :: {:ok, map()} | {:error, Error.t()}
+  @spec authenticate(map()) :: {:ok, map(), map()} | {:error, Error.t()}
   def authenticate(%{signed_request: sr} = material) do
     with :ok <- check_request_time(sr, material.now),
          {:ok, %{secret_key: secret, principal: principal}} <- lookup_secret(sr.access_key),
-         :ok <- verify_signature(sr, material, secret) do
+         {:ok, sig_context} <- verify_signature(sr, material, secret) do
       Log.info("sigv4 authenticated", auth_type: sr.auth_type)
-      {:ok, principal}
+      {:ok, principal, sig_context}
     end
   end
 
@@ -118,7 +118,15 @@ defmodule Maxio.Auth do
     computed = Signer.signature(key, sts)
 
     if Signer.secure_compare(computed, sr.signature) do
-      :ok
+      # sig_context = 验完 seed 签名后已有的、逐块流式验证（BodyReader→StreamingVerifier）
+      # 要复用的材料——避免重查 secret / 重推 kSigning（铁律 2：不重复劳动）。
+      {:ok,
+       %{
+         k_signing: key,
+         scope: scope,
+         seed_signature: sr.signature,
+         amz_date: sr.amz_date
+       }}
     else
       Log.warn("signature mismatch", auth_type: sr.auth_type, reason: :signature_does_not_match)
       {:error, Error.new(:signature_does_not_match)}
