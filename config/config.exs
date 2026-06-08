@@ -96,6 +96,9 @@ config :maxio, :storage_backend, Maxio.Storage.FS
 config :maxio, :credential_store, Maxio.Auth.CredentialStore.EctoStore
 config :maxio, :policy_store, Maxio.Policy.Store.EctoStore
 
+# M7 分片传输实现（prod = :erpc 到每节点 ShardServer；test 经 opts[:transport] 覆盖为 InProcess）。
+config :maxio, :shard_transport, Maxio.Cluster.Transport.Erpc
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

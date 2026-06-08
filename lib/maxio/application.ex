@@ -45,7 +45,7 @@ defmodule Maxio.Application do
         do: [],
         else: [{Cluster.Supervisor, [topologies, [name: Maxio.Cluster.ClusterSupervisor]]}]
 
-    libcluster ++ [Maxio.Cluster.Topology]
+    libcluster ++ [Maxio.Cluster.Topology, Maxio.Cluster.ShardServer]
   end
 
   # 诚实暴露 M4 defer（铁律 3：绝不假装已生效）。
