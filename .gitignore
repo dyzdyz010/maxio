@@ -41,6 +41,9 @@ npm-debug.log
 # Rust（Rustler NIF，后续里程碑）。
 /native/**/target/
 
+# Rustler 编译产出的 NIF 动态库（由 mix compile 从 native/ 源码重新生成、平台相关，不入库；镜像 huanxi）。
+/priv/native/
+
 # 本地对象存储数据目录（S3 后端落盘，不入库）。
 /priv/maxio_data/
 /priv/s3_data/

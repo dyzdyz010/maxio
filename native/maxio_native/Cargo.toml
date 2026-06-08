@@ -1,0 +1,15 @@
+[package]
+name = "maxio_native"
+version = "0.1.0"
+authors = ["maxio"]
+edition = "2021"
+
+[lib]
+name = "maxio_native"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.38"
+reed-solomon-simd = "3.1"
+blake3 = "1"
