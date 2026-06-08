@@ -26,11 +26,22 @@ defmodule Maxio.Application do
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
         maybe_bootstrap_root()
+        log_deferred_features()
         {:ok, pid}
 
       other ->
         other
     end
+  end
+
+  # 诚实暴露 M4 defer（铁律 3：绝不假装已生效）。
+  defp log_deferred_features do
+    require Logger
+
+    Logger.info(
+      "maxio M4 deferred: bucket lifecycle EXPIRATION execution not implemented (config stored/served only); " <>
+        "SSE-S3 uses single static master key (no rotation/KMS); MFA Delete not enforced; SSE-C/SSE-KMS return 501"
+    )
   end
 
   # 仅 EctoStore 下在 Repo 起来后幂等引导 root（MemoryStore 自带惰性引导，无需此步）。

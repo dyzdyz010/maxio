@@ -93,7 +93,9 @@ defmodule Maxio.S3.Error do
       {"AccessForbidden", 403,
        "CORSResponse: This CORS request is not allowed. This is usually because the evaluation of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted."},
     no_such_cors_configuration:
-      {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist."}
+      {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist."},
+    no_such_lifecycle_configuration:
+      {"NoSuchLifecycleConfiguration", 404, "The lifecycle configuration does not exist."}
   }
 
   @doc """
