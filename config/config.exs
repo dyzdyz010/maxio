@@ -75,6 +75,22 @@ config :maxio, Maxio.S3.Endpoint, port: 9000, ip: :any
 config :maxio, :sse,
   master_key: "bWF4aW8tc3NlLXMzLW1hc3Rlci1rZXktMzJieXRlcyE="
 
+# 纠删码后端默认参数（单机多盘 = 一个 erasure set）。默认后端仍为 FS（见下）；
+# 切到纠删码：把 storage_backend 改为 Maxio.Storage.ErasureCoded 即可（铁律 2：换后端只改一行）。
+# drives = N 个本地盘目录（N = data_shards + parity_shards）；block_size = 流式块（MinIO v2 默认 1 MiB）。
+config :maxio, :erasure,
+  drives: [
+    Path.expand("../priv/s3_data/ec/d0", __DIR__),
+    Path.expand("../priv/s3_data/ec/d1", __DIR__),
+    Path.expand("../priv/s3_data/ec/d2", __DIR__),
+    Path.expand("../priv/s3_data/ec/d3", __DIR__),
+    Path.expand("../priv/s3_data/ec/d4", __DIR__),
+    Path.expand("../priv/s3_data/ec/d5", __DIR__)
+  ],
+  data_shards: 4,
+  parity_shards: 2,
+  block_size: 1_048_576
+
 # 后端 behaviour 绑定（铁律 1/2：换后端只改这里）。
 config :maxio, :storage_backend, Maxio.Storage.FS
 config :maxio, :credential_store, Maxio.Auth.CredentialStore.EctoStore
