@@ -3,7 +3,7 @@ defmodule Maxio.S3.Handlers do
   Handler 分发门面：按 Dispatcher 解析出的 action 调对应 Service/Bucket/Object handler。
   M1 授权 stub：principal.type == :root 全权放行（非 root 当前不会出现，留接口）。
   """
-  alias Maxio.S3.Handlers.{Service, Bucket, Object, Multipart}
+  alias Maxio.S3.Handlers.{Service, Bucket, Object, Multipart, BucketPolicy}
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
   def dispatch(:list_buckets, conn), do: Service.list_buckets(conn)
@@ -26,4 +26,8 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:abort_multipart_upload, conn), do: Multipart.abort_multipart_upload(conn)
   def dispatch(:list_parts, conn), do: Multipart.list_parts(conn)
   def dispatch(:list_multipart_uploads, conn), do: Multipart.list_multipart_uploads(conn)
+
+  def dispatch(:put_bucket_policy, conn), do: BucketPolicy.put(conn)
+  def dispatch(:get_bucket_policy, conn), do: BucketPolicy.get(conn)
+  def dispatch(:delete_bucket_policy, conn), do: BucketPolicy.delete(conn)
 end

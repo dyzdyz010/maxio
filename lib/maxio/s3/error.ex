@@ -81,7 +81,11 @@ defmodule Maxio.S3.Error do
        "The provided 'x-amz-content-sha256' header does not match what was computed."},
     incomplete_body:
       {"IncompleteBody", 400,
-       "You did not provide the number of bytes specified by the Content-Length HTTP header."}
+       "You did not provide the number of bytes specified by the Content-Length HTTP header."},
+    malformed_policy:
+      {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'."},
+    no_such_bucket_policy:
+      {"NoSuchBucketPolicy", 404, "The bucket policy does not exist."}
   }
 
   @doc """
