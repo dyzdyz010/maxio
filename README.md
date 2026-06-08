@@ -107,3 +107,69 @@ LiveView mount 时凭 access_key 重查 principal。鉴权经 `live_session` 的
 - **Console 大文件多段上传**：MVP 走单 PUT（≤5 GiB，服务端临时文件中转）；接 `Maxio.Multipart` 逐 part 上传标为后续优化。
 - **生命周期后台执行**：Console 可编辑规则，但后台过期/转储执行未实现（沿用 M4 defer）。
 - **预签名分享 URL**：可经 `Maxio.Auth.SigV4.Signer` 生成指向 S3 端的预签名 GET（唯一引用 S3 HTTP 之处），MVP 未做 UI（不画死按钮）。
+
+## Erasure Coding（M6，单机多盘 Reed-Solomon 纠删码）
+
+maxio 在 FS 后端之上新增一个 **MinIO 式纠删码存储后端** `Maxio.Storage.ErasureCoded`，把对象字节以
+**Reed-Solomon (N = K + M)** 编码分散到 **N 个本地盘目录（单机多盘 = 一个 erasure set）**，提供
+per-shard BLAKE3 bitrot 检测、decode-on-read 容错与自愈/scrub。它实现与 `Maxio.Storage.FS`
+**完全相同**的 `Maxio.Storage.Backend` 契约（put/get/stat/delete + bucket ops + multipart parts +
+version_id 维度 + 流式 + ETag/sha256 返回形态逐字节一致），**核心请求管线 / handler / dispatcher /
+endpoint 一行不改**（铁律 2：后端即插件）。底层经 Rustler NIF（`native/maxio_native`，镜像姊妹项目
+huanxi 的 `h3o` 模式）封装 `reed-solomon-simd`（GF(2^16) SIMD、纯 Rust）+ `blake3`。
+
+### 启用方式（config 切后端）
+
+```elixir
+# 1) 把存储后端从 FS 切到纠删码（缺省仍是 Maxio.Storage.FS）
+config :maxio, :storage_backend, Maxio.Storage.ErasureCoded
+
+# 2) 配置 erasure set（N 个本地目录 = K + M，block_size 为流式块大小）
+config :maxio, :erasure,
+  drives: ["/data/d0", "/data/d1", "/data/d2", "/data/d3", "/data/d4", "/data/d5"],
+  data_shards: 4,        # K
+  parity_shards: 2,      # M（N = K + M = length(drives)）
+  block_size: 1_048_576  # 1 MiB 逻辑块
+```
+
+启动期 `Maxio.Storage.Erasure.Config.load!/1` 校验 `length(drives) == K + M`、`M >= 1`、
+`M <= N/2`（parity 至多半数），非法配置 **raise**（绝不带病启动）。
+
+### EC:M 记法与 quorum
+
+- 记法 **EC:M**（如 `EC:2` = M=2 校验分片）；对象在 N 个盘各落一个分片（前 K 个 systematic 数据分片、后 M 个校验分片）。
+- **read quorum = K**：任意 K 个存活分片即可重建整对象（可容忍最多 M 个盘缺失/损坏）。
+- **write quorum = K**（一般情形）；当 **K == M（即 M == N/2，脑裂边界）时 write quorum = K + 1**——单机已实现并强制此 quorum 返回值（跨节点分区语义 defer M7）。写入成功盘数 < write quorum → `{:error, :write_quorum}` + 结构化日志（绝不静默落盘）。
+
+### Bitrot 检测 + 自愈（heal / scrub）
+
+- **per-shard BLAKE3-256 校验和** 随对象元数据存进每盘的 `meta.json` sidecar（`shards[i].block_hashes[j]` = 盘 i 在 block j 的分片校验和）。
+- **decode-on-read**：GET 逐块 `pread` 各盘分片、重算 BLAKE3 与 sidecar 比对，**不匹配/缺失的分片显式置 nil**（RS 只纠已知 erasure、不定位 silent corruption，故必须先校验再重建——绝不把「在场但损坏」的分片喂解码器）；存活 ≥ K 重建并返回正确字节；存活 < K → raise `InsufficientShardsError`（**绝不静默返回错数据**，铁律 3）。
+- **heal**：从 K 个存活分片 RS 重建坏分片字节，`:file.pwrite` 精确回写坏 block 偏移（整列分片文件缺失时先补齐再回写）+ 修复该盘 sidecar 副本；某 block 存活 < K → **unrecoverable**（返回 `{:error, :unrecoverable}` + 结构化 error 日志，**绝不伪造数据**）。
+- **CLI**（铁律 4 可观测，结构化日志含 bucket/key/drive/block/result）：
+
+```bash
+mix maxio.heal <bucket> <key> [version_id]   # heal 单个对象（version_id 缺省 "null"）
+mix maxio.heal <bucket>                       # scrub 整桶（逐对象 heal）
+mix maxio.scrub                               # 全盘巡检：所有桶全部对象逐个 heal
+mix maxio.scrub <bucket>                      # 仅扫描指定桶
+```
+
+### 流式保证（铁律 4：body 绝不进内存）
+
+PUT 把上传字节流重切成固定 `block_size` 逻辑块，逐块 RS 编码后分片 i 追加到盘 i（手写有界块缓冲，
+绝不缓冲整对象）；GET 用 `Stream.resource/3` 逐块读 K 个存活分片、校验、重建、流式发出。任意时刻内存
+≈ 一个 block × N 分片。NIF 按块调用（每次有界、快速，绝不长跑卡调度器）。
+
+### M6 显式 defer 清单（M7，文档化，绝不静默丢弃）
+
+1. **真正多节点分布**：分片 I/O 跨主机（RPC 替本地 `:file`）。M6 的「N 盘 = N 本地目录」与分布式 erasure set 的 RS 数学**完全相同**，M7 只换分片访问 transport，不重写 encode/decode/heal 引擎。
+2. **多 erasure set + 对象→set 路由**（对象名 hash）；**server pools** + pool 路由；扩容 / rebalance。
+3. **跨节点读写 quorum**（含网络分区下 `K==M` 的 K+1 脑裂规则——M6 单机已实现并强制 quorum 返回值，分区语义 defer）。
+4. **分布式锁**（跨节点对象级锁，保证并发 PUT/heal 安全）。
+5. **拓扑感知路由 / 跨节点 heal 协调 / heal 限流 / failure-domain 感知分片放置**；MinIO 式 1/1024 scrub 采样（M6 全扫，单机量可控）。
+6. **存储类多 parity**（`x-amz-storage-class` → STANDARD/RRS 不同 EC:M）：M6 单一 (K, M) 配置。
+7. **inline 小对象**（< 128 KiB 直接进 sidecar 省 part 文件）：M6 所有对象都写 part 文件。
+8. **heal MVP 简化**：同步、单进程、无并发锁（单机串行）；heal 粒度到整对象（非 MinIO per-block 增量回写优化，正确优先）。
+
+**设计保证**：M7 在 M6 同一 RS 编解码 / heal 核心**之外**加 routing/locking/pools/transport 层，不重写引擎。

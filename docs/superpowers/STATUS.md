@@ -20,7 +20,7 @@
 | **M3 IAM / 策略** | access key + EctoStore + policy 评估 + canned ACL + bucket policy + Authz + 匿名 | ✅ 已实现并验证（master，2026-06-09；275 测试全绿、Evaluator 真值表 + 匿名/public policy/ACL/授权矩阵 e2e、`compile --warnings-as-errors` 零警告） |
 | **M4 高级特性** | versioning / tagging / lifecycle / CORS / SSE | ✅ 已实现并验证（master，2026-06-09；349 测试全绿、`compile --warnings-as-errors` 零警告、versioning/tagging/cors/lifecycle/sse e2e + 跨特性矩阵） |
 | **M5 Console** | LiveView 管理台 | ✅ 已实现并验证（master，2026-06-09；`compile --warnings-as-errors` 零警告、跨页 e2e LiveViewTest 矩阵全绿、鉴权/dashboard/buckets/object-browser/object-detail/settings/access-keys 单测全绿） |
-| **M6 纠删码 / 分布式** | Reed-Solomon（Rustler）+ 分布式 + 自愈 | ⬜ 待 |
+| **M6 纠删码（单机多盘）** | Reed-Solomon（Rustler NIF）纠删码后端 + bitrot 检测 + 自愈/scrub（多节点分布 defer M7） | ✅ 已实现并验证（master，2026-06-09；全量回归绿、`compile --warnings-as-errors` 零警告、NIF round-trip / Codec bitrot / 后端 conformance（同跑 FS+EC）/ S3 e2e / heal-scrub / bitrot e2e 全绿） |
 
 ## 当前会话进展（2026-06-08）
 
@@ -176,6 +176,28 @@ reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（无崩溃/安�
 2. **`create_folder` 在 Enabled 桶硬编码 version_id "null"**（同 M4 note #2 类，仅文件夹标记）。
 3. **`save_upload` 在 `Storage.put` 成功后用 `{:ok, obj} =` 硬匹配 `put_version_with_id`**：元数据插入若非 `{:ok}` 会崩 LV 进程且留孤儿字节（robustness，非鉴权关键路径）。
 4. **`download_controller` 用 `{:ok, stream} = Storage.get(...)` 硬匹配**：元数据存在但字节缺失（divergence）时会 500，建议映射结构化 404/500。
+
+## M6 实现摘要（纠删码 · 单机多盘 · Rustler NIF · subagent-driven 串行 executor M6-1…M6-5）
+
+- **`compile --warnings-as-errors` 零警告、全量 `mix test` 绿**（M5 基线 + M6 新增 NIF/Codec/后端/conformance/e2e/heal/scrub/bitrot 全套）。计划：`plans/2026-06-09-m6-erasure-coding.md`。核心管线**一行不改**：M6 仅新增一个 `Maxio.Storage.Backend` 实现 `Maxio.Storage.ErasureCoded`，经 `config :maxio, :storage_backend` 切换即启用（铁律 2 后端即插件，facade/behaviour/FS/handler/dispatcher/endpoint 全部未改）。
+- **M6-1 Rust NIF crate**（`native/maxio_native`，镜像姊妹项目 huanxi 的 `h3o` Rustler 模式）：`reed-solomon-simd 3.1`（GF(2^16) SIMD、纯 Rust、Windows MSVC 无 C 依赖）+ `blake3 1` + `rustler 0.38`，cdylib 经 `use Rustler` 宏在 `mix compile` 期驱动 cargo 构建。`Maxio.Native.ErasureCoding`：`encode/3`（K+M 等长分片，systematic 前 K 数据分片、末数据分片零填充）/ `reconstruct/3`（从 `[binary|nil]` 重建，缺/损置 nil）/ `blake3/1`（32 字节 per-shard 校验和）；契约「成功即返回值、非法即 raise ArgumentError」。NIF 名 `native_rs_encode`/`native_rs_reconstruct`/`native_blake3`。**架构级修正**：(a) reed_solomon_simd 3.1 `decode` 返回 `BTreeMap` 非计划所述 `HashMap`（`.get(&i)` API 不变，调用方无感）；(b) k=0 用显式 fallback 子句 raise `ArgumentError`（非 `FunctionClauseError`），对齐 success-or-raise 契约；(c) `.gitignore` 加 `/priv/native/`（避免提交 `mix compile` 拷贝的 cdylib）。
+- **M6-2 块编解码层**（纯 Elixir over NIF，不触盘/DB）：`Maxio.Storage.Erasure.Config`（`load!/1` 合并 opts+config、校验 `N==K+M`/`M<=N/2`、计算 `read_quorum=K`、`write_quorum= if M==N/2 then K+1 else K`（脑裂边界），`total/1`）；`Maxio.Storage.Erasure.Codec`（`split_block/2` → N 等长分片 + N 个 BLAKE3-256 校验和；`restore_block/5` 逐分片验校验和、不符/缺失置 nil、存活 ≥K 重建+截断、存活 <K → raise；`verify_shard/2`）；`Maxio.Storage.Erasure.InsufficientShardsError`（结构化字段 bucket/key/version_id/block_index/present/required）。**RS 只纠 erasure 不定位 silent corruption** → 校验和把损坏分片显式标记为缺失再交解码器（bitrot 安全的关键，绝不把「在场但损坏」分片喂 reconstruct）。
+- **M6-3 ErasureCoded put/get/stat/delete + bucket ops**（流式逐块 + sidecar + quorum，与 FS 返回形态逐字节一致）：对象在每盘 i 落 `<drive>/<bucket>/<rel>/{part.0,meta.json}`（version="null"）或 `.versions/<bucket>/<rel>/<version_id>/{...}`；PUT 用 `Enum.reduce` 块缓冲逐块编码（内存 ≈ 一块 × N 分片，绝不缓冲整对象）、分片 i 追加盘 i 的 part.0、sidecar 写全部 N 盘、成功盘数 ≥ write_quorum 才 `{:ok}`；GET 用 `Stream.resource/3` 逐块 `pread` K 存活分片、按 sidecar `block_hashes` 校验+重建+截断+Range 裁剪；etag/sha256 over **明文**。**架构级修正**（M6-3 prior executor）：(1) bitstring `binary-size` 用 pin 操作符 `^block_size`（Elixir 1.20 拒绝 struct 字段/local）；(2) **均匀 shard_len 不变量**——`write_block` 把每块零填充到固定 `block_size` 后再 split_block，使全对象所有块 shard_len 一致（= even(ceil(block_size/K))），GET 按每块 block_plain_len 截断（填充字节绝不到客户端），从而 `j*shard_len` 偏移寻址成立、解决末块更短分片破坏多块寻址的 bug；(3) `Stream.resource` ACC 形态 `{fds, j}` 在 start/halt/cleanup 三处一致（避免 Tuple 非 Enumerable 崩溃）。Sidecar 形态 `%{"ec"=>%{k,m,block_size,algo:"blake3-256"}, "size","etag","sha256","parts"=>[%{part:0,size}], "shards"=>[%{drive,shard_file_size,block_hashes:[hex...]}]}`。
+- **M6-4 parts + 共享 conformance + config 切后端 + S3 e2e**：4 个 parts 回调（put_part/get_part_stream/assemble/abort_upload）依 prior executor「behaviour 全有或全无 vs --warnings-as-errors」决策已在 M6-3 用计划 M6-4 verbatim 代码提前落地，故 M6-4 仅加测试——`test/support/storage_conformance.ex`（`Maxio.Test.StorageConformance` 6 个共享 `test`，using 模块先定义 `@backend Mod` + `defp opts(ctx)` 再 `use`）**同跑 FS 与 ErasureCoded** 证同一契约；`test/maxio/s3/erasure_e2e_test.exs` config-switch（同设 `:storage_backend` + `:erasure`，on_exit 还原）经 `Maxio.S3.Endpoint.call/2` 跑 Put/Get 全量/Range 206/Head/Delete→404，3000B + block_size 1024 验多块流式 + 跨块 Range。e2e 镜像 integration_test 的 `Maxio.DataCase, async: false` + 自签 SigV4（项目无 `Maxio.ConnCase`）。
+- **M6-5 heal/scrub + bitrot e2e**：`Maxio.Storage.Erasure.Heal`——`heal_object/4`（取任一存活 sidecar 得 EC 参数 + per-block-per-shard `block_hashes`，逐块逐盘 `pread`+BLAKE3 重算比对、坏分片 ≤M → `Codec.restore_block` 得明文 → 重填充到 block_size → `Codec.split_block` 重编码 → 仅坏盘分片 `:file.pwrite` 回写 `j*shard_len`（整列缺失先 `ensure_part_file!` 补到 shard_file_size）+ 重写该盘 sidecar；坏分片 >M（存活<K）→ `{:error, :unrecoverable}` + 结构化 error 日志，**绝不伪造数据**）；`scrub_bucket/2`（扫描桶内对象去重逐个 heal）/`scrub_all/1`（全盘所有桶）。`mix maxio.heal` / `mix maxio.scrub` CLI（结构化日志 bucket/key/drive/block/result，铁律 4 可观测）。bitrot e2e（`test/maxio/storage/erasure/bitrot_e2e_test.exs`）：删/篡改 ≤M 分片 GET 仍返回正确字节 + heal 回写；删 M+1 → GET 经惰性流在 `restore_block` raise `InsufficientShardsError`（绝不静默返回错数据）。**架构级修正**（M6-5）：heal 的重编码须与 PUT 的 `write_block` 完全一致——先把 `restore_block` 截断后的明文重新零填充到 `block_size` 再 `split_block`，否则末块（明文 < block_size）会重编码出更短 shard_len、`pwrite` 写入错长分片破坏块布局。
+
+### M6 已知非阻塞项 / M7 显式 defer（文档化，绝不静默丢弃）
+
+1. **真正多节点分布**：分片 I/O 跨主机（RPC 替本地 `:file`）。M6 的「N 盘 = N 本地目录」与分布式 erasure set 的 RS 数学**完全相同**，M7 只替换分片访问 transport，不重写 encode/decode/heal 引擎。
+2. **多 erasure set + 对象→set 路由**（对象名 hash）；**server pools** + pool 路由；扩容 / rebalance。
+3. **跨节点读写 quorum**（含网络分区下 `K==M` 即 `M==N/2` 的 K+1 脑裂规则——M6 单机已实现并强制 quorum 返回值，分区语义 defer）。
+4. **分布式锁**（跨节点对象级锁，保证并发 PUT/heal 安全）。
+5. **拓扑感知路由 / 跨节点 heal 协调 / heal 限流 / failure-domain 感知分片放置**；MinIO 式 1/1024 scrub 采样（M6 全扫，单机量可控）。
+6. **存储类多 parity**（`x-amz-storage-class` → STANDARD/RRS 不同 EC:M）：M6 单一 (K,M) 配置。
+7. **inline 小对象**（< 128 KiB 直接进 sidecar 省 part 文件）：M6 所有对象都写 part 文件。
+8. **heal MVP 简化**：同步、单进程、无并发锁（单机串行）；heal 粒度到整对象（非 MinIO per-block 增量回写优化，正确优先）。
+
+**设计保证**：M7 在 M6 同一 RS 编解码 / heal 核心**之外**加 routing/locking/pools/transport 层，不重写引擎（铁律 3，无静默缺口；deferral 在 STATUS + README 逐条显式列出）。
 
 ## 工具链与环境（本机 Windows 11，关键教训）
 
