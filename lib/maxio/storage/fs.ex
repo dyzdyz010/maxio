@@ -29,6 +29,26 @@ defmodule Maxio.Storage.FS do
   @impl true
   def delete_bucket(bucket, opts \\ []), do: do_delete_bucket(bucket, opts)
 
+  # ── 分段上传 parts 回调（M2-4）。part 字节落在
+  # <data_dir>/.uploads/<bucket>/<upload_id>/<part_number>.part；
+  # assemble 按 part 升序拼到对象路径；abort 删整个 upload 临时目录。──
+
+  @impl true
+  def put_part(bucket, key, upload_id, part_number, chunks, opts \\ []),
+    do: do_put_part(bucket, key, upload_id, part_number, chunks, opts)
+
+  @impl true
+  def get_part_stream(bucket, key, upload_id, part_number, opts \\ []),
+    do: do_get_part_stream(bucket, key, upload_id, part_number, opts)
+
+  @impl true
+  def assemble(bucket, key, upload_id, part_numbers, opts \\ []),
+    do: do_assemble(bucket, key, upload_id, part_numbers, opts)
+
+  @impl true
+  def abort_upload(bucket, key, upload_id, opts \\ []),
+    do: do_abort_upload(bucket, key, upload_id, opts)
+
   defp do_put(bucket, key, chunks, opts) do
     with {:ok, path} <- object_path(bucket, key, opts) do
       File.mkdir_p!(Path.dirname(path))
@@ -92,6 +112,95 @@ defmodule Maxio.Storage.FS do
       {:error, :enoent} -> :ok
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp do_put_part(bucket, key, upload_id, part_number, chunks, opts) do
+    with {:ok, _obj} <- object_path(bucket, key, opts) do
+      path = part_path(bucket, upload_id, part_number, opts)
+      File.mkdir_p!(Path.dirname(path))
+      {:ok, fd} = File.open(path, [:write, :binary, :raw])
+
+      try do
+        ctx0 = :crypto.hash_init(:md5)
+
+        {ctx, size} =
+          Enum.reduce(chunks, {ctx0, 0}, fn chunk, {ctx, acc} ->
+            :ok = IO.binwrite(fd, chunk)
+            {:crypto.hash_update(ctx, chunk), acc + byte_size(chunk)}
+          end)
+
+        md5_raw = :crypto.hash_final(ctx)
+        etag = Base.encode16(md5_raw, case: :lower)
+        {:ok, %{size: size, etag: etag, md5_raw: md5_raw}}
+      after
+        File.close(fd)
+      end
+    end
+  end
+
+  defp do_get_part_stream(bucket, key, upload_id, part_number, opts) do
+    with {:ok, _obj} <- object_path(bucket, key, opts) do
+      path = part_path(bucket, upload_id, part_number, opts)
+
+      case File.stat(path) do
+        {:ok, %File.Stat{size: total}} -> {:ok, stream_file(path, nil, total)}
+        {:error, :enoent} -> {:error, :enoent}
+      end
+    end
+  end
+
+  defp do_assemble(bucket, key, upload_id, part_numbers, opts) do
+    with {:ok, obj_path} <- object_path(bucket, key, opts) do
+      File.mkdir_p!(Path.dirname(obj_path))
+      {:ok, out} = File.open(obj_path, [:write, :binary, :raw])
+
+      try do
+        size =
+          Enum.reduce(part_numbers, 0, fn pn, acc ->
+            path = part_path(bucket, upload_id, pn, opts)
+            {:ok, in_fd} = :file.open(String.to_charlist(path), [:read, :binary, :raw])
+
+            try do
+              acc + copy_fd(in_fd, out, 0)
+            after
+              :file.close(in_fd)
+            end
+          end)
+
+        {:ok, %{size: size}}
+      after
+        File.close(out)
+      end
+    end
+  end
+
+  defp do_abort_upload(bucket, _key, upload_id, opts) do
+    dir = upload_dir(bucket, upload_id, opts)
+    _ = File.rm_rf(dir)
+    :ok
+  end
+
+  # 1MB 分块把 in_fd 全量拷到 out，返回拷贝字节数。
+  defp copy_fd(in_fd, out, acc) do
+    case :file.read(in_fd, @chunk_size) do
+      {:ok, data} ->
+        :ok = IO.binwrite(out, data)
+        copy_fd(in_fd, out, acc + byte_size(data))
+
+      :eof ->
+        acc
+
+      {:error, _} ->
+        acc
+    end
+  end
+
+  defp upload_dir(bucket, upload_id, opts) do
+    Path.join([data_dir(opts), ".uploads", bucket, upload_id])
+  end
+
+  defp part_path(bucket, upload_id, part_number, opts) do
+    Path.join(upload_dir(bucket, upload_id, opts), "#{part_number}.part")
   end
 
   defp stream_file(path, nil, total), do: stream_file(path, {0, max(total - 1, 0)}, total)

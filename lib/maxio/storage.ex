@@ -27,4 +27,25 @@ defmodule Maxio.Storage do
 
   @spec delete_bucket(String.t()) :: :ok | {:error, term()}
   def delete_bucket(bucket), do: backend().delete_bucket(bucket)
+
+  # ── 分段上传 parts 门面（M2-4，转发到 backend）──
+
+  @spec put_part(String.t(), String.t(), String.t(), pos_integer(), Enumerable.t(), keyword()) ::
+          {:ok, Maxio.Storage.Backend.part_put_result()} | {:error, term()}
+  def put_part(bucket, key, upload_id, part_number, chunks, opts \\ []),
+    do: backend().put_part(bucket, key, upload_id, part_number, chunks, opts)
+
+  @spec get_part_stream(String.t(), String.t(), String.t(), pos_integer(), keyword()) ::
+          {:ok, Enumerable.t()} | {:error, term()}
+  def get_part_stream(bucket, key, upload_id, part_number, opts \\ []),
+    do: backend().get_part_stream(bucket, key, upload_id, part_number, opts)
+
+  @spec assemble(String.t(), String.t(), String.t(), [pos_integer()], keyword()) ::
+          {:ok, %{size: non_neg_integer()}} | {:error, term()}
+  def assemble(bucket, key, upload_id, part_numbers, opts \\ []),
+    do: backend().assemble(bucket, key, upload_id, part_numbers, opts)
+
+  @spec abort_upload(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def abort_upload(bucket, key, upload_id, opts \\ []),
+    do: backend().abort_upload(bucket, key, upload_id, opts)
 end
