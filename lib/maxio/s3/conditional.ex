@@ -23,8 +23,13 @@ defmodule Maxio.S3.Conditional do
     if_none = get(headers, "if-none-match")
     if_mod = get(headers, "if-modified-since")
 
+    # HTTP-date 是秒粒度；把存储的亚秒 last_modified 截断到秒再比较（M2 note #3，铁律 5）。
+    lm = truncate_to_second(lm)
+
     step1(if_match, if_unmod, if_none, if_mod, etag, lm, method)
   end
+
+  defp truncate_to_second(%DateTime{} = dt), do: %{dt | microsecond: {0, 0}}
 
   defp step1(if_match, if_unmod, if_none, if_mod, etag, lm, method) do
     cond do

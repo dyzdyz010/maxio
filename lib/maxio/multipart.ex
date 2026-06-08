@@ -137,7 +137,8 @@ defmodule Maxio.Multipart do
 
       case Maxio.Storage.assemble(upload.bucket_name, upload.key, upload.upload_id, part_numbers) do
         {:ok, %{size: size}} ->
-          _ = Maxio.Storage.abort_upload(upload.bucket_name, upload.key, upload.upload_id)
+          # part 字节清理 + 会话/分块元数据删除统一由调用方 handler 的 Multipart.abort/1 负责
+          # （单一职责，不在此重复 abort_upload）。
           {:ok, %{etag: etag, size: size}}
 
         {:error, _} = err ->

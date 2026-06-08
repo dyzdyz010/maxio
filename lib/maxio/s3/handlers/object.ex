@@ -221,33 +221,65 @@ defmodule Maxio.S3.Handlers.Object do
         _ -> src_obj.content_type
       end
 
-    # 拷贝字节：读源流 → 写目标（FS put 重算 MD5；全量拷贝 ETag == 源 ETag，铁律 4 不全缓冲）。
+    # 拷贝字节（铁律 4 不全缓冲）。自拷贝（src==dest，此处必为 REPLACE）必须避免
+    # 「截断 dest 早于读 source」的数据丢失：先流式写到唯一临时 key，再流式搬到 dest，最后删临时。
+    self_copy? = src_bucket == dest_bucket and src_key == dest_key
+
+    {size, etag} = copy_bytes(self_copy?, src_bucket, src_key, dest_bucket, dest_key)
+
+    {:ok, obj} =
+      Objects.put_metadata(dest_bucket, dest_key, %{
+        size: size,
+        etag: etag,
+        content_type: content_type,
+        storage_class: "STANDARD"
+      })
+
+    Log.info("copy object",
+      action: :copy_object,
+      bucket: dest_bucket,
+      key: dest_key,
+      src_bucket: src_bucket,
+      src_key: src_key,
+      self_copy: self_copy?
+    )
+
+    body =
+      Maxio.S3.Views.CopyObjectResult.render(%{etag: etag, last_modified: obj.updated_at})
+
+    conn
+    |> put_resp_content_type("application/xml")
+    |> send_resp(200, body)
+  end
+
+  # 非自拷贝：直接流式读源写目标。
+  defp copy_bytes(false, src_bucket, src_key, dest_bucket, dest_key) do
     {:ok, src_stream} = Storage.get(src_bucket, src_key, nil)
 
     case Storage.put(dest_bucket, dest_key, src_stream) do
-      {:ok, %{size: size, etag: etag}} ->
-        {:ok, obj} =
-          Objects.put_metadata(dest_bucket, dest_key, %{
-            size: size,
-            etag: etag,
-            content_type: content_type,
-            storage_class: "STANDARD"
-          })
+      {:ok, %{size: size, etag: etag}} -> {size, etag}
+      {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
+    end
+  end
 
-        Log.info("copy object",
-          action: :copy_object,
-          bucket: dest_bucket,
-          key: dest_key,
-          src_bucket: src_bucket,
-          src_key: src_key
-        )
+  # 自拷贝（src==dest）：先写唯一临时 key（避免截断源），再流式搬到 dest，最后删临时。
+  defp copy_bytes(true, src_bucket, src_key, dest_bucket, dest_key) do
+    suffix = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+    tmp_key = dest_key <> ".maxio-copytmp-" <> suffix
+    {:ok, src_stream} = Storage.get(src_bucket, src_key, nil)
 
-        body =
-          Maxio.S3.Views.CopyObjectResult.render(%{etag: etag, last_modified: obj.updated_at})
+    case Storage.put(dest_bucket, tmp_key, src_stream) do
+      {:ok, _tmp} ->
+        {:ok, tmp_stream} = Storage.get(dest_bucket, tmp_key, nil)
 
-        conn
-        |> put_resp_content_type("application/xml")
-        |> send_resp(200, body)
+        result =
+          case Storage.put(dest_bucket, dest_key, tmp_stream) do
+            {:ok, %{size: size, etag: etag}} -> {size, etag}
+            {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
+          end
+
+        _ = Storage.delete(dest_bucket, tmp_key)
+        result
 
       {:error, reason} ->
         raise Error.new(:internal_error, message: inspect(reason))
