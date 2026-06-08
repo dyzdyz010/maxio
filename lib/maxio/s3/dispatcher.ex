@@ -13,7 +13,7 @@ defmodule Maxio.S3.Dispatcher do
 
   # M2+ 子资源标记（出现即 not_implemented）。
   # 注：uploads/uploadid/partnumber 已从本表移除，由 multipart_action/3 分发到具体 multipart 动作（M2-5）。
-  @m2_subresources ~w(delete acl tagging versioning cors policy lifecycle website
+  @m2_subresources ~w(acl tagging versioning cors policy lifecycle website
                       versions notification replication encryption object-lock legal-hold retention
                       attributes select torrent restore accelerate analytics inventory metrics
                       ownershipcontrols publicaccessblock requestpayment logging)
@@ -24,6 +24,9 @@ defmodule Maxio.S3.Dispatcher do
     cond do
       multipart_action(level, method, query_keys) != nil ->
         {:ok, multipart_action(level, method, query_keys)}
+
+      level == :bucket and method == "POST" and MapSet.member?(query_keys, "delete") ->
+        {:ok, :delete_objects}
 
       m2_subresource?(query_keys) ->
         {:error, :not_implemented}

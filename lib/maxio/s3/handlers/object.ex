@@ -5,7 +5,11 @@ defmodule Maxio.S3.Handlers.Object do
   """
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Storage}
-  alias Maxio.S3.{BodyReader, Error, Log, XML}
+  alias Maxio.S3.{BodyReader, Conditional, Error, Log, XML}
+  alias Maxio.S3.RequestParsers.Delete, as: DeleteParser
+  alias Maxio.S3.Views.DeleteResult
+
+  @complete_xml_limit 1_048_576
 
   @spec put(Plug.Conn.t()) :: Plug.Conn.t()
   def put(conn) do
@@ -71,15 +75,27 @@ defmodule Maxio.S3.Handlers.Object do
     key = conn.assigns.s3_key
 
     {object, total} = object_or_raise(bucket, key)
-    range = parse_range(header(conn, "range"), total)
 
-    case range do
-      :invalid ->
-        raise Error.new(:invalid_range, resource: "/#{bucket}/#{key}", extra: %{total: total})
+    # 条件头（If-*）按 RFC 7232 §6 次序求值。304/412 不应有 body（304 尤其禁止），
+    # 故 GET 的 304 直接 send_resp(304, "")，412 raise PreconditionFailed（带 XML body，符合 S3）。
+    case Conditional.evaluate(conn.req_headers, meta(object), "GET") do
+      :proceed ->
+        range = parse_range(header(conn, "range"), total)
 
-      _ ->
-        {:ok, stream} = Storage.get(bucket, key, range_tuple(range))
-        send_object(conn, object, total, range, stream)
+        case range do
+          :invalid ->
+            raise Error.new(:invalid_range, resource: "/#{bucket}/#{key}", extra: %{total: total})
+
+          _ ->
+            {:ok, stream} = Storage.get(bucket, key, range_tuple(range))
+            send_object(conn, object, total, range, stream)
+        end
+
+      {:respond, 304} ->
+        send_resp(conn, 304, "")
+
+      {:error, :precondition_failed} ->
+        raise Error.new(:precondition_failed, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -90,9 +106,19 @@ defmodule Maxio.S3.Handlers.Object do
 
     with {:ok, _b} <- Buckets.lookup(bucket),
          {:ok, object} <- Objects.get_metadata(bucket, key) do
-      conn
-      |> put_common_object_headers(object, object.size)
-      |> send_resp(200, "")
+      # HEAD 条件头：304/412 都无 body（HEAD 禁止 body），直接 send_resp。
+      case Conditional.evaluate(conn.req_headers, meta(object), "HEAD") do
+        :proceed ->
+          conn
+          |> put_common_object_headers(object, object.size)
+          |> send_resp(200, "")
+
+        {:respond, 304} ->
+          send_resp(conn, 304, "")
+
+        {:error, :precondition_failed} ->
+          send_resp(conn, 412, "")
+      end
     else
       {:error, :not_found} ->
         # HEAD 无 body：缺失桶/对象只回状态 + 头，绝不发 XML body（与 head_bucket 一致）。
@@ -113,8 +139,65 @@ defmodule Maxio.S3.Handlers.Object do
     send_resp(conn, 204, "")
   end
 
+  @spec delete_objects(Plug.Conn.t()) :: Plug.Conn.t()
+  def delete_objects(conn) do
+    bucket = conn.assigns.s3_bucket
+    _ = ensure_bucket!(bucket)
+    {conn, xml} = read_small_body!(conn)
+
+    %{quiet: quiet, objects: objects} =
+      case DeleteParser.parse(xml) do
+        {:ok, parsed} -> parsed
+        {:error, :malformed_xml} -> raise Error.new(:malformed_xml, resource: "/" <> bucket)
+      end
+
+    if length(objects) > 1000 do
+      raise Error.new(:malformed_xml, message: "A maximum of 1000 keys may be specified")
+    end
+
+    {deleted, errors} =
+      Enum.reduce(objects, {[], []}, fn %{key: key}, {dacc, eacc} ->
+        # 缺失 key 也算 success（S3 语义）；删元数据 + 字节皆幂等。
+        :ok = Objects.delete_metadata(bucket, key)
+        _ = Storage.delete(bucket, key)
+        {[key | dacc], eacc}
+      end)
+
+    Log.info("delete objects", action: :delete_objects, bucket: bucket, size: length(objects))
+
+    body =
+      DeleteResult.render(%{
+        deleted: if(quiet, do: [], else: Enum.reverse(deleted)),
+        errors: Enum.reverse(errors)
+      })
+
+    conn
+    |> put_resp_content_type("application/xml")
+    |> send_resp(200, body)
+  end
+
   # ── helpers ──
-  defp send_object(conn, object, total, nil, stream) do
+
+  # 条件头求值用的对象元信息（etag 无引号 hex；last_modified 用 updated_at）。
+  defp meta(object), do: %{etag: object.etag, last_modified: object.updated_at}
+
+  # DeleteObjects 的小 XML 整读（带上限，铁律 4）。read_body 会推进 conn，
+  # 返回后用推进过的 conn 发响应。
+  defp read_small_body!(conn) do
+    case read_body(conn, length: @complete_xml_limit, read_length: @complete_xml_limit) do
+      {:ok, body, conn} ->
+        {conn, body}
+
+      {:more, _partial, _conn} ->
+        raise Error.new(:entity_too_large, message: "Delete request body too large")
+
+      {:error, _} ->
+        raise Error.new(:malformed_xml)
+    end
+  end
+
+  # nil（无 Range）与 :full（多区间 → 对齐 S3 返回完整 200）走同一完整 200 分支。
+  defp send_object(conn, object, total, range, stream) when range in [nil, :full] do
     conn
     |> put_common_object_headers(object, total)
     |> send_chunked(200)
@@ -147,10 +230,21 @@ defmodule Maxio.S3.Handlers.Object do
     |> put_resp_header("content-length", Integer.to_string(content_length))
   end
 
-  # Range: bytes=a-b | bytes=a- | bytes=-suffix → {first,last} | nil | :invalid
+  # Range: bytes=a-b | bytes=a- | bytes=-suffix → {first,last} | nil | :full | :invalid
+  # 多区间（含逗号）对齐 S3 返回完整 200（不实现 multipart/byteranges）→ :full。
   defp parse_range(nil, _total), do: nil
 
   defp parse_range("bytes=" <> spec, total) do
+    if String.contains?(spec, ",") do
+      :full
+    else
+      parse_single_range(spec, total)
+    end
+  end
+
+  defp parse_range(_other, _total), do: :invalid
+
+  defp parse_single_range(spec, total) do
     case String.split(spec, "-") do
       [a, ""] ->
         case Integer.parse(a) do
@@ -178,9 +272,8 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  defp parse_range(_other, _total), do: :invalid
-
   defp range_tuple(nil), do: nil
+  defp range_tuple(:full), do: nil
   defp range_tuple({first, last}), do: {first, last}
 
   defp ensure_bucket!(bucket) do

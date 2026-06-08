@@ -68,8 +68,8 @@ defmodule Maxio.S3.DispatcherTest do
              Dispatcher.resolve(:bucket, "GET", keys(["uploads"]))
   end
 
-  test "DeleteObjects 子资源仍 not_implemented（M2-6 实现）" do
-    assert {:error, :not_implemented} = Dispatcher.resolve(:bucket, "POST", keys(["delete"]))
+  test "DeleteObjects 子资源 → delete_objects（M2-6 实现）" do
+    assert {:ok, :delete_objects} = Dispatcher.resolve(:bucket, "POST", keys(["delete"]))
   end
 
   test "无匹配方法 → method_not_allowed" do

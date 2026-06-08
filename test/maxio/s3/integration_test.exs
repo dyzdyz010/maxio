@@ -301,4 +301,80 @@ defmodule Maxio.S3.IntegrationTest do
     assert conn.status == 501
     assert conn.resp_body =~ "<Code>NotImplemented</Code>"
   end
+
+  test "DeleteObjects 批量删除 → 200 DeleteResult（含缺失 key 也算 success）" do
+    SigV4Request.signed_conn(:put, "/batchdel") |> call()
+    SigV4Request.signed_conn(:put, "/batchdel/a", body: "1") |> call()
+    SigV4Request.signed_conn(:put, "/batchdel/b", body: "2") |> call()
+
+    xml = "<Delete><Object><Key>a</Key></Object><Object><Key>ghost</Key></Object></Delete>"
+
+    del = SigV4Request.signed_conn(:post, "/batchdel", query: %{"delete" => ""}, body: xml) |> call()
+    assert del.status == 200
+    assert del.resp_body =~ "<Deleted><Key>a</Key></Deleted>"
+    assert del.resp_body =~ "<Deleted><Key>ghost</Key></Deleted>"
+
+    # a 已删
+    assert SigV4Request.signed_conn(:get, "/batchdel/a") |> call() |> Map.get(:status) == 404
+    # b 未删
+    assert SigV4Request.signed_conn(:get, "/batchdel/b") |> call() |> Map.get(:status) == 200
+  end
+
+  test "DeleteObjects quiet 模式不返回 Deleted" do
+    SigV4Request.signed_conn(:put, "/quietdel") |> call()
+    SigV4Request.signed_conn(:put, "/quietdel/a", body: "1") |> call()
+
+    xml = "<Delete><Quiet>true</Quiet><Object><Key>a</Key></Object></Delete>"
+    del = SigV4Request.signed_conn(:post, "/quietdel", query: %{"delete" => ""}, body: xml) |> call()
+    assert del.status == 200
+    refute del.resp_body =~ "<Deleted>"
+  end
+
+  test "DeleteObjects 超过 1000 key → 400 MalformedXML" do
+    SigV4Request.signed_conn(:put, "/bigdel") |> call()
+
+    objects =
+      1..1001
+      |> Enum.map(fn n -> "<Object><Key>k#{n}</Key></Object>" end)
+      |> Enum.join()
+
+    xml = "<Delete>" <> objects <> "</Delete>"
+    del = SigV4Request.signed_conn(:post, "/bigdel", query: %{"delete" => ""}, body: xml) |> call()
+    assert del.status == 400
+    assert del.resp_body =~ "<Code>MalformedXML</Code>"
+  end
+
+  test "GET If-None-Match 命中 → 304 无 body" do
+    SigV4Request.signed_conn(:put, "/condbk") |> call()
+    put = SigV4Request.signed_conn(:put, "/condbk/c.txt", body: "hello") |> call()
+    [etag] = get_resp_header(put, "etag")
+
+    get =
+      SigV4Request.signed_conn(:get, "/condbk/c.txt", headers: [{"if-none-match", etag}]) |> call()
+
+    assert get.status == 304
+    assert get.resp_body == ""
+  end
+
+  test "GET If-Match 不符 → 412" do
+    SigV4Request.signed_conn(:put, "/condbk2") |> call()
+    SigV4Request.signed_conn(:put, "/condbk2/c.txt", body: "hello") |> call()
+
+    get =
+      SigV4Request.signed_conn(:get, "/condbk2/c.txt", headers: [{"if-match", "\"nope\""}]) |> call()
+
+    assert get.status == 412
+    assert get.resp_body =~ "<Code>PreconditionFailed</Code>"
+  end
+
+  test "多区间 Range（含逗号）→ 完整 200（对齐 S3，不实现 multipart/byteranges）" do
+    SigV4Request.signed_conn(:put, "/multirange") |> call()
+    SigV4Request.signed_conn(:put, "/multirange/r.txt", body: "0123456789") |> call()
+
+    get =
+      SigV4Request.signed_conn(:get, "/multirange/r.txt", headers: [{"range", "bytes=0-2,5-7"}]) |> call()
+
+    assert get.status == 200
+    assert get.resp_body == "0123456789"
+  end
 end

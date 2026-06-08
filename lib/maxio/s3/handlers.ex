@@ -18,6 +18,7 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:get_object, conn), do: Object.get(conn)
   def dispatch(:head_object, conn), do: Object.head(conn)
   def dispatch(:delete_object, conn), do: Object.delete(conn)
+  def dispatch(:delete_objects, conn), do: Object.delete_objects(conn)
 
   def dispatch(:create_multipart_upload, conn), do: Multipart.create_multipart_upload(conn)
   def dispatch(:upload_part, conn), do: Multipart.upload_part(conn)
