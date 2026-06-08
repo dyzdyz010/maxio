@@ -35,16 +35,17 @@ defmodule Maxio.Application do
     end
   end
 
-  # M7：libcluster 节点发现 supervisor。仅当配置了非空 topologies 才起（多节点 prod）；
-  # 单节点 dev/test（无 topologies）跳过——Maxio.Cluster.nodes/0 退化为 [Node.self()]，同一代码路径。
+  # M7：libcluster 节点发现 supervisor（仅非空 topologies 才起）+ 拓扑解析 GenServer（始终起，
+  # 无配置时空转）。单节点 dev/test 跳过 Cluster.Supervisor，但 Topology 仍存在（读时若无配置 raise）。
   defp cluster_children do
     topologies = Application.get_env(:maxio, Maxio.Cluster, [])[:topologies] || []
 
-    if topologies == [] do
-      []
-    else
-      [{Cluster.Supervisor, [topologies, [name: Maxio.Cluster.ClusterSupervisor]]}]
-    end
+    libcluster =
+      if topologies == [],
+        do: [],
+        else: [{Cluster.Supervisor, [topologies, [name: Maxio.Cluster.ClusterSupervisor]]}]
+
+    libcluster ++ [Maxio.Cluster.Topology]
   end
 
   # 诚实暴露 M4 defer（铁律 3：绝不假装已生效）。

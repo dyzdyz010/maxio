@@ -16,4 +16,11 @@ defmodule Maxio.Cluster do
   @doc "某节点是否在线（在当前 mesh 中，含本机）。"
   @spec alive?(node()) :: boolean()
   def alive?(node), do: node == Node.self() or node in Node.list()
+
+  @doc """
+  某 set 的有序 {node, drive} 端点列表，索引 i = 分片 i 的归属（来自静态拓扑）。
+  与 mesh 在线与否无关——在线判定在分片 IO 时（M7-3）逐端点进行，离线端点产出 nil 分片交 EC 重建。
+  """
+  @spec drives_for_set(Maxio.Cluster.Topology.set_id()) :: [{node(), String.t()}]
+  def drives_for_set(set_id), do: Maxio.Cluster.Topology.endpoints(set_id)
 end
