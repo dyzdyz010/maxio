@@ -15,7 +15,7 @@ defmodule Maxio.S3.Plugs.SigV4 do
   import Plug.Conn
   alias Maxio.Auth
   alias Maxio.Auth.SigV4.AuthHeaderParser
-  alias Maxio.S3.{Error, ErrorView, Log}
+  alias Maxio.S3.{Error, ErrorView, Log, RawPath}
 
   @behaviour Plug
 
@@ -80,9 +80,9 @@ defmodule Maxio.S3.Plugs.SigV4 do
   end
 
   # 已 URL 解码的真实路径（Canonical 内部再做 S3 单次编码）。
-  defp decoded_path(conn) do
-    "/" <> Enum.join(conn.path_info, "/")
-  end
+  # 必须取自**原始 request_path**（保留尾/连续/前导斜杠），绝不用 conn.path_info——
+  # 后者折叠空段会让重建的 CanonicalURI ≠ 客户端签名路径，误判 SignatureDoesNotMatch（铁律 5）。
+  defp decoded_path(conn), do: RawPath.decoded_path(conn)
 
   # header 形态用真实 query；presigned 形态排除 X-Amz-Signature。
   defp signing_query(conn, %{auth_type: :presigned}),

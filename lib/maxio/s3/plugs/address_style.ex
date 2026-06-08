@@ -8,8 +8,13 @@ defmodule Maxio.S3.Plugs.AddressStyle do
   host 的权威来源是 `conn.host`（由 HTTP 适配器从 Host 头/authority 解析），
   与 SigV4 plug 一致：直接读 conn.host 而非 req_headers 的 host（新版 Plug 不再
   把 host 放进 req_headers，且禁止用 put_req_header 写 host）。跨适配器稳健（铁律 5）。
+
+  bucket / object key 一律由 `Maxio.S3.RawPath` 从**原始 request_path** 切出（单次解码、
+  不折叠 `/`）：绝不用 `conn.path_info`——后者会丢失尾斜杠/连续斜杠/前导斜杠（如 key
+  `"dir/"` 被折叠成 `"dir"` 导致数据丢失，铁律 5 禁止此类归一化）。
   """
   import Plug.Conn
+  alias Maxio.S3.RawPath
   @behaviour Plug
 
   @impl true
@@ -22,8 +27,8 @@ defmodule Maxio.S3.Plugs.AddressStyle do
 
     {bucket, key} =
       case virtual_host_bucket(host, domain) do
-        nil -> path_style(conn.path_info)
-        vbucket -> {vbucket, join_key(conn.path_info)}
+        nil -> RawPath.path_style(conn)
+        vbucket -> {vbucket, RawPath.vhost_key(conn)}
       end
 
     level = level_of(bucket, key)
@@ -46,14 +51,6 @@ defmodule Maxio.S3.Plugs.AddressStyle do
       nil
     end
   end
-
-  # path-style：[] → service；[bucket] → bucket；[bucket | rest] → object。
-  defp path_style([]), do: {nil, nil}
-  defp path_style([bucket]), do: {bucket, nil}
-  defp path_style([bucket | rest]), do: {bucket, Enum.join(rest, "/")}
-
-  defp join_key([]), do: nil
-  defp join_key(path_info), do: Enum.join(path_info, "/")
 
   defp level_of(nil, _key), do: :service
   defp level_of(_bucket, nil), do: :bucket

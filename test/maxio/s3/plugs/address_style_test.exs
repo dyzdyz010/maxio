@@ -51,4 +51,45 @@ defmodule Maxio.S3.Plugs.AddressStyleTest do
     conn = run(:get, "/", "mybucket.localhost:9000")
     assert conn.assigns.s3_bucket == "mybucket"
   end
+
+  # ── 铁律 5：key 取自原始 request_path，绝不折叠空段（path_info 会丢失这些字节）──
+  test "尾斜杠 folder marker key 完整保留（dir/ 不退化成 dir）" do
+    conn = run(:put, "/bucket/dir/", "localhost:9000")
+    assert conn.assigns.s3_level == :object
+    assert conn.assigns.s3_bucket == "bucket"
+    assert conn.assigns.s3_key == "dir/"
+  end
+
+  test "连续斜杠 key 保留空段（a//b.txt）" do
+    conn = run(:put, "/bucket/a//b.txt", "localhost:9000")
+    assert conn.assigns.s3_key == "a//b.txt"
+  end
+
+  test "前导斜杠 key 保留（/leading.txt）" do
+    conn = run(:put, "/bucket//leading.txt", "localhost:9000")
+    assert conn.assigns.s3_key == "/leading.txt"
+  end
+
+  test "编码斜杠 %2F 单次解码成字面 / （对齐真实 AWS）" do
+    conn = run(:put, "/bucket/dir%2F", "localhost:9000")
+    assert conn.assigns.s3_key == "dir/"
+  end
+
+  test "path-style /<bucket>/ 空 key → bucket 级（对齐 AWS）" do
+    conn = run(:put, "/mybucket/", "localhost:9000")
+    assert conn.assigns.s3_level == :bucket
+    assert conn.assigns.s3_bucket == "mybucket"
+    assert conn.assigns.s3_key == ""
+  end
+
+  test "key 含百分号编码（空格/UTF-8）单次解码" do
+    conn = run(:get, "/bucket/k%20ey%2F%E4%B8%AD.txt", "localhost:9000")
+    assert conn.assigns.s3_key == "k ey/中.txt"
+  end
+
+  test "virtual-host 尾斜杠 folder marker key 完整保留" do
+    conn = run(:put, "/dir/", "mybucket.localhost")
+    assert conn.assigns.s3_bucket == "mybucket"
+    assert conn.assigns.s3_key == "dir/"
+  end
 end

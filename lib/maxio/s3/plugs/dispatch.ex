@@ -5,7 +5,7 @@ defmodule Maxio.S3.Plugs.Dispatch do
   绝不静默 500（未预期异常也包成 InternalError 并打 error 日志，铁律 3）。
   """
   import Plug.Conn
-  alias Maxio.S3.{Dispatcher, Error, ErrorView, Handlers, Log}
+  alias Maxio.S3.{Dispatcher, Error, ErrorView, Handlers, Log, RawPath}
 
   @behaviour Plug
 
@@ -38,7 +38,8 @@ defmodule Maxio.S3.Plugs.Dispatch do
 
   defp render_error(conn, %Error{} = err) do
     request_id = conn |> get_req_header("x-request-id") |> List.first()
-    resource = "/" <> Enum.join(conn.path_info, "/")
+    # resource 用原始解码路径（保留尾/连续/前导斜杠），与 SigV4 CanonicalURI 一致，不用 path_info。
+    resource = RawPath.decoded_path(conn)
     err = %{err | request_id: request_id, resource: err.resource || resource}
     {status, body} = ErrorView.render(err)
 

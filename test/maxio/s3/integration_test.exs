@@ -140,6 +140,50 @@ defmodule Maxio.S3.IntegrationTest do
     assert conn.resp_body =~ "<Code>NoSuchBucket</Code>"
   end
 
+  # ── 铁律 5：含尾/连续/前导斜杠的 key 端到端不丢数据、签名不误判（修复回归）──
+  # 旧实现从折叠空段的 conn.path_info 重建路径：CanonicalURI ≠ 客户端签名路径 → 误 403，
+  # 且 key 退化丢字节。下列用例证明改用原始 request_path 后签名通过且 key 完整 round-trip。
+  test "folder marker 'dir/' 端到端：PUT 不误 403、key 完整保留、GET 取回" do
+    SigV4Request.signed_conn(:put, "/marker") |> call()
+
+    put = SigV4Request.signed_conn(:put, "/marker/dir/", body: "") |> call()
+    # 关键：不再是 403 SignatureDoesNotMatch
+    refute put.resp_body =~ "SignatureDoesNotMatch"
+    assert put.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/marker/dir/") |> call()
+    assert get.status == 200
+    assert get.resp_body == ""
+  end
+
+  test "连续斜杠 key 'a//b.txt' 端到端 round-trip（不折叠空段）" do
+    SigV4Request.signed_conn(:put, "/cons") |> call()
+
+    put = SigV4Request.signed_conn(:put, "/cons/a//b.txt", body: "payload") |> call()
+    refute put.resp_body =~ "SignatureDoesNotMatch"
+    assert put.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/cons/a//b.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "payload"
+
+    # 折叠后的 a/b.txt 不应存在（证明空段被忠实保留为不同的 key）
+    miss = SigV4Request.signed_conn(:get, "/cons/a/b.txt") |> call()
+    assert miss.status == 404
+  end
+
+  test "前导斜杠 key '/leading.txt' 端到端 round-trip" do
+    SigV4Request.signed_conn(:put, "/lead") |> call()
+
+    put = SigV4Request.signed_conn(:put, "/lead//leading.txt", body: "L") |> call()
+    refute put.resp_body =~ "SignatureDoesNotMatch"
+    assert put.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/lead//leading.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "L"
+  end
+
   test "篡改签名 → 403 SignatureDoesNotMatch（非静默）" do
     # 取一个完全合法的自签请求，仅把 Authorization 头里的 Signature=<hex> 篡改为伪值，
     # 其余（scope-date 与 x-amz-date 对齐、Credential、SignedHeaders）保持合法——
