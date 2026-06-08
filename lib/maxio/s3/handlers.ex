@@ -12,6 +12,7 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:delete_bucket, conn), do: Bucket.delete(conn)
   def dispatch(:head_bucket, conn), do: Bucket.head(conn)
   def dispatch(:list_objects_v2, conn), do: Bucket.list_objects_v2(conn)
+  def dispatch(:list_object_versions, conn), do: Bucket.list_object_versions(conn)
   def dispatch(:get_bucket_location, conn), do: Bucket.get_location(conn)
 
   def dispatch(:put_object, conn), do: Object.put(conn)

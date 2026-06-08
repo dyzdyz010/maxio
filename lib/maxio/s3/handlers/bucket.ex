@@ -3,7 +3,7 @@ defmodule Maxio.S3.Handlers.Bucket do
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Storage}
   alias Maxio.S3.{Error, Log}
-  alias Maxio.S3.Views.{ListBucket, LocationConstraint}
+  alias Maxio.S3.Views.{ListBucket, LocationConstraint, ListVersions}
 
   @spec create(Plug.Conn.t()) :: Plug.Conn.t()
   def create(conn) do
@@ -104,6 +104,51 @@ defmodule Maxio.S3.Handlers.Bucket do
         })
 
       Log.info("list objects v2", action: :list_objects_v2, bucket: bucket)
+
+      conn
+      |> put_resp_content_type("application/xml")
+      |> send_resp(200, body)
+    end
+  end
+
+  @spec list_object_versions(Plug.Conn.t()) :: Plug.Conn.t()
+  def list_object_versions(conn) do
+    bucket = conn.assigns.s3_bucket
+    conn = fetch_query_params(conn)
+    qp = conn.query_params
+
+    with {:ok, _b} <- bucket_or_raise(bucket) do
+      prefix = Map.get(qp, "prefix", "")
+      delimiter = Map.get(qp, "delimiter")
+      max_keys = parse_int(Map.get(qp, "max-keys"), 1000)
+      key_marker = Map.get(qp, "key-marker")
+      version_id_marker = Map.get(qp, "version-id-marker")
+
+      res =
+        Objects.list_object_versions(bucket, %{
+          prefix: prefix,
+          delimiter: delimiter,
+          max_keys: max_keys,
+          key_marker: key_marker,
+          version_id_marker: version_id_marker
+        })
+
+      body =
+        ListVersions.render(%{
+          name: bucket,
+          prefix: prefix,
+          delimiter: delimiter,
+          key_marker: key_marker,
+          version_id_marker: version_id_marker,
+          max_keys: max_keys,
+          is_truncated: res.is_truncated,
+          next_key_marker: res.next_key_marker,
+          next_version_id_marker: res.next_version_id_marker,
+          versions: res.versions,
+          common_prefixes: res.common_prefixes
+        })
+
+      Log.info("list object versions", action: :list_object_versions, bucket: bucket)
 
       conn
       |> put_resp_content_type("application/xml")

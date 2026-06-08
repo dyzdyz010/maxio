@@ -14,7 +14,7 @@ defmodule Maxio.S3.Dispatcher do
   # M2+ 子资源标记（出现即 not_implemented）。
   # 注：uploads/uploadid/partnumber 已从本表移除，由 multipart_action/3 分发到具体 multipart 动作（M2-5）。
   @m2_subresources ~w(tagging cors lifecycle website
-                      versions notification replication encryption object-lock legal-hold retention
+                      notification replication encryption object-lock legal-hold retention
                       attributes select torrent restore accelerate analytics inventory metrics
                       ownershipcontrols publicaccessblock requestpayment logging)
 
@@ -42,6 +42,9 @@ defmodule Maxio.S3.Dispatcher do
           "GET" -> {:ok, :get_bucket_versioning}
           _ -> {:error, :method_not_allowed}
         end
+
+      level == :bucket and method == "GET" and MapSet.member?(query_keys, "versions") ->
+        {:ok, :list_object_versions}
 
       MapSet.member?(query_keys, "acl") ->
         case {level, method} do

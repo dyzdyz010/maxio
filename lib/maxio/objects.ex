@@ -262,6 +262,110 @@ defmodule Maxio.Objects do
     end
   end
 
+  @type versions_result :: %{
+          versions: [Object.t()],
+          common_prefixes: [String.t()],
+          is_truncated: boolean(),
+          next_key_marker: String.t() | nil,
+          next_version_id_marker: String.t() | nil
+        }
+
+  @doc """
+  ListObjectVersions 查询（?versions）。返回 %{versions, common_prefixes, is_truncated,
+  next_key_marker, next_version_id_marker}。语义对齐官方：
+    * 排序：key 升序，key 内 newest-first（version_id 降序——ULID 时间序）。delete marker 与
+      version 交错在同一 key-then-newest 序列。
+    * 二维游标：(key_marker, version_id_marker) 之后开始（先 key 严格大于，或 key 相等且 version_id 严格小于）。
+    * delimiter 折叠：prefix 之后首个 delimiter 之间的串折叠成 CommonPrefixes（每个计一个结果）。
+    * max-keys 默认/上限 1000；多取一条判截断；截断时 next_key_marker/next_version_id_marker = 最后返回项。
+  versions 列表元素含 is_delete_marker，由 view 决定渲染 <Version> 还是 <DeleteMarker>。
+  """
+  @spec list_object_versions(String.t(), map()) :: versions_result()
+  def list_object_versions(bucket_name, opts \\ %{}) do
+    prefix = Map.get(opts, :prefix, "") || ""
+    delimiter = Map.get(opts, :delimiter)
+    max_keys = Map.get(opts, :max_keys, 1000)
+    key_marker = Map.get(opts, :key_marker)
+    version_id_marker = Map.get(opts, :version_id_marker)
+
+    base =
+      from o in Object,
+        where: o.bucket_name == ^bucket_name,
+        order_by: [asc: o.key, desc: o.version_id]
+
+    base =
+      if prefix != "",
+        do: where(base, [o], like(o.key, ^(escape_like(prefix) <> "%"))),
+        else: base
+
+    # 二维游标：key > key_marker，或 (key == key_marker and version_id < version_id_marker)。
+    base =
+      cond do
+        key_marker && version_id_marker ->
+          where(
+            base,
+            [o],
+            o.key > ^key_marker or (o.key == ^key_marker and o.version_id < ^version_id_marker)
+          )
+
+        key_marker ->
+          where(base, [o], o.key > ^key_marker)
+
+        true ->
+          base
+      end
+
+    candidates = Repo.all(base)
+
+    {versions, common_prefixes, truncated, last_key, last_vid} =
+      collapse_versions(candidates, prefix, delimiter, max_keys)
+
+    %{
+      versions: versions,
+      common_prefixes: common_prefixes,
+      is_truncated: truncated,
+      next_key_marker: if(truncated, do: last_key, else: nil),
+      next_version_id_marker: if(truncated, do: last_vid, else: nil)
+    }
+  end
+
+  # 折叠 delimiter 公共前缀 + 截断判断（与 list_objects_v2 同构，但游标是二维 (key, version_id)）。
+  defp collapse_versions(candidates, prefix, delimiter, max_keys) do
+    do_collapse_versions(candidates, prefix, delimiter, max_keys, [], MapSet.new(), [], nil, nil)
+  end
+
+  defp do_collapse_versions([], _prefix, _delim, _max, vers, _seen, cps, lk, lv) do
+    {Enum.reverse(vers), Enum.reverse(cps), false, lk, lv}
+  end
+
+  defp do_collapse_versions([obj | rest], prefix, delimiter, max, vers, seen, cps, _lk, _lv) do
+    count = length(vers) + MapSet.size(seen)
+
+    cond do
+      count >= max ->
+        {last_key, last_vid} = previous_version_token(vers, cps)
+        {Enum.reverse(vers), Enum.reverse(cps), true, last_key, last_vid}
+
+      true ->
+        case common_prefix_of(obj.key, prefix, delimiter) do
+          nil ->
+            do_collapse_versions(rest, prefix, delimiter, max, [obj | vers], seen, cps, obj.key, obj.version_id)
+
+          cp ->
+            if MapSet.member?(seen, cp) do
+              do_collapse_versions(rest, prefix, delimiter, max, vers, seen, cps, cp, nil)
+            else
+              do_collapse_versions(rest, prefix, delimiter, max, vers, MapSet.put(seen, cp), [cp | cps], cp, nil)
+            end
+        end
+    end
+  end
+
+  # 截断游标 = 已返回的最后一项（version 行 → 其 key/version_id；公共前缀 → key=cp, version_id=nil）。
+  defp previous_version_token([obj | _], _cps), do: {obj.key, obj.version_id}
+  defp previous_version_token([], [cp | _]), do: {cp, nil}
+  defp previous_version_token([], []), do: {nil, nil}
+
   @doc """
   ListObjectsV2 查询。返回 %{objects, common_prefixes, is_truncated,
   next_continuation_token, key_count}。语义对齐官方：
@@ -278,9 +382,10 @@ defmodule Maxio.Objects do
     cursor = Map.get(opts, :continuation_token) || Map.get(opts, :start_after)
 
     # 拉取候选 key（升序），从游标之后开始，仅取该 prefix。多取以便折叠后仍能判断截断。
+    # 多版本模型：ListObjectsV2 只看当前版本（is_latest）且非删除标记（is_delete_marker=false）。
     base_query =
       from o in Object,
-        where: o.bucket_name == ^bucket_name,
+        where: o.bucket_name == ^bucket_name and o.is_latest == true and o.is_delete_marker == false,
         order_by: [asc: o.key]
 
     base_query =
