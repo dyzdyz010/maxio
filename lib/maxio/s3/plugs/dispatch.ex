@@ -21,6 +21,7 @@ defmodule Maxio.S3.Plugs.Dispatch do
       case Dispatcher.resolve(conn.assigns.s3_level, conn.method, query_keys) do
         {:ok, action} ->
           conn = assign(conn, :s3_action, action)
+          :ok = Maxio.S3.Authz.authorize(conn, action)
           Handlers.dispatch(action, conn)
 
         {:error, reason} ->

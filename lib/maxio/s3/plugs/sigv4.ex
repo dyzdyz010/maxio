@@ -44,6 +44,12 @@ defmodule Maxio.S3.Plugs.SigV4 do
 
   defp do_authenticate(conn) do
     case detect_and_parse(conn) do
+      :anonymous ->
+        conn
+        |> assign(:principal, :anonymous)
+        |> assign(:auth_type, :anonymous)
+        |> assign(:payload_mode, :unsigned)
+
       {:ok, signed_request} ->
         material = build_material(conn, signed_request)
 
@@ -75,7 +81,11 @@ defmodule Maxio.S3.Plugs.SigV4 do
         AuthHeaderParser.parse_header(auth, amz_date, content_sha)
 
       true ->
-        {:error, :missing_security_header}
+        # 完全无凭据（无 Authorization 头 + 无 X-Amz-Signature 查询参数）→ 匿名 principal。
+        # 绝不静默放行：仅把放行/拒绝裁决下沉到 Authz/policy 层（默认拒绝、显式 deny 优先）。
+        # 注意：坏凭据（有 Authorization 但畸形 / 有 X-Amz-Signature 但缺参）仍走上面两分支硬失败——
+        # 匿名只从「凭据完全缺席」推断，绝不从解析失败推断（铁律 3 的精确边界）。
+        :anonymous
     end
   end
 

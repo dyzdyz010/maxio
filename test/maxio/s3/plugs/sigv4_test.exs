@@ -46,10 +46,11 @@ defmodule Maxio.S3.Plugs.SigV4Test do
     assert get_resp_header(conn, "content-type") |> List.first() =~ "application/xml"
   end
 
-  test "缺 Authorization 且无 presigned 参数 → 400 MissingSecurityHeader" do
+  test "完全无凭据（无 Authorization 且无 presigned 参数）→ 匿名 principal，不 halt（裁决下沉 Authz）" do
     conn = conn(:get, "http://x/test.txt") |> SigV4.call(SigV4.init([]))
-    assert conn.halted
-    assert conn.status == 400
-    assert conn.resp_body =~ "<Code>MissingSecurityHeader</Code>"
+    refute conn.halted
+    assert conn.assigns.principal == :anonymous
+    assert conn.assigns.auth_type == :anonymous
+    assert conn.assigns.payload_mode == :unsigned
   end
 end

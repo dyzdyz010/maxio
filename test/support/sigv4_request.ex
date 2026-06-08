@@ -169,4 +169,24 @@ defmodule Maxio.Test.SigV4Request do
   end
 
   def access_key, do: @access_key
+
+  @doc """
+  构造一个匿名（无凭据）请求 conn——无 Authorization 头、无 X-Amz-Signature 查询参数。
+  用于测试 public bucket policy / ACL 放行匿名访问。opts: :query、:headers、:body。
+  """
+  def anon_conn(method, path, opts \\ []) do
+    query = Keyword.get(opts, :query, %{})
+    extra_headers = Keyword.get(opts, :headers, [])
+    body = Keyword.get(opts, :body, "")
+
+    query_string = URI.encode_query(query)
+    full_path = if query_string == "", do: path, else: path <> "?" <> query_string
+
+    conn =
+      conn(method, full_path, body)
+      |> Map.put(:host, @host)
+      |> put_private(:maxio_now, DateTime.utc_now())
+
+    Enum.reduce(extra_headers, conn, fn {k, v}, acc -> put_req_header(acc, String.downcase(k), v) end)
+  end
 end
