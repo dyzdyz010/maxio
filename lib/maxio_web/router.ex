@@ -38,6 +38,7 @@ defmodule MaxioWeb.Router do
       # 与 M5-1 的 DashboardLive 占位同模式；各自单元再「完整替换」：
       #   BucketLive.Index → M5-4；AccessKeyLive.Index → M5-8。
       live "/buckets", BucketLive.Index, :index
+      live "/buckets/:bucket/browse", ObjectLive.Index, :index
       live "/access-keys", AccessKeyLive.Index, :index
     end
   end
