@@ -41,7 +41,7 @@ defmodule Maxio.S3.Authz do
     resource = resource_arn(level, bucket, key)
     conditions = extract_conditions(conn, authenticated?)
 
-    statements = gather_statements(level, bucket, key)
+    statements = gather_statements(level, bucket, key, principal)
 
     ctx = %RequestContext{
       principal: principal,
@@ -81,16 +81,16 @@ defmodule Maxio.S3.Authz do
   defp resource_arn(:bucket, bucket, _key), do: Arn.bucket_arn(bucket)
   defp resource_arn(:object, bucket, key), do: Arn.object_arn(bucket, key)
 
-  # ── statement 合并：bucket policy + canned ACL 派生 ──
-  defp gather_statements(:account, _bucket, _key), do: []
+  # ── statement 合并：bucket policy + canned ACL 派生 + identity policy（按真实 principal）──
+  defp gather_statements(:account, _bucket, _key, _principal), do: []
 
-  defp gather_statements(level, bucket, key) when is_binary(bucket) do
+  defp gather_statements(level, bucket, key, principal) when is_binary(bucket) do
     policy_stmts = Store.statements_for_bucket(bucket)
     acl_stmts = acl_statements(level, bucket, key)
-    policy_stmts ++ acl_stmts ++ Store.principal_policies(:anonymous)
+    policy_stmts ++ acl_stmts ++ Store.principal_policies(principal)
   end
 
-  defp gather_statements(_level, _bucket, _key), do: []
+  defp gather_statements(_level, _bucket, _key, _principal), do: []
 
   # 桶级动作看桶 ACL；对象级动作看对象 ACL（对象不存在则空——put 路径对象尚未建，靠 policy/owner）。
   defp acl_statements(:bucket, bucket, _key) do
@@ -149,7 +149,7 @@ defmodule Maxio.S3.Authz do
       raw ->
         {src_bucket, src_key} = parse_copy_source(raw)
         resource = Arn.object_arn(src_bucket, src_key)
-        statements = gather_statements(:object, src_bucket, src_key)
+        statements = gather_statements(:object, src_bucket, src_key, principal)
 
         ctx = %RequestContext{
           principal: principal,

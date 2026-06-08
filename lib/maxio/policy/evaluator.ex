@@ -39,7 +39,8 @@ defmodule Maxio.Policy.Evaluator do
   defp principal_match?({:aws, _list}, %RequestContext{principal: :anonymous}), do: false
 
   defp principal_match?({:aws, list}, %RequestContext{principal: %{arn: arn}}) do
-    Enum.any?(list, fn pat -> Arn.glob_match?(pat, arn) end)
+    # AWS Principal 精确匹配（区分大小写）；不做 glob（policy variable 未实现）。Statement 已把纯 "*" 归一化为 :any。
+    Enum.any?(list, fn pat -> pat == arn end)
   end
 
   defp principal_match?(_principals, _ctx), do: false
