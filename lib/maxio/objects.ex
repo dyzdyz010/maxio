@@ -172,7 +172,15 @@ defmodule Maxio.Objects do
     with {:ok, bucket} <- bucket_or_error(bucket_name) do
       base =
         attrs
-        |> Map.take([:content_type, :metadata, :storage_class, :acl_canned, :tags, :sse_algorithm])
+        |> Map.take([
+          :content_type,
+          :metadata,
+          :storage_class,
+          :acl_canned,
+          :tags,
+          :sse_algorithm,
+          :sse_envelope
+        ])
         |> Map.merge(%{
           bucket_id: bucket.id,
           bucket_name: bucket_name,

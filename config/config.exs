@@ -70,6 +70,11 @@ config :maxio, :s3,
 # 可经 MAXIO_S3_PORT 运行时覆盖（runtime.exs）。
 config :maxio, Maxio.S3.Endpoint, port: 9000, ip: :any
 
+# SSE-S3 服务端主密钥（信封加密包裹每对象 DEK）。dev/test 用固定 base64 32B；
+# prod 经 MAXIO_SSE_MASTER_KEY env（runtime.exs）。单一静态主密钥=简化密钥管理 MVP（无轮转/KMS，README 已声明）。
+config :maxio, :sse,
+  master_key: "bWF4aW8tc3NlLXMzLW1hc3Rlci1rZXktMzJieXRlcyE="
+
 # 后端 behaviour 绑定（铁律 1/2：换后端只改这里）。
 config :maxio, :storage_backend, Maxio.Storage.FS
 config :maxio, :credential_store, Maxio.Auth.CredentialStore.EctoStore

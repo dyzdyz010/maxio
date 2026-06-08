@@ -13,7 +13,8 @@ defmodule Maxio.S3.Handlers do
     Versioning,
     Tagging,
     Cors,
-    Lifecycle
+    Lifecycle,
+    Encryption
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -65,4 +66,8 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:put_bucket_lifecycle, conn), do: Lifecycle.put(conn)
   def dispatch(:get_bucket_lifecycle, conn), do: Lifecycle.get(conn)
   def dispatch(:delete_bucket_lifecycle, conn), do: Lifecycle.delete(conn)
+
+  def dispatch(:put_bucket_encryption, conn), do: Encryption.put(conn)
+  def dispatch(:get_bucket_encryption, conn), do: Encryption.get(conn)
+  def dispatch(:delete_bucket_encryption, conn), do: Encryption.delete(conn)
 end

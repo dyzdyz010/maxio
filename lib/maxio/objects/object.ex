@@ -20,6 +20,8 @@ defmodule Maxio.Objects.Object do
     field :is_latest, :boolean, default: true
     field :is_delete_marker, :boolean, default: false
     field :tags, :map, default: %{}
+    field :sse_algorithm, :string
+    field :sse_envelope, :map
 
     belongs_to :bucket, Maxio.Buckets.Bucket
 
@@ -39,7 +41,9 @@ defmodule Maxio.Objects.Object do
     :version_id,
     :is_latest,
     :is_delete_marker,
-    :tags
+    :tags,
+    :sse_algorithm,
+    :sse_envelope
   ]
   # etag 仅对真实对象版本必填；delete marker 无字节、无 etag（空串），故 etag 从必填中排除。
   @required [:bucket_id, :bucket_name, :key, :size]

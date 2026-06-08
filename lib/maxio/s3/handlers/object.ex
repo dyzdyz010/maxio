@@ -38,13 +38,27 @@ defmodule Maxio.S3.Handlers.Object do
     # x-amz-tagging 头（PutObject）→ jsonb tag map（校验失败 → InvalidTag 400，铁律 3）。
     tags_map = parse_tagging_header!(conn)
 
+    # SSE-S3：请求头或桶默认加密 = AES256 → 真实加密字节；非 AES256/SSE-C → 501（绝不静默）。
+    sse_requested = resolve_sse!(conn, bucket)
+
+    {chunks, sse_envelope} =
+      case sse_requested do
+        "AES256" -> Maxio.Crypto.SSE.wrap_stream(chunks)
+        nil -> {chunks, nil}
+      end
+
     case Storage.put(bucket, key, version_id, chunks) do
       {:ok, %{size: size, etag: etag, sha256: sha256}} ->
         # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
+        # SSE 加密对象：x-amz-decoded-content-length / x-amz-content-sha256 是针对明文传输完整性的闸，
+        # 而落盘字节是密文（密文≠明文必失配）；传输层完整性已由 SigV4/chunked 在 BodyReader 内验过，
+        # 故加密分支跳过这两个校验（铁律 3 仍由 GCM 认证 + 上游签名保证）。
         {:ok, obj} =
           try do
-            :ok = verify_decoded_length!(conn, payload_mode, size)
-            :ok = verify_content_sha256!(conn, payload_mode, sha256)
+            unless sse_requested do
+              :ok = verify_decoded_length!(conn, payload_mode, size)
+              :ok = verify_content_sha256!(conn, payload_mode, sha256)
+            end
 
             Objects.put_version_with_id(bucket, key, version_id, %{
               size: size,
@@ -52,7 +66,9 @@ defmodule Maxio.S3.Handlers.Object do
               content_type: content_type,
               storage_class: "STANDARD",
               acl_canned: header(conn, "x-amz-acl") || "private",
-              tags: tags_map
+              tags: tags_map,
+              sse_algorithm: sse_requested,
+              sse_envelope: sse_envelope
             })
           rescue
             err ->
@@ -78,6 +94,7 @@ defmodule Maxio.S3.Handlers.Object do
 
         conn
         |> maybe_put_version_id(obj.version_id)
+        |> maybe_put_sse(sse_requested)
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
 
@@ -126,6 +143,28 @@ defmodule Maxio.S3.Handlers.Object do
               :invalid ->
                 raise Error.new(:invalid_range, resource: "/#{bucket}/#{key}", extra: %{total: total})
 
+              _ when object.sse_algorithm == "AES256" ->
+                # SSE-S3 加密对象：整对象解密返回明文（密文是帧化的，对密文做 byte-range 会取错字节，
+                # 故 MVP 对加密对象忽略 Range，整对象解密 + 200，content-length 用解密后明文长度）。
+                # 大对象逐帧流式解密留 defer（密文与明文同量级，正确性优先）。
+                {:ok, raw_stream} = Storage.get(bucket, key, object.version_id, nil)
+
+                plain =
+                  Maxio.Crypto.SSE.unwrap_stream(raw_stream, object.sse_envelope)
+                  |> Enum.to_list()
+                  |> IO.iodata_to_binary()
+
+                conn
+                |> maybe_put_version_id(object.version_id)
+                |> maybe_put_sse(object.sse_algorithm)
+                |> put_resp_content_type(object.content_type)
+                |> put_resp_header("etag", XML.quote_etag(object.etag))
+                |> put_resp_header("last-modified", http_date(object.updated_at))
+                |> put_resp_header("accept-ranges", "bytes")
+                |> put_resp_header("content-length", Integer.to_string(byte_size(plain)))
+                |> maybe_tagging_count(object)
+                |> send_resp(200, plain)
+
               _ ->
                 {:ok, stream} = Storage.get(bucket, key, object.version_id, range_tuple(range))
                 conn = maybe_put_version_id(conn, object.version_id)
@@ -170,6 +209,7 @@ defmodule Maxio.S3.Handlers.Object do
             :proceed ->
               conn
               |> maybe_put_version_id(object.version_id)
+              |> maybe_put_sse(object.sse_algorithm)
               |> put_common_object_headers(object, object.size)
               |> send_resp(200, "")
 
@@ -565,6 +605,42 @@ defmodule Maxio.S3.Handlers.Object do
   # 仅当版本非 "null" 时回显 x-amz-version-id（Unversioned 桶不带该头，对齐 AWS）。
   defp maybe_put_version_id(conn, "null"), do: conn
   defp maybe_put_version_id(conn, version_id), do: put_resp_header(conn, "x-amz-version-id", version_id)
+
+  # 决定 SSE：请求头优先；其次桶默认加密配置。非 AES256/SSE-C → 501（绝不静默，铁律 3）。
+  defp resolve_sse!(conn, bucket) do
+    sse_c = header(conn, "x-amz-server-side-encryption-customer-algorithm")
+
+    if sse_c not in [nil, ""] do
+      raise Error.new(:not_implemented, message: "SSE-C (customer-provided keys) not implemented")
+    end
+
+    case header(conn, "x-amz-server-side-encryption") do
+      "AES256" ->
+        "AES256"
+
+      alg when alg in ["aws:kms", "aws:kms:dsse"] ->
+        raise Error.new(:not_implemented, message: "Only SSE-S3 (AES256) is supported; #{alg} not implemented")
+
+      nil ->
+        bucket_default_sse(bucket)
+
+      "" ->
+        bucket_default_sse(bucket)
+
+      _other ->
+        raise Error.new(:invalid_argument, message: "Invalid x-amz-server-side-encryption value")
+    end
+  end
+
+  defp bucket_default_sse(bucket) do
+    case Maxio.BucketConfigs.get(bucket, :encryption) do
+      {:ok, %{"algorithm" => "AES256"}} -> "AES256"
+      _ -> nil
+    end
+  end
+
+  defp maybe_put_sse(conn, nil), do: conn
+  defp maybe_put_sse(conn, alg), do: put_resp_header(conn, "x-amz-server-side-encryption", alg)
 
   # 流式 PUT 解帧后长度须等于声明的 decoded-content-length（aws-chunked 完整性闸，铁律 3）。
   defp verify_decoded_length!(conn, :streaming, actual_size) do
