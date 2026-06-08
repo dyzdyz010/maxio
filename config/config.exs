@@ -72,7 +72,7 @@ config :maxio, Maxio.S3.Endpoint, port: 9000, ip: :any
 
 # 后端 behaviour 绑定（铁律 1/2：换后端只改这里）。
 config :maxio, :storage_backend, Maxio.Storage.FS
-config :maxio, :credential_store, Maxio.Auth.CredentialStore.MemoryStore
+config :maxio, :credential_store, Maxio.Auth.CredentialStore.EctoStore
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

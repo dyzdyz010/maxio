@@ -41,3 +41,7 @@ config :maxio, :s3,
   root_password: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 config :maxio, Maxio.S3.Endpoint, server: false, port: 0
+
+# 凭据后端：test 用 MemoryStore（ETS，无需 DB 引导，root 从 config :maxio, :s3 引导，
+# 与 Maxio.Test.SigV4Request 的 root key 对齐）。EctoStore 由其专属测试单独覆盖。
+config :maxio, :credential_store, Maxio.Auth.CredentialStore.MemoryStore

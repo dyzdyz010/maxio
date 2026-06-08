@@ -22,7 +22,28 @@ defmodule Maxio.Application do
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Maxio.Supervisor]
-    Supervisor.start_link(children, opts)
+
+    case Supervisor.start_link(children, opts) do
+      {:ok, pid} ->
+        maybe_bootstrap_root()
+        {:ok, pid}
+
+      other ->
+        other
+    end
+  end
+
+  # 仅 EctoStore 下在 Repo 起来后幂等引导 root（MemoryStore 自带惰性引导，无需此步）。
+  defp maybe_bootstrap_root do
+    if Application.get_env(:maxio, :credential_store) == Maxio.Auth.CredentialStore.EctoStore do
+      try do
+        Maxio.IAM.bootstrap_root()
+      rescue
+        e ->
+          require Logger
+          Logger.warning("root bootstrap skipped: #{Exception.message(e)}")
+      end
+    end
   end
 
   # 独立 S3 Endpoint（Bandit, 端口 9000）。test 环境 server: false 时不启监听（走 Plug.Test）。
