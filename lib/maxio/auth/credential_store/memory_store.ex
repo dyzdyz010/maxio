@@ -17,7 +17,27 @@ defmodule Maxio.Auth.CredentialStore.MemoryStore do
         {:ok, %{secret_key: secret_key, principal: principal}}
 
       [] ->
-        :error
+        # 并发惰性建表竞态：另一进程已建表但尚未注入 root 时，本进程可能读到空。
+        # 仅当查询的是 root key 且表中确无该行时，幂等补一次 bootstrap 再重查（绝不静默丢失 root）。
+        maybe_bootstrap_root_for(access_key)
+    end
+  end
+
+  # 表已存在但 root 行尚未可见（建表进程的 bootstrap_root 与本进程 lookup 交错）时，
+  # 幂等补注入 root 并重查；非 root key 仍正常返回 :error。
+  defp maybe_bootstrap_root_for(access_key) do
+    if access_key == root_access_key() do
+      bootstrap_root()
+
+      case :ets.lookup(@table, access_key) do
+        [{^access_key, secret_key, principal}] ->
+          {:ok, %{secret_key: secret_key, principal: principal}}
+
+        [] ->
+          :error
+      end
+    else
+      :error
     end
   end
 
@@ -62,5 +82,11 @@ defmodule Maxio.Auth.CredentialStore.MemoryStore do
     sk = Keyword.fetch!(s3, :root_password)
     principal = %{type: :root, access_key: ak, arn: "arn:aws:iam:::root"}
     :ets.insert(@table, {ak, sk, principal})
+  end
+
+  defp root_access_key do
+    :maxio
+    |> Application.fetch_env!(:s3)
+    |> Keyword.fetch!(:root_user)
   end
 end

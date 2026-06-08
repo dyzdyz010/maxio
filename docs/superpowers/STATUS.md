@@ -19,7 +19,7 @@
 | **M2 分段上传 + 流式** | aws-chunked 逐块签名完整验证 + multipart 全套 + DeleteObjects 批删 + 条件头 + CopyObject + M1 硬化 | ✅ 已实现并验证（master，2026-06-08；191 测试全绿、aws-chunked 与 AWS 流式向量逐字节一致、独立 reviewer APPROVE_WITH_NOTES／0 must-fix） |
 | **M3 IAM / 策略** | access key + EctoStore + policy 评估 + canned ACL + bucket policy + Authz + 匿名 | ✅ 已实现并验证（master，2026-06-09；275 测试全绿、Evaluator 真值表 + 匿名/public policy/ACL/授权矩阵 e2e、`compile --warnings-as-errors` 零警告） |
 | **M4 高级特性** | versioning / tagging / lifecycle / CORS / SSE | ✅ 已实现并验证（master，2026-06-09；349 测试全绿、`compile --warnings-as-errors` 零警告、versioning/tagging/cors/lifecycle/sse e2e + 跨特性矩阵） |
-| **M5 Console** | LiveView 管理台 | ⬜ 待 |
+| **M5 Console** | LiveView 管理台 | ✅ 已实现并验证（master，2026-06-09；`compile --warnings-as-errors` 零警告、跨页 e2e LiveViewTest 矩阵全绿、鉴权/dashboard/buckets/object-browser/object-detail/settings/access-keys 单测全绿） |
 | **M6 纠删码 / 分布式** | Reed-Solomon（Rustler）+ 分布式 + 自愈 | ⬜ 待 |
 
 ## 当前会话进展（2026-06-08）
@@ -134,6 +134,39 @@ reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（均已文档化
 2. **Multipart-complete / CopyObject 在 Enabled 桶仍写 `version_id:"null"`/`is_latest:true`**：内部一致（字节走 null 路径），但 Enabled 桶若已有 ULID 版本，会 unset 它们的 latest 并让 null 行成 latest。已 defer #6，待 MPU 逐版本字节路径时修。
 3. **`delete_version` 的 promote_latest 按 `version_id DESC`**：混合 null+ULID 历史下可能把 "null" 当最新提升（源于 #2 的 edge）。
 4. **装饰性**：CORS 实际响应设了 `Access-Control-Allow-Methods` 且 `Vary` 仅 `Origin`（AWS 实际响应通常省 ACAM）；`lifecycle valid_rule?` 允许有 Status 无 action 的规则（AWS 要求 ≥1 action）。无害。
+
+## M5 实现摘要（subagent-driven：串行 executor M5-1…M5-9，每单元强制 StructuredOutput + 独立 reviewer/verifier 隔离）
+
+- **`compile --warnings-as-errors` 零警告、全量 `mix test` 绿**（M4 基线 349 + M5 新增 Console 单测与跨页 e2e 矩阵）。计划：`plans/2026-06-09-m5-console.md`。Console 跑在既有 `MaxioWeb.Endpoint`(:4000)，**物理隔离于 S3 Endpoint**(:9900/:9000)，**直接调用 maxio context**（同进程，不经 S3 HTTP API；唯一例外是预签名分享 URL，已 defer）。
+- **M5-1 Console 鉴权地基**：`MaxioWeb.ConsoleAuth`（`verify_credentials/2` 复用 `CredentialStore.get_secret/1` 常数时间比对、未知 ak 也假比对抹平计时；`log_in/2` renew session；`log_out/1` drop；`fetch_principal/1`；`session_key/0`→`"console_access_key"`，secret 绝不入 session）+ `ConsoleAuth.OnMount`（`:require_authenticated` 无 principal halt redirect `/login`；`:mount_current_principal`）+ `ConsoleAuthPlug`（`fetch_current_principal/2` 入 `:browser` 管线）+ `SessionController`(:new/:create/:delete) + `SessionHTML`/`new.html.heex`（登录页 `layout: false`，`#login-form`/`#login-error`/`#login-submit`，凭据错不泄露 ak/sk 谁错）+ 路由 public/protected 双区（受保护 `live_session :console_authenticated`）+ ConnCase `log_in_console/2` + app.js `window.__maxio` 钩子 + `[maxio][Console]` 标签日志。架构删除（非 hack）：旧 `PageController`/`PageHTML`/`home.html.heex`/`page_controller_test.exs`（GET / 被受保护 DashboardLive 取代）。
+- **M5-2 App Shell**：`Layouts.app/1` 改造为 Console 侧边栏 shell——`#console-sidebar` + `#nav-dashboard`/`#nav-buckets`/`#nav-access-keys`（私有 `nav_link/1` 组件）+ `#current-identity`(@current_scope.access_key) + `#logout-link`(`<.link href="/logout" method="delete">`) + 既有 `theme_toggle`；`flash_group/1` 仍只在 layouts.ex。新增最小占位 `BucketLive.Index`/`AccessKeyLive.Index` 使受保护路由（侧边栏 `~p` 链接）在 Phoenix 1.8 verified-routes + 路由 `__checks__` 下编译期可解析（同 M5-1 对 DashboardLive 的占位模式，各单元再「完整替换」）。
+- **M5-3 Dashboard**：`Maxio.Console.Stats.dashboard/0`（廉价 `Repo.aggregate` + per-bucket group_by；object_count/total_size 只算 `is_latest=true and not is_delete_marker`，与 ListObjectsV2 口径一致；`sum` nil → 0 空态不崩）；DashboardLive 充实 5 张统计卡片（`#stat-buckets`/`#stat-objects`/`#stat-size`/`#stat-keys`/`#stat-multipart`）+ `#per-bucket-table`（per-bucket 行可导航 `/buckets/:name/browse`）+ 私有 `format_bytes/1`。
+- **M5-4 Buckets 列表/创建/删除**：`BucketLive.Index` 完整替换占位——streams（`#buckets` 父 + `#buckets-empty` 空态）+ 创建表单（`Buckets.create/2`，owner=`current_principal.arn`）+ 删除（先 `lookup` 拿 `%Bucket{}` 再 `stream_delete`）；完整错误 flash 矩阵（`:invalid_bucket_name`/`:already_owned`/changeset/`:not_empty`/`:not_found`，绝不静默吞掉）。
+- **M5-5 Object Browser + 下载**：`ObjectLive.Index` 完整替换占位——prefix 面包屑（`handle_params` 读 `?prefix=` → `list_objects_v2` delimiter → `stream(reset: true)`）+ **上传**（`allow_upload` ≤5 GiB → `consume_uploaded_entries` `File.stream!` 流式喂 `Storage.put` + `put_version_with_id`，Storage 错 `{:postpone}` + `[maxio][Console]` Logger.error + flash，绝不静默）+ 新建文件夹（零字节 `prefix/` 对象）+ 删除（版本化感知）；`DownloadController.show/2` plain controller `send_chunked` + `Enum.reduce_while`（`{:error,:closed}` halt，绝不全缓冲，铁律 4）。
+- **M5-6 Object Detail**：`ObjectLive.Show` 完整替换占位——`#object-detail` 元数据 + 标签编辑（raw 文本 ↔ `[{k,v}]`，`Tags.validate(_, :object)`，`:invalid_tag` 显式 flash）+ 版本历史 stream（`list_object_versions`，含 delete marker badge，per-version 流式下载/永久删除 `delete_version` 后 `stream(reset: true)` 反映 promote_latest）；不存在桶/对象 `push_navigate` 回 browse + flash。
+- **M5-7 Bucket Settings（7 tab）**：`BucketLive.Settings` 完整替换占位——`?tab=` + `push_patch` 在 versioning/policy/acl/tags/cors/lifecycle/encryption 间切换；versioning（`put_versioning/3`，"Unversioned"→"Suspended" 映射）+ policy JSON（`Statement.parse_policy` 校验，空=`delete_bucket_policy`，畸形→MalformedPolicy flash）+ canned ACL（`put_acl/2`，非 @canned 拒绝）+ 桶标签（`Tags.validate(_, :bucket)`）+ CORS/lifecycle JSON（`BucketConfigs` put/delete，畸形 JSON flash，lifecycle 显式 defer-alert）+ 默认加密（`none`=禁用 / `AES256` / SSE-KMS 绝不静默当 AES256，KMS 永不覆盖既有 AES256）。
+- **M5-8 Access Keys**：`AccessKeyLive.Index` 完整替换占位——列表 stream（`#access-keys`，自定义 `dom_id`，绝不回 secret）+ 创建（`IAM.create_access_key`，secret 经 `#new-secret-banner` 仅显示一次、一次性 assign 不入 stream/session）+ 删除（`IAM.delete_access_key`，`:cannot_delete_last_root` 显式 flash）；root/iam_user badge 区分。
+- **M5-9 Polish + e2e 矩阵 + 文档**：`test/maxio_web/live/console_e2e_test.exs`（全链路 建桶→浏览→详情→设置启用版本化→access keys + 未登录全程门控 `/`/`/buckets`/`/access-keys` 均 redirect `/login`）+ README Console 章节（含完整 defer 清单）+ 本 STATUS 更新。
+
+### M5 已知非阻塞项 / 显式 defer（文档化，绝不静默放行/假装实现）
+
+1. **Identity（Users/Groups/IAM identity policy/STS/IdP）**：maxio 单租户，无独立 user/group 实体（`principal_policies/1` 恒 `[]`）。Console 用 access key 作 identity primitive；Users/Groups 在侧边栏**不出现**（不画灰条目假装有）。
+2. **Bucket 高级（Quota/Events-Notifications/Replication/Object-Lock-Retention-Legal-Hold）**：后端未实现，Settings 不画这些 tab。
+3. **Object（内联预览/Legal hold/Retention）**：未实现；SSE 对象 GET 全缓冲（M4 defer #5）使大加密对象预览风险——仅下载。
+4. **Monitoring（Logs/Trace/Audit/Drives/Heal/时序图）**：需 Prometheus/纠删码（M6）；Dashboard 只做廉价计数。
+5. **Configuration 运行时编辑 / Tiers / Site Replication / Batch Jobs / License**：后端无运行时配置存储；不做。
+6. **Console 大文件多段上传**：MVP 走单 PUT（≤5 GiB，服务端临时文件中转）；接 `Maxio.Multipart` 逐 part 上传标为后续优化（`VERIFY-AT-IMPL: console multipart`）。
+7. **生命周期后台执行**：Console 可编辑规则，后台过期/转储执行未实现（沿用 M4 defer #1）。
+8. **预签名分享 URL**：可经 `Maxio.Auth.SigV4.Signer` 生成指向 S3 端的预签名 GET（唯一引用 S3 HTTP 之处），MVP 未做 UI（不画死按钮）。
+
+### M5 各单元 executor 记录的架构性偏差（非 hack，已在各 commit 落证）
+
+- **forward-reference 路由预注册（M5-1..M5-5 一致模式）**：Phoenix 1.8 verified-routes 在编译期校验 `~p` 路径存在，且路由 `__checks__/0` 校验目标 LiveView 定义 `__live__/0`——两者在 `--warnings-as-errors` 下均会失败，除非路由 + 模块当下即存在。故各单元在引入指向后续单元页面的 `<.link navigate=>` 时，同步在 `:console_authenticated` 预注册路由 + 最小占位 LiveView，后续单元「完整替换」占位（绝不重复添加路由）。这把受保护 Console 路由表 + 导航 chrome 视为一个内聚面，符合 verified-routes 契约。
+- **`push_navigate` 重定向断言更正**：mount 内 `push_navigate/2` 始终 yield `:live_redirect`（非 `:redirect`）；M5-5/M5-6/M5-7 的 not-found 测试断言相应更正为 `{:error, {:live_redirect, %{...}}}`（LiveView 逻辑不变）。受保护页未登录门控经 OnMount `redirect/2` 则 yield `:redirect`（e2e 矩阵的未登录断言用 `:redirect` 正确）。
+- **登出测试**：`configure_session(drop: true)` 仅在响应发送时丢弃 cookie；测试 `recycle()` + 后续 GET 再 `refute get_session` 验证 dropped cookie 不持久化（controller 逻辑不变，标准 Phoenix log_out 模式）。
+- **HEEx 安全**：settings 的 CORS 帮助文本曾内嵌字面 JSON（`{`/`:` 被 HEEx 当插值解析失败），改为字段名 `<code>` 列表（同等信息、HEEx 安全）；占位 moduledoc 内 `#{...}` 会被插值，改写为 `<bucket>` 角括号避免 CompileError。
+- **ConnCase 不 import `Phoenix.LiveViewTest`**：所有 M5 Console 测试文件各自 `import Phoenix.LiveViewTest`（一致约定）。
+- **M5-9 治本的潜伏并发 bug（MemoryStore 惰性建表竞态，架构级修复非 hack）**：`Maxio.Auth.CredentialStore.MemoryStore` 惰性建 `:public, :named_table` ETS 表——建表进程在 `:ets.new` 与 `bootstrap_root` 之间存在窗口，并发 reader 可读到「表已存在但 root 行未注入」→ root `get_secret` 误返回 `:error`（Console 鉴权 mount 误判未登录 → 全程 redirect /login，e2e 矩阵首个 `live(~p"/buckets")` 偶发失败）。M5 e2e 矩阵作为早期 async 测试首次稳定暴露此竞态。修复（铁律 3，绝不静默丢失 root）：`get_secret` 对 root key 的空查询走 `maybe_bootstrap_root_for/1` 幂等补 `bootstrap_root` 再重查；新增私有 `root_access_key/0` 读 config。全量 412 测试在原失败 seed 790436 + seed 0 + 随机 seed 下稳定全绿。
 
 ## 工具链与环境（本机 Windows 11，关键教训）
 
