@@ -91,7 +91,9 @@ config :maxio, :erasure,
   parity_shards: 2,
   block_size: 1_048_576
 
-# 后端 behaviour 绑定（铁律 1/2：换后端只改这里）。
+# 后端 behaviour 绑定（铁律 1/2：换后端只改这里）。默认 FS（单机）。
+# 切单机纠删码：Maxio.Storage.ErasureCoded（+ config :maxio, :erasure）。
+# 切多节点分布式：Maxio.Storage.Distributed（+ config :maxio, Maxio.Cluster.Topology + Maxio.Cluster）。
 config :maxio, :storage_backend, Maxio.Storage.FS
 config :maxio, :credential_store, Maxio.Auth.CredentialStore.EctoStore
 config :maxio, :policy_store, Maxio.Policy.Store.EctoStore
