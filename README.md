@@ -173,3 +173,132 @@ PUT 把上传字节流重切成固定 `block_size` 逻辑块，逐块 RS 编码�
 8. **heal MVP 简化**：同步、单进程、无并发锁（单机串行）；heal 粒度到整对象（非 MinIO per-block 增量回写优化，正确优先）。
 
 **设计保证**：M7 在 M6 同一 RS 编解码 / heal 核心**之外**加 routing/locking/pools/transport 层，不重写引擎。
+
+## 多节点分布式纠删码（M7，跨节点 erasure + quorum + 分布式锁 + 跨节点 heal）
+
+maxio 在 M6 单机纠删码核心之上新增 **MinIO 式多节点分布式存储后端** `Maxio.Storage.Distributed`，
+把对象字节以 **Reed-Solomon (N = K + M)** 编码分散到**跨多个节点的 N 个 `{node, drive}` 端点
+（一个 erasure set 跨节点）**。它实现与 `Maxio.Storage.FS`/`Maxio.Storage.ErasureCoded`
+**完全相同**的 `Maxio.Storage.Backend` 契约（ETag/sha256/Range/part ETag 返回形态逐字节一致），
+**核心请求管线 / handler / dispatcher / endpoint 一行不改**（铁律 2：后端即插件）。M6 的 RS 数学、
+流式结构、quorum 公式、heal 引擎**全部复用、一行不重写**——只把「分片 i → 本地盘 i」替换为
+「分片 i → 该对象 erasure set 的第 i 个 `{node, drive}` 端点（经 :erpc/transport 访问）」。
+
+### 启用方式（config 切后端）
+
+```elixir
+# 1) 把存储后端切到分布式（缺省仍是 Maxio.Storage.FS）
+config :maxio, :storage_backend, Maxio.Storage.Distributed
+
+# 2) 节点发现拓扑（libcluster）：dev gossip / prod epmd（MAXIO_PEERS env 逗号分隔 node 名）
+config :maxio, Maxio.Cluster,
+  topologies: [
+    maxio_gossip: [strategy: Cluster.Strategy.Gossip, config: [port: 45_892]]
+  ]
+
+# 3) erasure 部署拓扑：pools → sets → 有序 N 个 {node, drive} 端点（索引 i = 分片 i）
+config :maxio, Maxio.Cluster.Topology,
+  data_shards: 4,        # K
+  parity_shards: 2,      # M（N = K + M = 每 set 的端点数）
+  block_size: 1_048_576, # 1 MiB 逻辑块
+  pools: [
+    %{
+      id: 0,
+      sets: [
+        %{
+          id: 0,
+          endpoints: [
+            {:"maxio@10.0.0.1", "/data/d0"}, {:"maxio@10.0.0.1", "/data/d1"},
+            {:"maxio@10.0.0.2", "/data/d0"}, {:"maxio@10.0.0.2", "/data/d1"},
+            {:"maxio@10.0.0.3", "/data/d0"}, {:"maxio@10.0.0.3", "/data/d1"}
+          ]
+        }
+      ]
+    }
+  ]
+
+# 4) 分片传输实现（prod = :erpc；test 覆盖为 InProcess）
+config :maxio, :shard_transport, Maxio.Cluster.Transport.Erpc
+```
+
+启动期 `Maxio.Cluster.Topology.parse_and_validate!/1` 校验每 set endpoints 数 `== K+M`、
+`M >= 1`、`M <= N/2`、set id 不重复、至少一个 set，非法拓扑 **raise**（绝不带病启动）。
+运维须保证「N 个端点尽量跨节点、每节点端点数 ≤ M」（failure-domain 自动 set 形成 = defer，见下）。
+
+### dev 单机多节点起法（自发现 + iex）
+
+```bash
+# 三个 iex 会话（同一 cookie；gossip UDP 自发现），各起一个具名节点：
+iex --sname maxio_a --cookie maxio -S mix
+iex --sname maxio_b --cookie maxio -S mix
+iex --sname maxio_c --cookie maxio -S mix
+# Maxio.Cluster.nodes/0 会汇出三节点；拓扑 config 把端点的 node 写成 :"maxio_a@<host>" 等。
+```
+
+### 对象 → erasure set 路由（铁律 5 对齐 MinIO）
+
+- **`Maxio.Cluster.Router.set_for(bucket, key)`** = `phash2(bucket <> "/" <> key) mod 全局 set 数`，
+  确定性放置。**版本不入哈希**（同对象全版本同 set，故版本化 GET/PUT 路由一致）。
+- set 数 per pool **不可变**（online 扩缩需重哈希迁移 = defer）。
+
+### 跨节点 quorum + 容错（铁律 3）
+
+- **read quorum = K**、**write quorum = K**（一般情形）；**K == M（脑裂边界）时 write quorum = K + 1**。
+  以 K=4 M=2（N=6）为例：read_quorum=4、write_quorum=4，可容忍最多 M=2 个端点（≈1 节点 2 drive）缺失。
+- **PUT**：逐块 RS 编码，分片 i 经 transport 并行写端点 i（铁律 4：每条 :erpc 消息只载一个 block 的一个分片，
+  绝不一次传整对象/整文件）；成功端点数 `>= write_quorum` 才 `{:ok}`，否则 `{:error, :write_quorum}` + 结构化日志。
+- **GET**：逐块跨节点并行读 K-of-N 分片（宕机/超时端点经 transport 兜底 → nil），按 sidecar BLAKE3 校验 +
+  RS 重建（存活 `< K` → raise `InsufficientShardsError`，**绝不静默返回错数据**）+ Range 裁剪 + 流式发出。
+- **并发守护**：PUT/assemble/delete 经 `Maxio.Cluster.Lock.with_lock`（`:global.trans` 全 mesh 互斥），
+  获锁失败 → `{:error, :locked}`（**绝不静默并发写同对象**）。
+- **节点宕机/超时/远端异常**：`Transport.Erpc` 统一兜底为 nil 分片（与 M6 缺失本地文件语义完全相同），
+  交 RS 重建，绝不把异常上抛炸后端。
+
+### 跨节点 heal（自愈）
+
+- **`Maxio.Cluster.Heal.heal_object(bucket, key, version_id, opts)`**：经 `Transport` 逐块跨端点读 +
+  BLAKE3 重算比对 → 检测宕机/被替换节点上缺失的整列分片、被篡改（bitrot）的分片 → 从 K 个存活端点（peer）
+  RS 重建坏分片 → 经 `transport.heal_shard` 仅回写坏端点 + 修复其 sidecar 副本；某 block 存活 `< K` →
+  `{:error, :unrecoverable}` + 结构化 error 日志（**绝不伪造数据**，铁律 3）；无任何 sidecar → `{:error, :enoent}`。
+- **CLI**（铁律 4 可观测，结构化日志含 bucket/key/block/repaired_endpoints）：
+
+```bash
+mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_id 缺省 "null"）
+```
+
+### 测试覆盖（确定性 InProcess 主力 + :peer 真节点）
+
+- **进程内多节点 transport 注入**（`Maxio.Cluster.Transport.InProcess`，可在运行中 `set_down/1` 打掉端点）：
+  在 `async` ExUnit 里跑真实 quorum + 节点宕机 + bitrot + heal，无需第二个 BEAM 节点。共享 `StorageConformance`
+  套件第三次同跑 `Distributed`+`InProcess` 证同一契约。集群 e2e 四场景（一节点宕仍写 / 一节点宕仍读 /
+  节点返回后 heal / 两节点宕 quorum-loss raise）全绿。
+- **`:peer` 真节点集成测试**（`@moduletag :distributed`，默认排除，`mix test --include distributed` 跑）：
+  起真实额外 BEAM 节点跑真 `:erpc`，杀节点验真 `:erpc :noconnection` → nil 分片 → RS 重建。
+  本机 epmd/`:peer` 不可用时自动 skip（主回归不受影响）。
+
+### M7 显式 defer 清单（文档化，绝不静默假装实现）
+
+1. **Rebalance / Decommission / online pool 扩容**：添加/退役 pool、跨 pool 迁移、free-space 加权放置
+   （MinIO `mc admin rebalance`/`decommission`）。M7 单 pool（多 pool 两级路由 + 加权新写 + 迁移 = defer）；
+   set 数 per pool 不可变。
+2. **完整 dsync 锁语义**：M7 用 `:global.trans`（全 mesh 互斥）+ `quorum_with_lock` 骨架。
+   lock lease/refresh keepalive、owner-crash refresh-expiry、`ForceUnlock`、read/write 锁区分、
+   split-brain 处理 = defer。
+3. **跨节点 IAM / bucket-metadata 复制**：maxio 的 IAM/bucket-meta 走 **Postgres**（多节点共享 DB 天然一致，
+   故无需 `.maxio.sys` 对象化复制——架构差异，非缺口）；节点本地 ETS 缓存的跨节点失效通知（PubSub 广播）= defer。
+4. **scanner 全自动跨节点 walk + 1/1024 采样 + 限流**：`heal_object/4`（单对象跨节点重建）完整；
+   `scrub_bucket` 的对象列举当前经 `opts[:objects]` 显式列表（CLI 从 `Maxio.Objects` 取）。
+   自动跨节点目录 walk（需 transport `list_dir` callback + peer 列举）+ hash 采样 + token-bucket 限流 = defer。
+5. **多 parity / storage class**：单一 (K,M)；`x-amz-storage-class` → 不同 EC = defer（沿用 M6）。
+6. **parity upgrade on degraded write**：写未达 write_quorum 即 `{:error, :write_quorum}`（绝不静默）；
+   MinIO 的「写时临时提高 effective parity」= defer。
+7. **专用流式分片传输（gRPC/HTTP2 + 连接池 + 背压）**：M7 用 :erpc（OTP 内置，逐 block-shard 有界）。
+   大规模 / 跨数据中心 / mTLS 专用传输 = defer（`Transport` behaviour 已抽象，换实现不动后端）。
+8. **failure-domain 感知的自动 set 形成**：M7 拓扑由 config **手工**指定每 set 的 N 个 `{node, drive}`。
+   MinIO 的 ellipsis 展开 + node-interleaving + GCD set sizing 自动形成 = defer（手工 config 即可达同等放置）。
+9. **沿用 M0–M6 全部既有 defer**（lifecycle 后台执行、SSE 大对象逐帧流式 GET、identity policy、
+   MFA Delete 强制、跨账户多租户、完整条件算子、inline 小对象等）。
+
+**设计保证**：M7 在 M6 同一 RS 核心**之外**加 routing/locking/topology/transport 层，**不重写
+encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分片 → EC 重建或结构化 raise，
+**绝不静默返回错数据**（铁律 3）。deferral 逐条显式列出，无静默缺口。
