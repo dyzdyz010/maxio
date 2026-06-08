@@ -45,6 +45,9 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:get_object_acl), do: {"s3:GetObjectAcl", :object}
   def for_action(:put_object_acl), do: {"s3:PutObjectAcl", :object}
 
+  def for_action(:put_bucket_versioning), do: {"s3:PutBucketVersioning", :bucket}
+  def for_action(:get_bucket_versioning), do: {"s3:GetBucketVersioning", :bucket}
+
   # CopyObject 走 :put_object（put 路径内部分流），源读权限的二次检查由 Authz 特判（见 authorize/2 的 copy 分支）。
   def for_action(_other), do: nil
 end

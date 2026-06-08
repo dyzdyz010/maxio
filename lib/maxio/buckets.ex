@@ -95,6 +95,31 @@ defmodule Maxio.Buckets do
     end
   end
 
+  @doc """
+  设置桶版本化状态（PutBucketVersioning）。status 为 nil（空 body）→ 不改 versioning；
+  显式 "Enabled"/"Suspended" → 更新。mfa 非 nil → 更新 mfa_delete。桶不存在 → :not_found。
+  """
+  @spec put_versioning(String.t(), String.t() | nil, String.t() | nil) :: :ok | {:error, :not_found}
+  def put_versioning(name, status, mfa) do
+    case lookup(name) do
+      {:ok, bucket} ->
+        changes =
+          %{}
+          |> then(fn m -> if status, do: Map.put(m, :versioning, status), else: m end)
+          |> then(fn m -> if mfa, do: Map.put(m, :mfa_delete, mfa), else: m end)
+
+        if changes == %{} do
+          :ok
+        else
+          bucket |> Bucket.changeset(changes) |> Repo.update!()
+          :ok
+        end
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
   @doc "列出全部桶，按名升序（ListBuckets 用）。"
   @spec list() :: [Bucket.t()]
   def list, do: Repo.all(from b in Bucket, order_by: [asc: b.name])

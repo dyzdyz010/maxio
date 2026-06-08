@@ -8,6 +8,7 @@ defmodule Maxio.Objects do
   alias Maxio.Repo
   alias Maxio.Buckets
   alias Maxio.Objects.Object
+  alias Maxio.Versioning.VersionId
 
   @type list_opts :: %{
           optional(:prefix) => String.t(),
@@ -26,8 +27,9 @@ defmodule Maxio.Objects do
         }
 
   @doc """
-  写入/覆盖对象元数据（按 (bucket, key) upsert）。`attrs` 至少含 size、etag；
-  可含 content_type、metadata、storage_class。桶不存在 → {:error, :no_such_bucket}。
+  写入/覆盖对象元数据（按 (bucket, key) 的 "null" 版本行 upsert，并置 latest）。`attrs` 至少含
+  size、etag；可含 content_type、metadata、storage_class。桶不存在 → {:error, :no_such_bucket}。
+  CopyObject / Multipart Complete 走此路径（字节落 null 路径，对象当 null 版本）。
   """
   @spec put_metadata(String.t(), String.t(), map()) ::
           {:ok, Object.t()} | {:error, :no_such_bucket | Ecto.Changeset.t()}
@@ -42,17 +44,37 @@ defmodule Maxio.Objects do
         content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
         metadata: Map.get(attrs, :metadata, %{}),
         storage_class: Map.get(attrs, :storage_class, "STANDARD"),
-        acl_canned: Map.get(attrs, :acl_canned, "private")
+        acl_canned: Map.get(attrs, :acl_canned, "private"),
+        version_id: "null",
+        is_latest: true,
+        is_delete_marker: false
       }
 
-      %Object{}
-      |> Object.changeset(base)
-      |> Repo.insert(
-        on_conflict:
-          {:replace,
-           [:size, :etag, :content_type, :metadata, :storage_class, :acl_canned, :updated_at]},
-        conflict_target: [:bucket_id, :key]
-      )
+      Repo.transaction(fn ->
+        unset_latest(bucket.id, key)
+
+        {:ok, obj} =
+          %Object{}
+          |> Object.changeset(base)
+          |> Repo.insert(
+            on_conflict:
+              {:replace,
+               [
+                 :size,
+                 :etag,
+                 :content_type,
+                 :metadata,
+                 :storage_class,
+                 :acl_canned,
+                 :is_latest,
+                 :is_delete_marker,
+                 :updated_at
+               ]},
+            conflict_target: [:bucket_id, :key, :version_id]
+          )
+
+        obj
+      end)
     end
   end
 
@@ -69,10 +91,19 @@ defmodule Maxio.Objects do
     end
   end
 
-  @doc "按 (bucket, key) 取对象元数据。"
+  @doc "按 (bucket, key) 取当前版本（is_latest=true）的对象元数据。delete marker 也会返回（调用方判 is_delete_marker）。"
   @spec get_metadata(String.t(), String.t()) :: {:ok, Object.t()} | {:error, :not_found}
   def get_metadata(bucket_name, key) do
-    case Repo.get_by(Object, bucket_name: bucket_name, key: key) do
+    case Repo.get_by(Object, bucket_name: bucket_name, key: key, is_latest: true) do
+      nil -> {:error, :not_found}
+      object -> {:ok, object}
+    end
+  end
+
+  @doc "按 (bucket, key, version_id) 取特定版本行。"
+  @spec get_version(String.t(), String.t(), String.t()) :: {:ok, Object.t()} | {:error, :not_found}
+  def get_version(bucket_name, key, version_id) do
+    case Repo.get_by(Object, bucket_name: bucket_name, key: key, version_id: version_id) do
       nil -> {:error, :not_found}
       object -> {:ok, object}
     end
@@ -83,6 +114,152 @@ defmodule Maxio.Objects do
   def delete_metadata(bucket_name, key) do
     Repo.delete_all(from o in Object, where: o.bucket_name == ^bucket_name and o.key == ^key)
     :ok
+  end
+
+  @doc """
+  按桶版本化状态写入一个对象版本（PutObject 的元数据落库）。
+  versioning ∈ "Enabled" | "Suspended" | "Unversioned"：
+    * Enabled → 生成新 ULID version_id，插入新行并置 latest（旧 latest 置 false）。
+    * Suspended/Unversioned → version_id="null"，upsert 既有 null 行并置 latest（其余非 null 版本不动）。
+  attrs 至少含 size、etag；可含 content_type/metadata/storage_class/acl_canned/tags/sse_algorithm。
+  返回 {:ok, Object.t()}（含其 version_id）。
+  """
+  @spec put_version(String.t(), String.t(), String.t(), map()) ::
+          {:ok, Object.t()} | {:error, :no_such_bucket | Ecto.Changeset.t()}
+  def put_version(bucket_name, key, versioning, attrs) do
+    version_id = if versioning == "Enabled", do: VersionId.generate(), else: "null"
+    put_version_with_id(bucket_name, key, version_id, attrs)
+  end
+
+  @doc "用外部已生成的 version_id 写入版本行（PutObject 路径：字节已按此 version_id 落盘）。"
+  @spec put_version_with_id(String.t(), String.t(), String.t(), map()) ::
+          {:ok, Object.t()} | {:error, :no_such_bucket | Ecto.Changeset.t()}
+  def put_version_with_id(bucket_name, key, version_id, attrs) do
+    with {:ok, bucket} <- bucket_or_error(bucket_name) do
+      base =
+        attrs
+        |> Map.take([:content_type, :metadata, :storage_class, :acl_canned, :tags, :sse_algorithm])
+        |> Map.merge(%{
+          bucket_id: bucket.id,
+          bucket_name: bucket_name,
+          key: key,
+          size: Map.fetch!(attrs, :size),
+          etag: Map.fetch!(attrs, :etag),
+          version_id: version_id,
+          is_latest: true,
+          is_delete_marker: false
+        })
+
+      Repo.transaction(fn ->
+        unset_latest(bucket.id, key)
+
+        case %Object{}
+             |> Object.changeset(base)
+             |> Repo.insert(
+               on_conflict:
+                 {:replace,
+                  [
+                    :size,
+                    :etag,
+                    :content_type,
+                    :metadata,
+                    :storage_class,
+                    :acl_canned,
+                    :is_latest,
+                    :is_delete_marker,
+                    :updated_at
+                  ]},
+               conflict_target: [:bucket_id, :key, :version_id]
+             ) do
+          {:ok, obj} -> obj
+          {:error, cs} -> Repo.rollback(cs)
+        end
+      end)
+    end
+  end
+
+  @doc """
+  插入删除标记（DELETE 无 versionId，桶 Enabled/Suspended）。
+  Enabled → 新 ULID delete marker 置 latest；Suspended → "null" delete marker upsert 置 latest。
+  返回 {:ok, %{version_id}}。
+  """
+  @spec insert_delete_marker(String.t(), String.t(), String.t()) ::
+          {:ok, %{version_id: String.t()}} | {:error, :no_such_bucket}
+  def insert_delete_marker(bucket_name, key, versioning) do
+    with {:ok, bucket} <- bucket_or_error(bucket_name) do
+      version_id = if versioning == "Enabled", do: VersionId.generate(), else: "null"
+
+      base = %{
+        bucket_id: bucket.id,
+        bucket_name: bucket_name,
+        key: key,
+        size: 0,
+        etag: "",
+        version_id: version_id,
+        is_latest: true,
+        is_delete_marker: true
+      }
+
+      Repo.transaction(fn ->
+        unset_latest(bucket.id, key)
+
+        {:ok, _} =
+          %Object{}
+          |> Object.changeset(base)
+          |> Repo.insert(
+            on_conflict: {:replace, [:size, :etag, :is_latest, :is_delete_marker, :updated_at]},
+            conflict_target: [:bucket_id, :key, :version_id]
+          )
+      end)
+
+      {:ok, %{version_id: version_id}}
+    end
+  end
+
+  @doc """
+  永久删除某特定版本行（DELETE ?versionId）。删后若被删的是当时的 latest，则把该 key 余下
+  version_id 最大者重新置 latest（delete marker 的删除会让更老版本重新浮现，对齐 AWS）。
+  返回 {:ok, %{was_delete_marker: boolean()}} | {:error, :not_found}。
+  """
+  @spec delete_version(String.t(), String.t(), String.t()) ::
+          {:ok, %{was_delete_marker: boolean()}} | {:error, :not_found}
+  def delete_version(bucket_name, key, version_id) do
+    case get_version(bucket_name, key, version_id) do
+      {:error, :not_found} ->
+        {:error, :not_found}
+
+      {:ok, %Object{} = obj} ->
+        Repo.transaction(fn ->
+          Repo.delete!(obj)
+
+          if obj.is_latest do
+            promote_latest(obj.bucket_id, key)
+          end
+        end)
+
+        {:ok, %{was_delete_marker: obj.is_delete_marker}}
+    end
+  end
+
+  # 把该 (bucket,key) 现有 latest 行全部置 false（写新版本前调用，事务内）。
+  defp unset_latest(bucket_id, key) do
+    from(o in Object, where: o.bucket_id == ^bucket_id and o.key == ^key and o.is_latest == true)
+    |> Repo.update_all(set: [is_latest: false])
+  end
+
+  # 删 latest 后，把余下 version_id 最大（最新）的行重新置 latest（无余下行则无操作）。
+  defp promote_latest(bucket_id, key) do
+    candidate =
+      from(o in Object,
+        where: o.bucket_id == ^bucket_id and o.key == ^key,
+        order_by: [desc: o.version_id],
+        limit: 1
+      )
+      |> Repo.one()
+
+    if candidate do
+      candidate |> Ecto.Changeset.change(is_latest: true) |> Repo.update!()
+    end
   end
 
   @doc """

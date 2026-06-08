@@ -12,16 +12,19 @@ defmodule Maxio.Storage.FS do
   @chunk_size 1_048_576
 
   @impl true
-  def put(bucket, key, chunks, opts \\ []), do: do_put(bucket, key, chunks, opts)
+  def put(bucket, key, version_id \\ "null", chunks, opts \\ [])
+  def put(bucket, key, version_id, chunks, opts), do: do_put(bucket, key, version_id, chunks, opts)
 
   @impl true
-  def get(bucket, key, range \\ nil, opts \\ []), do: do_get(bucket, key, range, opts)
+  def get(bucket, key, version_id \\ "null", range \\ nil, opts \\ []),
+    do: do_get(bucket, key, version_id, range, opts)
 
   @impl true
-  def stat(bucket, key, opts \\ []), do: do_stat(bucket, key, opts)
+  def stat(bucket, key, version_id \\ "null", opts \\ []), do: do_stat(bucket, key, version_id, opts)
 
   @impl true
-  def delete(bucket, key, opts \\ []), do: do_delete(bucket, key, opts)
+  def delete(bucket, key, version_id \\ "null", opts \\ []),
+    do: do_delete(bucket, key, version_id, opts)
 
   @impl true
   def put_bucket(bucket, opts \\ []), do: do_put_bucket(bucket, opts)
@@ -49,8 +52,8 @@ defmodule Maxio.Storage.FS do
   def abort_upload(bucket, key, upload_id, opts \\ []),
     do: do_abort_upload(bucket, key, upload_id, opts)
 
-  defp do_put(bucket, key, chunks, opts) do
-    with {:ok, path} <- object_path(bucket, key, opts) do
+  defp do_put(bucket, key, version_id, chunks, opts) do
+    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
       File.mkdir_p!(Path.dirname(path))
       {:ok, fd} = File.open(path, [:write, :binary, :raw])
 
@@ -73,8 +76,8 @@ defmodule Maxio.Storage.FS do
     end
   end
 
-  defp do_get(bucket, key, range, opts) do
-    with {:ok, path} <- object_path(bucket, key, opts) do
+  defp do_get(bucket, key, version_id, range, opts) do
+    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
       case File.stat(path) do
         {:ok, %File.Stat{size: total}} -> {:ok, stream_file(path, range, total)}
         {:error, :enoent} -> {:error, :enoent}
@@ -82,8 +85,8 @@ defmodule Maxio.Storage.FS do
     end
   end
 
-  defp do_stat(bucket, key, opts) do
-    with {:ok, path} <- object_path(bucket, key, opts) do
+  defp do_stat(bucket, key, version_id, opts) do
+    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
       case File.stat(path) do
         {:ok, %File.Stat{size: size}} -> {:ok, %{size: size}}
         {:error, :enoent} -> {:error, :enoent}
@@ -91,8 +94,8 @@ defmodule Maxio.Storage.FS do
     end
   end
 
-  defp do_delete(bucket, key, opts) do
-    with {:ok, path} <- object_path(bucket, key, opts) do
+  defp do_delete(bucket, key, version_id, opts) do
+    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
       case File.rm(path) do
         :ok -> :ok
         {:error, :enoent} -> :ok
@@ -115,7 +118,7 @@ defmodule Maxio.Storage.FS do
   end
 
   defp do_put_part(bucket, key, upload_id, part_number, chunks, opts) do
-    with {:ok, _obj} <- object_path(bucket, key, opts) do
+    with {:ok, _obj} <- object_path(bucket, key, "null", opts) do
       path = part_path(bucket, upload_id, part_number, opts)
       File.mkdir_p!(Path.dirname(path))
       {:ok, fd} = File.open(path, [:write, :binary, :raw])
@@ -139,7 +142,7 @@ defmodule Maxio.Storage.FS do
   end
 
   defp do_get_part_stream(bucket, key, upload_id, part_number, opts) do
-    with {:ok, _obj} <- object_path(bucket, key, opts) do
+    with {:ok, _obj} <- object_path(bucket, key, "null", opts) do
       path = part_path(bucket, upload_id, part_number, opts)
 
       case File.stat(path) do
@@ -150,7 +153,7 @@ defmodule Maxio.Storage.FS do
   end
 
   defp do_assemble(bucket, key, upload_id, part_numbers, opts) do
-    with {:ok, obj_path} <- object_path(bucket, key, opts) do
+    with {:ok, obj_path} <- object_path(bucket, key, "null", opts) do
       File.mkdir_p!(Path.dirname(obj_path))
       {:ok, out} = File.open(obj_path, [:write, :binary, :raw])
 
@@ -238,10 +241,22 @@ defmodule Maxio.Storage.FS do
 
   defp bucket_path(bucket, opts), do: Path.join(data_dir(opts), bucket)
 
-  defp object_path(bucket, key, opts) do
+  # version_id == "null"（无版本）→ 落原路径 <data_dir>/<bucket>/<key>（向后兼容既有对象）。
+  # 否则落版本化路径 <data_dir>/.versions/<bucket>/<key>/<version_id>（与对象路径物理隔离，避免与 key 命名冲突）。
+  defp object_path(bucket, key, "null", opts) do
     case safe_relative(key) do
       {:ok, rel} -> {:ok, Path.join([data_dir(opts), bucket, rel])}
       :error -> {:error, :invalid_key}
+    end
+  end
+
+  defp object_path(bucket, key, version_id, opts) do
+    case safe_relative(key) do
+      {:ok, rel} ->
+        {:ok, Path.join([data_dir(opts), ".versions", bucket, rel, version_id])}
+
+      :error ->
+        {:error, :invalid_key}
     end
   end
 

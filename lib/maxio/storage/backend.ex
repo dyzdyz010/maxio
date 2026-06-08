@@ -16,13 +16,13 @@ defmodule Maxio.Storage.Backend do
   @type range :: nil | {non_neg_integer(), non_neg_integer()}
   @type put_result :: %{size: non_neg_integer(), etag: String.t(), sha256: String.t()}
 
-  @callback put(bucket(), key(), chunks :: Enumerable.t(), opts :: keyword()) ::
+  @callback put(bucket(), key(), version_id :: String.t(), chunks :: Enumerable.t(), opts :: keyword()) ::
               {:ok, put_result()} | {:error, term()}
-  @callback get(bucket(), key(), range()) ::
+  @callback get(bucket(), key(), version_id :: String.t(), range()) ::
               {:ok, Enumerable.t()} | {:error, :enoent | term()}
-  @callback stat(bucket(), key()) ::
+  @callback stat(bucket(), key(), version_id :: String.t()) ::
               {:ok, %{size: non_neg_integer()}} | {:error, :enoent}
-  @callback delete(bucket(), key()) :: :ok | {:error, term()}
+  @callback delete(bucket(), key(), version_id :: String.t()) :: :ok | {:error, term()}
   @callback put_bucket(bucket()) :: :ok | {:error, term()}
   @callback delete_bucket(bucket()) :: :ok | {:error, term()}
 

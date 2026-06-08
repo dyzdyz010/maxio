@@ -38,7 +38,7 @@ defmodule Maxio.MultipartTest do
 
       assert size == 7
       assert String.ends_with?(etag, "-2")
-      assert {:ok, stream} = Maxio.Storage.get("mp-bucket", "obj", nil)
+      assert {:ok, stream} = Maxio.Storage.get("mp-bucket", "obj", "null", nil)
       assert IO.iodata_to_binary(Enum.to_list(stream)) == "AAAAABB"
     end
 

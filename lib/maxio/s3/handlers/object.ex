@@ -30,34 +30,39 @@ defmodule Maxio.S3.Handlers.Object do
     payload_mode = conn.assigns.payload_mode
     chunks = BodyReader.stream(conn, payload_mode)
 
-    case Storage.put(bucket, key, chunks) do
+    # 版本字节路径对齐：先按桶 versioning 算 version_id（Enabled→新 ULID，否则 "null"），
+    # 字节流式写入该 version_id 路径；落库用同一 version_id（铁律 4：不缓冲重写）。
+    versioning = bucket_versioning(bucket)
+    version_id = if versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
+
+    case Storage.put(bucket, key, version_id, chunks) do
       {:ok, %{size: size, etag: etag, sha256: sha256}} ->
         # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
-        try do
-          :ok = verify_decoded_length!(conn, payload_mode, size)
-          :ok = verify_content_sha256!(conn, payload_mode, sha256)
+        {:ok, obj} =
+          try do
+            :ok = verify_decoded_length!(conn, payload_mode, size)
+            :ok = verify_content_sha256!(conn, payload_mode, sha256)
 
-          {:ok, _obj} =
-            Objects.put_metadata(bucket, key, %{
+            Objects.put_version_with_id(bucket, key, version_id, %{
               size: size,
               etag: etag,
               content_type: content_type,
               storage_class: "STANDARD",
               acl_canned: header(conn, "x-amz-acl") || "private"
             })
-        rescue
-          err ->
-            _ = Storage.delete(bucket, key)
+          rescue
+            err ->
+              _ = Storage.delete(bucket, key, version_id)
 
-            Log.warn("put object rolled back orphan bytes",
-              action: :put_object,
-              bucket: bucket,
-              key: key,
-              reason: :incomplete_body
-            )
+              Log.warn("put object rolled back orphan bytes",
+                action: :put_object,
+                bucket: bucket,
+                key: key,
+                reason: :incomplete_body
+              )
 
-            reraise(err, __STACKTRACE__)
-        end
+              reraise(err, __STACKTRACE__)
+          end
 
         Log.info("put object",
           action: :put_object,
@@ -68,6 +73,7 @@ defmodule Maxio.S3.Handlers.Object do
         )
 
         conn
+        |> maybe_put_version_id(obj.version_id)
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
 
@@ -83,29 +89,51 @@ defmodule Maxio.S3.Handlers.Object do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
+    conn = fetch_query_params(conn)
+    _ = ensure_bucket!(bucket)
 
-    {object, total} = object_or_raise(bucket, key)
+    version_id = Map.get(conn.query_params, "versionId")
+    {object, total} = resolve_object_for_get!(bucket, key, version_id)
 
-    # 条件头（If-*）按 RFC 7232 §6 次序求值。304/412 不应有 body（304 尤其禁止），
-    # 故 GET 的 304 直接 send_resp(304, "")，412 raise PreconditionFailed（带 XML body，符合 S3）。
-    case Conditional.evaluate(conn.req_headers, meta(object), "GET") do
-      :proceed ->
-        range = parse_range(header(conn, "range"), total)
+    cond do
+      object.is_delete_marker and version_id == nil ->
+        # current 是 delete marker，简单 GET → 404 + x-amz-delete-marker
+        conn
+        |> put_resp_header("x-amz-delete-marker", "true")
+        |> maybe_put_version_id(object.version_id)
+        |> send_resp(404, "")
 
-        case range do
-          :invalid ->
-            raise Error.new(:invalid_range, resource: "/#{bucket}/#{key}", extra: %{total: total})
+      object.is_delete_marker ->
+        # ?versionId 指向 delete marker → 405 + headers
+        conn
+        |> put_resp_header("x-amz-delete-marker", "true")
+        |> put_resp_header("last-modified", http_date(object.updated_at))
+        |> maybe_put_version_id(object.version_id)
+        |> send_resp(405, "")
 
-          _ ->
-            {:ok, stream} = Storage.get(bucket, key, range_tuple(range))
-            send_object(conn, object, total, range, stream)
+      true ->
+        # 条件头（If-*）按 RFC 7232 §6 次序求值。304/412 不应有 body（304 尤其禁止），
+        # 故 GET 的 304 直接 send_resp(304, "")，412 raise PreconditionFailed（带 XML body，符合 S3）。
+        case Conditional.evaluate(conn.req_headers, meta(object), "GET") do
+          :proceed ->
+            range = parse_range(header(conn, "range"), total)
+
+            case range do
+              :invalid ->
+                raise Error.new(:invalid_range, resource: "/#{bucket}/#{key}", extra: %{total: total})
+
+              _ ->
+                {:ok, stream} = Storage.get(bucket, key, object.version_id, range_tuple(range))
+                conn = maybe_put_version_id(conn, object.version_id)
+                send_object(conn, object, total, range, stream)
+            end
+
+          {:respond, 304} ->
+            send_resp(conn, 304, "")
+
+          {:error, :precondition_failed} ->
+            raise Error.new(:precondition_failed, resource: "/#{bucket}/#{key}")
         end
-
-      {:respond, 304} ->
-        send_resp(conn, 304, "")
-
-      {:error, :precondition_failed} ->
-        raise Error.new(:precondition_failed, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -113,21 +141,40 @@ defmodule Maxio.S3.Handlers.Object do
   def head(conn) do
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
+    conn = fetch_query_params(conn)
+    version_id = Map.get(conn.query_params, "versionId")
 
     with {:ok, _b} <- Buckets.lookup(bucket),
-         {:ok, object} <- Objects.get_metadata(bucket, key) do
-      # HEAD 条件头：304/412 都无 body（HEAD 禁止 body），直接 send_resp。
-      case Conditional.evaluate(conn.req_headers, meta(object), "HEAD") do
-        :proceed ->
+         {:ok, object} <- fetch_for_head(bucket, key, version_id) do
+      cond do
+        object.is_delete_marker and version_id == nil ->
           conn
-          |> put_common_object_headers(object, object.size)
-          |> send_resp(200, "")
+          |> put_resp_header("x-amz-delete-marker", "true")
+          |> maybe_put_version_id(object.version_id)
+          |> send_resp(404, "")
 
-        {:respond, 304} ->
-          send_resp(conn, 304, "")
+        object.is_delete_marker ->
+          conn
+          |> put_resp_header("x-amz-delete-marker", "true")
+          |> put_resp_header("last-modified", http_date(object.updated_at))
+          |> maybe_put_version_id(object.version_id)
+          |> send_resp(405, "")
 
-        {:error, :precondition_failed} ->
-          send_resp(conn, 412, "")
+        true ->
+          # HEAD 条件头：304/412 都无 body（HEAD 禁止 body），直接 send_resp。
+          case Conditional.evaluate(conn.req_headers, meta(object), "HEAD") do
+            :proceed ->
+              conn
+              |> maybe_put_version_id(object.version_id)
+              |> put_common_object_headers(object, object.size)
+              |> send_resp(200, "")
+
+            {:respond, 304} ->
+              send_resp(conn, 304, "")
+
+            {:error, :precondition_failed} ->
+              send_resp(conn, 412, "")
+          end
       end
     else
       {:error, :not_found} ->
@@ -137,16 +184,54 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
+  defp fetch_for_head(bucket, key, nil), do: Objects.get_metadata(bucket, key)
+  defp fetch_for_head(bucket, key, version_id), do: Objects.get_version(bucket, key, version_id)
+
   @spec delete(Plug.Conn.t()) :: Plug.Conn.t()
   def delete(conn) do
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
+    conn = fetch_query_params(conn)
     _ = ensure_bucket!(bucket)
 
-    :ok = Objects.delete_metadata(bucket, key)
-    _ = Storage.delete(bucket, key)
-    Log.info("delete object", action: :delete_object, bucket: bucket, key: key)
-    send_resp(conn, 204, "")
+    version_id = Map.get(conn.query_params, "versionId")
+    versioning = bucket_versioning(bucket)
+
+    cond do
+      version_id != nil ->
+        # 永久删除指定版本（含 delete marker）。
+        case Objects.delete_version(bucket, key, version_id) do
+          {:ok, %{was_delete_marker: dm?}} ->
+            _ = Storage.delete(bucket, key, version_id)
+            Log.info("delete object version", action: :delete_object, bucket: bucket, key: key)
+
+            conn
+            |> put_resp_header("x-amz-version-id", version_id)
+            |> then(fn c -> if dm?, do: put_resp_header(c, "x-amz-delete-marker", "true"), else: c end)
+            |> send_resp(204, "")
+
+          {:error, :not_found} ->
+            # 幂等：删不存在的版本也回 204（对齐 AWS）。
+            conn |> put_resp_header("x-amz-version-id", version_id) |> send_resp(204, "")
+        end
+
+      versioning in ["Enabled", "Suspended"] ->
+        # 插入 delete marker（Enabled 新 ULID；Suspended null）。
+        {:ok, %{version_id: dm_vid}} = Objects.insert_delete_marker(bucket, key, versioning)
+        Log.info("delete object marker", action: :delete_object, bucket: bucket, key: key)
+
+        conn
+        |> maybe_put_version_id(dm_vid)
+        |> put_resp_header("x-amz-delete-marker", "true")
+        |> send_resp(204, "")
+
+      true ->
+        # Unversioned：真删（删 null 行 + 字节）。
+        :ok = Objects.delete_metadata(bucket, key)
+        _ = Storage.delete(bucket, key)
+        Log.info("delete object", action: :delete_object, bucket: bucket, key: key)
+        send_resp(conn, 204, "")
+    end
   end
 
   @spec delete_objects(Plug.Conn.t()) :: Plug.Conn.t()
@@ -253,11 +338,11 @@ defmodule Maxio.S3.Handlers.Object do
     |> send_resp(200, body)
   end
 
-  # 非自拷贝：直接流式读源写目标。
+  # 非自拷贝：直接流式读源写目标（均走 null 版本路径——拷贝目标当 null 版本，对齐 put_metadata）。
   defp copy_bytes(false, src_bucket, src_key, dest_bucket, dest_key) do
-    {:ok, src_stream} = Storage.get(src_bucket, src_key, nil)
+    {:ok, src_stream} = Storage.get(src_bucket, src_key, "null", nil)
 
-    case Storage.put(dest_bucket, dest_key, src_stream) do
+    case Storage.put(dest_bucket, dest_key, "null", src_stream) do
       {:ok, %{size: size, etag: etag}} -> {size, etag}
       {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
     end
@@ -267,19 +352,19 @@ defmodule Maxio.S3.Handlers.Object do
   defp copy_bytes(true, src_bucket, src_key, dest_bucket, dest_key) do
     suffix = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
     tmp_key = dest_key <> ".maxio-copytmp-" <> suffix
-    {:ok, src_stream} = Storage.get(src_bucket, src_key, nil)
+    {:ok, src_stream} = Storage.get(src_bucket, src_key, "null", nil)
 
-    case Storage.put(dest_bucket, tmp_key, src_stream) do
+    case Storage.put(dest_bucket, tmp_key, "null", src_stream) do
       {:ok, _tmp} ->
-        {:ok, tmp_stream} = Storage.get(dest_bucket, tmp_key, nil)
+        {:ok, tmp_stream} = Storage.get(dest_bucket, tmp_key, "null", nil)
 
         result =
-          case Storage.put(dest_bucket, dest_key, tmp_stream) do
+          case Storage.put(dest_bucket, dest_key, "null", tmp_stream) do
             {:ok, %{size: size, etag: etag}} -> {size, etag}
             {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
           end
 
-        _ = Storage.delete(dest_bucket, tmp_key)
+        _ = Storage.delete(dest_bucket, tmp_key, "null")
         result
 
       {:error, reason} ->
@@ -441,6 +526,33 @@ defmodule Maxio.S3.Handlers.Object do
       {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
     end
   end
+
+  # version_id == nil → 取当前版本（latest）；否则取指定版本行。缺失 → NoSuchKey。
+  defp resolve_object_for_get!(bucket, key, nil) do
+    case Objects.get_metadata(bucket, key) do
+      {:ok, object} -> {object, object.size}
+      {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  defp resolve_object_for_get!(bucket, key, version_id) do
+    case Objects.get_version(bucket, key, version_id) do
+      {:ok, object} -> {object, object.size}
+      {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  # 桶版本化状态（Unversioned|Enabled|Suspended）。
+  defp bucket_versioning(bucket) do
+    case Buckets.lookup(bucket) do
+      {:ok, %{versioning: v}} when is_binary(v) -> v
+      _ -> "Unversioned"
+    end
+  end
+
+  # 仅当版本非 "null" 时回显 x-amz-version-id（Unversioned 桶不带该头，对齐 AWS）。
+  defp maybe_put_version_id(conn, "null"), do: conn
+  defp maybe_put_version_id(conn, version_id), do: put_resp_header(conn, "x-amz-version-id", version_id)
 
   # 流式 PUT 解帧后长度须等于声明的 decoded-content-length（aws-chunked 完整性闸，铁律 3）。
   defp verify_decoded_length!(conn, :streaming, actual_size) do

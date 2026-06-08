@@ -34,7 +34,7 @@ defmodule Maxio.Storage.FSPartsTest do
     {:ok, _} = FS.put_part("b", "big", "uid2", 2, ["DEF"], opts(dir))
     {:ok, _} = FS.put_part("b", "big", "uid2", 1, ["ABC"], opts(dir))
     {:ok, %{size: 6}} = FS.assemble("b", "big", "uid2", [1, 2], opts(dir))
-    {:ok, stream} = FS.get("b", "big", nil, opts(dir))
+    {:ok, stream} = FS.get("b", "big", "null", nil, opts(dir))
     assert IO.iodata_to_binary(Enum.to_list(stream)) == "ABCDEF"
   end
 
