@@ -39,6 +39,11 @@ defmodule MaxioWeb.Router do
       #   BucketLive.Index → M5-4；AccessKeyLive.Index → M5-8。
       live "/buckets", BucketLive.Index, :index
       live "/buckets/:bucket/browse", ObjectLive.Index, :index
+      # M5-5 的 ObjectLive.Index 行内对象名链接用
+      # `~p"/buckets/#{bucket}/object/#{key}"`；Phoenix 1.8 验证路由 + __checks__ 要求
+      # 该路由与目标 LiveView 编译期即存在。故此处先挂最小占位 ObjectLive.Show
+      # （同 M5-1/M5-2/M5-3/M5-4 占位模式），M5-6 「完整替换」。
+      live "/buckets/:bucket/object/*key", ObjectLive.Show, :show
       # M5-4 的 buckets 列表行（及 M5-5 对象浏览器顶栏）用
       # `~p"/buckets/#{bucket}/settings"` 设置链接；Phoenix 1.8 验证路由 + __checks__
       # 要求该路由与目标 LiveView 模块编译期即存在。故此处先挂最小占位
@@ -46,6 +51,11 @@ defmodule MaxioWeb.Router do
       live "/buckets/:bucket/settings", BucketLive.Settings, :show
       live "/access-keys", AccessKeyLive.Index, :index
     end
+
+    # 纯 controller（非 LiveView）流式下载（send_chunked + reduce_while，绝不全缓冲，
+    # 铁律 4）。live_session 外、:browser 管线内——M5-5 的 ObjectLive.Index 行内
+    # `~p"/buckets/#{bucket}/download/#{key}"` 链接需此路由编译期存在。
+    get "/buckets/:bucket/download/*key", DownloadController, :show
   end
 
   # Other scopes may use custom stacks.
