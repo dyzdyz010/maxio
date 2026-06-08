@@ -33,6 +33,8 @@ defmodule Maxio.Test.SigV4Request do
     query = Keyword.get(opts, :query, %{})
     extra_headers = Keyword.get(opts, :headers, [])
     body = Keyword.get(opts, :body, "")
+    access_key = Keyword.get(opts, :access_key, @access_key)
+    secret = Keyword.get(opts, :secret, @secret)
 
     now = DateTime.utc_now()
     amz_date = Calendar.strftime(now, "%Y%m%dT%H%M%SZ")
@@ -59,12 +61,12 @@ defmodule Maxio.Test.SigV4Request do
 
     canonical = Canonical.canonical_request(canonical_req)
     sts = Signer.string_to_sign(amz_date, scope, canonical, "AWS4-HMAC-SHA256")
-    key = Signer.derive_signing_key(@secret, scope_date, @region, @service)
+    key = Signer.derive_signing_key(secret, scope_date, @region, @service)
     signature = Signer.signature(key, sts)
     signed_headers = Canonical.signed_headers(base_headers)
 
     auth =
-      "AWS4-HMAC-SHA256 Credential=#{@access_key}/#{scope}," <>
+      "AWS4-HMAC-SHA256 Credential=#{access_key}/#{scope}," <>
         "SignedHeaders=#{signed_headers},Signature=#{signature}"
 
     query_string = URI.encode_query(query)
