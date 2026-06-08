@@ -1,0 +1,162 @@
+defmodule Maxio.S3.IntegrationTest do
+  use Maxio.DataCase, async: false
+
+  import Plug.Conn
+  alias Maxio.Test.SigV4Request
+  alias Maxio.S3.Endpoint
+
+  @data_dir Path.join(System.tmp_dir!(), "maxio_int_test")
+
+  setup do
+    # 隔离对象数据目录（避免污染 dev/test 共享目录）
+    File.rm_rf(@data_dir)
+    File.mkdir_p!(@data_dir)
+    prev = Application.get_env(:maxio, :s3)
+    Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
+
+    on_exit(fn ->
+      Application.put_env(:maxio, :s3, prev)
+      File.rm_rf(@data_dir)
+    end)
+
+    :ok
+  end
+
+  defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
+
+  test "CreateBucket → 200 + Location 头" do
+    conn = SigV4Request.signed_conn(:put, "/mybucket") |> call()
+    assert conn.status == 200
+    assert get_resp_header(conn, "location") == ["/mybucket"]
+  end
+
+  test "ListBuckets 列出已创建的桶" do
+    SigV4Request.signed_conn(:put, "/b-one") |> call()
+    SigV4Request.signed_conn(:put, "/b-two") |> call()
+
+    conn = SigV4Request.signed_conn(:get, "/") |> call()
+    assert conn.status == 200
+    assert conn.resp_body =~ "<Name>b-one</Name>"
+    assert conn.resp_body =~ "<Name>b-two</Name>"
+  end
+
+  test "PutObject 流式 → GetObject 取回完整内容 + ETag" do
+    SigV4Request.signed_conn(:put, "/data") |> call()
+
+    body = "Welcome to Amazon S3."
+
+    put =
+      SigV4Request.signed_conn(:put, "/data/hello.txt",
+        body: body,
+        headers: [{"content-type", "text/plain"}]
+      )
+      |> call()
+
+    assert put.status == 200
+    expected_etag = "\"" <> (:crypto.hash(:md5, body) |> Base.encode16(case: :lower)) <> "\""
+    assert get_resp_header(put, "etag") == [expected_etag]
+
+    get = SigV4Request.signed_conn(:get, "/data/hello.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == body
+    assert get_resp_header(get, "content-type") == ["text/plain"]
+    assert get_resp_header(get, "etag") == [expected_etag]
+  end
+
+  test "GetObject Range → 206 + Content-Range + 区间内容" do
+    SigV4Request.signed_conn(:put, "/data") |> call()
+    SigV4Request.signed_conn(:put, "/data/r.txt", body: "0123456789") |> call()
+
+    get = SigV4Request.signed_conn(:get, "/data/r.txt", headers: [{"range", "bytes=2-5"}]) |> call()
+    assert get.status == 206
+    assert get_resp_header(get, "content-range") == ["bytes 2-5/10"]
+    assert get.resp_body == "2345"
+  end
+
+  test "HeadObject → 200 空体 + 元数据头" do
+    SigV4Request.signed_conn(:put, "/data") |> call()
+    SigV4Request.signed_conn(:put, "/data/h.txt", body: "abc") |> call()
+
+    head = SigV4Request.signed_conn(:head, "/data/h.txt") |> call()
+    assert head.status == 200
+    assert head.resp_body == ""
+    assert get_resp_header(head, "content-length") == ["3"]
+  end
+
+  test "DeleteObject → 204；再 Get → 404 NoSuchKey" do
+    SigV4Request.signed_conn(:put, "/data") |> call()
+    SigV4Request.signed_conn(:put, "/data/d.txt", body: "x") |> call()
+
+    del = SigV4Request.signed_conn(:delete, "/data/d.txt") |> call()
+    assert del.status == 204
+
+    get = SigV4Request.signed_conn(:get, "/data/d.txt") |> call()
+    assert get.status == 404
+    assert get.resp_body =~ "<Code>NoSuchKey</Code>"
+  end
+
+  test "ListObjectsV2 prefix + delimiter → CommonPrefixes" do
+    SigV4Request.signed_conn(:put, "/listbk") |> call()
+
+    for k <- ~w(photos/2006/a photos/2007/b top.txt) do
+      SigV4Request.signed_conn(:put, "/listbk/#{k}", body: "z") |> call()
+    end
+
+    conn =
+      SigV4Request.signed_conn(:get, "/listbk",
+        query: %{"list-type" => "2", "prefix" => "photos/", "delimiter" => "/"}
+      )
+      |> call()
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "<CommonPrefixes><Prefix>photos/2006/</Prefix></CommonPrefixes>"
+    assert conn.resp_body =~ "<CommonPrefixes><Prefix>photos/2007/</Prefix></CommonPrefixes>"
+  end
+
+  test "GetBucketLocation us-east-1 返回空体" do
+    SigV4Request.signed_conn(:put, "/loc") |> call()
+    conn = SigV4Request.signed_conn(:get, "/loc", query: %{"location" => ""}) |> call()
+    assert conn.status == 200
+    assert conn.resp_body =~ "<LocationConstraint"
+    refute conn.resp_body =~ "us-east-1"
+  end
+
+  test "DeleteBucket 非空 → 409 BucketNotEmpty；空桶 → 204" do
+    SigV4Request.signed_conn(:put, "/delbk") |> call()
+    SigV4Request.signed_conn(:put, "/delbk/o", body: "x") |> call()
+
+    busy = SigV4Request.signed_conn(:delete, "/delbk") |> call()
+    assert busy.status == 409
+    assert busy.resp_body =~ "<Code>BucketNotEmpty</Code>"
+
+    SigV4Request.signed_conn(:delete, "/delbk/o") |> call()
+    ok = SigV4Request.signed_conn(:delete, "/delbk") |> call()
+    assert ok.status == 204
+  end
+
+  test "未知桶 GetObject → 404 NoSuchBucket" do
+    conn = SigV4Request.signed_conn(:get, "/ghost/key") |> call()
+    assert conn.status == 404
+    assert conn.resp_body =~ "<Code>NoSuchBucket</Code>"
+  end
+
+  test "篡改签名 → 403 SignatureDoesNotMatch（非静默）" do
+    # 取一个完全合法的自签请求，仅把 Authorization 头里的 Signature=<hex> 篡改为伪值，
+    # 其余（scope-date 与 x-amz-date 对齐、Credential、SignedHeaders）保持合法——
+    # 故解析/时钟/查 secret 均通过，唯独签名比对失败 → SignatureDoesNotMatch（铁律 3：非静默）。
+    conn = SigV4Request.signed_conn(:get, "/")
+    [auth] = get_req_header(conn, "authorization")
+
+    tampered_auth =
+      String.replace(
+        auth,
+        ~r/Signature=[0-9a-f]+$/,
+        "Signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+      )
+
+    bad = put_req_header(conn, "authorization", tampered_auth)
+    out = call(bad)
+    assert out.status == 403
+    assert out.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
+  end
+end
