@@ -13,6 +13,15 @@ defmodule Maxio.S3.Handlers.Object do
 
   @spec put(Plug.Conn.t()) :: Plug.Conn.t()
   def put(conn) do
+    # x-amz-copy-source 头存在 → 服务端拷贝（CopyObject）；否则普通上传（PutObject）。
+    case header(conn, "x-amz-copy-source") do
+      nil -> do_put(conn)
+      _src -> copy(conn)
+    end
+  end
+
+  @spec do_put(Plug.Conn.t()) :: Plug.Conn.t()
+  def do_put(conn) do
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
     _ = ensure_bucket!(bucket)
@@ -176,10 +185,118 @@ defmodule Maxio.S3.Handlers.Object do
     |> send_resp(200, body)
   end
 
+  @spec copy(Plug.Conn.t()) :: Plug.Conn.t()
+  def copy(conn) do
+    dest_bucket = conn.assigns.s3_bucket
+    dest_key = conn.assigns.s3_key
+    _ = ensure_bucket!(dest_bucket)
+
+    {src_bucket, src_key} = parse_copy_source!(header(conn, "x-amz-copy-source"))
+    {src_obj, _total} = object_or_raise(src_bucket, src_key)
+
+    # 源条件头（对源对象求值；失败 412）。
+    case eval_copy_source_conditions(conn, src_obj) do
+      :proceed ->
+        :ok
+
+      {:error, :precondition_failed} ->
+        raise Error.new(:precondition_failed, resource: "/#{src_bucket}/#{src_key}")
+    end
+
+    directive = header(conn, "x-amz-metadata-directive") || "COPY"
+
+    # 自拷贝守卫：src==dest 且 COPY 且无元数据变化 → 400 InvalidRequest。
+    if src_bucket == dest_bucket and src_key == dest_key and directive == "COPY" do
+      raise Error.new(:invalid_request,
+        message:
+          "This copy request is illegal because it is trying to copy an object to itself " <>
+            "without changing the object's metadata, storage class, website redirect location " <>
+            "or encryption attributes."
+      )
+    end
+
+    content_type =
+      case directive do
+        "REPLACE" -> header(conn, "content-type") || "binary/octet-stream"
+        _ -> src_obj.content_type
+      end
+
+    # 拷贝字节：读源流 → 写目标（FS put 重算 MD5；全量拷贝 ETag == 源 ETag，铁律 4 不全缓冲）。
+    {:ok, src_stream} = Storage.get(src_bucket, src_key, nil)
+
+    case Storage.put(dest_bucket, dest_key, src_stream) do
+      {:ok, %{size: size, etag: etag}} ->
+        {:ok, obj} =
+          Objects.put_metadata(dest_bucket, dest_key, %{
+            size: size,
+            etag: etag,
+            content_type: content_type,
+            storage_class: "STANDARD"
+          })
+
+        Log.info("copy object",
+          action: :copy_object,
+          bucket: dest_bucket,
+          key: dest_key,
+          src_bucket: src_bucket,
+          src_key: src_key
+        )
+
+        body =
+          Maxio.S3.Views.CopyObjectResult.render(%{etag: etag, last_modified: obj.updated_at})
+
+        conn
+        |> put_resp_content_type("application/xml")
+        |> send_resp(200, body)
+
+      {:error, reason} ->
+        raise Error.new(:internal_error, message: inspect(reason))
+    end
+  end
+
   # ── helpers ──
 
   # 条件头求值用的对象元信息（etag 无引号 hex；last_modified 用 updated_at）。
   defp meta(object), do: %{etag: object.etag, last_modified: object.updated_at}
+
+  # x-amz-copy-source 解析："/srcBucket/srcKey" | "srcBucket/srcKey"（URL 编码；忽略 ?versionId=）。
+  defp parse_copy_source!(raw) do
+    decoded = URI.decode(raw)
+    trimmed = String.replace_prefix(decoded, "/", "")
+    # 去掉 ?versionId=...（M2 无 versioning）。
+    [path | _] = String.split(trimmed, "?", parts: 2)
+
+    case String.split(path, "/", parts: 2) do
+      [bucket, key] when key != "" -> {bucket, key}
+      _ -> raise Error.new(:invalid_argument, message: "Invalid x-amz-copy-source")
+    end
+  end
+
+  # 源条件头（x-amz-copy-source-if-*）→ 复用 Conditional，先映射成标准头名再对源对象求值。
+  # 用 method="COPY"（非 GET/HEAD）：If-None-Match 命中 → 412（状态变更语义，非 304）。
+  defp eval_copy_source_conditions(conn, src_obj) do
+    mapped =
+      conn.req_headers
+      |> Enum.flat_map(fn {k, v} ->
+        case String.downcase(k) do
+          "x-amz-copy-source-if-match" -> [{"if-match", v}]
+          "x-amz-copy-source-if-none-match" -> [{"if-none-match", v}]
+          "x-amz-copy-source-if-modified-since" -> [{"if-modified-since", v}]
+          "x-amz-copy-source-if-unmodified-since" -> [{"if-unmodified-since", v}]
+          _ -> []
+        end
+      end)
+
+    case Conditional.evaluate(
+           mapped,
+           %{etag: src_obj.etag, last_modified: src_obj.updated_at},
+           "COPY"
+         ) do
+      :proceed -> :proceed
+      {:respond, 304} -> {:error, :precondition_failed}
+      {:error, :precondition_failed} -> {:error, :precondition_failed}
+    end
+  end
 
   # DeleteObjects 的小 XML 整读（带上限，铁律 4）。read_body 会推进 conn，
   # 返回后用推进过的 conn 发响应。

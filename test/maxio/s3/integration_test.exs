@@ -377,4 +377,55 @@ defmodule Maxio.S3.IntegrationTest do
     assert get.status == 200
     assert get.resp_body == "0123456789"
   end
+
+  test "CopyObject 复制源对象到目标 + CopyObjectResult（ETag 一致）" do
+    SigV4Request.signed_conn(:put, "/copybk") |> call()
+    put = SigV4Request.signed_conn(:put, "/copybk/src.txt", body: "copy-me") |> call()
+    [src_etag] = get_resp_header(put, "etag")
+
+    copy =
+      SigV4Request.signed_conn(:put, "/copybk/dst.txt",
+        headers: [{"x-amz-copy-source", "/copybk/src.txt"}]
+      )
+      |> call()
+
+    assert copy.status == 200
+    assert copy.resp_body =~ "<CopyObjectResult"
+    assert copy.resp_body =~ "<ETag>"
+
+    get = SigV4Request.signed_conn(:get, "/copybk/dst.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "copy-me"
+    assert get_resp_header(get, "etag") == [src_etag]
+  end
+
+  test "CopyObject 自拷贝（COPY 无变化）→ 400 InvalidRequest" do
+    SigV4Request.signed_conn(:put, "/selfcopy") |> call()
+    SigV4Request.signed_conn(:put, "/selfcopy/x.txt", body: "x") |> call()
+
+    copy =
+      SigV4Request.signed_conn(:put, "/selfcopy/x.txt",
+        headers: [{"x-amz-copy-source", "/selfcopy/x.txt"}]
+      )
+      |> call()
+
+    assert copy.status == 400
+    assert copy.resp_body =~ "<Code>InvalidRequest</Code>"
+  end
+
+  test "CopyObject 源 if-match 不符 → 412" do
+    SigV4Request.signed_conn(:put, "/copycond") |> call()
+    SigV4Request.signed_conn(:put, "/copycond/s.txt", body: "y") |> call()
+
+    copy =
+      SigV4Request.signed_conn(:put, "/copycond/d.txt",
+        headers: [
+          {"x-amz-copy-source", "/copycond/s.txt"},
+          {"x-amz-copy-source-if-match", "\"wrong\""}
+        ]
+      )
+      |> call()
+
+    assert copy.status == 412
+  end
 end
