@@ -1,0 +1,133 @@
+defmodule Maxio.S3.Plugs.SigV4 do
+  @moduledoc """
+  SigV4 鉴权 plug（铁律 3/4）。从 conn 提取签名材料（不消费 body！），调
+  `Maxio.Auth.authenticate/1`，成功写 assigns.principal/auth_type/payload_mode；
+  失败 halt + S3 Error XML，并打结构化日志（绝不静默放行）。
+
+  分流：
+    * query 含 X-Amz-Signature → presigned；
+    * 有 Authorization: AWS4-HMAC-SHA256 → header；
+    * 否则 MissingSecurityHeader（400）。
+
+  时钟参考（依赖注入）：优先 `conn.private[:maxio_now]`（测试注入固定时刻），
+  否则 `DateTime.utc_now()`（生产真实时钟），交由 Maxio.Auth 做偏移/过期判定。
+  """
+  import Plug.Conn
+  alias Maxio.Auth
+  alias Maxio.Auth.SigV4.AuthHeaderParser
+  alias Maxio.S3.{Error, ErrorView, Log}
+
+  @behaviour Plug
+
+  @impl true
+  def init(opts), do: opts
+
+  @impl true
+  def call(conn, _opts) do
+    conn = fetch_query_params(conn)
+
+    case detect_and_parse(conn) do
+      {:ok, signed_request} ->
+        material = build_material(conn, signed_request)
+
+        case Auth.authenticate(material) do
+          {:ok, principal} ->
+            conn
+            |> assign(:principal, principal)
+            |> assign(:auth_type, signed_request.auth_type)
+            |> assign(:payload_mode, signed_request.payload_mode)
+
+          {:error, %Error{} = err} ->
+            reject(conn, err)
+        end
+
+      {:error, code} ->
+        reject(conn, Error.new(code))
+    end
+  end
+
+  defp detect_and_parse(conn) do
+    cond do
+      Map.has_key?(conn.query_params, "X-Amz-Signature") ->
+        AuthHeaderParser.parse_presigned(conn.query_params)
+
+      auth = get_req_header(conn, "authorization") |> List.first() ->
+        amz_date = header(conn, "x-amz-date")
+        content_sha = header(conn, "x-amz-content-sha256") || ""
+        AuthHeaderParser.parse_header(auth, amz_date, content_sha)
+
+      true ->
+        {:error, :missing_security_header}
+    end
+  end
+
+  defp build_material(conn, sr) do
+    payload_hash =
+      case sr.auth_type do
+        :presigned -> "UNSIGNED-PAYLOAD"
+        :header -> header(conn, "x-amz-content-sha256") || ""
+      end
+
+    %{
+      signed_request: sr,
+      method: conn.method,
+      path: decoded_path(conn),
+      query: signing_query(conn, sr),
+      headers: req_headers_lower(conn),
+      payload_hash: payload_hash,
+      now: now(conn)
+    }
+  end
+
+  # 已 URL 解码的真实路径（Canonical 内部再做 S3 单次编码）。
+  defp decoded_path(conn) do
+    "/" <> Enum.join(conn.path_info, "/")
+  end
+
+  # header 形态用真实 query；presigned 形态排除 X-Amz-Signature。
+  defp signing_query(conn, %{auth_type: :presigned}),
+    do: Map.delete(conn.query_params, "X-Amz-Signature")
+
+  defp signing_query(conn, _sr), do: conn.query_params
+
+  # SigV4 的 SignedHeaders 几乎总含 host，但 host 的权威来源是 conn.host
+  # （由 HTTP 适配器从 Host 头/authority 解析；某些适配器不把它放进 req_headers）。
+  # 为跨适配器稳健（铁律 5），若 req_headers 缺 host，则用 conn.host 补齐。
+  defp req_headers_lower(conn) do
+    lowered = Enum.map(conn.req_headers, fn {name, value} -> {String.downcase(name), value} end)
+
+    if List.keymember?(lowered, "host", 0) do
+      lowered
+    else
+      [{"host", host_value(conn)} | lowered]
+    end
+  end
+
+  defp host_value(conn) do
+    case conn.port do
+      nil -> conn.host
+      80 -> conn.host
+      443 -> conn.host
+      port -> "#{conn.host}:#{port}"
+    end
+  end
+
+  defp header(conn, name) do
+    conn |> get_req_header(name) |> List.first()
+  end
+
+  # 依赖注入时钟：测试经 conn.private[:maxio_now] 注入固定时刻，生产用真实时钟。
+  defp now(conn), do: conn.private[:maxio_now] || DateTime.utc_now()
+
+  defp reject(conn, %Error{} = err) do
+    request_id = conn |> get_req_header("x-request-id") |> List.first()
+    err = %{err | request_id: request_id, resource: decoded_path(conn)}
+    {status, body} = ErrorView.render(err)
+    Log.warn("sigv4 rejected", code: err.code, status: status)
+
+    conn
+    |> put_resp_content_type("application/xml")
+    |> send_resp(status, body)
+    |> halt()
+  end
+end
