@@ -1,0 +1,36 @@
+defmodule Maxio.S3.Log do
+  @moduledoc """
+  S3 管线统一结构化日志辅助（AGENTS.md 铁律 4：后端无 GUI，必须 CLI + 结构化日志可观测）。
+
+  所有 S3 关键阶段（鉴权 / 分发 / put / get / 错误）经此模块打日志，统一把
+  request_id / bucket / key / action / auth_type / reason 等放进 Logger metadata，
+  便于按 request_id 串联一次请求的全链路。绝不静默——签名/校验失败必须经 warn/2 留痕。
+  """
+  require Logger
+
+  @md_keys [:request_id, :bucket, :key, :action, :auth_type, :payload_mode, :reason, :code, :status, :size]
+
+  @doc "把关键字参数中已知的 S3 元数据键提取为 Logger metadata keyword 列表。"
+  @spec context(keyword()) :: keyword()
+  def context(fields) when is_list(fields) do
+    Enum.filter(fields, fn {k, _v} -> k in @md_keys end)
+  end
+
+  @doc "info 级结构化日志。"
+  @spec info(String.t(), keyword()) :: :ok
+  def info(message, fields \\ []) do
+    Logger.info(message, context(fields))
+  end
+
+  @doc "warning 级结构化日志（用于签名失败 / 授权拒绝 / 校验失败等非静默场景）。"
+  @spec warn(String.t(), keyword()) :: :ok
+  def warn(message, fields \\ []) do
+    Logger.warning(message, context(fields))
+  end
+
+  @doc "error 级结构化日志（兜底 500 等）。"
+  @spec error(String.t(), keyword()) :: :ok
+  def error(message, fields \\ []) do
+    Logger.error(message, context(fields))
+  end
+end

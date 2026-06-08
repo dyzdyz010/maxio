@@ -87,3 +87,9 @@ config :phoenix_live_view,
   debug_attributes: true,
   # Enable helpful, but potentially expensive runtime checks
   enable_expensive_runtime_checks: true
+
+# maxio S3：开发期对象数据目录与监听端口
+config :maxio, :s3,
+  data_dir: Path.expand("../priv/s3_data/dev", __DIR__)
+
+config :maxio, Maxio.S3.Endpoint, port: 9000, ip: {127, 0, 0, 1}

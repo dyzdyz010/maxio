@@ -63,7 +63,9 @@ defmodule Maxio.MixProject do
       {:gettext, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
-      {:bandit, "~> 1.5"}
+      {:bandit, "~> 1.5"},
+      # S3 XML 出站构造 + 入站 SAX 解析（一依赖两用）
+      {:saxy, "~> 1.6"}
     ]
   end
 

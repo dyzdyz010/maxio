@@ -33,3 +33,11 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# maxio S3：测试期对象数据目录（每次运行前清理）与监听配置
+config :maxio, :s3,
+  data_dir: Path.expand("../priv/s3_data/test", __DIR__),
+  root_user: "AKIAIOSFODNN7EXAMPLE",
+  root_password: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+config :maxio, Maxio.S3.Endpoint, server: false, port: 0

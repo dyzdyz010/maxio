@@ -46,7 +46,7 @@ config :tailwind,
 # Configure Elixir's Logger
 config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id]
+  metadata: [:request_id, :bucket, :key, :action, :auth_type, :reason, :code, :status]
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
@@ -54,6 +54,23 @@ config :phoenix, :json_library, Jason
 # 在 Windows 非管理员环境下，LiveView 的 ColocatedJS 无法创建 node_modules 符号链接（:eperm），
 # maxio 不使用 colocated hooks/js，关闭该警告以保证 `compile --warnings-as-errors` 干净。
 config :phoenix_live_view, :colocated_js, disable_symlink_warning: true
+
+# ── maxio S3 子系统配置（独立于 Console 的 MaxioWeb.Endpoint）──
+# 寻址根域名（virtual-host 判定基准）、默认区域、对象数据目录、时钟偏移容忍、root 凭据引导。
+config :maxio, :s3,
+  domain: "localhost",
+  region: "us-east-1",
+  clock_skew_ms: 900_000,
+  data_dir: Path.expand("../priv/s3_data", __DIR__),
+  root_user: "minioadmin",
+  root_password: "minioadmin"
+
+# 独立 S3 Endpoint（Bandit child）监听配置。
+config :maxio, Maxio.S3.Endpoint, port: 9000, ip: :any
+
+# 后端 behaviour 绑定（铁律 1/2：换后端只改这里）。
+config :maxio, :storage_backend, Maxio.Storage.FS
+config :maxio, :credential_store, Maxio.Auth.CredentialStore.MemoryStore
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

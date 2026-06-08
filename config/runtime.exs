@@ -22,6 +22,23 @@ end
 
 config :maxio, MaxioWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# maxio S3：运行时从环境变量引导 root 凭据 / 数据目录 / S3 端口（缺省回落编译期默认）。
+if root_user = System.get_env("MAXIO_ROOT_USER") do
+  config :maxio, :s3, root_user: root_user
+end
+
+if root_password = System.get_env("MAXIO_ROOT_PASSWORD") do
+  config :maxio, :s3, root_password: root_password
+end
+
+if data_dir = System.get_env("MAXIO_DATA_DIR") do
+  config :maxio, :s3, data_dir: data_dir
+end
+
+if s3_port = System.get_env("MAXIO_S3_PORT") do
+  config :maxio, Maxio.S3.Endpoint, port: String.to_integer(s3_port)
+end
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||
