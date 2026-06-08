@@ -56,6 +56,10 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:get_bucket_tagging), do: {"s3:GetBucketTagging", :bucket}
   def for_action(:delete_bucket_tagging), do: {"s3:DeleteBucketTagging", :bucket}
 
+  def for_action(:put_bucket_cors), do: {"s3:PutBucketCORS", :bucket}
+  def for_action(:get_bucket_cors), do: {"s3:GetBucketCORS", :bucket}
+  def for_action(:delete_bucket_cors), do: {"s3:PutBucketCORS", :bucket}
+
   # CopyObject 走 :put_object（put 路径内部分流），源读权限的二次检查由 Authz 特判（见 authorize/2 的 copy 分支）。
   def for_action(_other), do: nil
 end
