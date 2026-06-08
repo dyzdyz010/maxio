@@ -39,6 +39,11 @@ defmodule MaxioWeb.Router do
       #   BucketLive.Index → M5-4；AccessKeyLive.Index → M5-8。
       live "/buckets", BucketLive.Index, :index
       live "/buckets/:bucket/browse", ObjectLive.Index, :index
+      # M5-4 的 buckets 列表行（及 M5-5 对象浏览器顶栏）用
+      # `~p"/buckets/#{bucket}/settings"` 设置链接；Phoenix 1.8 验证路由 + __checks__
+      # 要求该路由与目标 LiveView 模块编译期即存在。故此处先挂最小占位
+      # BucketLive.Settings（同 M5-1/M5-2/M5-3 占位模式），M5-7 「完整替换」。
+      live "/buckets/:bucket/settings", BucketLive.Settings, :show
       live "/access-keys", AccessKeyLive.Index, :index
     end
   end
