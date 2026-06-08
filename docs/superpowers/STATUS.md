@@ -18,7 +18,7 @@
 | **M1 S3 核心读写** | 独立 S3 Endpoint + AddressStyle + SigV4 + Dispatcher + bucket/object handlers + ListObjectsV2 + XML + 错误映射 + CLI；自签 SigV4 e2e | ✅ 已实现并验证（master，2026-06-08；125 测试全绿、SigV4 与 AWS 向量逐字节一致、独立 reviewer APPROVE_WITH_NOTES／0 must-fix） |
 | **M2 分段上传 + 流式** | aws-chunked 逐块签名完整验证 + multipart 全套 + DeleteObjects 批删 + 条件头 + CopyObject + M1 硬化 | ✅ 已实现并验证（master，2026-06-08；191 测试全绿、aws-chunked 与 AWS 流式向量逐字节一致、独立 reviewer APPROVE_WITH_NOTES／0 must-fix） |
 | **M3 IAM / 策略** | access key + EctoStore + policy 评估 + canned ACL + bucket policy + Authz + 匿名 | ✅ 已实现并验证（master，2026-06-09；275 测试全绿、Evaluator 真值表 + 匿名/public policy/ACL/授权矩阵 e2e、`compile --warnings-as-errors` 零警告） |
-| **M4 高级特性** | versioning / tagging / lifecycle / CORS / CopyObject / SSE | ⬜ 待 |
+| **M4 高级特性** | versioning / tagging / lifecycle / CORS / SSE | ✅ 已实现并验证（master，2026-06-09；349 测试全绿、`compile --warnings-as-errors` 零警告、versioning/tagging/cors/lifecycle/sse e2e + 跨特性矩阵） |
 | **M5 Console** | LiveView 管理台 | ⬜ 待 |
 | **M6 纠删码 / 分布式** | Reed-Solomon（Rustler）+ 分布式 + 自愈 | ⬜ 待 |
 
@@ -101,6 +101,31 @@ reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（当前无害，
 3. **CopyObject 不传播 `acl_canned`（正确但隐式）**：copy 覆盖会把目标 ACL 重置为 private——与 AWS 默认（copy 不保留 ACL，除非带 `x-amz-acl`）一致，仅为隐式行为。
 4. **Principal `{:aws, list}` 用 glob 匹配（轻微过权）**：AWS 视 Principal 为精确匹配（除非 policy variable）。`arn:aws:iam:::user/*` 会被通配命中。建议后续改 AWS principal 精确匹配。
 
+## M4 实现摘要（subagent-driven：研究核验 → planner → 串行 executor M4-1…M4-8 → 独立 verifier/reviewer）
+
+- **349 测试全绿、`compile --warnings-as-errors` 零警告**（M3 基线 275 + M4 新增；串行 executor 逐单元实现 + 强制 StructuredOutput）。计划：`plans/2026-06-09-m4-advanced-features.md`。
+- **M4-1 M3 收尾硬化（reviewer note 1/4 治本）**：`Maxio.S3.Authz.gather_statements/3`→`/4`，把真实 `principal` 贯穿到 `Store.principal_policies/1`（不再硬编码 `:anonymous`，identity policy 落地前接口就绪）；`Maxio.Policy.Evaluator` 的 AWS Principal `{:aws, list}` 改**精确字符串等值**（区分大小写，不再 glob 过度命中；Statement 已把纯 `"*"` 归一化为 `:any`）。回归测试 `authz_principal_test`/`principal_exact_test`。
+- **M4-2 XML 入站解析框架 + 配置载体**：`buckets` 加 `versioning`（三态 `Unversioned`/`Enabled`/`Suspended`，默认 Unversioned）+ `mfa_delete` 列；新建 `bucket_configs` 表（每桶一行，`cors`/`lifecycle`/`encryption` 各一 jsonb，唯一 `bucket_name` 索引，全中文 COMMENT）+ `Maxio.BucketConfigs` 上下文（`get/2`/`put/3`/`delete/2`，按 kind 读写单列，`get` 返回已解析 list/map 或 `:none`）；第一个 saxy SAX 解析器 `Maxio.S3.RequestParsers.VersioningConfiguration`（确立 `local/1` 去命名空间前缀模式，非法 Status/MfaDelete 值→`:malformed_xml`）。
+- **M4-3a Versioning 核心**：`objects` 表演进为「多版本行」模型——加 `version_id`(ULID 或保留串 `"null"`)/`is_latest`/`is_delete_marker` 列，唯一约束改 `(bucket_id,key,version_id)`，全中文 COMMENT；`Maxio.Versioning.VersionId`（自实现 ULID：48-bit 毫秒时间戳 + 80-bit 随机，Crockford base32 26 字符，时间有序、URL-safe）；`Maxio.Storage.Backend` behaviour 演进——`put/get/stat/delete` 全部加 `version_id` 维度（FS `"null"`→原路径向后兼容、否则 `.versions/<bucket>/<key>/<version_id>` 路径）；`Maxio.Objects` 加 `get_version`/`put_version`/`put_version_with_id`/`insert_delete_marker`/`delete_version`（delete marker 是无字节的特殊版本行，etag 空串 sentinel）；Object handler 实现三态 Put/Get/Head/Delete 版本语义（Enabled 生成新 ULID 置 latest；Suspended/Unversioned `"null"` 就地覆盖；GET 当前 delete marker→404 + `x-amz-delete-marker`，`?versionId` 指向 delete marker→405；DELETE 无 versionId 插 delete marker，`?versionId` 永久删该版本并提升下一最新版本）；`x-amz-version-id`/`x-amz-delete-marker` 响应头；`PutBucketVersioning`/`GetBucketVersioning`（`?versioning`，never-set 不回 `<Status>`）。
+- **M4-3b ListObjectVersions + latest 过滤**：`Maxio.Objects.list_objects_v2/2` 收紧为只返回 `is_latest=true and is_delete_marker=false`；`list_object_versions/2`（二维游标 `key>marker OR (key==marker AND version_id<vid_marker)`，`ORDER BY key asc, version_id desc` = newest-first，common prefixes/delimiter）；`Maxio.S3.Views.ListVersions`（Version 与 DeleteMarker 交错，DeleteMarker 无 ETag/Size/StorageClass）；`?versions` Dispatcher/ActionMap/Handlers 三处接线 + e2e。
+- **M4-4 Tagging**：`objects.tags`/`buckets.tags`（jsonb，中文 COMMENT）；`Maxio.Tags`（`validate/2` 对象≤10/桶≤50、键 1..128/值 0..256、不可 `aws:` 前缀、允许字符正则；`parse_header/1` 解 `x-amz-tagging` query-string；`map_to_list`/`list_to_map`）；`Maxio.S3.RequestParsers.Tagging` + `Maxio.S3.Views.Tagging`；`Maxio.S3.Handlers.Tagging`（对象/桶 `?tagging` PUT/GET/DELETE）；PutObject 的 `x-amz-tagging` 头落版本行；GET/HEAD 的 `x-amz-tagging-count` 响应头（仅 >0 时）；超限→`InvalidTag 400`（新错误码）；`?tagging&versionId=` 作用于指定版本行。
+- **M4-5 CORS**：`Maxio.S3.RequestParsers.Cors` + `Maxio.S3.Views.Cors`；`Maxio.Cors`（`match_preflight/4`/`match_actual/3` 首个匹配、单 `*` 通配、AllowedHeader 大小写不敏感）；`Maxio.S3.Handlers.Cors`（`?cors` PUT/GET/DELETE，校验≤100 规则/方法非空/至多一 `*`，无配置→`NoSuchCORSConfiguration 404`）；`Maxio.S3.Plugs.Cors`（OPTIONS 预检在 SigV4 **之前** 命中→200+CORS 头并 halt，预检不签名；非 OPTIONS 带 Origin→注册 `before_send` 注入 ACAO/ACAM/Expose/Vary，流式安全；无 Origin 完全放行不动既有管线）；Endpoint 插入于 AddressStyle 与 SigV4 之间；新错误码 `access_forbidden`/`no_such_cors_configuration`。仅作用于 S3 Endpoint（Console:4000 不受影响）。
+- **M4-6 Lifecycle（config-only，执行 defer）**：`Maxio.S3.RequestParsers.Lifecycle` + `Maxio.S3.Views.Lifecycle`（Filter/And/legacy Prefix、Expiration、NoncurrentVersionExpiration、AbortIncompleteMultipartUpload、Transition 字节级往返）；`Maxio.S3.Handlers.Lifecycle`（`?lifecycle` PUT/GET/DELETE，校验≤1000 规则/Status/Expiration 不可 Days+Date/ExpiredObjectDeleteMarker 互斥，无配置→`NoSuchLifecycleConfiguration 404`）；**后台过期/中止 MPU 执行未实现（defer，诚实暴露）**——`Maxio.Application` 启动 `Logger.info` 列 M4 defer + `mix maxio.lifecycle.run` stub 打印「execution not implemented」+ README 标注。
+- **M4-7 SSE-S3（真实 AES-256-GCM 信封加密）**：`objects` 加 `sse_algorithm`(`"AES256"`|nil) + `sse_envelope`(jsonb `%{wrapped_dek_b64,dek_iv_b64,dek_tag_b64}`)，中文 COMMENT；`Maxio.Crypto.SSE`（`wrap_stream`：每对象随机 256-bit DEK，数据重切 64KB 帧、每帧 AES-256-GCM 独立 IV+tag、帧头 `<ct_len::32><iv::96><tag::128>`，DEK 由单一静态主密钥 AES-256-GCM 包裹；`unwrap_stream` 逐帧解密，GCM 认证失败 RAISE 绝不静默）；PutObject `x-amz-server-side-encryption: AES256`（或桶默认加密）→真实 at-rest 加密 + 回显头；GET 透明解密；`PutBucketEncryption`/`Get`/`Delete`（`?encryption`）；`aws:kms`/`aws:kms:dsse`/SSE-C→`501 NotImplemented`（绝不静默当 AES256）；新错误码 `server_side_encryption_configuration_not_found`；主密钥经 `config :maxio, :sse, master_key`（base64 32B，dev/test 固定值，prod 经 env）。
+- **M4-8 跨特性集成矩阵 + 文档收尾**：`test/maxio/s3/m4_matrix_test.exs`（版本化+tagging 逐版本作用域、版本化+SSE 多版本各自解密、authz 匿名 public-read 版本化对象放行）全绿；全量回归 349 测试绿；本 STATUS + README 高级特性章节（含 defer 清单）更新。
+
+### M4 已知非阻塞项 / 显式 defer（文档化，绝不静默放行/吞错）
+
+1. **Lifecycle 后台过期/中止 MPU 执行**：M4 仅**存储 + 校验 + 出站**配置；不跑后台 sweeper。诚实暴露：启动 `Logger.info` + `mix maxio.lifecycle.run` stub + README。`Transition`/`NoncurrentVersionTransition` 单层 maxio 接受持久化但 no-op。
+2. **MFA Delete**：`MfaDelete` 状态解析/存储/回显（GetBucketVersioning 仅曾配置时回 `<MfaDelete>`），但**不强制 MFA 校验**（无设备），`x-amz-mfa` 头不验证。
+3. **SSE-C / SSE-KMS / DSSE-KMS**：仅 SSE-S3（AES256）。`aws:kms`/`aws:kms:dsse` 或 `x-amz-server-side-encryption-customer-*` → `501 NotImplemented`（绝不静默当 AES256）。`BucketKeyEnabled` 接受持久化但 no-op（KMS 专属）。
+4. **SSE 密钥管理简化**：单一静态服务端主密钥（`config/env`），无轮转/HSM/KMS——README/启动日志已声明。
+5. **SSE 对象 + Range / 大对象逐帧流式解密**：MVP 对加密对象的 Range 请求降级为完整对象（200，绝不返回错数据）；GET 整对象解密后 `send_resp`（大对象逐帧流式解密留后续优化）。SSE 对象 `objects.size` 存密文长度（FS 见密文），GET 的 `Content-Length` 用解密后明文 `byte_size`，HEAD 用密文长度（近似，AWS-like）；ETag 为密文 MD5（与 AWS SSE-S3 一致非明文 MD5）。
+6. **Multipart 完成对象在版本化桶的逐版本字节路径**：multipart Complete 的对象字节走 null 路径、元数据当 latest null 版本；多段对象逐版本化字节路径 defer（单段 PutObject 版本化完整）。
+7. **对象级逐版本独立 tag set**：tag 挂在版本行（`?tagging&versionId` 已支持指定版本）；`s3:*VersionTagging` 细粒度权限按同名非 version 权限评估（单租户）。
+8. **lifecycle `Date`（绝对时间）与 `Transition` 执行**：仅存储/校验。
+9. **沿用 M3 全部 defer**：跨账户/多租户、完整条件算子、identity policy（`principal_policies/1` 恒 `[]`，M4-1 已修为传真实 principal——接口就绪，实现仍 defer）、STS/session token、email grantee、`x-amz-grant-*` 细粒度、Block Public Access、checksum trailer 重算、DeleteObjects 逐 key 授权。
+
 ## 工具链与环境（本机 Windows 11，关键教训）
 
 - **Elixir 1.20.0 / Erlang OTP 28** 在 `C:\Users\dyz\Documents\dev\usr\Elixir\bin`；mix / phx_new 1.8.5 / hex 已装；docker / git 可用；**psql 不在 PATH**（用 `docker exec maxio-db psql -U postgres -d maxio_dev -c "..."`）。
@@ -120,7 +145,8 @@ reviewer 终审 APPROVE_WITH_NOTES / 0 must-fix，另挖 4 项（当前无害，
 
 ## 下一步（续作入口）
 
-- **M4 高级特性**（下一里程碑）：versioning（版本化 + 版本删除标记）/ object tagging / lifecycle 规则 / CORS 配置 / SSE（服务端加密）。在 M3 授权链路之上扩展（新动作接 `ActionMap` + Authz、新子资源接 Dispatcher、新元数据接 schema 中文 COMMENT）。设计见 `_design_inputs/`。
-- M3 续作/可选硬化（非阻塞，已文档化于「M3 已知非阻塞项 / 显式 defer」）：presigned 与 STS 完整化、identity policy（`principal_policies/1` 当前恒 `[]`）、完整条件算子、secret at-rest 加密。
+- **M5 Console**（下一里程碑）：LiveView 管理台（`MaxioWeb.Endpoint`:4000）。在 M0–M4 完整 S3 + IAM/策略 + 高级特性之上做可视化管理（桶/对象浏览、IAM key 管理、bucket policy/ACL/versioning/tagging/cors/lifecycle/encryption 配置编辑、上传/下载）。物理隔离于 S3 Endpoint，CORS 仅作用于 S3 端不影响 Console。
+- M4 续作/可选硬化（非阻塞，已文档化于「M4 已知非阻塞项 / 显式 defer」）：lifecycle 后台过期 sweeper 执行、SSE 密钥轮转/KMS、SSE 大对象逐帧流式解密 + Range、multipart 版本化逐版本字节路径、MFA Delete 强制校验。
+- M3 续作/可选硬化（非阻塞）：presigned 与 STS 完整化、identity policy（`principal_policies/1` 当前恒 `[]`，M4-1 已修为传真实 principal，接口就绪）、完整条件算子、secret at-rest 加密。
 - 每完成一里程碑：独立 reviewer/verifier 取证 + 更新本 STATUS + 提交。
 - 已建立的成功模式：研究核验（官方文档/向量）→ opus planner 产出 gold-standard 计划 → 有界串行 executor（每单元强制 StructuredOutput，避免过大）→ 独立 verifier → 有界 fix → 独立 code-reviewer。通用实现 workflow 在 `.omc/workflows/implement-milestone.js`（参数化 milestone/plan_path/baseline/units）。
