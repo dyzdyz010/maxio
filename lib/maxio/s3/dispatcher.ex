@@ -11,16 +11,20 @@ defmodule Maxio.S3.Dispatcher do
   @type level :: :service | :bucket | :object
   @type action :: atom()
 
-  # M2+ 子资源标记（出现即 not_implemented）
-  @m2_subresources ~w(uploads uploadid delete acl tagging versioning cors policy lifecycle website
+  # M2+ 子资源标记（出现即 not_implemented）。
+  # 注：uploads/uploadid/partnumber 已从本表移除，由 multipart_action/3 分发到具体 multipart 动作（M2-5）。
+  @m2_subresources ~w(delete acl tagging versioning cors policy lifecycle website
                       versions notification replication encryption object-lock legal-hold retention
                       attributes select torrent restore accelerate analytics inventory metrics
-                      ownershipcontrols publicaccessblock requestpayment logging partnumber)
+                      ownershipcontrols publicaccessblock requestpayment logging)
 
   @spec resolve(level(), String.t(), MapSet.t()) ::
           {:ok, action()} | {:error, :method_not_allowed | :not_implemented}
   def resolve(level, method, query_keys) do
     cond do
+      multipart_action(level, method, query_keys) != nil ->
+        {:ok, multipart_action(level, method, query_keys)}
+
       m2_subresource?(query_keys) ->
         {:error, :not_implemented}
 
@@ -31,6 +35,35 @@ defmodule Maxio.S3.Dispatcher do
         dispatch(level, method)
     end
   end
+
+  # multipart 子资源分发（nil = 非 multipart）。query key 已小写。
+  defp multipart_action(:object, "POST", qk) do
+    cond do
+      MapSet.member?(qk, "uploads") -> :create_multipart_upload
+      MapSet.member?(qk, "uploadid") -> :complete_multipart_upload
+      true -> nil
+    end
+  end
+
+  defp multipart_action(:object, "PUT", qk) do
+    if MapSet.member?(qk, "partnumber") and MapSet.member?(qk, "uploadid"),
+      do: :upload_part,
+      else: nil
+  end
+
+  defp multipart_action(:object, "DELETE", qk) do
+    if MapSet.member?(qk, "uploadid"), do: :abort_multipart_upload, else: nil
+  end
+
+  defp multipart_action(:object, "GET", qk) do
+    if MapSet.member?(qk, "uploadid"), do: :list_parts, else: nil
+  end
+
+  defp multipart_action(:bucket, "GET", qk) do
+    if MapSet.member?(qk, "uploads"), do: :list_multipart_uploads, else: nil
+  end
+
+  defp multipart_action(_level, _method, _qk), do: nil
 
   defp m2_subresource?(query_keys) do
     Enum.any?(@m2_subresources, &MapSet.member?(query_keys, &1))

@@ -49,12 +49,26 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:ok, :delete_object} = Dispatcher.resolve(:object, "DELETE", keys([]))
   end
 
-  test "multipart 子资源 → not_implemented（M2）" do
-    assert {:error, :not_implemented} = Dispatcher.resolve(:object, "POST", keys(["uploads"]))
+  test "multipart 子资源 → 具体动作（M2-5 升级，原 not_implemented）" do
+    assert {:ok, :create_multipart_upload} =
+             Dispatcher.resolve(:object, "POST", keys(["uploads"]))
 
-    assert {:error, :not_implemented} =
+    assert {:ok, :complete_multipart_upload} =
+             Dispatcher.resolve(:object, "POST", keys(["uploadid"]))
+
+    assert {:ok, :upload_part} =
              Dispatcher.resolve(:object, "PUT", keys(["uploadid", "partnumber"]))
 
+    assert {:ok, :abort_multipart_upload} =
+             Dispatcher.resolve(:object, "DELETE", keys(["uploadid"]))
+
+    assert {:ok, :list_parts} = Dispatcher.resolve(:object, "GET", keys(["uploadid"]))
+
+    assert {:ok, :list_multipart_uploads} =
+             Dispatcher.resolve(:bucket, "GET", keys(["uploads"]))
+  end
+
+  test "DeleteObjects 子资源仍 not_implemented（M2-6 实现）" do
     assert {:error, :not_implemented} = Dispatcher.resolve(:bucket, "POST", keys(["delete"]))
   end
 
