@@ -21,6 +21,11 @@ defmodule Maxio.S3.Error do
     no_such_key: {"NoSuchKey", 404, "The specified key does not exist."},
     no_such_upload: {"NoSuchUpload", 404, "The specified multipart upload does not exist."},
     access_denied: {"AccessDenied", 403, "Access Denied"},
+    # MinIO extractSignedHeaders 在验签前的硬性检查：SignedHeaders 漏强制 host →
+    # ErrUnsignedHeaders（Code AccessDenied，但 HTTP 400，区别于上面 403 的 access_denied）。
+    unsigned_headers:
+      {"AccessDenied", 400,
+       "There were headers present in the request which were not signed"},
     signature_does_not_match:
       {"SignatureDoesNotMatch", 403,
        "The request signature that the server calculated does not match the signature that you provided. Check your AWS secret access key and signing method."},

@@ -24,11 +24,23 @@ defmodule Maxio.Auth do
 
   @spec authenticate(map()) :: {:ok, map(), map()} | {:error, Error.t()}
   def authenticate(%{signed_request: sr} = material) do
-    with :ok <- check_request_time(sr, material.now),
+    with :ok <- check_signed_headers(sr),
+         :ok <- check_request_time(sr, material.now),
          {:ok, %{secret_key: secret, principal: principal}} <- lookup_secret(sr.access_key),
          {:ok, sig_context} <- verify_signature(sr, material, secret) do
       Log.info("sigv4 authenticated", auth_type: sr.auth_type)
       {:ok, principal, sig_context}
+    end
+  end
+
+  # SignedHeaders 必须含 host（MinIO extractSignedHeaders 在验签前的硬性检查）。
+  # 缺 host → ErrUnsignedHeaders（AccessDenied/400），绝不放行自洽但漏签 host 的请求（铁律 3/5）。
+  defp check_signed_headers(%{signed_headers: signed_headers}) do
+    if "host" in Enum.map(signed_headers, &String.downcase/1) do
+      :ok
+    else
+      Log.warn("unsigned host header", reason: :unsigned_headers)
+      {:error, Error.new(:unsigned_headers)}
     end
   end
 
