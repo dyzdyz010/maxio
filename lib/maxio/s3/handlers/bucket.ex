@@ -76,14 +76,18 @@ defmodule Maxio.S3.Handlers.Bucket do
       start_after = Map.get(qp, "start-after")
       encoding_type = Map.get(qp, "encoding-type")
 
-      res =
-        Objects.list_objects_v2(bucket, %{
-          prefix: prefix,
-          delimiter: delimiter,
-          max_keys: max_keys,
-          continuation_token: continuation,
-          start_after: start_after
-        })
+      list_opts = %{
+        prefix: prefix,
+        delimiter: delimiter,
+        max_keys: max_keys,
+        continuation_token: continuation,
+        start_after: start_after
+      }
+
+      res = Objects.list_objects_v2(bucket, list_opts)
+
+      # ROUTE B P3：drive-walk shadow 比对（best-effort，不改返回/控制流；分歧记结构化日志，自吞绝不破坏列举）。
+      _ = Maxio.ObjectMeta.list_shadow(bucket, list_opts, pg: res)
 
       objects =
         Enum.map(res.objects, fn o ->

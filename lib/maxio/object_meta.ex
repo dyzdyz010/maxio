@@ -174,6 +174,65 @@ defmodule Maxio.ObjectMeta do
   defp field_diff(_field, same, same), do: nil
   defp field_diff(field, pg_v, sc_v), do: {field, pg: pg_v, sidecar: sc_v}
 
+  @doc """
+  ROUTE B P3 —— ListObjectsV2 的 drive-walk shadow（best-effort，不翻 list 权威）。
+
+  比对 PG SQL 结果（`opts[:pg]`）与 `Maxio.Listing` 跨端点走盘结果的 **key 集 + common_prefixes**
+  （走盘只到 key 级，无对象元数据，故不比 ETag/Size/LastModified——见 Maxio.Listing 边界说明），
+  任一侧多出 key 或 common_prefix 即 `Log.warn` 结构化分歧（铁律 3 绝不静默）。
+
+  任何异常 / throw / exit 都被自吞并降级为一条 warn（shadow 绝不破坏列举路径，同 read shadow）。
+  恒返回 `:ok`。`opts` 同时透传给 `Maxio.Listing.list_objects_v2/3`（`:transport` / `:topology`）。
+  """
+  @spec list_shadow(String.t(), map(), keyword()) :: :ok
+  def list_shadow(bucket, list_opts, opts) do
+    pg = Keyword.get(opts, :pg)
+
+    try do
+      walk = Maxio.Listing.list_objects_v2(bucket, list_opts, opts)
+      compare_list(bucket, pg, walk)
+    rescue
+      e -> Log.warn("list shadow error", bucket: bucket, reason: inspect(e))
+    catch
+      kind, reason ->
+        Log.warn("list shadow caught", bucket: bucket, reason: inspect({kind, reason}))
+    end
+
+    :ok
+  end
+
+  # 比对 PG 与 drive-walk 的 key 集 + common_prefixes；任一侧独有项 -> 结构化分歧日志（返回 :ok）。
+  # objects 元素：PG 为 %Object{}、walk 为 %{key: ...}，两者均有 .key，故 & &1.key 统一取键。
+  defp compare_list(bucket, %{} = pg, %{} = walk) do
+    pg_keys = MapSet.new(Map.get(pg, :objects, []), & &1.key)
+    walk_keys = MapSet.new(Map.get(walk, :objects, []), & &1.key)
+    pg_cps = MapSet.new(Map.get(pg, :common_prefixes, []))
+    walk_cps = MapSet.new(Map.get(walk, :common_prefixes, []))
+
+    only_pg = MapSet.difference(pg_keys, walk_keys)
+    only_walk = MapSet.difference(walk_keys, pg_keys)
+    cp_only_pg = MapSet.difference(pg_cps, walk_cps)
+    cp_only_walk = MapSet.difference(walk_cps, pg_cps)
+
+    if MapSet.size(only_pg) > 0 or MapSet.size(only_walk) > 0 or
+         MapSet.size(cp_only_pg) > 0 or MapSet.size(cp_only_walk) > 0 do
+      Log.warn("list divergence: PG vs drive-walk",
+        bucket: bucket,
+        reason:
+          inspect(
+            only_pg: Enum.take(MapSet.to_list(only_pg), 20),
+            only_walk: Enum.take(MapSet.to_list(only_walk), 20),
+            cp_only_pg: MapSet.to_list(cp_only_pg),
+            cp_only_walk: MapSet.to_list(cp_only_walk)
+          )
+      )
+    end
+
+    :ok
+  end
+
+  defp compare_list(_bucket, _pg, _walk), do: :ok
+
   # 读全 N 端点 sidecar -> [%{node, drive, meta} | :missing]。eff_vid 已是落盘版本（"null" 或 ULID），
   # 与 Storage.get(bucket, key, object.version_id, ...) 的字节/sidecar 落点一致（方案 B 每版本独立目录）。
   defp read_endpoint_sidecars(bucket, key, eff_vid, opts) do

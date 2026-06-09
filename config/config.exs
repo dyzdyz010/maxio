@@ -110,9 +110,9 @@ config :maxio, :durability, fsync: true
 # 实际取 min(sql_hard_limit, max_keys*4+1000)。B3 drive-walk 上线后 PG 仅作快路径，此闸保留为 DoS 兜底。
 config :maxio, :listing, sql_hard_limit: 100_000
 
-# ROUTE B 元数据权威来源（读/列/写分别可切；P2 仅引入 :read，默认 :pg = 今天行为，shadow 比对不翻权威）。
-# P4 之后把 :read 切 :sidecar 即翻转读权威（届时 reconcile read-quorum 错误成 5xx）。
-config :maxio, :authoritative_source, read: :pg
+# ROUTE B 元数据权威来源（读/列/写分别可切；P2 引入 :read，P3 引入 :list；默认全 :pg = 今天行为，shadow 比对不翻权威）。
+# P4 之后把 :read / :list 切 :sidecar 即翻转读 / 列权威（届时 reconcile / drive-walk quorum 错误成 5xx）。
+config :maxio, :authoritative_source, read: :pg, list: :pg
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
