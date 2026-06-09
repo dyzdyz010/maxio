@@ -1,26 +1,55 @@
 defmodule Maxio.Policy.Condition do
   @moduledoc """
-  策略 Condition 块求值（铁律 5，对齐官方条件算子语义）。MVP 子集：
-    StringEquals / StringLike / Bool / IpAddress / DateGreaterThan。
-  其余算子（StringNotEquals / Numeric* / Arn* / Null / ForAnyValue: / *IfExists /
-  StringEqualsIgnoreCase / NotIpAddress / DateLessThan...）→ defer：本 MVP 把含未知算子的
-  Condition 块判为「不成立」（保守：含 defer 算子的 statement 不命中，绝不静默放行）。
+  策略 Condition 块求值（铁律 5，对齐官方条件算子语义）。
 
-  语义：
+  这里区分两套算子集合（解耦「能否接受」与「能否求值」，对齐 minio condition.UnmarshalJSON）：
+
+    * `known_operators/0` —— **AWS/MinIO 全量合法算子白名单**（~24 个 + 各 `*IfExists` 变体）。
+      PutBucketPolicy parse 期只拒绝**真正不存在于 AWS/MinIO**的算子（→ 400 MalformedPolicy）；
+      合法但本 MVP 未实现求值的算子（如 NumericLessThan / StringNotEquals / DateLessThan /
+      NotIpAddress / Null …）**正常接受（HTTP 204）**，与 mc/aws-cli/boto3/MinIO 一致。
+    * `implemented_operators/0` —— 本 MVP 真正实现求值逻辑的子集：
+      StringEquals / StringLike / Bool / IpAddress / DateGreaterThan。
+
+  求值语义（`hold?/2`）：
     * Condition 块 = %{ operator => %{ key => value | [values] } }；所有 operator/key 项须全真（AND）。
     * 单 key 内 policy 值为数组 → 任一命中即真（OR）。
     * 缺失 key（请求未提供该条件键）→ 该项为 false（statement 不命中）。MVP 无 *IfExists/Null。
     * Bool 的 policy 值是字符串 "true"/"false"，与请求实际布尔比较。
     * IpAddress 支持单 IP（视为 /32）与 CIDR。
     * DateGreaterThan：请求时间 > policy ISO8601 时间。
+    * **合法但未实现求值**的算子 → 保守判「不成立」（statement 不命中，绝不静默放行），
+      但绝不在 PutBucketPolicy parse 期拒绝（那会破坏携带这些算子的合法客户端策略）。
   """
   import Bitwise
 
-  @known ~w(StringEquals StringLike Bool IpAddress DateGreaterThan)
+  # 本 MVP 真正实现求值的算子。
+  @implemented ~w(StringEquals StringLike Bool IpAddress DateGreaterThan)
 
-  @doc "本 MVP 支持的 Condition 算子集合（PutBucketPolicy parse 期校验复用，单一事实来源）。"
-  @spec supported_operators() :: [String.t()]
-  def supported_operators, do: @known
+  # AWS/MinIO 全量合法算子（minio/pkg policy/condition/func.go 支持集 + 各 *IfExists 变体）。
+  # parse 期只用它判断「是否为真实存在的 AWS/MinIO 算子」；不在此集合内才畸形。
+  @base_operators ~w(
+    StringEquals StringNotEquals StringEqualsIgnoreCase StringNotEqualsIgnoreCase
+    StringLike StringNotLike
+    BinaryEquals
+    IpAddress NotIpAddress
+    Null Bool
+    NumericEquals NumericNotEquals
+    NumericLessThan NumericLessThanEquals NumericGreaterThan NumericGreaterThanEquals
+    DateEquals DateNotEquals
+    DateLessThan DateLessThanEquals DateGreaterThan DateGreaterThanEquals
+    ArnEquals ArnNotEquals ArnLike ArnNotLike
+  )
+
+  @known @base_operators ++ Enum.map(@base_operators, &(&1 <> "IfExists"))
+
+  @doc "AWS/MinIO 全量合法 Condition 算子白名单（含 *IfExists 变体；PutBucketPolicy parse 期校验复用）。"
+  @spec known_operators() :: [String.t()]
+  def known_operators, do: @known
+
+  @doc "本 MVP 真正实现求值逻辑的 Condition 算子集合。"
+  @spec implemented_operators() :: [String.t()]
+  def implemented_operators, do: @implemented
 
   @doc "Condition 块是否全部成立。conditions = 请求上下文条件键值 map。"
   @spec hold?(map() | nil, map()) :: boolean()
@@ -29,8 +58,8 @@ defmodule Maxio.Policy.Condition do
 
   def hold?(block, ctx) when is_map(block) do
     Enum.all?(block, fn {operator, kv} ->
-      # 含未知（defer）算子 → 保守判 false（不放行）。
-      operator in @known and operator_holds?(operator, kv, ctx)
+      # 合法但未实现求值的算子（如 NumericLessThan）→ 保守判 false（不放行），但已在 parse 期接受。
+      operator in @implemented and operator_holds?(operator, kv, ctx)
     end)
   end
 

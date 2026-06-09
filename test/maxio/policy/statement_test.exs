@@ -112,16 +112,30 @@ defmodule Maxio.Policy.StatementTest do
     assert {:ok, [_]} = Statement.parse_policy(json)
   end
 
-  test "parse_conditions 拒绝未支持算子（StringEqualsIgnoreCase）→ malformed" do
+  test "parse_conditions 拒绝真正不存在的算子（NotAnOperator）→ malformed" do
     json =
-      ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEqualsIgnoreCase":{"s3:prefix":"x"}}}]})
+      ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"NotAnOperator":{"s3:prefix":"x"}}}]})
 
     assert {:error, :malformed} = Statement.parse_policy(json, "b")
   end
 
-  test "parse_conditions 接受支持算子（Bool）" do
+  test "parse_conditions 接受已实现求值的算子（Bool）" do
     json =
       ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"Bool":{"aws:SecureTransport":"true"}}}]})
+
+    assert {:ok, [_]} = Statement.parse_policy(json, "b")
+  end
+
+  test "parse_conditions 接受合法但未实现求值的算子（StringEqualsIgnoreCase/NumericLessThan/Null）" do
+    json =
+      ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEqualsIgnoreCase":{"s3:prefix":"x"},"NumericLessThan":{"s3:max-keys":"10"},"Null":{"s3:x-amz-server-side-encryption":"true"}}}]})
+
+    assert {:ok, [_]} = Statement.parse_policy(json, "b")
+  end
+
+  test "parse_conditions 接受合法的 *IfExists 变体（StringLikeIfExists）" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringLikeIfExists":{"s3:prefix":"home/*"}}}]})
 
     assert {:ok, [_]} = Statement.parse_policy(json, "b")
   end

@@ -50,10 +50,10 @@ defmodule Maxio.S3.Views.ListBucket do
     ])
   end
 
-  # encoding-type=url → S3 风格 URL 编码（query 模式：A-Za-z0-9-_.~ 原样，'/' 编为 %2F，空格 %20）。
-  # 复用 Canonical.uri_encode/2 的 query 模式（与 SigV4 同一 UriEncode，铁律 5 一致性）。
-  defp encode(value, "url") when is_binary(value),
-    do: Maxio.Auth.SigV4.Canonical.uri_encode(value, :query)
+  # encoding-type=url → MinIO s3URLEncode（保留字面 '/' 与 '*'，空格→'+'，其余字节→%XX 大写）。
+  # 用 Maxio.S3.URLEncode（与 SigV4 的 RFC3986 编码不同：S3 list 编码不转义 '/'，故 delimiter /
+  # CommonPrefixes 的伪目录语义不被破坏，对齐 AWS/MinIO 线上字节，铁律 5）。
+  defp encode(value, "url") when is_binary(value), do: Maxio.S3.URLEncode.encode(value)
 
   defp encode(value, _enc), do: value
 

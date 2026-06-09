@@ -104,11 +104,12 @@ defmodule Maxio.S3.BucketPolicyTest do
     assert res.status == 204
   end
 
-  test "PutBucketPolicy 含未支持 Condition 算子 → 400 MalformedPolicy" do
+  test "PutBucketPolicy 含真正不存在的 Condition 算子 → 400 MalformedPolicy" do
     SigV4Request.signed_conn(:put, "/pbc1") |> call()
 
+    # "NotAnOperator" 不是任何 AWS/MinIO 合法算子 → 应拒绝（区别于「合法但未实现求值」的算子）。
     policy =
-      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbc1/*"],"Condition":{"NumericLessThan":{"s3:max-keys":"10"}}}]})
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbc1/*"],"Condition":{"NotAnOperator":{"s3:max-keys":"10"}}}]})
 
     res =
       SigV4Request.signed_conn(:put, "/pbc1", query: %{"policy" => ""}, body: policy) |> call()
@@ -117,7 +118,7 @@ defmodule Maxio.S3.BucketPolicyTest do
     assert res.resp_body =~ "MalformedPolicy"
   end
 
-  test "PutBucketPolicy 含受支持 Condition 算子（Bool）→ 204" do
+  test "PutBucketPolicy 含受实现求值的 Condition 算子（Bool）→ 204" do
     SigV4Request.signed_conn(:put, "/pbc2") |> call()
 
     policy =
@@ -125,6 +126,42 @@ defmodule Maxio.S3.BucketPolicyTest do
 
     res =
       SigV4Request.signed_conn(:put, "/pbc2", query: %{"policy" => ""}, body: policy) |> call()
+
+    assert res.status == 204
+  end
+
+  test "PutBucketPolicy 含合法但未实现求值的 Condition 算子（NumericLessThan）→ 204（对齐 MinIO/AWS）" do
+    SigV4Request.signed_conn(:put, "/pbc3") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbc3/*"],"Condition":{"NumericLessThan":{"s3:max-keys":"10"}}}]})
+
+    res =
+      SigV4Request.signed_conn(:put, "/pbc3", query: %{"policy" => ""}, body: policy) |> call()
+
+    assert res.status == 204
+  end
+
+  test "PutBucketPolicy 含合法但未实现求值的算子（StringNotEquals/DateLessThan/NotIpAddress/Null）→ 204" do
+    SigV4Request.signed_conn(:put, "/pbc4") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbc4/*"],"Condition":{"StringNotEquals":{"s3:x-amz-acl":"public-read"},"DateLessThan":{"aws:CurrentTime":"2030-01-01T00:00:00Z"},"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"},"Null":{"s3:x-amz-server-side-encryption":"true"}}}]})
+
+    res =
+      SigV4Request.signed_conn(:put, "/pbc4", query: %{"policy" => ""}, body: policy) |> call()
+
+    assert res.status == 204
+  end
+
+  test "PutBucketPolicy 含合法的 *IfExists 算子变体（StringEqualsIfExists）→ 204" do
+    SigV4Request.signed_conn(:put, "/pbc5") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbc5/*"],"Condition":{"StringEqualsIfExists":{"s3:prefix":"home/"}}}]})
+
+    res =
+      SigV4Request.signed_conn(:put, "/pbc5", query: %{"policy" => ""}, body: policy) |> call()
 
     assert res.status == 204
   end

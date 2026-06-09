@@ -52,4 +52,23 @@ defmodule Maxio.Policy.ConditionTest do
     assert Condition.hold?(block, %{"aws:SecureTransport" => true, "s3:prefix" => "home/"})
     refute Condition.hold?(block, %{"aws:SecureTransport" => true, "s3:prefix" => "away/"})
   end
+
+  test "合法但未实现求值的算子（NumericLessThan）→ 保守判 false（statement 不命中，绝不静默放行）" do
+    block = %{"NumericLessThan" => %{"s3:max-keys" => "10"}}
+    # 即便请求上下文「逻辑上满足」该数值条件，未实现求值的算子也保守不命中。
+    refute Condition.hold?(block, %{"s3:max-keys" => "5"})
+    refute Condition.hold?(block, %{})
+  end
+
+  test "known_operators 含全量 AWS/MinIO 算子；implemented_operators 是其真子集" do
+    known = MapSet.new(Condition.known_operators())
+    impl = MapSet.new(Condition.implemented_operators())
+    # 全量白名单含合法但未实现求值的算子与 *IfExists 变体。
+    for op <- ~w(StringNotEquals NumericLessThan DateLessThan NotIpAddress Null StringEqualsIfExists) do
+      assert MapSet.member?(known, op), "known_operators 应含 #{op}"
+    end
+    # 实现集是接受集的真子集。
+    assert MapSet.subset?(impl, known)
+    refute MapSet.equal?(impl, known)
+  end
 end

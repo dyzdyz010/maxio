@@ -159,15 +159,18 @@ defmodule Maxio.Policy.Statement do
   defp parse_principal(nil), do: {:error, :malformed}
   defp parse_principal(_), do: {:error, :malformed}
 
-  # Condition 校验：算子必须在受支持集合内（复用 Maxio.Policy.Condition.supported_operators/0，
-  # 单一事实来源），否则 {:error, :malformed} → PutBucketPolicy 回 400 MalformedPolicy（铁律 3/5，
-  # 对齐 minio condition.UnmarshalJSON 在 parse 期拒绝未知算子，绝不存「行为与所写不符」的策略）。
+  # Condition 校验（铁律 3/5，对齐 minio condition.UnmarshalJSON）：
+  # 只拒绝**真正不存在于 AWS/MinIO** 的算子（不在 Maxio.Policy.Condition.known_operators/0 全量白名单内）
+  # → {:error, :malformed} → PutBucketPolicy 回 400 MalformedPolicy。
+  # 合法但本 MVP 未实现求值的算子（NumericLessThan / StringNotEquals / DateLessThan / Null …）
+  # **正常接受**（HTTP 204）——与 mc/aws-cli/boto3/MinIO 一致，绝不因「未实现求值」而拒收合法策略。
+  # 这些未求值算子在 Condition.hold?/2 中被保守判为「不成立」（statement 不命中），故不会静默放行。
   defp parse_conditions(nil), do: {:ok, %{}}
 
   defp parse_conditions(%{} = cond_map) do
-    supported = MapSet.new(Maxio.Policy.Condition.supported_operators())
+    known = MapSet.new(Maxio.Policy.Condition.known_operators())
 
-    if Enum.all?(Map.keys(cond_map), &MapSet.member?(supported, &1)) do
+    if Enum.all?(Map.keys(cond_map), &MapSet.member?(known, &1)) do
       {:ok, cond_map}
     else
       {:error, :malformed}
