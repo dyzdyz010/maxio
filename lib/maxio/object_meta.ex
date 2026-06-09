@@ -55,29 +55,56 @@ defmodule Maxio.ObjectMeta do
   @doc """
   best-effort shadow 比对：读全 N 端点 sidecar -> reconcile -> 比对 PG。任何异常都被吞并记日志
   （shadow 绝不破坏读路径）。返回 :ok。
+
+  门控（铁律 4：结构化日志须有用、非每请求错误噪声）：仅当**确有 sidecar-backed 分布式拓扑**
+  （`Topology.configured?/0` 真，或 test 经 `opts[:topology]` 显式注入）时才执行；单机 FS / dev / test
+  默认无拓扑 -> 直接短路 :ok（shadow 在 FS 上零有用工作，绝不靠 rescue 吞一个必然的 ArgumentError）。
+
+  版本定位（修复 versioned-latest 假分歧）：sidecar 文件随**解析后的 PG 对象版本**落盘
+  （`Storage.get` 用 `object.version_id`，方案 B 每版本独立目录）。故 latest 读（请求 version_id=nil）
+  须用 PG 行的 `version_id`（一个 ULID）定位 sidecar 路径与 reconcile target，绝不用请求级 nil
+  退化成 "null" 版本路径（那是空的，会系统性误报 read_quorum / sidecar-missing 分歧）。
   """
   @spec shadow_check(String.t(), String.t(), String.t() | nil, term(), keyword()) :: :ok
   def shadow_check(bucket, key, version_id, pg, opts) do
-    target = if version_id, do: {:version, version_id}, else: :latest
+    if shadow_enabled?(opts) do
+      # 路径与 target 都基于「有效版本」：请求显式带 version_id 用之；否则（latest 读）取解析后的
+      # PG 行 version_id；无 PG 行（PG 缺对象）回退请求级 version_id || "null"（与历史一致）。
+      eff_vid = effective_version_id(version_id, pg)
+      target = if eff_vid == "null", do: :latest, else: {:version, eff_vid}
 
-    try do
-      do_shadow(bucket, key, version_id, target, pg, opts)
-    rescue
-      e -> Log.warn("metadata shadow error", bucket: bucket, key: key, reason: inspect(e))
-    catch
-      kind, reason ->
-        Log.warn("metadata shadow caught",
-          bucket: bucket,
-          key: key,
-          reason: inspect({kind, reason})
-        )
+      try do
+        do_shadow(bucket, key, version_id, eff_vid, target, pg, opts)
+      rescue
+        e -> Log.warn("metadata shadow error", bucket: bucket, key: key, reason: inspect(e))
+      catch
+        kind, reason ->
+          Log.warn("metadata shadow caught",
+            bucket: bucket,
+            key: key,
+            reason: inspect({kind, reason})
+          )
+      end
     end
 
     :ok
   end
 
-  defp do_shadow(bucket, key, version_id, target, pg, opts) do
-    copies = read_endpoint_sidecars(bucket, key, version_id, opts)
+  # shadow 仅在确有分布式拓扑时有意义：test 显式注入 opts[:topology] 优先；否则读 Topology 是否已配置。
+  defp shadow_enabled?(opts) do
+    case Keyword.get(opts, :topology) do
+      nil -> Topology.configured?()
+      _t -> true
+    end
+  end
+
+  # 有效版本：请求显式版本优先；latest 读取解析后 PG 行版本；无 PG 行回退 "null"（历史行为）。
+  defp effective_version_id(version_id, _pg) when is_binary(version_id), do: version_id
+  defp effective_version_id(nil, %Objects.Object{version_id: vid}) when is_binary(vid), do: vid
+  defp effective_version_id(_version_id, _pg), do: "null"
+
+  defp do_shadow(bucket, key, version_id, eff_vid, target, pg, opts) do
+    copies = read_endpoint_sidecars(bucket, key, eff_vid, opts)
     rq = read_quorum(opts)
 
     case MetaReconcile.reconcile(copies, rq, target) do
@@ -147,12 +174,13 @@ defmodule Maxio.ObjectMeta do
   defp field_diff(_field, same, same), do: nil
   defp field_diff(field, pg_v, sc_v), do: {field, pg: pg_v, sidecar: sc_v}
 
-  # 读全 N 端点 sidecar -> [%{node, drive, meta} | :missing]
-  defp read_endpoint_sidecars(bucket, key, version_id, opts) do
+  # 读全 N 端点 sidecar -> [%{node, drive, meta} | :missing]。eff_vid 已是落盘版本（"null" 或 ULID），
+  # 与 Storage.get(bucket, key, object.version_id, ...) 的字节/sidecar 落点一致（方案 B 每版本独立目录）。
+  defp read_endpoint_sidecars(bucket, key, eff_vid, opts) do
     transport = Keyword.get(opts, :transport, Maxio.Cluster.Transport.impl(opts))
     endpoints = endpoints_for(bucket, key, opts)
 
-    case Paths.object_rel(bucket, key, version_id || "null") do
+    case Paths.object_rel(bucket, key, eff_vid) do
       {:ok, rel} ->
         Enum.map(endpoints, fn {node, drive} ->
           dir = Path.join(drive, rel)

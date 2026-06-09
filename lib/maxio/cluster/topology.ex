@@ -39,6 +39,14 @@ defmodule Maxio.Cluster.Topology do
 
   # ── 读 API（prod 走 :persistent_term；test 经 *_from/*_with 注入 parsed）──
 
+  @doc """
+  是否已配置分布式拓扑（:persistent_term 已存 parsed）。门面（如 ObjectMeta dual-read shadow）据此
+  判断「当前部署是否真有 sidecar-backed 分布式拓扑」——无拓扑（单机 FS / dev / test）时短路，绝不调用
+  会 raise 的 `get/0`。与 `get/0` 读同一 :persistent_term，是「拓扑是否存在」的单一事实来源。
+  """
+  @spec configured?() :: boolean()
+  def configured?, do: :persistent_term.get(@pt_key, :no_topology) != :no_topology
+
   @doc "所有 set_id（按 pool 顺序 + set 顺序展平）的全局有序列表。路由 mod 用其长度。"
   @spec all_set_ids() :: [set_id()]
   def all_set_ids, do: get().set_ids
