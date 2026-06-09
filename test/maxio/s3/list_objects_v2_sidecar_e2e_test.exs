@@ -131,6 +131,7 @@ defmodule Maxio.S3.ListObjectsV2SidecarE2ETest do
 
     assert res.status == 200
     assert res.resp_body =~ "<Key>b.txt</Key>"
+
     # 兜底：Size=0、ETag 空引号、LastModified 合法 ISO8601（当前时刻），XML 不崩。
     assert res.resp_body =~ "<Size>0</Size>"
     assert res.resp_body =~ "<ETag>\"\"</ETag>"

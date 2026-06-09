@@ -110,6 +110,7 @@ defmodule Maxio.ObjectMetaReadAuthorityTest do
   } do
     put(eps, "dk", m("vd", "delete_marker"))
     obj = ObjectMeta.get("rab", "dk", nil, opts(topo))
+
     # 保真修复：返回 %Object{is_delete_marker: true, version_id: "vd"}，交 handler 发 404 +
     # x-amz-delete-marker:true + x-amz-version-id（与 :pg 路径同构），绝不丢删除标记头。
     assert %Maxio.Objects.Object{} = obj
