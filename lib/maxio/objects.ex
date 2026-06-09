@@ -222,6 +222,25 @@ defmodule Maxio.Objects do
   end
 
   @doc """
+  ROUTE B B4-2 —— best-effort 索引写（与 put_version_with_id/4 同参数/同语义，但捕获异常返回
+  `{:error, term}` 而非抛出，且把成功结果归一为 `:ok`）。
+
+  用于 `authoritative_source(:write) == :sidecar`：sidecar 才是写路径的权威载体（Storage.put 达
+  write_quorum = 字节 + sidecar 已耐久落盘），PG 仅作派生索引，故 PG 写失败**非致命**——调用方据
+  `:ok | {:error, reason}` 记结构化日志而非让对象 PUT 失败（去 PG 写路径 SPOF，铁律 3 绝不静默：
+  失败必由调用方记 Log.error）。`:pg` 权威（默认）仍走 put_version_with_id/4 的致命 + 回滚语义。
+  """
+  @spec put_version_index(String.t(), String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def put_version_index(bucket_name, key, version_id, attrs) do
+    case put_version_with_id(bucket_name, key, version_id, attrs) do
+      {:ok, _obj} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, e}
+  end
+
+  @doc """
   插入删除标记（DELETE 无 versionId，桶 Enabled/Suspended）。
   Enabled → 新 ULID delete marker 置 latest；Suspended → "null" delete marker upsert 置 latest。
   返回 {:ok, %{version_id}}。

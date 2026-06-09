@@ -60,14 +60,18 @@ defmodule Maxio.S3.Handlers.Object do
             # SSE 加密对象：x-amz-decoded-content-length / x-amz-content-sha256 是针对明文传输完整性的闸，
             # 而落盘字节是密文（密文≠明文必失配）；传输层完整性已由 SigV4/chunked 在 BodyReader 内验过，
             # 故加密分支跳过这两个校验（铁律 3 仍由 GCM 认证 + 上游签名保证）。
-            {:ok, obj} =
+            #
+            # 传输完整性（decoded-length / content-sha256）失败在两条权威分支下都**致命 + 回滚孤儿**
+            # （这是 digest/签名失配，与 PG 无关，铁律 3 绝不静默接受）；仅 PG 索引写在
+            # authoritative_source(:write)==:sidecar 时降为 best-effort（见下）。
+            obj =
               try do
                 unless sse_requested do
                   :ok = verify_decoded_length!(conn, payload_mode, size)
                   :ok = verify_content_sha256!(conn, payload_mode, sha256)
                 end
 
-                Objects.put_version_with_id(bucket, key, version_id, %{
+                attrs = %{
                   size: size,
                   etag: etag,
                   content_type: content_type,
@@ -76,7 +80,9 @@ defmodule Maxio.S3.Handlers.Object do
                   tags: tags_map,
                   sse_algorithm: sse_requested,
                   sse_envelope: sse_envelope
-                })
+                }
+
+                commit_metadata(bucket, key, version_id, attrs)
               rescue
                 err ->
                   _ = Storage.delete(bucket, key, version_id)
@@ -629,6 +635,63 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   # ── helpers ──
+
+  # ROUTE B B4-2 —— 元数据提交按写权威分流（authoritative_source(:write)）：
+  #
+  #   :pg（默认）→ 维持 B1-1 致命语义：put_version_with_id 失败则 {:error, cs} 由 Repo.rollback
+  #     冒泡成异常（此处 {:ok, obj} 模式匹配失败 -> MatchError），被上层 try/rescue 捕获 -> 回滚字节 +
+  #     reraise（对象绝不留孤儿、绝不静默接受落库失败，铁律 3）。
+  #
+  #   :sidecar → sidecar 已达 write_quorum = 字节 + sidecar 权威已耐久落盘；PG 仅派生索引，用
+  #     put_version_index best-effort：失败 -> Log.error（绝不静默，铁律 3）+ **不回滚字节、不失败请求**
+  #     （对象耐久存于 sidecar，PG 索引滞后由后续 scanner reconcile）；响应视图由 version_id + 已知 attrs
+  #     在内存构造（build_put_view，不依赖 PG 读回，去 PG 写/读回路径 SPOF）。
+  defp commit_metadata(bucket, key, version_id, attrs) do
+    case Maxio.ObjectMeta.authoritative_source(:write) do
+      :sidecar ->
+        case Objects.put_version_index(bucket, key, version_id, attrs) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Log.error("pg index update failed (object durably stored in sidecars)",
+              action: :put_object,
+              bucket: bucket,
+              key: key,
+              reason: inspect(reason)
+            )
+        end
+
+        build_put_view(bucket, key, version_id, attrs)
+
+      _pg ->
+        {:ok, obj} = Objects.put_version_with_id(bucket, key, version_id, attrs)
+        obj
+    end
+  end
+
+  # ROUTE B B4-2 —— :write=:sidecar 时的响应视图（不依赖 PG 读回）：从已写入的 version_id +
+  # 已知 attrs 在内存构造一个 %Objects.Object{}（与 :pg 分支返回的结构同型，下游响应管线只读
+  # .version_id/.etag/.size 等字段，故无需 PG 行）。updated_at 用当前时刻（响应头 last-modified
+  # 由 GET/HEAD 另取，此处 PUT 仅需 version_id/etag）。
+  defp build_put_view(bucket, key, version_id, attrs) do
+    %Objects.Object{
+      bucket_name: bucket,
+      key: key,
+      version_id: version_id,
+      size: Map.fetch!(attrs, :size),
+      etag: Map.fetch!(attrs, :etag),
+      content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
+      storage_class: Map.get(attrs, :storage_class, "STANDARD"),
+      acl_canned: Map.get(attrs, :acl_canned, "private"),
+      tags: Map.get(attrs, :tags, %{}),
+      sse_algorithm: Map.get(attrs, :sse_algorithm),
+      sse_envelope: Map.get(attrs, :sse_envelope),
+      is_latest: true,
+      is_delete_marker: false,
+      updated_at: DateTime.utc_now()
+    }
+  end
 
   # FX-M4：计算 CopyObject 目标的用户 metadata（x-amz-meta-*）：
   #   COPY（默认）→ 原样保留源对象的 metadata（src_obj.metadata，nil 兜底 %{}）；
