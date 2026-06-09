@@ -33,10 +33,26 @@ defmodule Maxio.Auth.SigV4.Canonical do
   def canonical_uri(path), do: uri_encode(path, :path)
 
   @doc """
-  CanonicalQueryString：每个 name/value 单独 UriEncode（query 模式，编码 /），
-  按编码后 name 字典序排序，key=value 以 & 连接，空值保留 `key=`。
+  CanonicalQueryString。两种入参：
+    * **raw query 字符串**（推荐，SigV4 plug 传 conn.query_string）：按 '&' 切对、每对按首个 '='
+      切 name/value，用严格 RFC3986 解码（URI.decode/1，**绝不**把 '+' 当空格），再 query-模式
+      UriEncode，按编码后 name 排序。这保证客户端字面 '+'（wire 上 %2B）canonicalize 回 %2B
+      而非 %20（对齐 AWS / MinIO RawQuery 语义，铁律 5）。
+    * **map**（向后兼容既有纯函数测试/调用方）：对每个 name/value 直接 query-模式 UriEncode 后排序。
+  两种入参对"无 '+'/无重复键"的普通请求结果完全一致。空值保留 `key=`。
   """
-  @spec canonical_query(map()) :: String.t()
+  @spec canonical_query(String.t() | map()) :: String.t()
+  def canonical_query(query) when is_binary(query) do
+    query
+    |> split_raw_query()
+    |> Enum.map(fn {k, v} ->
+      {uri_encode(decode_strict(k), :query), uri_encode(decode_strict(v), :query)}
+    end)
+    |> Enum.sort_by(fn {k, v} -> {k, v} end)
+    |> Enum.map(fn {k, v} -> k <> "=" <> v end)
+    |> Enum.join("&")
+  end
+
   def canonical_query(query) when is_map(query) do
     query
     |> Enum.map(fn {k, v} ->
@@ -46,6 +62,23 @@ defmodule Maxio.Auth.SigV4.Canonical do
     |> Enum.map(fn {k, v} -> k <> "=" <> v end)
     |> Enum.join("&")
   end
+
+  # 把 raw query 切成 [{name, value}]（保留重复键，值缺省为 ""）。空串 → []。
+  defp split_raw_query(""), do: []
+
+  defp split_raw_query(raw) do
+    raw
+    |> String.split("&", trim: true)
+    |> Enum.map(fn pair ->
+      case String.split(pair, "=", parts: 2) do
+        [k, v] -> {k, v}
+        [k] -> {k, ""}
+      end
+    end)
+  end
+
+  # 严格 RFC3986 percent-decode：只解 %XX，**绝不**把 '+' 当空格（区别于 URI.decode_www_form/1）。
+  defp decode_strict(str), do: URI.decode(str)
 
   @doc "CanonicalHeaders：每行 lname:trimall(value)\\n，按 lname 排序。整体以 \\n 结尾。"
   @spec canonical_headers([{String.t(), String.t()}]) :: String.t()

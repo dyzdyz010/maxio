@@ -4,7 +4,9 @@ defmodule Maxio.Auth do
   成功返回 principal map，失败返回 %Maxio.S3.Error{}（绝不静默，所有失败打结构化日志）。
 
   验证材料 map：%{signed_request, method, path, query, headers, payload_hash, now}。
-    * query 必须**已排除 X-Amz-Signature**（presigned）；
+    * query 既可是 raw query 字符串（SigV4 plug 传 conn.query_string，保留字面 '+'/重复键，
+      由 Canonical.canonical_query/1 的字符串子句严格 RFC3986 解码后规范化），也可是 name=>value
+      map（向后兼容）；presigned 形态必须**已排除 X-Amz-Signature**；
     * headers 必须仅含 SignedHeaders 子集（已小写）；
     * path 是已 URL 解码的真实对象 key 路径（Canonical 内部再做 S3 单次编码）；
     * now 是注入的服务器参考时钟（依赖注入：生产默认 DateTime.utc_now()，

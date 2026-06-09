@@ -115,11 +115,25 @@ defmodule Maxio.S3.Plugs.SigV4 do
   # 后者折叠空段会让重建的 CanonicalURI ≠ 客户端签名路径，误判 SignatureDoesNotMatch（铁律 5）。
   defp decoded_path(conn), do: RawPath.decoded_path(conn)
 
-  # header 形态用真实 query；presigned 形态排除 X-Amz-Signature。
+  # header 形态用真实 raw query（conn.query_string，保留 '+'/重复键）；
+  # presigned 形态需排除 X-Amz-Signature，故从 raw query 串里剔除该参数后再传。
   defp signing_query(conn, %{auth_type: :presigned}),
-    do: Map.delete(conn.query_params, "X-Amz-Signature")
+    do: raw_query_without(conn.query_string, "X-Amz-Signature")
 
-  defp signing_query(conn, _sr), do: conn.query_params
+  defp signing_query(conn, _sr), do: conn.query_string
+
+  # 从 raw query 串里剔除指定参数名（保留其余原始编码，绝不经 map 往返）。
+  defp raw_query_without(raw, name) do
+    raw
+    |> String.split("&", trim: true)
+    |> Enum.reject(fn pair ->
+      case String.split(pair, "=", parts: 2) do
+        [k | _] -> k == name
+        _ -> false
+      end
+    end)
+    |> Enum.join("&")
+  end
 
   # SigV4 的 SignedHeaders 几乎总含 host，但 host 的权威来源是 conn.host
   # （由 HTTP 适配器从 Host 头/authority 解析；某些适配器不把它放进 req_headers）。
