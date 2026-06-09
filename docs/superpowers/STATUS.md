@@ -270,10 +270,25 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
      Sidecar.to_view/3 / Maxio.MetaReconcile（纯函数跨端点 quorum 仲裁，无 quorum 报错绝不猜，真值表硬测）/ Maxio.ObjectMeta dual-read shadow（PG 仍权威 + 分歧结构化日志 + 读路径绝不被破坏，authoritative_source[:read]=:pg 默认）+ GET/HEAD shadow 接线；executor 修正计划的 get_metadata 返回类型 + 2 fidelity 修复（modtime-first 选组 / shadow 按 topology 门控）
 ✅ 路线 B P3（drive-walk LIST · shadow）— 65a4540..a9c43f2（658 测试，precommit 绿）
      Transport.list_dir/ShardServer.list_dir（单端点走盘原语）/ Maxio.Listing（跨 set 递归走盘 + delimiter 折叠 + walk-position 续点，从构造消除 LIST 无 SQL LIMIT DoS）/ ObjectMeta.list_shadow（PG 仍权威 + drive-walk vs PG key集/common-prefix 分歧日志 + 绝不破坏列举，authoritative_source[:list]=:pg）+ ListObjectsV2 接线；fidelity 复检加 .versions 枚举+排除 delete marker + 续点游标对齐
-⚠ 路线 B P4（翻转读/列/写权威 · 去 PG-SPOF）— B4-1..B4-4 已落 181edb7..deb4609 + fidelity 修复 acb4f26 + format-tail 20045a1（681→673 测试随阶段；compile 零警告）
+✅ 路线 B P4（翻转读/列/写权威 · 去 PG-SPOF）— 181edb7..5dd510c（686 测试，mix precommit exit 0 权威确认）
      B4-1 Maxio.SidecarHeal（分歧 sidecar 原子回写 canonical + 读路径调度）/ B4-2 写路径 PG 降 best-effort（:write=:sidecar 下 PG 失败非致命、对象在 sidecar 仍耐久；传输完整性失败仍致命+回滚孤儿）/ B4-3 翻读权威（reconcile 结果权威、read-quorum 不足 503 绝不猜、acb4f26 加 resolve_sidecar_version→discover_current_version 走盘发现 Enabled 桶当前版本、SlowDownRead/x-amz-delete-marker 头保真）/ B4-4 翻列权威（drive-walk + per-key quorum 确认）
-     ❗ **code-review CHANGES_REQUESTED — 发现 critical 集成断裂（must_fix #1）**：写路径 build_meta 仍产**扁平 v1 meta**（无 format/versions），而 reconcile 经 Sidecar.latest/find_version（`when is_list(versions)`）对 v1 返回 nil → 真实 PutObject 写出的对象在分布式拓扑 + :read/:list=:sidecar 下 GET 503 / LIST 丢对象。新增 5 测试手搓 maxio/2 fixture 绕过真实 Storage.put（虚假信心）。默认 :pg 安全，但翻权威能力对真实对象不可用。
-   ◇ 路线 B B4-5（写路径产出 maxio/2 版本化 sidecar）← **进行中**：让 Storage.put 经 Sidecar.migrate_v1 产出含 versions 的完整 sidecar（透传 content_type/tags/sse/acl/storage_class/user_metadata）+ 真实 PUT→翻权威→GET/LIST 端到端取证（Unversioned/Versioned/SSE）。计划 `plans/2026-06-09-routeB-b4-5-write-path-maxio2-sidecar.md`。同时关闭 must_fix #2（版本桶 latest 读：discover 发现版本目录后需 v2 entry 才能 reconcile）。
+     ❗→✅ **code-review 曾报 CHANGES_REQUESTED 的 critical 集成断裂（must_fix #1）已由 B4-5 闭合**：原 build_meta 产**扁平 v1 meta**（无 format/versions），reconcile 经 Sidecar.latest/find_version（`when is_list(versions)`）对 v1 返回 nil → 真实 PutObject 对象在分布式拓扑 + :read/:list=:sidecar 下 GET 503 / LIST 丢对象（5 个 B4 测试手搓 maxio/2 fixture 绕过真实 Storage.put、虚假信心）。
+   ✅ 路线 B B4-5（写路径产出 maxio/2 版本化 sidecar）— 5dd510c（686 测试，APPROVE_WITH_NOTES，precommit 绿）
+     Storage.put/5 新增 :object_meta opts 契约（不改 arity）；ErasureCoded/Distributed build_meta 增 version_id+opts 形参、构造 v1 core 后经 Sidecar.migrate_v1 产出含 versions 的完整 maxio/2 sidecar（耐久 ec/shards/size/etag/sha256/parts 字节不变）；handler do_put + CopyObject 组 object_meta（content_type/tags/sse/acl/storage_class/user_metadata，复用 parse_user_metadata）经 Storage.put 透传；modtime 单次计算保 N 份 signature 一致。**真实 PUT→翻 :read/:list=:sidecar→GET/LIST 端到端取证**（distributed+InProcess+注入 topology；Case A Unversioned 盘上 sidecar maxio/2+富字段、ObjectMeta.get 返 %Object{} 而非 read_quorum、Listing key+ETag/Size 正确；Case B Versioned latest 经 discover_current_version+reconcile 解析当前版本=**关闭 must_fix #2**；Case C SSE 信封携带+解密成功）。**严禁手搓 sidecar**。计划 `plans/2026-06-09-routeB-b4-5-write-path-maxio2-sidecar.md`。
+     → B4-5 独立 MinIO-fidelity 审计（3 lenses）报 3 medium + 1 low（无 critical/high），排入 B4-6（见下「B4-6 backlog」）。
+   ◇ 路线 B B4-6（写路径元数据保真补全）← **下一步**：修 fidelity 3 个 medium。计划 `plans/2026-06-09-routeB-b4-6-write-path-metadata-fidelity.md`。
+
+> **路线 B 主目标达成**：sidecar(meta.json) 已是对象元数据真值源、真实 PUT 对象在 `:read/:list/:write=:sidecar` 下完整可读/可列/可写（端到端取证），PG 降为可派生索引——**PG 单点故障从构造上消除**。默认 `:pg` 全程不变、字节级可回滚。剩余 B4-6 为元数据富度/一致性保真（非阻塞主目标）；生产默认翻 :sidecar 前需 P7 backfill/迁移（既有 v1 对象升 maxio/2）。
+
+#### B4-6 backlog（B4-5 fidelity 审计的 medium，按「全部修 medium」处理）
+- **D1（medium）**：多段完成对象 sidecar 丢 Content-Type/user_metadata（assemble 路径 build_meta 空 opts → :sidecar 读返 binary/octet-stream）。修：Multipart.complete 透传 upload.content_type/user_metadata 经 Storage.assemble → build_meta。
+- **D2（medium）**：PutObject 现捕获 x-amz-meta-* 但无 2 KB 上限 → 缺 MetadataTooLarge/400。修：加错误码 + Maxio.Metadata.validate_size!（2048B）+ do_put/copy(REPLACE) 调用（pre-commit 校验、无孤儿）。
+- **D3（medium，B4-5 引入）**：PutObject user_metadata 进 sidecar 却没进 PG → :pg/:sidecar 读分裂。修：do_put PG attrs 并入 metadata: parse_user_metadata（与 CopyObject 对齐）。
+
+#### low 偏离 defer（与既有 12 项 low 同级，文档化留后续）
+- **D4（low）**：CopyObject sidecar 硬编码 private/STANDARD 忽略 x-amz-acl/x-amz-storage-class——预存在且与 PG 路径一致（PG copy 也硬编码），非 B4-5 引入。留 CopyObject directive 完整化里程碑统一处理（届时 sidecar 与 PG 锁步）。
+- **响应层缺口**：put_common_object_headers 不发 x-amz-meta-*/x-amz-storage-class 响应头（两路共有、预存在）。留响应层里程碑。
+- **shadow-list 健壮性**：precommit 见一条 `Protocol.UndefinedError{value: :not_a_list}` list shadow error（被 catch+日志、默认 :pg 列举不受影响、非 B4-5 引入）。留 shadow 比对健壮性跟进。
 
 > **网络教训（本机当前）**：长时运行的 subagent（尤其重 WebFetch 的研究/规划 agent）会因 `socket connection was closed` / 证书错误被掐断，特征是任务 `subagent_tokens=0`、跑数分钟后中断；短探针 agent 可过。对策：① 规划/设计文档改由 orchestrator 主线直接撰写（CLAUDE.md 允许，已用于 P2 计划）；② 实现 workflow 的 executor 逐单元（比长研究 agent 短）+ 每单元独立提交，被掐断只丢当前单元、可续；③ 遇 `subagent_tokens=0` 失败先探针确认连接再重启，绝不盲目重跑。
 ```
