@@ -259,12 +259,15 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 ### 当前编排队列（critical→P1→high→medium）
 
 ```
-✅ 批次1 critical（DeleteObjects 数据丢失）— c07a6b4
-▶  路线 B P1（B1-1..B1-4 无悔架构修正：锁横跨接缝 / 原子 temp-rename+fsync / distinct-node 校验+LIST 硬限 / sidecar v2+reverse-GC 脚手架）← 下一步
-   批次2 七个 high 保真偏离（CopyObject 版本化×2 / SigV4 +号 raw-query / PutBucketPolicy ARN 校验 / CORS Allow-Credentials / DeleteObjects 对象级授权 / CopyObject 授权回归锁）
+✅ 批次1 critical（DeleteObjects 数据丢失）— c07a6b4（513 测试）
+✅ 路线 B P1（B1-1..B1-4 无悔架构修正）— 8b41b59..b5d2928（557 测试，APPROVE_WITH_NOTES）
+     B1-1 锁横跨接缝（消除静默 ETag/字节不一致，Maxio.Lock+SlowDown 503）/ B1-2 原子 temp-rename+fsync（crash 无撕裂+telemetry 断言+quorum 回滚，Windows rename-busy DI 测试）/ B1-3 distinct-node 校验+LIST 硬限（含静默欠截断修复）/ B1-4 sidecar v2 schema+reverse-GC 诚实脚手架
+▶  批次2 七个 high 保真偏离（CopyObject 版本化×2 / SigV4 +号 raw-query / PutBucketPolicy ARN 校验 / CORS Allow-Credentials / DeleteObjects 对象级授权 / CopyObject 授权回归锁）← 下一步
    批次3 五个 medium（host 强制签名 / encoding-type=url ×2 / COPY 元数据保留 / 未支持条件算子拒绝）
    评估路线 B P2–P7（sidecar 权威翻转：读→列→写）
 ```
+
+**P1 遗留（已排入后续，非阻塞）**：CopyObject/CompleteMPU 的 `put_metadata` 硬编码 `version_id:null`（= 批次2 FX-H1/H2 + 路线 B P4 范畴）；max-keys 未夹到 1000（小项）；锁竞争 503 用 Code `SlowDown` 而 MinIO 用 `RequestTimeout`（状态 503 已对，仅 Code 字符串，小项）。LIST 静默欠截断已在 `b5d2928` 当场修复。
 
 ## 下一步（续作入口）
 
