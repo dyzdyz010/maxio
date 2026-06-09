@@ -33,6 +33,7 @@ defmodule Maxio.Storage.Distributed do
 
   alias Maxio.Storage.Erasure.{Codec, Config}
   alias Maxio.Cluster.{Paths, Router, Topology, Transport}
+  alias Maxio.Sidecar
 
   # ── Backend callbacks（签名与 FS/ErasureCoded 一致）──
 
@@ -185,11 +186,11 @@ defmodule Maxio.Storage.Distributed do
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
-        put_locked(bucket, key, obj_rel, chunks, opts)
+        put_locked(bucket, key, version_id, obj_rel, chunks, opts)
     end
   end
 
-  defp put_locked(bucket, key, obj_rel, chunks, opts) do
+  defp put_locked(bucket, key, version_id, obj_rel, chunks, opts) do
     c = cfg(opts)
     endpoints = endpoints_for(bucket, key, opts)
     tx = transport(opts)
@@ -224,6 +225,8 @@ defmodule Maxio.Storage.Distributed do
     meta =
       build_meta(
         c,
+        version_id,
+        opts,
         acc.size,
         etag,
         sha256,
@@ -320,7 +323,11 @@ defmodule Maxio.Storage.Distributed do
     end)
   end
 
-  defp build_meta(cfg, size, etag, sha256, shard_len, block_hashes_per_drive) do
+  # ROUTE B B4-5：构造 v1 core（耐久 ec/shards/size/etag/sha256/parts，字节不变）后经
+  # Sidecar.migrate_v1/2 升级为完整 maxio/2 sidecar（仅 Map.put 加 format + 单元素 versions，绝不
+  # 污染耐久字段）。分布式同样单次 build_meta、同一份 meta 发所有端点 → N 份 signature 逐字一致。
+  # version_id + opts 由 put/5 → do_put → put_locked 一路透传。
+  defp build_meta(cfg, version_id, opts, size, etag, sha256, shard_len, block_hashes_per_drive) do
     n = Config.total(cfg)
 
     shards =
@@ -329,7 +336,7 @@ defmodule Maxio.Storage.Distributed do
         %{"drive" => i, "shard_file_size" => length(hashes) * shard_len, "block_hashes" => hashes}
       end
 
-    %{
+    core = %{
       "ec" => %{
         "k" => cfg.data_shards,
         "m" => cfg.parity_shards,
@@ -345,6 +352,28 @@ defmodule Maxio.Storage.Distributed do
       "parts" => [%{"part" => 0, "size" => size}],
       "shards" => shards
     }
+
+    Sidecar.migrate_v1(core, version_opts(version_id, opts))
+  end
+
+  # 从 opts[:object_meta] 取 maxio/2 版本头字段，产出 Sidecar.migrate_v1/2 的 keyword（与
+  # ErasureCoded.version_opts 逐字一致）。modtime 一次计算（同一份 meta 发所有端点 → N 份
+  # signature 一致）；data_dir = version_id（方案 B 每版本独立目录）。
+  defp version_opts(version_id, opts) do
+    om = Keyword.get(opts, :object_meta, %{})
+    modtime = System.os_time(:nanosecond)
+
+    [
+      version_id: version_id,
+      data_dir: version_id,
+      modtime: modtime,
+      content_type: Map.get(om, :content_type, "binary/octet-stream"),
+      tags: Map.get(om, :tags, %{}),
+      sse: Map.get(om, :sse),
+      acl_canned: Map.get(om, :acl_canned, "private"),
+      storage_class: Map.get(om, :storage_class, "STANDARD"),
+      user_metadata: Map.get(om, :user_metadata, %{})
+    ]
   end
 
   # sidecar 写各端点（并行），返回成功端点数。dirs 可能含 nil（begin_tmp 失败端点）-> 跳过。
@@ -731,9 +760,14 @@ defmodule Maxio.Storage.Distributed do
     sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
     shard_len = acc.shard_len || 0
 
+    # 多段 assemble 的最终对象落 null 布局（Paths.object_rel(..., "null")）；同样产 maxio/2 sidecar
+    # 使其 sidecar-可读/可列。富 object_meta（content_type/user_metadata）此处够不到（Multipart.complete
+    # 不经 Storage.assemble 透传），用 migrate_v1 默认兜底 —— 富元数据透传见 notes B4-6 跟进。
     meta =
       build_meta(
         c,
+        "null",
+        [],
         acc.size,
         etag,
         sha256,

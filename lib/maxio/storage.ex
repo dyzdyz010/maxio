@@ -8,6 +8,11 @@ defmodule Maxio.Storage do
   @spec backend() :: module()
   def backend, do: Application.fetch_env!(:maxio, :storage_backend)
 
+  @doc """
+  流式写入对象字节并落 sidecar。`opts` 透传给后端；其中 `:object_meta`（map）携带 GET/HEAD/LIST
+  所需的富元数据（content_type/tags/sse/acl_canned/storage_class/user_metadata），令纠删/分布式
+  后端写出完整 maxio/2 sidecar（见 `Maxio.Storage.Backend` 的 `:object_meta` 契约）。不改 arity。
+  """
   @spec put(String.t(), String.t(), String.t(), Enumerable.t(), keyword()) ::
           {:ok, Maxio.Storage.Backend.put_result()} | {:error, term()}
   def put(bucket, key, version_id \\ "null", chunks, opts \\ [])

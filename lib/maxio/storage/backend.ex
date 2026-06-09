@@ -9,19 +9,41 @@ defmodule Maxio.Storage.Backend do
     * get/3 的 range 为 nil（全量）或 {first_byte, last_byte}（含端点，0-based），
       返回产出二进制块的 Enumerable（供 send_chunked 流式发出）。
     * ETag 形态：单次 PUT 对象 = MD5(对象内容) 的小写 hex（**不含引号**，引号由 XML/HTTP 层加）。
+
+  ## put/5 的 `:object_meta`（ROUTE B B4-5）
+
+  `opts[:object_meta]`（可选 map）携带 GET/HEAD/LIST 所需的全部 S3 富元数据，使纠删/分布式后端
+  写出**完整 maxio/2 sidecar**（携带 `format:"maxio/2"` + 单元素 `versions` 数组）——盘上 sidecar
+  即事实来源（Route B），故写路径**必须**自描述这些字段，否则 `authoritative_source(:read|:list)=:sidecar`
+  下对真实对象 reconcile 取不到 versioned entry（v1 扁平 meta → `Sidecar.latest/find_version` 返回 nil）
+  → GET 503 / LIST 丢对象。形状（缺省 `%{}`，缺省字段由 `Maxio.Sidecar.migrate_v1/2` 兜底）：
+
+      %{
+        content_type: String.t(),
+        tags: %{String.t() => String.t()},
+        sse: nil | %{"algo" => "AES256", "envelope" => map()},
+        acl_canned: String.t(),
+        storage_class: String.t(),
+        user_metadata: %{String.t() => String.t()}
+      }
+
+  `sse` 形状必须匹配 `Sidecar.to_view/3` 读 `e["sse"]["algo"]` / `e["sse"]["envelope"]`（信封随读视图携带，
+  否则 SSE 对象 GET 解密 `unwrap_dek(nil)` 炸 500）。FS 后端无多端点拓扑（读权威永不命中 FS），可忽略
+  本 opt——耐久核心字节不变（铁律 5：默认 :pg 路径字节级可回滚）。
   """
 
   @type bucket :: String.t()
   @type key :: String.t()
   @type range :: nil | {non_neg_integer(), non_neg_integer()}
   @type put_result :: %{size: non_neg_integer(), etag: String.t(), sha256: String.t()}
+  @type object_meta :: %{optional(atom()) => term()}
 
   @callback put(
               bucket(),
               key(),
               version_id :: String.t(),
               chunks :: Enumerable.t(),
-              opts :: keyword()
+              opts :: [{:object_meta, object_meta()} | {atom(), term()}]
             ) ::
               {:ok, put_result()} | {:error, term()}
   @callback get(bucket(), key(), version_id :: String.t(), range()) ::

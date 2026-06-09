@@ -49,12 +49,19 @@ defmodule Maxio.S3.Handlers.Object do
         nil -> {chunks, nil}
       end
 
+    # ROUTE B B4-5：把已算出的富 S3 元数据组成 object_meta，透传进 Storage.put，使纠删/分布式后端
+    # 写出完整 maxio/2 sidecar（盘上即事实来源，read/list=:sidecar 下对真实对象可读/可列）。
+    # PutObject 当前未捕获 x-amz-meta-*，此处用既有 parse_user_metadata/1 解析并入 sidecar（自描述完整）；
+    # PG 索引侧 attrs 保持不变（:pg 默认路径字节级可回滚，user_metadata 仅注入 sidecar）。
+    object_meta =
+      build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope)
+
     # B1-1：把整个提交 seam（字节经 Storage.put + 元数据经 Objects.put_version_with_id）纳入
     # 同一对象锁，消灭并发同 key 写的「A 字节 + B 元数据」交错（静默 ETag/bytes 分歧）。
     # version_id/SSE/tags 等纯计算/读保持锁外；获锁失败 -> {:error,:locked} -> 503 SlowDown（铁律 3）。
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
-        case Storage.put(bucket, key, version_id, chunks) do
+        case Storage.put(bucket, key, version_id, chunks, object_meta: object_meta) do
           {:ok, %{size: size, etag: etag, sha256: sha256}} ->
             # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
             # SSE 加密对象：x-amz-decoded-content-length / x-amz-content-sha256 是针对明文传输完整性的闸，
@@ -565,10 +572,24 @@ defmodule Maxio.S3.Handlers.Object do
         dest_key
       )
 
+    # ROUTE B B4-5：CopyObject 同样透传 object_meta（content_type/tags/user_metadata 已按
+    # metadata/tagging-directive 解析），使复制对象也写出完整 maxio/2 sidecar。CopyObject MVP 不做
+    # SSE（sse: nil）；acl/storage_class 用默认（与 :pg 分支 put_version_with_id 的 STANDARD 一致）。
+    dest_object_meta = %{
+      content_type: content_type,
+      tags: tags,
+      acl_canned: "private",
+      storage_class: "STANDARD",
+      sse: nil,
+      user_metadata: meta_map
+    }
+
     commit_result =
       Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
         {size, etag} =
-          case Storage.put(dest_bucket, dest_key, dest_version_id, src_stream.stream) do
+          case Storage.put(dest_bucket, dest_key, dest_version_id, src_stream.stream,
+                 object_meta: dest_object_meta
+               ) do
             {:ok, %{size: size, etag: etag}} -> {size, etag}
             {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
           end
@@ -713,6 +734,25 @@ defmodule Maxio.S3.Handlers.Object do
   #   REPLACE     → 用请求头 x-amz-meta-* 解析的新 metadata（不继承源；无头 → %{}）。
   defp copy_user_metadata(conn, _src_obj, "REPLACE"), do: parse_user_metadata(conn)
   defp copy_user_metadata(_conn, src_obj, _copy), do: src_obj.metadata || %{}
+
+  # ROUTE B B4-5：组装透传给 Storage.put 的 object_meta（让后端写出完整 maxio/2 sidecar）。
+  # 各字段均来自 do_put/copy 已就绪的计算值（content_type/tags/acl/storage_class/sse），加
+  # 用户 metadata（x-amz-meta-*，PutObject 现注入 sidecar 使其自描述完整）。sse 形状须匹配
+  # Sidecar.to_view 读 e["sse"]["algo"] / e["sse"]["envelope"]（信封随读视图携带，绝不丢）。
+  defp build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope) do
+    %{
+      content_type: content_type,
+      tags: tags_map,
+      acl_canned: header(conn, "x-amz-acl") || "private",
+      storage_class: "STANDARD",
+      sse: sse_meta(sse_requested, sse_envelope),
+      user_metadata: parse_user_metadata(conn)
+    }
+  end
+
+  # sse 字段：未加密 → nil；SSE-S3 → %{"algo" => "AES256", "envelope" => 信封}（信封含 wrapped DEK）。
+  defp sse_meta(nil, _envelope), do: nil
+  defp sse_meta(algo, envelope), do: %{"algo" => algo, "envelope" => envelope}
 
   # x-amz-meta-* 头 → %{"name" => "value"}（去掉 "x-amz-meta-" 前缀，名小写；空名跳过）。
   defp parse_user_metadata(conn) do
