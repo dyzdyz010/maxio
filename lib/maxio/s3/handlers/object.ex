@@ -496,8 +496,13 @@ defmodule Maxio.S3.Handlers.Object do
         _ -> src_obj.content_type
       end
 
-    # tagging-directive 默认 COPY（对齐 AWS/MinIO）：COPY → 目标继承源 tag-set；
-    # REPLACE → 用 x-amz-tagging 头解析的新 tag-set（复用 PutObject helper，非法 → InvalidTag 400）。
+    # FX-M4：用户 metadata（x-amz-meta-*）按 metadata-directive 计算——
+    # COPY（默认）保留源对象 metadata；REPLACE 用请求头 x-amz-meta-* 头（不继承源）。
+    meta_map = copy_user_metadata(conn, src_obj, directive)
+
+    # tags 受 tagging-directive 独立控制（与 metadata-directive 正交，对齐 AWS/MinIO，铁律 5）：
+    # COPY（默认）→ 目标继承源 tag-set；REPLACE → 用 x-amz-tagging 头解析的新 tag-set
+    # （复用 PutObject helper，非法 → InvalidTag 400）。
     tagging_directive = header(conn, "x-amz-tagging-directive") || "COPY"
 
     tags =
@@ -545,6 +550,7 @@ defmodule Maxio.S3.Handlers.Object do
             etag: etag,
             content_type: content_type,
             storage_class: "STANDARD",
+            metadata: meta_map,
             tags: tags
           })
 
@@ -615,6 +621,24 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   # ── helpers ──
+
+  # FX-M4：计算 CopyObject 目标的用户 metadata（x-amz-meta-*）：
+  #   COPY（默认）→ 原样保留源对象的 metadata（src_obj.metadata，nil 兜底 %{}）；
+  #   REPLACE     → 用请求头 x-amz-meta-* 解析的新 metadata（不继承源；无头 → %{}）。
+  defp copy_user_metadata(conn, _src_obj, "REPLACE"), do: parse_user_metadata(conn)
+  defp copy_user_metadata(_conn, src_obj, _copy), do: src_obj.metadata || %{}
+
+  # x-amz-meta-* 头 → %{"name" => "value"}（去掉 "x-amz-meta-" 前缀，名小写；空名跳过）。
+  defp parse_user_metadata(conn) do
+    conn.req_headers
+    |> Enum.flat_map(fn {k, v} ->
+      case String.downcase(k) do
+        "x-amz-meta-" <> name when name != "" -> [{name, v}]
+        _ -> []
+      end
+    end)
+    |> Map.new()
+  end
 
   # 条件头求值用的对象元信息（etag 无引号 hex；last_modified 用 updated_at）。
   defp meta(object), do: %{etag: object.etag, last_modified: object.updated_at}
