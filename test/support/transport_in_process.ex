@@ -85,4 +85,9 @@ defmodule Maxio.Cluster.Transport.InProcess do
       do: {:error, :unavailable},
       else: ShardServer.commit(tmp_dir, final_obj_dir, opts)
   end
+
+  @impl true
+  def list_dir(node, drive_dir, opts) do
+    if down?(node), do: {:error, :unavailable}, else: ShardServer.list_dir(drive_dir, opts)
+  end
 end

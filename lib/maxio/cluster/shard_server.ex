@@ -101,6 +101,39 @@ defmodule Maxio.Cluster.ShardServer do
     end
   end
 
+  # 走盘 LIST 须跳过的内部前缀（ROUTE B P3）：.versions（版本树）/.uploads（multipart parts）/.tmp（原子提交临时区）。
+  @internal_prefixes [".versions", ".uploads", ".tmp"]
+
+  @doc """
+  读单层目录 drive_dir 下的条目（ROUTE B P3 drive-walk LIST 原语，本机；被 :erpc 寻址，无 node 首参）。
+  返回 `{:ok, [%{name, object?}]}`（name 升序）；object? = 该子目录内含 meta.json（即一个 null 版本对象目录）。
+  跳过内部前缀 .versions/.uploads/.tmp 与 meta.json/part.0 文件本身。目录不存在 -> {:ok, []}。
+  """
+  @spec list_dir(String.t(), keyword()) ::
+          {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
+  def list_dir(drive_dir, _opts \\ []) do
+    case File.ls(drive_dir) do
+      {:ok, names} ->
+        entries =
+          names
+          |> Enum.reject(&(&1 in @internal_prefixes))
+          |> Enum.reject(&(&1 in [@meta_file, @part_file]))
+          |> Enum.filter(fn n -> File.dir?(Path.join(drive_dir, n)) end)
+          |> Enum.sort()
+          |> Enum.map(fn n ->
+            %{name: n, object?: File.regular?(Path.join([drive_dir, n, @meta_file]))}
+          end)
+
+        {:ok, entries}
+
+      {:error, :enoent} ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @doc "stat：该 drive 上 part.0 字节数（heal 用其判文件完整）。"
   @spec stat_shard(String.t()) :: {:ok, non_neg_integer()} | {:error, :enoent}
   def stat_shard(drive_obj_dir) do

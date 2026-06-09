@@ -24,6 +24,11 @@ defmodule Maxio.Cluster.Transport do
   @callback begin_tmp(node(), String.t()) :: {:ok, String.t()} | {:error, term()}
   @callback commit_object(node(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
 
+  # 走盘 LIST 单层目录原语（ROUTE B P3）：读单端点 drive_dir 下一层条目并标记每个子目录是否为对象。
+  # 节点宕机/超时/远端异常 -> {:error, :unavailable}（铁律 3：结构化降级，绝不上抛炸列举路径）。
+  @callback list_dir(node(), String.t(), keyword()) ::
+              {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
+
   @doc "当前配置的传输实现（test 经 opts[:transport] 覆盖；缺省 config :maxio, :shard_transport）。"
   @spec impl(keyword()) :: module()
   def impl(opts \\ []) do
@@ -88,6 +93,11 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def commit_object(node, tmp_dir, final_obj_dir, opts) do
     call(node, :commit, [tmp_dir, final_obj_dir, opts], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def list_dir(node, drive_dir, opts) do
+    call(node, :list_dir, [drive_dir, opts], fn -> {:error, :unavailable} end)
   end
 
   # 本地直接调；远端 :erpc。任何宕机/超时/异常 -> on_fail 兜底（铁律 3：结构化降级，绝不上抛）。
