@@ -268,7 +268,9 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
      host 强制签名（ErrUnsignedHeaders 400）/ ListObjectsV2+ListObjectVersions encoding-type=url（顺带修 SigV4Request 签名 path 双编码 bug，特殊字符 key 真正可用）/ CopyObject COPY 保留源元数据+tags / PutBucketPolicy 拒绝未支持条件算子；fidelity 复检加 encoding-type=url 斜杠保留 + 策略 Condition 接受集修正
 ✅ 路线 B P2（sidecar 权威翻转 · shadow 读）— a0dfe1c..a184ffe（630 测试，precommit 绿）
      Sidecar.to_view/3 / Maxio.MetaReconcile（纯函数跨端点 quorum 仲裁，无 quorum 报错绝不猜，真值表硬测）/ Maxio.ObjectMeta dual-read shadow（PG 仍权威 + 分歧结构化日志 + 读路径绝不被破坏，authoritative_source[:read]=:pg 默认）+ GET/HEAD shadow 接线；executor 修正计划的 get_metadata 返回类型 + 2 fidelity 修复（modtime-first 选组 / shadow 按 topology 门控）
-   ◇ 评估路线 B P3（drive-walk LIST）/ P4（原子写权威 + 翻转读权威 + sidecar heal 回写）← 下一步（需用户拍板）
+✅ 路线 B P3（drive-walk LIST · shadow）— 65a4540..a9c43f2（658 测试，precommit 绿）
+     Transport.list_dir/ShardServer.list_dir（单端点走盘原语）/ Maxio.Listing（跨 set 递归走盘 + delimiter 折叠 + walk-position 续点，从构造消除 LIST 无 SQL LIMIT DoS）/ ObjectMeta.list_shadow（PG 仍权威 + drive-walk vs PG key集/common-prefix 分歧日志 + 绝不破坏列举，authoritative_source[:list]=:pg）+ ListObjectsV2 接线；fidelity 复检加 .versions 枚举+排除 delete marker + 续点游标对齐
+   ◇ 评估路线 B P4（原子写权威 + 翻转读/列权威 + sidecar heal 回写）← 下一步（需用户拍板；这是真正去 PG-SPOF 的临门一脚）
 
 > **网络教训（本机当前）**：长时运行的 subagent（尤其重 WebFetch 的研究/规划 agent）会因 `socket connection was closed` / 证书错误被掐断，特征是任务 `subagent_tokens=0`、跑数分钟后中断；短探针 agent 可过。对策：① 规划/设计文档改由 orchestrator 主线直接撰写（CLAUDE.md 允许，已用于 P2 计划）；② 实现 workflow 的 executor 逐单元（比长研究 agent 短）+ 每单元独立提交，被掐断只丢当前单元、可续；③ 遇 `subagent_tokens=0` 失败先探针确认连接再重启，绝不盲目重跑。
 ```
