@@ -1,5 +1,6 @@
 defmodule Maxio.ListingTest do
   use ExUnit.Case, async: true
+  import ExUnit.CaptureLog
   alias Maxio.Listing
   alias Maxio.Cluster.Transport.InProcess
 
@@ -110,10 +111,92 @@ defmodule Maxio.ListingTest do
     assert Enum.map(r.objects, & &1.key) == ["b", "c"]
   end
 
-  test "Continuation encode/decode round-trip", %{} do
+  # 回归（review must-fix）：分页第 2 页 shadow 必须用与权威 Objects 路径同语义的续点游标。
+  # 权威 Objects.list_objects_v2 发出的 next_continuation_token = 最后返回项的【裸 key】
+  # （objects_test.exs:66 验证 == "b"）；handler 把该 client-echoed token 原样喂给 PG 与本 shadow。
+  # 修复前：本 shadow base64 解码裸 key -> 乱码/:error -> 回落 start_after=nil 走全桶 -> 第 2 页
+  # 走盘从头列举，drive-walk 第 2 页与 PG 第 2 页不一致 -> 每个分页请求都伪报 list divergence。
+  # 修复后：续点原文直通，走盘第 2 页 == PG 第 2 页，compare_list 零分歧。
+  test "多页：第 2 页续点（裸 key，对齐权威）走盘结果与权威分页一致，零伪分歧", %{
+    topo: topo,
+    eps: eps
+  } do
+    for k <- ~w(a b c d e), do: put(eps, "b", k)
+
+    # ---- 第 1 页：max_keys=2 ----
+    r1 = Listing.list_objects_v2("b", %{max_keys: 2}, opts(topo))
+    assert Enum.map(r1.objects, & &1.key) == ["a", "b"]
+    assert r1.is_truncated == true
+    # 续点必须是【裸 key】"b"（与权威 Objects 路径逐字对齐，objects_test.exs:66），绝非 base64。
+    assert r1.next_continuation_token == "b"
+
+    # ---- 第 2 页：用权威路径会发的裸 key 续点回传（模拟 client echo）----
+    page2_opts = %{max_keys: 2, continuation_token: r1.next_continuation_token}
+    r2 = Listing.list_objects_v2("b", page2_opts, opts(topo))
+    # 续点对齐后第 2 页从 "b" 之后续走，绝不回头走全桶。
+    assert Enum.map(r2.objects, & &1.key) == ["c", "d"]
+    assert r2.is_truncated == true
+    assert r2.next_continuation_token == "d"
+
+    # ---- shadow 比对零伪分歧：构造与权威 PG 第 2 页【逐字段一致】的 pg 结果，过 list_shadow ----
+    # （walk 与 PG 数据一致时，compare_list 不得记 "list divergence"。修复前第 2 页必报。）
+    pg_page2 = %{
+      objects: [%{key: "c"}, %{key: "d"}],
+      common_prefixes: [],
+      is_truncated: true,
+      next_continuation_token: "d",
+      key_count: 2
+    }
+
+    log =
+      capture_log(fn ->
+        assert :ok =
+                 Maxio.ObjectMeta.list_shadow(
+                   "b",
+                   page2_opts,
+                   [pg: pg_page2] ++ opts(topo)
+                 )
+      end)
+
+    refute log =~ "list divergence"
+
+    # ---- 第 3 页（末页）续点同样裸 key 直通，零分歧，正确收尾 ----
+    page3_opts = %{max_keys: 2, continuation_token: r2.next_continuation_token}
+    r3 = Listing.list_objects_v2("b", page3_opts, opts(topo))
+    assert Enum.map(r3.objects, & &1.key) == ["e"]
+    assert r3.is_truncated == false
+
+    pg_page3 = %{
+      objects: [%{key: "e"}],
+      common_prefixes: [],
+      is_truncated: false,
+      next_continuation_token: nil,
+      key_count: 1
+    }
+
+    log3 =
+      capture_log(fn ->
+        assert :ok =
+                 Maxio.ObjectMeta.list_shadow(
+                   "b",
+                   page3_opts,
+                   [pg: pg_page3] ++ opts(topo)
+                 )
+      end)
+
+    refute log3 =~ "list divergence"
+  end
+
+  test "Continuation encode/decode round-trip（原文直通，对齐权威路径裸 key 续点）", %{} do
+    # 续点 token = key 原文（绝不二次编码）：encode 是 identity，decode 把任意字符串当作 key 游标。
     tok = Maxio.Listing.Continuation.encode("photos/x.jpg")
+    assert tok == "photos/x.jpg"
     assert {:ok, "photos/x.jpg"} = Maxio.Listing.Continuation.decode(tok)
-    assert :error = Maxio.Listing.Continuation.decode("!!!notbase64!!!")
+    # 关键回归：权威 Objects 发的裸 key（如 "key1"/"photos/2006/"）必须被当成 key 游标原样接收，
+    # 绝不再当成 base64 解码成乱码或报 :error 而回落 start_after=nil 走全桶（伪分歧根因）。
+    assert {:ok, "key1"} = Maxio.Listing.Continuation.decode("key1")
+    assert {:ok, "photos/2006/"} = Maxio.Listing.Continuation.decode("photos/2006/")
+    assert :error = Maxio.Listing.Continuation.decode(nil)
   end
 
   # 跨 set 全端点递归走盘：两个 set 各 3 端点；对象按 key 分散到不同 set（同 key 必同 set），

@@ -18,27 +18,35 @@ defmodule Maxio.Listing do
     * 走盘只到 key 级——list_result 的 `objects` 元素仅含 `:key`（无 LastModified/ETag/Size）；
       B3-3 shadow 比对只比 key 集 + common_prefixes，不比对象元数据。翻权威时再读 sidecar 富集（P4）。
 
-  续点语义：`next_continuation_token` = base64 包裹「本页最后纳入 objects/common_prefixes 的那条
-  原始遍历 key」（walk-position）。下次以 `start_after = 该 key` 续走（严格大于），保证可分页遍历
-  不重不漏（升序 + 严格大于游标）。
+  续点语义（必须与权威路径 `Maxio.Objects.list_objects_v2/2` 逐字对齐——shadow 铁律）：
+  `next_continuation_token` = 「本页最后纳入 objects/common_prefixes 的那条原始遍历 key」
+  （walk-position）**的原文字符串**，绝不二次编码。下次客户端原样回传该 token，本端以
+  `start_after = 该 key` 续走（严格大于），保证可分页遍历不重不漏（升序 + 严格大于游标）。
+
+  为什么 token = 原始 key 而非 base64：权威路径（`objects.ex` `next_continuation_token` = 最后
+  返回项的**裸** key）与本 shadow 由同一个 handler 喂同一份 client-echoed `list_opts`
+  （`s3/handlers/bucket.ex` `list_objects_v2/1`）。若本 shadow 用 base64 包裹/解包，则客户端回传
+  的「裸 PG key」会被本端当成 base64 解码成乱码游标（`"key1" -> <<145,236,181>>`）或解码失败
+  （`"photos/2006/" -> :error`）回落 `start_after=nil` 走全桶，使第 2 页起 shadow 必报伪分歧并
+  淹没铁律 3 分歧日志。故 token 编解码必须与权威路径同语义：原文 key 直通。
   """
 
   alias Maxio.Cluster.{Topology, Transport}
 
   defmodule Continuation do
-    @moduledoc "walk-position 续点 token（base64 包裹最后产出的 key；绝非 offset）。"
+    @moduledoc """
+    walk-position 续点 token（= 最后产出的原始 key 字符串；绝非 offset，绝不二次编码）。
+
+    与权威 `Maxio.Objects.list_objects_v2/2` 续点语义逐字对齐：token 即 key 原文。保留具名抽象
+    （`encode/1` `decode/1`）以隔离「token 表示」决策、稳定 `decode :: {:ok, key} | :error` 契约，
+    使调用点与续点演进解耦；当前实现为原文直通（identity）。
+    """
 
     @spec encode(String.t()) :: String.t()
-    def encode(last_key) when is_binary(last_key), do: Base.url_encode64(last_key, padding: false)
+    def encode(last_key) when is_binary(last_key), do: last_key
 
     @spec decode(String.t()) :: {:ok, String.t()} | :error
-    def decode(token) when is_binary(token) do
-      case Base.url_decode64(token, padding: false) do
-        {:ok, key} -> {:ok, key}
-        :error -> :error
-      end
-    end
-
+    def decode(token) when is_binary(token), do: {:ok, token}
     def decode(_), do: :error
   end
 
