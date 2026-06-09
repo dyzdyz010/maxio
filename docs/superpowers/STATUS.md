@@ -262,8 +262,9 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 ✅ 批次1 critical（DeleteObjects 数据丢失）— c07a6b4（513 测试）
 ✅ 路线 B P1（B1-1..B1-4 无悔架构修正）— 8b41b59..b5d2928（557 测试，APPROVE_WITH_NOTES）
      B1-1 锁横跨接缝（消除静默 ETag/字节不一致，Maxio.Lock+SlowDown 503）/ B1-2 原子 temp-rename+fsync（crash 无撕裂+telemetry 断言+quorum 回滚，Windows rename-busy DI 测试）/ B1-3 distinct-node 校验+LIST 硬限（含静默欠截断修复）/ B1-4 sidecar v2 schema+reverse-GC 诚实脚手架
-▶  批次2 七个 high 保真偏离（CopyObject 版本化×2 / SigV4 +号 raw-query / PutBucketPolicy ARN 校验 / CORS Allow-Credentials / DeleteObjects 对象级授权 / CopyObject 授权回归锁）← 下一步
-   批次3 五个 medium（host 强制签名 / encoding-type=url ×2 / COPY 元数据保留 / 未支持条件算子拒绝）
+✅ 批次2 七个 high 保真偏离 — 1456e99..21bcac1（593 测试，APPROVE_WITH_NOTES）
+     CopyObject 版本感知源读 + 目标建版本+x-amz-version-id/copy-source-version-id（消化 P1 version_id:null 遗留）/ SigV4 +号 raw-query 规范化（AWS 向量无回归）/ PutBucketPolicy 跨桶 ARN→400 / CORS Allow-Credentials / DeleteObjects 对象级授权 / CopyObject 授权回归锁；fidelity 复检加 CopyObject delete-marker 源→404 + tagging-directive COPY
+▶  批次3 五个 medium（host 强制签名 / encoding-type=url ×2 / COPY 元数据保留 / 未支持条件算子拒绝）← 下一步
    评估路线 B P2–P7（sidecar 权威翻转：读→列→写）
 ```
 
