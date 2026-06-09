@@ -225,7 +225,7 @@ defmodule Maxio.S3.Handlers.Object do
     version_id = Map.get(conn.query_params, "versionId")
 
     # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口；:pg 默认含内部 shadow，行为不变）。
-    # HEAD 无 body：缺失/read_quorum 不足都只回状态 + 头（read_quorum 不足 → 503 ServiceUnavailable）。
+    # HEAD 无 body：缺失/read_quorum 不足都只回状态 + 头（read_quorum 不足 → 503，对齐 GET SlowDownRead）。
     with {:ok, _b} <- Buckets.lookup(bucket),
          {:ok, object} <- fetch_for_head(bucket, key, version_id) do
       cond do
@@ -267,7 +267,8 @@ defmodule Maxio.S3.Handlers.Object do
 
       {:error, :read_quorum} ->
         # 仅 :read=:sidecar 时可达：sidecar reconcile 不足 read_quorum → 503（绝不猜，铁律 3）。
-        # HEAD 无 body：只回 503 状态（与 GET 的 ServiceUnavailable 同源，SDK 据此退避重试）。
+        # HEAD 无 body：只回 503 状态（与 GET 的 SlowDownRead 同源，SDK 据此退避重试；HEAD 响应无
+        # XML body 故不渲染 Code，但状态码与 GET 的 503 一致，对齐 MinIO errErasureReadQuorum）。
         Log.warn("head object unavailable: sidecar read_quorum unmet",
           action: :head_object,
           bucket: bucket,
@@ -917,7 +918,9 @@ defmodule Maxio.S3.Handlers.Object do
   # version_id == nil → 取当前版本（latest）；否则取指定版本行。经 ObjectMeta.get 统一读权威分流：
   #   %Object{} → {object, object.size}；
   #   {:error,:not_found} → NoSuchKey 404（既有语义）；
-  #   {:error,:read_quorum}（仅 :read=:sidecar 时可达）→ 503 ServiceUnavailable（绝不返回猜测副本，铁律 3）。
+  #   {:error,:read_quorum}（仅 :read=:sidecar 时可达）→ 503 SlowDownRead（绝不返回猜测副本，铁律 3）。
+  #     对齐 MinIO：errErasureReadQuorum -> ErrSlowDownRead（cmd/api-errors.go），与 PUT 写 quorum
+  #     的 :slow_down_write 对称；绝不用 AWS 泛化的 ServiceUnavailable（MinIO 从不产此 Code）。
   defp resolve_object_for_get!(bucket, key, version_id) do
     case Maxio.ObjectMeta.get(bucket, key, version_id, []) do
       %Objects.Object{} = object ->
@@ -934,7 +937,7 @@ defmodule Maxio.S3.Handlers.Object do
           reason: :read_quorum
         )
 
-        raise Error.new(:service_unavailable, resource: "/#{bucket}/#{key}")
+        raise Error.new(:slow_down_read, resource: "/#{bucket}/#{key}")
     end
   end
 

@@ -77,13 +77,13 @@ defmodule Maxio.S3.Error do
     # 把 503 SlowDown* 视为限流并指数退避，依赖此路径在集群降级/瞬时争用下自愈；
     # 绝不能退化成 500 InternalError（被多数客户端当硬失败、跳过退避）。
     slow_down_write: {"SlowDownWrite", 503, "Please reduce your write request rate."},
+    # ROUTE B B4-3：翻读权威（:read=:sidecar）后，GET/HEAD 的 sidecar reconcile 不足 read_quorum
+    # （端点宕机 / 副本分歧）→ 对象当前不可读、绝不返回猜测副本（铁律 3）。映射为 SlowDownRead(503)，
+    # 与 PUT 写 quorum 的 :slow_down_write 对称，逐字对齐 MinIO toAPIErrorCode()：
+    # errErasureReadQuorum / InsufficientReadQuorum -> ErrSlowDownRead（cmd/api-errors.go）。
+    # 绝不用 AWS 泛化的 ServiceUnavailable——MinIO errorCodes 表无该 Code，maxio 声称 MinIO 兼容，
+    # 须产 MinIO 字节一致的 SlowDownRead（SDK 重试分类器据 SlowDown* 视为限流退避）。
     slow_down_read: {"SlowDownRead", 503, "Please reduce your read request rate."},
-    # ROUTE B B4-3：翻读权威（:read=:sidecar）后，sidecar reconcile 不足 read_quorum（端点宕机 /
-    # 副本分歧）→ 对象当前不可读、绝不返回猜测副本（铁律 3）。映射为可重试的 503 ServiceUnavailable
-    # （对齐 AWS S3 ServiceUnavailable：临时性，SDK 据此退避重试，集群恢复 quorum 后自愈）。
-    service_unavailable:
-      {"ServiceUnavailable", 503,
-       "Reduce your request rate or try again later; the service is temporarily unable to satisfy your request."},
     internal_error: {"InternalError", 500, "An internal error occurred. Try again."},
     authorization_header_malformed:
       {"AuthorizationHeaderMalformed", 400,

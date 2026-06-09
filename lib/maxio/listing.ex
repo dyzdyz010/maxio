@@ -112,6 +112,78 @@ defmodule Maxio.Listing do
     }
   end
 
+  @doc """
+  ROUTE B B4-3 修复 —— 发现单个 key 的【当前版本】id（跨全端点走盘，去 PG 读 SPOF）。
+
+  read=:sidecar 翻读权威下，latest GET/HEAD 须解析当前版本，绝不能硬编码 "null"
+  （那只对 Unversioned 桶成立；Enabled 桶版本落 `.versions/<bucket>/<key>/<ULID>/`，
+  null 路径为空 → 系统性 404）。本函数枚举两源候选版本：
+    1. null 布局：`<bucket>/<key>/meta.json` 存在 → 候选 "null"；
+    2. 版本树：`.versions/<bucket>/<key>/<version_id>/meta.json` 每个 → 候选 version_id；
+  跨端点收敛（任一端点命中即为候选，与 `collect_keys` 的版本枚举同源），按 `current_version`
+  语义（max ULID = newest，null 为对等）选出当前版本 id。盘上无任何版本 → nil。
+
+  仅枚举版本 id（不读 meta、不做 quorum 计数）；quorum / 签名仲裁仍由调用方
+  （`MetaReconcile.reconcile`）在解析出的当前版本路径上做（绝不在此猜副本，铁律 3）。
+  """
+  @spec discover_current_version(String.t(), String.t(), keyword()) :: String.t() | nil
+  def discover_current_version(bucket, key, opts \\ []) do
+    transport = Transport.impl(opts)
+    topo = Keyword.get(opts, :topology)
+    set_ids = if topo, do: Topology.all_set_ids_from(topo), else: Topology.all_set_ids()
+
+    vids =
+      set_ids
+      |> Enum.flat_map(fn set_id ->
+        if topo, do: Topology.endpoints_from(topo, set_id), else: Topology.endpoints(set_id)
+      end)
+      |> Enum.flat_map(fn {node, drive} ->
+        null_candidate(transport, node, drive, bucket, key) ++
+          version_candidates(transport, node, drive, bucket, key)
+      end)
+      |> Enum.uniq()
+
+    case vids do
+      [] -> nil
+      _ -> current_version(vids)
+    end
+  end
+
+  # null 布局候选：`<bucket>/<key>/meta.json` 在该端点存在 → ["null"]，否则 []。
+  defp null_candidate(transport, node, drive, bucket, key) do
+    case Maxio.Cluster.Paths.object_rel(bucket, key, "null") do
+      {:ok, rel} ->
+        case transport.get_sidecar(node, Path.join(drive, rel)) do
+          {:ok, _meta} -> ["null"]
+          {:error, _} -> []
+        end
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  # 版本树候选：列 `.versions/<bucket>/<key>/` 下每个含 meta.json 的子目录名（= version_id）。
+  # 路径穿越守卫复用 object_rel("null") 的 safe_relative（非法 key → []）。端点读失败 → []（铁律 3）。
+  defp version_candidates(transport, node, drive, bucket, key) do
+    case Maxio.Cluster.Paths.object_rel(bucket, key, "null") do
+      {:ok, rel} ->
+        # rel = "bucket/key"；版本树目录 = ".versions/bucket/key"。
+        ver_dir = Path.join([drive, @versions_prefix, rel])
+
+        case transport.list_dir(node, ver_dir, []) do
+          {:ok, entries} ->
+            entries |> Enum.filter(& &1.object?) |> Enum.map(& &1.name)
+
+          {:error, _} ->
+            []
+        end
+
+      {:error, _} ->
+        []
+    end
+  end
+
   # continuation_token 优先于 start_after 作为分页游标（两者都是 key 的"严格大于"起点，对齐
   # Objects.list_objects_v2）。无法解码的 continuation_token 回落 start_after。
   defp continuation_cursor(list_opts) do

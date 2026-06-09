@@ -43,12 +43,15 @@ defmodule Maxio.ObjectMeta do
 
     * `:pg`（默认）→ SHADOW 模式：返回 PG 权威 `%Object{}`（或 `{:error,:not_found}`），
       并 best-effort 跨端点 sidecar reconcile + 分歧日志（不影响返回值、不抛错；含 B4-1 heal 调度）。
-    * `:sidecar`（B4-3 翻读权威）→ 读全 N 端点 sidecar -> `MetaReconcile.reconcile`：
-        - `{:ok, entry, divergent}` → 调度 heal（B4-1）；entry 是 delete_marker 且 version_id==nil
-          → `{:error, :not_found}`（latest 是删除标记，未带 versionId 的 GET 应 404）；否则返回
-          `Sidecar.to_view` 补全为与 `%Object{}` 兼容的结构（不依赖 PG 读回，去 PG 读 SPOF）。
+    * `:sidecar`（B4-3 翻读权威）→ latest（version_id=nil）先经 `Maxio.Listing.discover_current_version`
+      跨端点走盘发现当前版本（绝不硬编码 "null"——Enabled 桶版本落 `.versions/<bucket>/<key>/<ULID>/`），
+      再读全 N 端点该版本 sidecar -> `MetaReconcile.reconcile`：
+        - `{:ok, entry, divergent}` → 调度 heal（B4-1）；返回 `Sidecar.to_view` 补全为与 `%Object{}`
+          兼容的结构（不依赖 PG 读回，去 PG 读 SPOF）。entry 是 delete_marker（含 latest delete marker）
+          时**仍返回视图**（`is_delete_marker: true` + version_id），交 handler 发 404+x-amz-delete-marker:true
+          / 405——与 :pg 路径逐字节同构，绝不塌缩成裸 not_found 丢删除标记头。
         - `{:error, :read_quorum}` → 若**所有端点确实缺该对象**（genuinely absent）→ `{:error, :not_found}`；
-          否则（部分端点有但 < quorum / 分歧）→ `{:error, :read_quorum}`（handler 映射 503，绝不猜）。
+          否则（部分端点有但 < quorum / 分歧）→ `{:error, :read_quorum}`（handler 映射 503 SlowDownRead，绝不猜）。
         - sidecar 路径完全不可达（无拓扑 / object_rel 非法 / 读 sidecar 抛异常）→ 降级 PG fallback +
           `Log.warn`（绝不因 sidecar 不可达而让对象读不出，PG 索引兜底）。
 
@@ -71,11 +74,15 @@ defmodule Maxio.ObjectMeta do
   # B4-3 —— 读权威 :sidecar：读全 N 端点 sidecar -> reconcile，返回值取自 sidecar（不依赖 PG）。
   # 完全不可达（无拓扑 / object_rel 非法 / 读 sidecar 抛异常）→ 降级 PG fallback（记 Log.warn）。
   defp sidecar_read(bucket, key, version_id, opts) do
-    # latest 读（version_id=nil）对应盘上「null」目录或 :latest target；显式版本走 .versions 路径。
-    # sidecar 权威下无 PG 行可解析有效版本，故 latest 直接用 "null" 目录 + :latest reconcile target
-    # （方案 B 每版本独立目录：latest 视图落在 null/当前目录，与写路径 do_put version_id 落点一致）。
-    eff_vid = version_id || "null"
-    target = if version_id == nil, do: :latest, else: {:version, version_id}
+    # 解析有效落盘版本 + reconcile target：
+    #   * 显式 versionId → 直接走该版本路径（`.versions/<bucket>/<key>/<vid>` 或 null）。
+    #   * latest（version_id=nil）→ 跨全端点走盘**发现当前版本**（绝不硬编码 "null"——那只对
+    #     Unversioned 桶成立；Enabled 桶版本落 `.versions/<bucket>/<key>/<ULID>/`，硬编码 null
+    #     会系统性 404 versioned 桶对象，铁律 3）。发现到的当前版本 id 既定位 sidecar 路径，
+    #     又作 reconcile target（在该版本路径上做 quorum/签名仲裁，绝不在此猜副本）。
+    #     盘上无任何版本（discover 返回 nil）→ 退回 "null" 路径 + :latest target（保持
+    #     全端点缺该对象 → not_found 的既有语义，与 reconcile_sidecar_read 的 all-missing 分支一致）。
+    {eff_vid, target} = resolve_sidecar_version(bucket, key, version_id, opts)
 
     try do
       copies = read_endpoint_sidecars(bucket, key, eff_vid, opts)
@@ -107,6 +114,37 @@ defmodule Maxio.ObjectMeta do
     end
   end
 
+  # 解析 read=:sidecar 下的「有效落盘版本 + reconcile target」。
+  #   * 显式 versionId（is_binary）→ 直接走该版本（target = {:version, vid}）。
+  #   * latest（nil）→ 经 `Maxio.Listing.discover_current_version` 跨端点走盘发现当前版本
+  #     （max ULID = newest，null 为对等；reuse list 权威同一版本发现逻辑，去 PG SPOF）。
+  #     - 发现到 ULID 当前版本 → {vid, {:version, vid}}（在该版本路径做 quorum 仲裁）。
+  #     - 发现到 "null"（Unversioned 当前布局）→ {"null", :latest}（null 路径 meta 的 latest entry）。
+  #     - 盘上无任何版本（nil）→ {"null", :latest}（读空 null 路径 → all-missing → not_found，
+  #       保持「全端点缺该对象 → 404」语义）。
+  #   * discover 抛异常（无拓扑等）→ 回退 {"null", :latest}（再由 read_endpoint_sidecars 的
+  #     copies==[] 分支降级 PG fallback）。
+  defp resolve_sidecar_version(_bucket, _key, version_id, _opts) when is_binary(version_id),
+    do: {version_id, {:version, version_id}}
+
+  defp resolve_sidecar_version(bucket, key, nil, opts) do
+    case discover_current_version(bucket, key, opts) do
+      nil -> {"null", :latest}
+      "null" -> {"null", :latest}
+      vid -> {vid, {:version, vid}}
+    end
+  end
+
+  # 委派 Maxio.Listing 的单 key 当前版本发现（reuse list 权威版本枚举，绝不另起一套走盘）。
+  # 任何异常/throw/exit 都吞并回退 nil（→ resolve_sidecar_version 退 "null" 路径，绝不炸读路径，铁律 3）。
+  defp discover_current_version(bucket, key, opts) do
+    Maxio.Listing.discover_current_version(bucket, key, opts)
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
   defp reconcile_sidecar_read(bucket, key, version_id, eff_vid, target, copies, opts) do
     rq = read_quorum(opts)
 
@@ -136,12 +174,14 @@ defmodule Maxio.ObjectMeta do
     end
   end
 
-  # 把 reconcile 出的权威 entry 翻成与 %Object{} 兼容的读视图；latest 是 delete_marker 且未带
-  # versionId → not_found（GET/HEAD 应 404）；显式 versionId 指向 delete_marker 时仍返回视图
-  # （handler 据 is_delete_marker 走 405 分支，与 :pg 路径一致）。
-  defp view_or_not_found(_bucket, _key, nil, %{"type" => "delete_marker"}),
-    do: {:error, :not_found}
-
+  # 把 reconcile 出的权威 entry 翻成与 %Object{} 兼容的读视图。
+  #
+  # delete marker 处理（修复：保真对齐 :pg 路径与 AWS S3）：latest 是 delete_marker 且未带 versionId
+  # 时，**绝不**塌缩成 {:error, :not_found}（那会丢 x-amz-delete-marker:true + x-amz-version-id 头，
+  # 让客户端把「被删除标记遮蔽」误判为「从未存在」）。统一返回 `%Object{is_delete_marker: true}` 视图，
+  # 交回 handler——其 GET/HEAD `object.is_delete_marker and version_id==nil` 分支发 404 +
+  # x-amz-delete-marker:true + maybe_put_version_id，与 :pg 路径**逐字节同构**。显式 versionId 指向
+  # delete_marker 时同样返回视图（handler 走 405 + 头分支）。
   defp view_or_not_found(bucket, key, _version_id, entry) do
     view = Sidecar.to_view(bucket, key, entry)
 
