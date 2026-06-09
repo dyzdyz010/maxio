@@ -177,6 +177,28 @@ defmodule Maxio.Sidecar do
     }
   end
 
+  @doc """
+  把 sidecar 某版本 entry 翻成「读路径可比视图」map（B2 shadow 比对用）。
+  键与 `Maxio.Objects.Object` 的读相关字段对齐，便于 ObjectMeta 逐字段比对 PG 与 sidecar。
+  与 `to_object_attrs/3` 取值一致，但固定输出读路径字段集。
+  """
+  @spec to_view(String.t(), String.t(), version_entry()) :: map()
+  def to_view(_bucket, _key, %{} = e) do
+    %{
+      version_id: e["version_id"],
+      size: e["size"] || 0,
+      etag: e["etag"] || "",
+      content_type: e["content_type"] || "binary/octet-stream",
+      metadata: e["user_metadata"] || %{},
+      storage_class: e["storage_class"] || "STANDARD",
+      acl_canned: e["acl_canned"] || "private",
+      tags: e["tags"] || %{},
+      sse_algorithm: get_in(e, ["sse", "algo"]),
+      is_latest: e["is_latest"] || false,
+      is_delete_marker: e["type"] == "delete_marker"
+    }
+  end
+
   defp recompute_latest(versions) do
     case Enum.max_by(versions, &sort_key/1, fn -> nil end) do
       nil -> versions
