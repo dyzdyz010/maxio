@@ -279,7 +279,10 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
    ✅ 路线 B B4-6（写路径元数据保真补全）— 583697a + fidelity-fix f856c7e（700 测试，APPROVE_WITH_NOTES，verify 绿）
      修 3 medium：D1 多段 complete 透传 content_type/user_metadata 进 sidecar（Multipart.complete→Storage.assemble→build_meta opts）/ D2 新建 Maxio.Metadata.validate_size!（2KB）+ MetadataTooLarge 400 错误码，do_put 与 copy(REPLACE) pre-commit 闸（无孤儿）/ D3 PutObject user_metadata 也写 PG（与 sidecar 锁步、消除读分裂）。
      **B4-6 fidelity 又抓 2 high → fidelity-fix f856c7e 当场修**：x-amz-meta-* 写→读 round-trip——(1) put_common_object_headers 现 GET/HEAD 回显 x-amz-meta-*（此前写了不可读）；(2) CreateMultipartUpload 现解析 x-amz-meta-*+create-time 2KB 闸、complete 把 metadata 传 PG（消 MPU 分裂）；铁律 2 单一来源 Maxio.Metadata.parse_headers/1；加 HTTP 级 e2e D4a-f 证往返。计划 `plans/2026-06-09-routeB-b4-6-write-path-metadata-fidelity.md`。
-   ◇ 路线 B B4-7（元数据 2KB 上限含 x-amz-meta- 前缀）← **下一步**：修 B4-6 fidelity 残留 1 medium（E1：validate_size! 剥前缀后计量少算 11B/头，边界请求被错误接受 vs MinIO len(key 含前缀)+len(value)）+ docstring low（E2：引用不存在的 s3-tests 函数）。基线设 583697a 使 review/fidelity 一并覆盖未独立审查的 f856c7e。计划 `plans/2026-06-09-routeB-b4-7-metadata-size-prefix.md`。
+   ✅ 路线 B B4-7（元数据 2KB 上限含 x-amz-meta- 前缀）— 87413bb（701 测试，**APPROVE / 0 must-fix**，fidelity 3 lens 全 0 critical/high/medium）
+     E1（medium）：Maxio.Metadata.validate_size!/1 加 @meta_prefix_size=byte_size("x-amz-meta-")=11/条，使 `11+byte_size(name)+byte_size(value)` 边界逐字镜像 MinIO isHTTPHeaderSizeTooLarge `len(fullKey)+len(value)`，严格 >2048（d2b 2048→200、新 d2b1 2049→400 钉死）；E2（low）：删 metadata.ex/error.ex 引用不存在的 s3-tests 函数，换真实权威（AWS UsingMetadata + minio generic-handlers）。**基线 583697a 使本轮 review/fidelity 补审了 f856c7e**（APPROVE 确认 x-amz-meta-* round-trip 接线 sound）。计划 `plans/2026-06-09-routeB-b4-7-metadata-size-prefix.md`。
+
+> **✅ 路线 B 写路径元数据保真面收敛（B4-5→B4-7 + f856c7e）**：critical/high/medium 全清零。真实 PUT/Copy/MPU 对象的 content_type/user_metadata 在 `:pg` 与 `:sidecar` 两路一致自描述、x-amz-meta-* 写→读 round-trip 闭合、2KB MetadataTooLarge 边界对齐 MinIO。剩余仅 low（见下），按既定政策文档化 defer。
 
 > **路线 B 主目标达成**：sidecar(meta.json) 已是对象元数据真值源、真实 PUT 对象在 `:read/:list/:write=:sidecar` 下完整可读/可列/可写（端到端取证），PG 降为可派生索引——**PG 单点故障从构造上消除**。默认 `:pg` 全程不变、字节级可回滚。剩余 B4-6 为元数据富度/一致性保真（非阻塞主目标）；生产默认翻 :sidecar 前需 P7 backfill/迁移（既有 v1 对象升 maxio/2）。
 
@@ -290,7 +293,8 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 
 #### low 偏离 defer（与既有 12 项 low 同级，文档化留后续）
 - **D4（low）**：CopyObject sidecar 硬编码 private/STANDARD 忽略 x-amz-acl/x-amz-storage-class——预存在且与 PG 路径一致（PG copy 也硬编码），非 B4-5 引入。留 CopyObject directive 完整化里程碑统一处理（届时 sidecar 与 PG 锁步）。
-- **E3（low）**：缺 8 KB 总请求头上限 + 不识别 x-minio-meta- 前缀（MinIO 两者皆 → MetadataTooLarge 400，在 setRequestLimitMiddleware 层）。属请求管线 plug scope，留「镜像 isHTTPHeaderSizeTooLarge」中间件里程碑。
+- **E3（low）**：缺 8 KB 总请求头上限 + 不识别 x-minio-meta- 前缀（MinIO 两者皆 → MetadataTooLarge 400，在 setRequestLimitMiddleware 层）+ 元数据大小校验只在写 handler 而非 request-wide。属请求管线 plug scope，留「镜像 isHTTPHeaderSizeTooLarge」中间件里程碑（届时：总头 >8192→400、user-metadata 前缀集含 x-minio-meta-、包一个 wrap 全请求的 Plug）。
+- **重复 x-amz-meta-<name> 头（low）**：Maxio.Metadata.parse_headers/1 用 Map.new 末值胜，AWS 对同名 metadata 取首值/逗号合并、MinIO 取首值。真实 SigV4 SDK 几乎不发重复 meta 头；如需严格 parity 让 parse_headers 保留首次出现。预存在（B4-6 从 object.ex 平移、非 B4-7 引入）。
 - **系统头 follow-up**：PutObject/CopyObject/MPU 未捕获/回显 Content-Disposition/Content-Encoding/Cache-Control/Expires（真实 S3/MinIO 对象系统元数据）。x-amz-meta-* round-trip 已由 f856c7e 闭合；这批系统头留响应/写路径系统头里程碑。
 - **x-amz-storage-class 响应头**：put_common_object_headers 不发（STANDARD 时 AWS 本就省略，非默认 storage-class 才需）。CopyObject directive 里程碑一并处理。
 - **shadow-list 健壮性**：precommit 见一条 `Protocol.UndefinedError{value: :not_a_list}` list shadow error（被 catch+日志、默认 :pg 列举不受影响、非 B4-5 引入）。留 shadow 比对健壮性跟进。
