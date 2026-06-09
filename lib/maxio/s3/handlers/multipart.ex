@@ -93,18 +93,31 @@ defmodule Maxio.S3.Handlers.Multipart do
         {:error, :malformed_xml} -> raise Error.new(:malformed_xml, resource: "/#{bucket}/#{key}")
       end
 
-    case Multipart.complete(upload, requested) do
-      {:ok, %{etag: etag, size: size}} ->
-        {:ok, _obj} =
-          Objects.put_metadata(bucket, key, %{
-            size: size,
-            etag: etag,
-            content_type: upload.content_type,
-            storage_class: upload.storage_class
-          })
+    # B1-1：提交 seam（assemble 字节 via Multipart.complete + Objects.put_metadata 元数据）
+    # 纳入同一对象锁，避免与并发同 key PUT/Complete 交错（获锁失败 -> 503 SlowDown，铁律 3）。
+    # 后端 assemble 不再自持锁（锁责任收敛到 handler 单点，避免 :global.trans 非重入死等）。
+    commit_result =
+      Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        case Multipart.complete(upload, requested) do
+          {:ok, %{etag: etag, size: size}} ->
+            {:ok, _obj} =
+              Objects.put_metadata(bucket, key, %{
+                size: size,
+                etag: etag,
+                content_type: upload.content_type,
+                storage_class: upload.storage_class
+              })
 
-        _ = Multipart.abort(upload)
+            _ = Multipart.abort(upload)
+            {:ok, {etag, size}}
 
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end)
+
+    case commit_result do
+      {:ok, {:ok, {etag, size}}} ->
         Log.info("complete multipart upload",
           action: :complete_multipart_upload,
           bucket: bucket,
@@ -124,8 +137,11 @@ defmodule Maxio.S3.Handlers.Multipart do
         |> put_resp_content_type("application/xml")
         |> send_resp(200, body)
 
-      {:error, reason} ->
+      {:ok, {:error, reason}} ->
         raise complete_error(reason, bucket, key)
+
+      {:error, :locked} ->
+        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
     end
   end
 

@@ -49,43 +49,57 @@ defmodule Maxio.S3.Handlers.Object do
         nil -> {chunks, nil}
       end
 
-    case Storage.put(bucket, key, version_id, chunks) do
-      {:ok, %{size: size, etag: etag, sha256: sha256}} ->
-        # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
-        # SSE 加密对象：x-amz-decoded-content-length / x-amz-content-sha256 是针对明文传输完整性的闸，
-        # 而落盘字节是密文（密文≠明文必失配）；传输层完整性已由 SigV4/chunked 在 BodyReader 内验过，
-        # 故加密分支跳过这两个校验（铁律 3 仍由 GCM 认证 + 上游签名保证）。
-        {:ok, obj} =
-          try do
-            unless sse_requested do
-              :ok = verify_decoded_length!(conn, payload_mode, size)
-              :ok = verify_content_sha256!(conn, payload_mode, sha256)
-            end
+    # B1-1：把整个提交 seam（字节经 Storage.put + 元数据经 Objects.put_version_with_id）纳入
+    # 同一对象锁，消灭并发同 key 写的「A 字节 + B 元数据」交错（静默 ETag/bytes 分歧）。
+    # version_id/SSE/tags 等纯计算/读保持锁外；获锁失败 -> {:error,:locked} -> 503 SlowDown（铁律 3）。
+    commit_result =
+      Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        case Storage.put(bucket, key, version_id, chunks) do
+          {:ok, %{size: size, etag: etag, sha256: sha256}} ->
+            # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
+            # SSE 加密对象：x-amz-decoded-content-length / x-amz-content-sha256 是针对明文传输完整性的闸，
+            # 而落盘字节是密文（密文≠明文必失配）；传输层完整性已由 SigV4/chunked 在 BodyReader 内验过，
+            # 故加密分支跳过这两个校验（铁律 3 仍由 GCM 认证 + 上游签名保证）。
+            {:ok, obj} =
+              try do
+                unless sse_requested do
+                  :ok = verify_decoded_length!(conn, payload_mode, size)
+                  :ok = verify_content_sha256!(conn, payload_mode, sha256)
+                end
 
-            Objects.put_version_with_id(bucket, key, version_id, %{
-              size: size,
-              etag: etag,
-              content_type: content_type,
-              storage_class: "STANDARD",
-              acl_canned: header(conn, "x-amz-acl") || "private",
-              tags: tags_map,
-              sse_algorithm: sse_requested,
-              sse_envelope: sse_envelope
-            })
-          rescue
-            err ->
-              _ = Storage.delete(bucket, key, version_id)
+                Objects.put_version_with_id(bucket, key, version_id, %{
+                  size: size,
+                  etag: etag,
+                  content_type: content_type,
+                  storage_class: "STANDARD",
+                  acl_canned: header(conn, "x-amz-acl") || "private",
+                  tags: tags_map,
+                  sse_algorithm: sse_requested,
+                  sse_envelope: sse_envelope
+                })
+              rescue
+                err ->
+                  _ = Storage.delete(bucket, key, version_id)
 
-              Log.warn("put object rolled back orphan bytes",
-                action: :put_object,
-                bucket: bucket,
-                key: key,
-                reason: :incomplete_body
-              )
+                  Log.warn("put object rolled back orphan bytes",
+                    action: :put_object,
+                    bucket: bucket,
+                    key: key,
+                    reason: :incomplete_body
+                  )
 
-              reraise(err, __STACKTRACE__)
-          end
+                  reraise(err, __STACKTRACE__)
+              end
 
+            {:ok, {size, etag, obj}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end)
+
+    case commit_result do
+      {:ok, {:ok, {size, etag, obj}}} ->
         Log.info("put object",
           action: :put_object,
           bucket: bucket,
@@ -100,11 +114,14 @@ defmodule Maxio.S3.Handlers.Object do
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
 
-      {:error, :invalid_key} ->
+      {:ok, {:error, :invalid_key}} ->
         raise Error.new(:invalid_argument, resource: "/#{bucket}/#{key}", message: "Invalid key")
 
-      {:error, reason} ->
+      {:ok, {:error, reason}} ->
         raise Error.new(:internal_error, message: inspect(reason))
+
+      {:error, :locked} ->
+        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -277,11 +294,20 @@ defmodule Maxio.S3.Handlers.Object do
         |> send_resp(204, "")
 
       true ->
-        # Unversioned：真删（删 null 行 + 字节）。
-        :ok = Objects.delete_metadata(bucket, key)
-        _ = Storage.delete(bucket, key)
-        Log.info("delete object", action: :delete_object, bucket: bucket, key: key)
-        send_resp(conn, 204, "")
+        # Unversioned：真删（删 null 行 + 字节）。B1-1：元数据 + 字节删除纳入同一对象锁，
+        # 避免与并发同 key PUT 的提交 seam 交错（获锁失败 -> 503 SlowDown，铁律 3）。
+        case Maxio.Lock.with_object_lock({bucket, key}, fn ->
+               :ok = Objects.delete_metadata(bucket, key)
+               _ = Storage.delete(bucket, key)
+               :ok
+             end) do
+          {:ok, :ok} ->
+            Log.info("delete object", action: :delete_object, bucket: bucket, key: key)
+            send_resp(conn, 204, "")
+
+          {:error, :locked} ->
+            raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+        end
     end
   end
 
@@ -422,15 +448,38 @@ defmodule Maxio.S3.Handlers.Object do
     # 「截断 dest 早于读 source」的数据丢失：先流式写到唯一临时 key，再流式搬到 dest，最后删临时。
     self_copy? = src_bucket == dest_bucket and src_key == dest_key
 
-    {size, etag} = copy_bytes(self_copy?, src_bucket, src_key, dest_bucket, dest_key)
+    # B1-1：目标提交 seam（目标字节写 + Objects.put_metadata）纳入「目标对象锁」单点。
+    # 源读（含自拷贝先写临时 key）在锁外完成 —— 仅目标 dest_key 持目标锁，绝不在源读上持目标锁，
+    # 避免跨 key 死锁 + :global.trans 非重入死等（铁律 2：锁是请求编排关注点）。
+    src_stream = prepare_copy_source(self_copy?, src_bucket, src_key, dest_bucket, dest_key)
 
-    {:ok, obj} =
-      Objects.put_metadata(dest_bucket, dest_key, %{
-        size: size,
-        etag: etag,
-        content_type: content_type,
-        storage_class: "STANDARD"
-      })
+    commit_result =
+      Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
+        {size, etag} =
+          case Storage.put(dest_bucket, dest_key, "null", src_stream.stream) do
+            {:ok, %{size: size, etag: etag}} -> {size, etag}
+            {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
+          end
+
+        {:ok, obj} =
+          Objects.put_metadata(dest_bucket, dest_key, %{
+            size: size,
+            etag: etag,
+            content_type: content_type,
+            storage_class: "STANDARD"
+          })
+
+        {size, etag, obj}
+      end)
+
+    # 自拷贝的临时 key 在锁外清理（与目标 key 无关，绝不放锁内拖长持锁时间）。
+    cleanup_copy_source(src_stream)
+
+    {_size, etag, obj} =
+      case commit_result do
+        {:ok, committed} -> committed
+        {:error, :locked} -> raise Error.new(:slow_down, resource: "/#{dest_bucket}/#{dest_key}")
+      end
 
     Log.info("copy object",
       action: :copy_object,
@@ -449,18 +498,14 @@ defmodule Maxio.S3.Handlers.Object do
     |> send_resp(200, body)
   end
 
-  # 非自拷贝：直接流式读源写目标（均走 null 版本路径——拷贝目标当 null 版本，对齐 put_metadata）。
-  defp copy_bytes(false, src_bucket, src_key, dest_bucket, dest_key) do
+  # 非自拷贝：直接返回源对象流（锁外打开，目标写时消费）。:tmp_key=nil 表示无临时副本需清理。
+  defp prepare_copy_source(false, src_bucket, src_key, _dest_bucket, _dest_key) do
     {:ok, src_stream} = Storage.get(src_bucket, src_key, "null", nil)
-
-    case Storage.put(dest_bucket, dest_key, "null", src_stream) do
-      {:ok, %{size: size, etag: etag}} -> {size, etag}
-      {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
-    end
+    %{stream: src_stream, dest_bucket: nil, tmp_key: nil}
   end
 
-  # 自拷贝（src==dest）：先写唯一临时 key（避免截断源），再流式搬到 dest，最后删临时。
-  defp copy_bytes(true, src_bucket, src_key, dest_bucket, dest_key) do
+  # 自拷贝（src==dest）：锁外先把源流式写到唯一临时 key（避免目标写截断源），返回临时流供目标写消费。
+  defp prepare_copy_source(true, src_bucket, src_key, dest_bucket, dest_key) do
     suffix = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
     tmp_key = dest_key <> ".maxio-copytmp-" <> suffix
     {:ok, src_stream} = Storage.get(src_bucket, src_key, "null", nil)
@@ -468,19 +513,19 @@ defmodule Maxio.S3.Handlers.Object do
     case Storage.put(dest_bucket, tmp_key, "null", src_stream) do
       {:ok, _tmp} ->
         {:ok, tmp_stream} = Storage.get(dest_bucket, tmp_key, "null", nil)
-
-        result =
-          case Storage.put(dest_bucket, dest_key, "null", tmp_stream) do
-            {:ok, %{size: size, etag: etag}} -> {size, etag}
-            {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
-          end
-
-        _ = Storage.delete(dest_bucket, tmp_key, "null")
-        result
+        %{stream: tmp_stream, dest_bucket: dest_bucket, tmp_key: tmp_key}
 
       {:error, reason} ->
         raise Error.new(:internal_error, message: inspect(reason))
     end
+  end
+
+  # 清理自拷贝的临时副本（非自拷贝 tmp_key=nil，无操作）。
+  defp cleanup_copy_source(%{tmp_key: nil}), do: :ok
+
+  defp cleanup_copy_source(%{dest_bucket: dest_bucket, tmp_key: tmp_key}) do
+    _ = Storage.delete(dest_bucket, tmp_key, "null")
+    :ok
   end
 
   # ── helpers ──

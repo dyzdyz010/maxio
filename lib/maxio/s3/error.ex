@@ -66,6 +66,9 @@ defmodule Maxio.S3.Error do
     not_implemented:
       {"NotImplemented", 501,
        "A header that you provided implies functionality that is not implemented."},
+    slow_down:
+      {"SlowDown", 503,
+       "Please reduce your request rate."},
     internal_error: {"InternalError", 500, "An internal error occurred. Try again."},
     authorization_header_malformed:
       {"AuthorizationHeaderMalformed", 400,

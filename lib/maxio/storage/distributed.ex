@@ -11,7 +11,11 @@ defmodule Maxio.Storage.Distributed do
   「分片 i 经 Transport 写端点 i」。
 
   put：逐块流式编码（Codec.split_block），分片 i 写端点 i，成功端点数 >= write_quorum 才 {:ok}，
-       否则 {:error,:write_quorum}（铁律 3）；PUT 用 Maxio.Cluster.Lock.with_lock 守护并发（绝不撕裂对象）。
+       否则 {:error,:write_quorum}（铁律 3）。
+  对象锁（B1-1）由 handler 层 `Maxio.Lock` 横跨「字节 + 元数据」提交 seam 单点持有；本后端不自持
+  对象锁——否则 handler 已持同名 {bucket,key} 锁、后端再 `:global.trans` 同资源会死等自己
+  （`:global.trans` 非重入）。锁是请求编排关注点，不是字节后端关注点（铁律 2）。非 handler 的直接
+  调用方（backfill/scanner/conformance）若需并发安全须自行 `Maxio.Lock.with_object_lock`。
   get：逐块跨节点并行读 K-of-N 分片（宕机/超时端点 -> nil），按 sidecar BLAKE3 校验 + Codec.restore_block
        重建（存活 < K -> raise InsufficientShardsError，绝不静默返回错数据，铁律 3）+ 截断 + Range 裁剪，流式发出。
 
@@ -23,7 +27,7 @@ defmodule Maxio.Storage.Distributed do
   require Logger
 
   alias Maxio.Storage.Erasure.{Codec, Config}
-  alias Maxio.Cluster.{Lock, Paths, Router, Topology, Transport}
+  alias Maxio.Cluster.{Paths, Router, Topology, Transport}
 
   # ── Backend callbacks（签名与 FS/ErasureCoded 一致）──
 
@@ -110,7 +114,8 @@ defmodule Maxio.Storage.Distributed do
   defp endpoint_dirs(endpoints, obj_rel),
     do: Enum.map(endpoints, fn {node, drive} -> {node, Path.join(drive, obj_rel)} end)
 
-  # ── PUT（逐块流式编码；分片 i -> 端点 i；with_lock 守护）──
+  # ── PUT（逐块流式编码；分片 i -> 端点 i）──
+  # 不自持对象锁：B1-1 起锁由 handler 层 Maxio.Lock 横跨字节+元数据 seam 单点持有（避免双锁/非重入死等）。
 
   defp do_put(bucket, key, version_id, chunks, opts) do
     case Paths.object_rel(bucket, key, version_id) do
@@ -118,12 +123,7 @@ defmodule Maxio.Storage.Distributed do
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
-        case Lock.with_lock({bucket, key}, fn ->
-               put_locked(bucket, key, obj_rel, chunks, opts)
-             end) do
-          {:ok, result} -> result
-          {:error, :locked} -> {:error, :locked}
-        end
+        put_locked(bucket, key, obj_rel, chunks, opts)
     end
   end
 
@@ -452,13 +452,9 @@ defmodule Maxio.Storage.Distributed do
         dirs = endpoint_dirs(endpoints, obj_rel)
         tx = transport(opts)
 
-        case Lock.with_lock({bucket, key}, fn ->
-               Enum.each(dirs, fn {node, dir} -> tx.delete_shard(node, dir) end)
-               :ok
-             end) do
-          {:ok, :ok} -> :ok
-          {:error, :locked} -> {:error, :locked}
-        end
+        # 不自持对象锁（B1-1：锁由 handler 层 Maxio.Lock 横跨提交 seam 单点持有）。
+        Enum.each(dirs, fn {node, dir} -> tx.delete_shard(node, dir) end)
+        :ok
     end
   end
 
@@ -617,12 +613,8 @@ defmodule Maxio.Storage.Distributed do
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
-        case Lock.with_lock({bucket, key}, fn ->
-               assemble_locked(bucket, key, upload_id, obj_rel, part_numbers, opts)
-             end) do
-          {:ok, result} -> result
-          {:error, :locked} -> {:error, :locked}
-        end
+        # 不自持对象锁（B1-1：锁由 handler 层 Maxio.Lock 横跨 assemble 字节 + put_metadata 元数据单点持有）。
+        assemble_locked(bucket, key, upload_id, obj_rel, part_numbers, opts)
     end
   end
 
