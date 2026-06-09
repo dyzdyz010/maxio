@@ -157,7 +157,10 @@ defmodule Maxio.ObjectMeta do
       acl_canned: view.acl_canned,
       tags: view.tags,
       sse_algorithm: view.sse_algorithm,
-      sse_envelope: nil,
+      # 信封从 sidecar 版本 entry 携带（Sidecar.to_view 读 e["sse"]["envelope"]）——绝不再硬编码 nil。
+      # 否则 read=:sidecar 下 SSE-S3 对象 GET 会带 sse_algorithm="AES256" 却无信封，
+      # handlers/object.ex 解密走 Crypto.SSE.unwrap_stream(stream, nil) -> unwrap_dek(nil) 炸 500（铁律 3）。
+      sse_envelope: view.sse_envelope,
       is_latest: view.is_latest,
       is_delete_marker: view.is_delete_marker,
       updated_at: entry_modtime_to_datetime(entry)

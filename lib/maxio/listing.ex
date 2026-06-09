@@ -87,15 +87,18 @@ defmodule Maxio.Listing do
     max_keys = Map.get(list_opts, :max_keys, 1000) || 1000
     cursor = continuation_cursor(list_opts)
 
+    # collect_keys 返回 {keys, meta_index}：keys 是当前版本存活（quorum 确认、非 DM）的对象 key；
+    # meta_index 是 key => %{last_modified, etag, size}（从当前版本 sidecar 富集，B4 翻 list 权威）。
+    {all_keys, meta_index} = collect_keys(bucket, opts)
+
     keys =
-      bucket
-      |> collect_keys(opts)
+      all_keys
       |> Enum.filter(&String.starts_with?(&1, prefix))
       |> apply_cursor(cursor)
       |> Enum.sort()
 
     {objects, common_prefixes, truncated, last} =
-      fold(keys, prefix, delimiter, max_keys, [], MapSet.new(), [], nil)
+      fold(keys, meta_index, prefix, delimiter, max_keys, [], MapSet.new(), [], nil)
 
     objects = Enum.reverse(objects)
     common_prefixes = Enum.reverse(common_prefixes)
@@ -166,13 +169,75 @@ defmodule Maxio.Listing do
       endpoints_with_current = endpoint_count_for_version(entries, current_vid)
       {key, current_vid, endpoints_with_current}
     end)
-    |> Enum.reject(fn {key, current_vid, _count} ->
-      delete_marker_current?(transport, opts, bucket, key, current_vid)
-    end)
+    # quorum 门先过滤（未达 quorum 的 key 不可信，绝不读其 meta、绝不返回）。
     |> Enum.filter(fn {_key, _current_vid, count} -> count >= rq end)
-    |> Enum.map(fn {key, _vid, _count} -> key end)
-    |> Enum.uniq()
+    # 每个 quorum-确认的 key 读一次当前版本 sidecar：既判 delete marker（剔除当前版本为 DM 的 key），
+    # 又从同一份 meta 富集 LastModified/ETag/Size（B4 翻 list 权威，绝不再让 handler 拿 nil 渲染崩
+    # ListObjectsV2，铁律 3 / S3 正确性）。读不到 meta（盘上无可判定信息）-> 不剔除、富集留空兜底。
+    |> Enum.reduce({[], %{}}, fn {key, current_vid, _count}, {keys, idx} ->
+      meta = current_version_meta(transport, opts, bucket, key, current_vid)
+
+      cond do
+        delete_marker?(meta) ->
+          {keys, idx}
+
+        true ->
+          {[key | keys], Map.put(idx, key, list_attrs(meta, current_vid))}
+      end
+    end)
+    |> then(fn {keys, idx} -> {keys |> Enum.reverse() |> Enum.uniq(), idx} end)
   end
+
+  # 从当前版本 sidecar meta 提取 ListObjectsV2 富字段（LastModified/ETag/Size）。
+  # meta 形态二选一：(1) maxio/2 versions 数组——取当前版本 entry（找不到则 latest）；
+  # (2) 旧扁平 meta（build_meta 风格，顶层 size/etag）。两者都缺 -> 字段留 nil（XML view 安全兜底）。
+  defp list_attrs(nil, _current_vid), do: %{last_modified: nil, etag: nil, size: nil}
+
+  defp list_attrs(meta, current_vid) do
+    entry = version_entry(meta, current_vid)
+
+    %{
+      last_modified: modtime_to_datetime(entry["modtime"] || meta["modtime"]),
+      etag: entry["etag"] || meta["etag"],
+      size: entry["size"] || meta["size"]
+    }
+  end
+
+  # 取 meta 中对应当前版本的 entry：v2 versions 数组里按 version_id 命中（找不到回退 latest）；
+  # 非 v2（扁平）meta -> 空 entry（富字段后续从顶层 meta 兜底取）。
+  defp version_entry(%{"versions" => versions} = meta, current_vid) when is_list(versions) do
+    Maxio.Sidecar.find_version(meta, current_vid) || Maxio.Sidecar.latest(meta) || %{}
+  end
+
+  defp version_entry(_meta, _current_vid), do: %{}
+
+  # int64 纳秒 modtime -> DateTime（ListObjectsV2 LastModified 用）。缺失/非整数 -> nil（view 兜底当前时刻）。
+  defp modtime_to_datetime(ns) when is_integer(ns) do
+    case DateTime.from_unix(ns, :nanosecond) do
+      {:ok, dt} -> dt
+      {:error, _} -> nil
+    end
+  end
+
+  defp modtime_to_datetime(_), do: nil
+
+  # 当前版本是否为 delete marker：v2 entry type=="delete_marker"，或扁平 meta 顶层 is_delete_marker。
+  # meta=nil（盘上无可判定信息）-> false（不剔除，见模块文档 delete marker 可见性边界）。
+  defp delete_marker?(nil), do: false
+
+  defp delete_marker?(meta) do
+    Map.get(meta, "is_delete_marker", false) == true or
+      get_in(meta, ["versions"]) |> latest_type_is_dm?(meta)
+  end
+
+  defp latest_type_is_dm?(versions, meta) when is_list(versions) do
+    case Maxio.Sidecar.latest(meta) do
+      %{"type" => "delete_marker"} -> true
+      _ -> false
+    end
+  end
+
+  defp latest_type_is_dm?(_versions, _meta), do: false
 
   # 跨 set 的全部端点，附带全局唯一递增序号（quorum 端点计数用；同一物理端点只出现一次）。
   defp endpoints_with_index(set_ids, topo) do
@@ -224,36 +289,28 @@ defmodule Maxio.Listing do
     end
   end
 
-  # 当前版本是否为 delete marker：读其落盘 sidecar meta 的 is_delete_marker（缺省/缺失 -> false，
-  # 即盘上无可判定信息时不剔除——见模块文档 delete marker 可见性边界 + handler 门控）。
-  defp delete_marker_current?(transport, opts, bucket, key, current_vid) do
-    case read_current_meta(transport, opts, bucket, key, current_vid) do
-      {:ok, meta} -> Map.get(meta, "is_delete_marker", false) == true
-      :error -> false
-    end
-  end
-
-  # 从任一存活端点读该 key 当前版本的 sidecar（任一命中即可，shadow 阶段不强制 quorum）。
-  defp read_current_meta(transport, opts, bucket, key, current_vid) do
+  # 从任一存活端点读该 key 当前版本的 sidecar meta（任一命中即可），命中 -> meta map；缺失 -> nil。
+  # 既用于 delete marker 判定，又用于 LastModified/ETag/Size 富集（同一份 meta，单次读，避免双读）。
+  defp current_version_meta(transport, opts, bucket, key, current_vid) do
     case Maxio.Cluster.Paths.object_rel(bucket, key, current_vid) do
       {:ok, rel} ->
         topo = Keyword.get(opts, :topology)
         set_ids = if topo, do: Topology.all_set_ids_from(topo), else: Topology.all_set_ids()
 
-        Enum.find_value(set_ids, :error, fn set_id ->
+        Enum.find_value(set_ids, nil, fn set_id ->
           endpoints =
             if topo, do: Topology.endpoints_from(topo, set_id), else: Topology.endpoints(set_id)
 
           Enum.find_value(endpoints, fn {node, drive} ->
             case transport.get_sidecar(node, Path.join(drive, rel)) do
-              {:ok, meta} -> {:ok, meta}
+              {:ok, meta} -> meta
               {:error, _} -> nil
             end
           end)
         end)
 
       {:error, _} ->
-        :error
+        nil
     end
   end
 
@@ -306,26 +363,40 @@ defmodule Maxio.Listing do
 
   # 惰性折叠：升序 key 流逐条扫描，累计到 max_keys（对象与公共前缀各计一个 key_count）。
   # last = 已纳入本页的最后一条原始遍历 key（续点 walk-position）；候选耗尽 -> 不截断。
-  defp fold([], _prefix, _delim, _max, objs, _seen, cps, _last), do: {objs, cps, false, nil}
+  # meta_index：key => %{last_modified, etag, size}（当前版本 sidecar 富集），纳入对象时附带。
+  defp fold([], _idx, _prefix, _delim, _max, objs, _seen, cps, _last), do: {objs, cps, false, nil}
 
-  defp fold([key | rest], prefix, delimiter, max, objs, seen, cps, last) do
+  defp fold([key | rest], idx, prefix, delimiter, max, objs, seen, cps, last) do
     if length(objs) + MapSet.size(seen) >= max do
       # 已达上限且仍有候选 -> 截断；续点 = 上一条已纳入的 key（last）。
       {objs, cps, true, last}
     else
       case common_prefix(key, prefix, delimiter) do
         nil ->
-          fold(rest, prefix, delimiter, max, [%{key: key} | objs], seen, cps, key)
+          fold(rest, idx, prefix, delimiter, max, [object_elem(key, idx) | objs], seen, cps, key)
 
         cp ->
           if MapSet.member?(seen, cp) do
             # 已折叠过的公共前缀，跳过该 key 不计数，但仍推进 walk-position。
-            fold(rest, prefix, delimiter, max, objs, seen, cps, key)
+            fold(rest, idx, prefix, delimiter, max, objs, seen, cps, key)
           else
-            fold(rest, prefix, delimiter, max, objs, MapSet.put(seen, cp), [cp | cps], key)
+            fold(rest, idx, prefix, delimiter, max, objs, MapSet.put(seen, cp), [cp | cps], key)
           end
       end
     end
+  end
+
+  # 对象列表元素：恒带 :key（向后兼容现有 shadow 比对/调用方），并附当前版本富字段
+  # （:last_modified/:etag/:size，缺失留 nil——handler 透传、XML view 安全兜底）。
+  defp object_elem(key, idx) do
+    attrs = Map.get(idx, key, %{})
+
+    %{
+      key: key,
+      last_modified: Map.get(attrs, :last_modified),
+      etag: Map.get(attrs, :etag),
+      size: Map.get(attrs, :size)
+    }
   end
 
   # 该 key 去掉 prefix 后剩余若含 delimiter -> prefix <> 截到首个 delimiter（含）为公共前缀；

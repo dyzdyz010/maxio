@@ -42,15 +42,27 @@ defmodule Maxio.S3.Views.ListBucket do
     XML.encode(root)
   end
 
+  # 富字段（LastModified/ETag/Size）缺失时用 S3-valid 兜底，绝不让 nil 把 XML 渲染炸成 500
+  # （铁律 3）：drive-walk 列举源在盘上无对应 sidecar meta 时这些字段可能为 nil——此时按
+  # AWS 语义给安全默认（LastModified=当前时刻、ETag 空引号、Size=0），返回合法 ListObjectsV2 XML。
   defp content_elem(obj, enc) do
     element("Contents", [], [
       element("Key", [], characters(encode(obj.key, enc))),
-      element("LastModified", [], characters(XML.iso8601(obj.last_modified))),
-      element("ETag", [], characters(XML.quote_etag(obj.etag))),
-      element("Size", [], characters(Integer.to_string(obj.size))),
+      element("LastModified", [], characters(XML.iso8601(last_modified(obj)))),
+      element("ETag", [], characters(XML.quote_etag(etag(obj)))),
+      element("Size", [], characters(Integer.to_string(size(obj)))),
       element("StorageClass", [], characters("STANDARD"))
     ])
   end
+
+  defp last_modified(%{last_modified: %DateTime{} = dt}), do: dt
+  defp last_modified(_), do: DateTime.utc_now()
+
+  defp etag(%{etag: e}) when is_binary(e), do: e
+  defp etag(_), do: ""
+
+  defp size(%{size: s}) when is_integer(s), do: s
+  defp size(_), do: 0
 
   # encoding-type=url → MinIO s3URLEncode（保留字面 '/' 与 '*'，空格→'+'，其余字节→%XX 大写）。
   # 用 Maxio.S3.URLEncode（与 SigV4 的 RFC3986 编码不同：S3 list 编码不转义 '/'，故 delimiter /

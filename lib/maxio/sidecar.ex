@@ -194,6 +194,10 @@ defmodule Maxio.Sidecar do
       acl_canned: e["acl_canned"] || "private",
       tags: e["tags"] || %{},
       sse_algorithm: get_in(e, ["sse", "algo"]),
+      # SSE-S3/-C 的封装信封（含 wrapped DEK）。必须随读视图携带——否则 sidecar 读权威下
+      # 加密对象 GET 会拿到 sse_algorithm="AES256" 却缺信封，解密时 unwrap_dek(nil) 炸（铁律 3）。
+      # 取值与 to_object_attrs/3 逐字一致，保证 sidecar 读视图与 PG 读视图对加密对象同构。
+      sse_envelope: e["sse"] && e["sse"]["envelope"],
       is_latest: e["is_latest"] || false,
       is_delete_marker: e["type"] == "delete_marker"
     }
