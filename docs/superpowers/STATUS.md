@@ -244,6 +244,28 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 5. **XML 用 saxy**：出站 builder + 入站 SAX 解析，一依赖两用。
 6. **M1 签名范围**：header-based SigV4（单块 + UNSIGNED-PAYLOAD）+ presigned；aws-chunked 流式签名留 M2（aws-cli 默认上传方式，头号兼容风险）。
 
+## 架构评审 + MinIO 保真审计 + 路线 B 决策（2026-06-09，用户质疑「架构是否最优」触发）
+
+用户问「分布式架构是不是最优」。独立对抗式架构评审（4 视角读真实代码 + 对照 MinIO）裁定 **4/10、is_optimal=false**：一致性 4 / 扩展性 4 / MinIO 保真 4 / 运维 3。底层 RS 数据面优秀（quorum 数学与 MinIO 一致、BLAKE3 bitrot、`InsufficientShardsError` 绝不返回错字节），但**根本分歧 = 所有元数据放共享 Postgres（MinIO 是 shared-nothing xl.meta）**，由此：① PG 硬 SPOF + 吞吐天花板闸住 100% S3 操作；② 非原子双写 + DELETE 先删元数据 + GC 只走元数据 → **孤儿分片永久泄漏**；③ 对象锁未覆盖双写接缝 → 并发同 key PUT **静默 ETag/字节不一致**；④ 全程无 fsync（write-quorum 非持久）；⑤ LIST 无 SQL LIMIT（DoS）；⑥ 不可变 mod-N 路由无在线弹性 + 拓扑不校验 distinct-node。
+
+**用户决策**：选**路线 B（元数据 shared-nothing 重构）**——sidecar(meta.json) 升为对象元数据真值源、PG 降为可选派生索引，从构造上消除 SPOF + 双写/孤儿/静默不一致整类问题。7 阶段路线图见 `plans/2026-06-09-routeB-shared-nothing-metadata.md`；P1 详细计划见 `plans/2026-06-09-routeB-phase1-no-regret-fixes.md`。
+
+**同时**：用户要求审查阶段加「MinIO 偏离检查」组——已永久加入 `implement-milestone.js`（Fidelity + Fidelity-Fix 两阶段，对照 AWS 文档 + minio 源码）。一次性回溯审计 M0–M7 查出 **25 偏离（1 critical/7 high/5 medium/12 low）**，计划 `plans/2026-06-09-minio-fidelity-fixes.md`。核心结论：非版本化常规路径高保真，**保真悬崖在 versioning/copy**。用户决策**全修 critical+high+medium（13 项）**，编排 **critical → 路线B P1 → high → medium**。
+
+### ✅ 保真修复批次1（CRITICAL）已交付（2026-06-09，commit `c07a6b4`）
+
+**FX-C1 DeleteObjects 版本化静默数据丢失修复**：原 DeleteObjects 丢弃每对象 VersionId、硬删所有版本历史。修为镜像单对象 `Object.delete` 语义——给定 VersionId 删该版本、Enabled 桶无 VersionId 插 delete marker（绝不硬删历史）、Unversioned 仍硬删；DeleteResult 按 AWS 回显 VersionId/DeleteMarker；per-key 失败降级为结构化 `<Error>`（不整批 500）。**513 测试全绿**（+3 版本化回归，活体证明旧版本批删后仍可经 ?versionId 取回原始字节）、零警告、独立 verify GREEN + reviewer **APPROVE / 0 must-fix** + Fidelity 复检。
+
+### 当前编排队列（critical→P1→high→medium）
+
+```
+✅ 批次1 critical（DeleteObjects 数据丢失）— c07a6b4
+▶  路线 B P1（B1-1..B1-4 无悔架构修正：锁横跨接缝 / 原子 temp-rename+fsync / distinct-node 校验+LIST 硬限 / sidecar v2+reverse-GC 脚手架）← 下一步
+   批次2 七个 high 保真偏离（CopyObject 版本化×2 / SigV4 +号 raw-query / PutBucketPolicy ARN 校验 / CORS Allow-Credentials / DeleteObjects 对象级授权 / CopyObject 授权回归锁）
+   批次3 五个 medium（host 强制签名 / encoding-type=url ×2 / COPY 元数据保留 / 未支持条件算子拒绝）
+   评估路线 B P2–P7（sidecar 权威翻转：读→列→写）
+```
+
 ## 下一步（续作入口）
 
 - **M7 多节点分布式纠删码已完成**（master，2026-06-09）：libcluster + Topology/Router/Paths + 跨节点 Transport（:erpc/InProcess）+ ShardServer + 分布式锁 + `Maxio.Storage.Distributed` 后端 + 跨节点 heal + 集群 e2e（InProcess 四场景 + `:peer` 真节点）。续作运维 parity 见上「M7 已知非阻塞项 / 显式 defer」9 条（rebalance/decommission、完整 dsync 锁语义、跨节点缓存失效通知、scanner 自动跨节点 walk+采样+限流、多 parity/storage-class、degraded-write parity upgrade、专用流式传输、failure-domain 自动 set 形成）。
