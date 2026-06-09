@@ -14,6 +14,8 @@ defmodule Maxio.Cluster.TopologyTest do
       data_shards: k,
       parity_shards: m,
       block_size: 1024,
+      # 同机模拟多节点（rem(i,3) 复用 node 名），显式放行 distinct-node 校验（B1-3）。
+      allow_colocated_endpoints: true,
       pools: [%{id: 0, sets: Enum.map(0..(endpoints_per_set - 1), mk)}]
     ]
   end
@@ -42,6 +44,8 @@ defmodule Maxio.Cluster.TopologyTest do
         data_shards: 4,
         parity_shards: 2,
         block_size: 1024,
+        # dup 的 6 端点同 node（:maxio@n），放行 distinct-node 以让校验走到「重复 set id」分支。
+        allow_colocated_endpoints: true,
         pools: [%{id: 0, sets: [dup, dup]}]
       ]
 

@@ -358,7 +358,8 @@ defmodule Maxio.Objects do
           base
       end
 
-    candidates = Repo.all(base)
+    # ROUTE B B1-3 临时硬 LIMIT 闸（同 list_objects_v2）：有界 SQL 取数防大桶 DoS。
+    candidates = Repo.all(limit(base, ^list_fetch_limit(max_keys)))
 
     {versions, common_prefixes, truncated, last_key, last_vid} =
       collapse_versions(candidates, prefix, delimiter, max_keys)
@@ -461,7 +462,10 @@ defmodule Maxio.Objects do
 
     base_query = if cursor, do: where(base_query, [o], o.key > ^cursor), else: base_query
 
-    candidates = Repo.all(base_query)
+    # ROUTE B B1-3 临时硬 LIMIT 闸：PG 权威期无界 Repo.all 大桶 = DoS。给 SQL 加有界 limit，
+    # 折叠 delimiter 时一个公共前缀可能吃掉很多行（max_keys+1 不够），取 max_keys*4+1000 经验余量，
+    # 上限 sql_hard_limit（默认 100_000）防 DoS。B3 drive-walk 上线后保留为兜底。
+    candidates = Repo.all(limit(base_query, ^list_fetch_limit(max_keys)))
 
     {objects, common_prefixes, truncated, next_token} =
       collapse(candidates, prefix, delimiter, max_keys)
@@ -535,6 +539,13 @@ defmodule Maxio.Objects do
   defp previous_token([obj | _], _cps), do: obj.key
   defp previous_token([], [cp | _]), do: cp
   defp previous_token([], []), do: nil
+
+  # ROUTE B B1-3 SQL LIST 临时硬 LIMIT 闸：有界取数行数 = min(sql_hard_limit, max_keys*4+1000)。
+  # 折叠 delimiter 余量取 *4+1000（一个公共前缀可吃掉很多行，max_keys+1 不够）；上限硬 LIMIT 防 DoS。
+  defp list_fetch_limit(max_keys) do
+    hard_limit = Application.get_env(:maxio, :listing, [])[:sql_hard_limit] || 100_000
+    min(hard_limit, max_keys * 4 + 1000)
+  end
 
   # 转义 LIKE 通配（% 与 _ 与 \）。
   defp escape_like(str) do

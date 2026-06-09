@@ -86,13 +86,16 @@ defmodule Maxio.Cluster.Topology do
 
   @doc """
   解析+校验拓扑 config。返回 parsed struct。非法 raise ArgumentError（铁律 3）。
-  校验：每 set endpoints 数 == K+M；M >= 1；M <= N/2；K >= 1；set id 不重复；至少一个 set。
+  校验：每 set endpoints 数 == K+M；M >= 1；M <= N/2；K >= 1；set id 不重复；至少一个 set；
+  每 set 的 N 端点落在 distinct 节点（failure domain）—— 同一节点上多端点会把真实容错降到 M 以下
+  （quorum 谎言）。单机部署/测试经 `allow_colocated_endpoints: true` 显式放行 distinct-node 校验。
   """
   @spec parse_and_validate!(keyword()) :: t()
   def parse_and_validate!(cfg) do
     k = Keyword.fetch!(cfg, :data_shards)
     m = Keyword.fetch!(cfg, :parity_shards)
     bs = Keyword.get(cfg, :block_size, 1_048_576)
+    allow_colocated = Keyword.get(cfg, :allow_colocated_endpoints, false)
     n = k + m
 
     cond do
@@ -123,6 +126,8 @@ defmodule Maxio.Cluster.Topology do
           raise ArgumentError, "topology: 重复 set id #{s.id}"
         end
 
+        validate_distinct_nodes!(s, allow_colocated)
+
         {Map.put(acc, s.id, %{id: s.id, endpoints: s.endpoints}), [s.id | ids]}
       end)
 
@@ -137,5 +142,23 @@ defmodule Maxio.Cluster.Topology do
       sets: sets,
       set_ids: Enum.sort(ids)
     }
+  end
+
+  # distinct-node failure-domain 校验：一个 set 的 N 端点须落在 distinct 节点，否则同一节点宕机会
+  # 一次性带走 >1 个分片，把真实容错降到 M 以下（write/read quorum 成谎言）。allow_colocated 为真
+  # 时跳过（单机部署/测试同机模拟多节点）。
+  defp validate_distinct_nodes!(_s, true), do: :ok
+
+  defp validate_distinct_nodes!(s, false) do
+    ep_nodes = Enum.map(s.endpoints, fn {node, _drive} -> node end)
+
+    if length(Enum.uniq(ep_nodes)) != length(ep_nodes) do
+      raise ArgumentError,
+            "topology: set #{s.id} 的端点未落在 distinct 节点（failure domain）；" <>
+              "同一节点上多端点会把真实容错降到 M 以下（quorum 谎言）。" <>
+              "单机部署/测试请显式设 allow_colocated_endpoints: true。"
+    end
+
+    :ok
   end
 end

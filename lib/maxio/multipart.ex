@@ -101,7 +101,8 @@ defmodule Maxio.Multipart do
 
     base = if key_marker, do: where(base, [u], u.key > ^key_marker), else: base
 
-    candidates = Repo.all(base)
+    # ROUTE B B1-3 临时硬 LIMIT 闸（同 Objects.list_objects_v2）：有界 SQL 取数防大桶 DoS。
+    candidates = Repo.all(limit(base, ^list_fetch_limit(max_uploads)))
 
     {uploads, common_prefixes, truncated, next_key} =
       collapse_uploads(candidates, prefix, delimiter, max_uploads)
@@ -226,6 +227,13 @@ defmodule Maxio.Multipart do
     |> String.replace("\\", "\\\\")
     |> String.replace("%", "\\%")
     |> String.replace("_", "\\_")
+  end
+
+  # ROUTE B B1-3 SQL LIST 临时硬 LIMIT 闸（同 Objects.list_fetch_limit/1）：
+  # min(sql_hard_limit, max_uploads*4+1000)，折叠 delimiter 余量 *4+1000，上限防 DoS。
+  defp list_fetch_limit(max_uploads) do
+    hard_limit = Application.get_env(:maxio, :listing, [])[:sql_hard_limit] || 100_000
+    min(hard_limit, max_uploads * 4 + 1000)
   end
 
   defp min_part_size do

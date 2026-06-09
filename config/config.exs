@@ -105,6 +105,11 @@ config :maxio, :shard_transport, Maxio.Cluster.Transport.Erpc
 # test 关闭以提速（见 test.exs）。可经此 flag 整体回退 fsync。
 config :maxio, :durability, fsync: true
 
+# ROUTE B B1-3 列举 SQL 临时硬 LIMIT 闸：PG 权威期三处 LIST（list_objects_v2 / list_object_versions /
+# list_uploads）无界 Repo.all 大桶 = DoS。每次 SQL 取数行数封顶 sql_hard_limit（默认 100_000），
+# 实际取 min(sql_hard_limit, max_keys*4+1000)。B3 drive-walk 上线后 PG 仅作快路径，此闸保留为 DoS 兜底。
+config :maxio, :listing, sql_hard_limit: 100_000
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

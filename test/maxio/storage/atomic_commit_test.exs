@@ -228,6 +228,8 @@ defmodule Maxio.Storage.AtomicCommitTest do
         data_shards: 4,
         parity_shards: 2,
         block_size: 16,
+        # 3 node × 2 drive 同 node 名复用，放行 distinct-node 校验（B1-3）。
+        allow_colocated_endpoints: true,
         pools: [%{id: 0, sets: [%{id: 0, endpoints: endpoints}]}]
       )
 
