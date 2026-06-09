@@ -141,6 +141,10 @@ defmodule Maxio.S3.Handlers.Object do
     version_id = Map.get(conn.query_params, "versionId")
     {object, total} = resolve_object_for_get!(bucket, key, version_id)
 
+    # ROUTE B P2 dual-read SHADOW：PG 取到对象后追加 best-effort sidecar reconcile 比对
+    # （已 try/rescue 自吞，绝不改返回/控制流，绝不破坏读路径）。
+    _ = Maxio.ObjectMeta.shadow_check(bucket, key, version_id, object, [])
+
     cond do
       object.is_delete_marker and version_id == nil ->
         # current 是 delete marker，简单 GET → 404 + x-amz-delete-marker
@@ -217,6 +221,10 @@ defmodule Maxio.S3.Handlers.Object do
 
     with {:ok, _b} <- Buckets.lookup(bucket),
          {:ok, object} <- fetch_for_head(bucket, key, version_id) do
+      # ROUTE B P2 dual-read SHADOW：PG 取到对象后追加 best-effort sidecar reconcile 比对
+      # （已 try/rescue 自吞，绝不改返回/控制流，绝不破坏读路径）。
+      _ = Maxio.ObjectMeta.shadow_check(bucket, key, version_id, object, [])
+
       cond do
         object.is_delete_marker and version_id == nil ->
           conn
