@@ -78,4 +78,29 @@ defmodule Maxio.S3.BucketPolicyTest do
     del = SigV4Request.signed_conn(:delete, "/pb4", query: %{"policy" => ""}) |> call()
     assert del.status == 204
   end
+
+  test "PutBucketPolicy: Resource 引用别的桶 → 400 MalformedPolicy（不再静默接受）" do
+    SigV4Request.signed_conn(:put, "/pbp1") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::otherbucket/*"]}]})
+
+    res =
+      SigV4Request.signed_conn(:put, "/pbp1", query: %{"policy" => ""}, body: policy) |> call()
+
+    assert res.status == 400
+    assert res.resp_body =~ "MalformedPolicy"
+  end
+
+  test "PutBucketPolicy: Resource 引用本桶（精确/通配）→ 204" do
+    SigV4Request.signed_conn(:put, "/pbp2") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbp2/*","arn:aws:s3:::pbp2"]}]})
+
+    res =
+      SigV4Request.signed_conn(:put, "/pbp2", query: %{"policy" => ""}, body: policy) |> call()
+
+    assert res.status == 204
+  end
 end

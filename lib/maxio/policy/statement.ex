@@ -36,13 +36,23 @@ defmodule Maxio.Policy.Statement do
 
   @allowed_versions ["2012-10-17", "2008-10-17"]
 
-  @doc "解析整篇 policy JSON。成功 → {:ok, [t()]}；任何畸形 → {:error, :malformed}。"
+  @doc "解析整篇 policy JSON（不做 bucket 交叉校验）。成功 → {:ok, [t()]}；畸形 → {:error, :malformed}。"
   @spec parse_policy(binary()) :: {:ok, [t()]} | {:error, :malformed}
-  def parse_policy(json) when is_binary(json) do
+  def parse_policy(json) when is_binary(json), do: parse_policy(json, nil)
+
+  @doc """
+  解析整篇 policy JSON，并（当 bucket 非 nil 时）校验每条 statement 的每个 Resource ARN 都引用
+  目标桶（对齐 minio/pkg Resource.ValidateBucket：桶段精确或通配匹配 bucket，允许 'bucket' 与
+  'bucket/...'）。任一 Resource 桶段不匹配 → {:error, :malformed}（→ 400 MalformedPolicy）。
+  bucket == nil（如 Store 回读路径 parse_policy/1）→ 跳过桶校验（向后兼容）。
+  """
+  @spec parse_policy(binary(), String.t() | nil) :: {:ok, [t()]} | {:error, :malformed}
+  def parse_policy(json, bucket) when is_binary(json) do
     with {:ok, doc} <- decode(json),
          :ok <- check_version(doc),
          {:ok, raw_stmts} <- fetch_statements(doc),
-         {:ok, stmts} <- normalize_all(raw_stmts) do
+         {:ok, stmts} <- normalize_all(raw_stmts),
+         :ok <- validate_resources_bucket(stmts, bucket) do
       {:ok, stmts}
     else
       _ -> {:error, :malformed}
@@ -164,4 +174,25 @@ defmodule Maxio.Policy.Statement do
   def resource_match?(%__MODULE__{resources: resources}, resource) do
     Enum.any?(resources, &Arn.glob_match?(&1, resource))
   end
+
+  # nil bucket（如 Store 回读路径 parse_policy/1）→ 跳过桶校验（向后兼容）。
+  defp validate_resources_bucket(_stmts, nil), do: :ok
+
+  defp validate_resources_bucket(stmts, bucket) do
+    ok? =
+      Enum.all?(stmts, fn %__MODULE__{resources: resources} ->
+        Enum.all?(resources, &resource_references_bucket?(&1, bucket))
+      end)
+
+    if ok?, do: :ok, else: {:error, :malformed}
+  end
+
+  # Resource ARN 是否引用目标桶：剥 "arn:aws:s3:::" 前缀后取桶段（首个 '/' 之前），
+  # 用 policy 通配语义匹配 bucket（pattern 可含 *、?）。无前缀 → 不匹配（畸形）。
+  defp resource_references_bucket?("arn:aws:s3:::" <> rest, bucket) do
+    bucket_segment = rest |> String.split("/", parts: 2) |> List.first()
+    Arn.glob_match?(bucket_segment, bucket)
+  end
+
+  defp resource_references_bucket?(_other, _bucket), do: false
 end

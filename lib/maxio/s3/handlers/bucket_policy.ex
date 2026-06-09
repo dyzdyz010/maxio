@@ -17,8 +17,9 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
     _ = ensure_bucket!(bucket)
     {conn, json} = read_small_body!(conn)
 
-    # 语义校验：JSON 合法 + 策略结构合法（Version/Effect/Action/Resource/Principal）。
-    case Statement.parse_policy(json) do
+    # 语义校验：JSON 合法 + 策略结构合法（Version/Effect/Action/Resource/Principal）
+    # + 每个 Resource ARN 引用目标桶（跨桶 → MalformedPolicy，铁律 5 对齐 minio Resource.ValidateBucket）。
+    case Statement.parse_policy(json, bucket) do
       {:ok, _stmts} ->
         case Store.put_bucket_policy(bucket, json) do
           :ok ->

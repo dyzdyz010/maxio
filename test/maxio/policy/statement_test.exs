@@ -76,4 +76,39 @@ defmodule Maxio.Policy.StatementTest do
     assert {:ok, [s]} = Statement.parse_policy(json)
     assert s.conditions == %{"Bool" => %{"aws:SecureTransport" => "false"}}
   end
+
+  test "parse_policy/2 拒绝跨桶 Resource" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::other/*"}]})
+
+    assert {:error, :malformed} = Statement.parse_policy(json, "mybucket")
+  end
+
+  test "parse_policy/2 接受引用目标桶的 Resource（精确与通配）" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":["arn:aws:s3:::mybucket/*","arn:aws:s3:::my*"]}]})
+
+    assert {:ok, [_]} = Statement.parse_policy(json, "mybucket")
+  end
+
+  test "parse_policy/2 精确桶名（无 /*）也接受" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]})
+
+    assert {:ok, [_]} = Statement.parse_policy(json, "mybucket")
+  end
+
+  test "parse_policy/2 无 arn 前缀的 Resource → 畸形" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"mybucket/*"}]})
+
+    assert {:error, :malformed} = Statement.parse_policy(json, "mybucket")
+  end
+
+  test "parse_policy/1 不做桶校验（向后兼容回读）" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::other/*"}]})
+
+    assert {:ok, [_]} = Statement.parse_policy(json)
+  end
 end
