@@ -339,6 +339,9 @@ defmodule Maxio.Storage.Distributed do
       "size" => size,
       "etag" => etag,
       "sha256" => sha256,
+      # 字节承载对象恒非 delete marker；sidecar 自描述该字段（缺省 false），使 drive-walk LIST
+      # 能从盘上判定当前版本是否逻辑删除（对齐 MinIO xl.meta 承载 version type）。
+      "is_delete_marker" => false,
       "parts" => [%{"part" => 0, "size" => size}],
       "shards" => shards
     }

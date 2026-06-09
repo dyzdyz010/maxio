@@ -183,22 +183,65 @@ defmodule Maxio.ObjectMeta do
 
   任何异常 / throw / exit 都被自吞并降级为一条 warn（shadow 绝不破坏列举路径，同 read shadow）。
   恒返回 `:ok`。`opts` 同时透传给 `Maxio.Listing.list_objects_v2/3`（`:transport` / `:topology`）。
+
+  ## 门控：仅 Unversioned 桶（保真安全网）
+
+  drive-walk 对 delete marker 的判定依赖当前版本在盘上确有 sidecar（`build_meta` 现恒带
+  `is_delete_marker`）；但纯 PG delete marker（`Objects.insert_delete_marker` 当前不落盘）在盘上
+  无痕迹——Enabled 桶 delete marker latest 的 key 会被 drive-walk 误判为 live（盘上仅旧版本），
+  Suspended 桶被删 null 对象的陈旧 `<bucket>/<key>/meta.json` 同样残留。两者都会让 versioned/
+  suspended 桶上的 shadow 产生**保证性伪分歧**（与权威 is_latest/is_delete_marker 过滤系统性不符），
+  淹没铁律 3 分歧日志。故 list shadow **门控到 Unversioned 桶**：versioned/suspended 桶直接短路
+  :ok（不跑 drive-walk、不比对）。版本树枚举（Maxio.Listing）本身已正确，门控解除待 delete marker
+  落盘 sidecar 模型补齐（P4/B4 翻 list 权威时）。
+
+  桶 versioning 状态：`opts[:bucket_versioning]` 显式覆盖（test）优先；否则查 `Buckets.lookup/1`
+  （缺省/查不到 -> "Unversioned"，与 handler `bucket_versioning/1` 同语义）。
   """
   @spec list_shadow(String.t(), map(), keyword()) :: :ok
   def list_shadow(bucket, list_opts, opts) do
-    pg = Keyword.get(opts, :pg)
+    if list_shadow_enabled?(bucket, opts) do
+      pg = Keyword.get(opts, :pg)
 
-    try do
-      walk = Maxio.Listing.list_objects_v2(bucket, list_opts, opts)
-      compare_list(bucket, pg, walk)
-    rescue
-      e -> Log.warn("list shadow error", bucket: bucket, reason: inspect(e))
-    catch
-      kind, reason ->
-        Log.warn("list shadow caught", bucket: bucket, reason: inspect({kind, reason}))
+      try do
+        walk = Maxio.Listing.list_objects_v2(bucket, list_opts, opts)
+        compare_list(bucket, pg, walk)
+      rescue
+        e -> Log.warn("list shadow error", bucket: bucket, reason: inspect(e))
+      catch
+        kind, reason ->
+          Log.warn("list shadow caught", bucket: bucket, reason: inspect({kind, reason}))
+      end
     end
 
     :ok
+  end
+
+  # list shadow 门控：仅 Unversioned 桶（见 @doc）。test 经 opts[:bucket_versioning] 注入覆盖。
+  defp list_shadow_enabled?(bucket, opts) do
+    versioning_of(bucket, opts) == "Unversioned"
+  end
+
+  # 桶 versioning：opts[:bucket_versioning]（handler 透传，prod 主路径）优先；否则查 DB 兜底
+  # （直接调用者/单测）。DB 不可用/无 sandbox/桶不存在 -> "Unversioned"（shadow 绝不因取 versioning
+  # 失败而破坏列举路径，与本模块自吞哲学一致）。
+  defp versioning_of(bucket, opts) do
+    case Keyword.get(opts, :bucket_versioning) do
+      v when is_binary(v) ->
+        v
+
+      _ ->
+        try do
+          case Maxio.Buckets.lookup(bucket) do
+            {:ok, %{versioning: v}} when is_binary(v) -> v
+            _ -> "Unversioned"
+          end
+        rescue
+          _ -> "Unversioned"
+        catch
+          _, _ -> "Unversioned"
+        end
+    end
   end
 
   # 比对 PG 与 drive-walk 的 key 集 + common_prefixes；任一侧独有项 -> 结构化分歧日志（返回 :ok）。

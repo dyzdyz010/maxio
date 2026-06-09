@@ -68,7 +68,7 @@ defmodule Maxio.S3.Handlers.Bucket do
     conn = fetch_query_params(conn)
     qp = conn.query_params
 
-    with {:ok, _b} <- bucket_or_raise(bucket) do
+    with {:ok, b} <- bucket_or_raise(bucket) do
       prefix = Map.get(qp, "prefix", "")
       delimiter = Map.get(qp, "delimiter")
       max_keys = parse_int(Map.get(qp, "max-keys"), 1000)
@@ -87,7 +87,9 @@ defmodule Maxio.S3.Handlers.Bucket do
       res = Objects.list_objects_v2(bucket, list_opts)
 
       # ROUTE B P3：drive-walk shadow 比对（best-effort，不改返回/控制流；分歧记结构化日志，自吞绝不破坏列举）。
-      _ = Maxio.ObjectMeta.list_shadow(bucket, list_opts, pg: res)
+      # 透传桶 versioning：shadow 门控到 Unversioned 桶（见 Maxio.ObjectMeta.list_shadow），
+      # 避免 versioned/suspended 桶上纯 PG delete marker 在盘无痕迹导致的保证性伪分歧。
+      _ = Maxio.ObjectMeta.list_shadow(bucket, list_opts, pg: res, bucket_versioning: versioning_of(b))
 
       objects =
         Enum.map(res.objects, fn o ->
@@ -183,6 +185,10 @@ defmodule Maxio.S3.Handlers.Bucket do
       {:error, :not_found} -> raise Error.new(:no_such_bucket, resource: "/" <> bucket)
     end
   end
+
+  # 桶 versioning 状态（Unversioned|Enabled|Suspended）；缺省 "Unversioned"。
+  defp versioning_of(%{versioning: v}) when is_binary(v), do: v
+  defp versioning_of(_), do: "Unversioned"
 
   defp parse_int(nil, default), do: default
 

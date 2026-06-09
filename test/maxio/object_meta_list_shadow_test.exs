@@ -150,6 +150,64 @@ defmodule Maxio.ObjectMetaListShadowTest do
     refute log3 =~ "divergence"
   end
 
+  # 门控：versioned/suspended 桶上 list shadow 短路（不跑 drive-walk、不比对、不记分歧）。
+  # 即使 PG 与 drive-walk 在该桶上必然不一致（纯 PG delete marker 在盘上无痕迹），也绝不记伪分歧。
+  test "Enabled 桶 list shadow 门控短路：不记分歧（盘上有 key、PG 无）", %{topo: topo, eps: eps} do
+    # drive 上有 key（旧版本字节残留），PG 空（当前版本是纯 PG delete marker）-> 修复前会伪报分歧。
+    put_drive(eps, "lsb", "deleted.txt")
+    pg = %{objects: [], common_prefixes: [], is_truncated: false, next_continuation_token: nil, key_count: 0}
+
+    log =
+      capture_log(fn ->
+        assert :ok =
+                 ObjectMeta.list_shadow("lsb", %{max_keys: 100},
+                   pg: pg,
+                   transport: InProcess,
+                   topology: topo,
+                   bucket_versioning: "Enabled"
+                 )
+      end)
+
+    refute log =~ "divergence"
+  end
+
+  test "Suspended 桶 list shadow 同样门控短路：不记分歧", %{topo: topo, eps: eps} do
+    put_drive(eps, "lsb", "stale-null.txt")
+    pg = %{objects: [], common_prefixes: [], is_truncated: false, next_continuation_token: nil, key_count: 0}
+
+    log =
+      capture_log(fn ->
+        assert :ok =
+                 ObjectMeta.list_shadow("lsb", %{max_keys: 100},
+                   pg: pg,
+                   transport: InProcess,
+                   topology: topo,
+                   bucket_versioning: "Suspended"
+                 )
+      end)
+
+    refute log =~ "divergence"
+  end
+
+  # Unversioned 桶（默认）仍跑 shadow：drive-walk 多出 key -> 记分歧（门控不误伤未版本化桶）。
+  test "Unversioned 桶门控放行：drive-walk 独有 key 仍记分歧", %{topo: topo, eps: eps} do
+    put_drive(eps, "lsb", "orphan.txt")
+    pg = Objects.list_objects_v2("lsb", %{max_keys: 100})
+
+    log =
+      capture_log(fn ->
+        assert :ok =
+                 ObjectMeta.list_shadow("lsb", %{max_keys: 100},
+                   pg: pg,
+                   transport: InProcess,
+                   topology: topo,
+                   bucket_versioning: "Unversioned"
+                 )
+      end)
+
+    assert log =~ "divergence"
+  end
+
   test "list_shadow 自吞异常绝不破坏列举（坏 transport -> :ok）", %{topo: topo} do
     pg = Objects.list_objects_v2("lsb", %{max_keys: 100})
 
