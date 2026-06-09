@@ -264,9 +264,24 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
      B1-1 锁横跨接缝（消除静默 ETag/字节不一致，Maxio.Lock+SlowDown 503）/ B1-2 原子 temp-rename+fsync（crash 无撕裂+telemetry 断言+quorum 回滚，Windows rename-busy DI 测试）/ B1-3 distinct-node 校验+LIST 硬限（含静默欠截断修复）/ B1-4 sidecar v2 schema+reverse-GC 诚实脚手架
 ✅ 批次2 七个 high 保真偏离 — 1456e99..21bcac1（593 测试，APPROVE_WITH_NOTES）
      CopyObject 版本感知源读 + 目标建版本+x-amz-version-id/copy-source-version-id（消化 P1 version_id:null 遗留）/ SigV4 +号 raw-query 规范化（AWS 向量无回归）/ PutBucketPolicy 跨桶 ARN→400 / CORS Allow-Credentials / DeleteObjects 对象级授权 / CopyObject 授权回归锁；fidelity 复检加 CopyObject delete-marker 源→404 + tagging-directive COPY
-▶  批次3 五个 medium（host 强制签名 / encoding-type=url ×2 / COPY 元数据保留 / 未支持条件算子拒绝）← 下一步
-   评估路线 B P2–P7（sidecar 权威翻转：读→列→写）
+✅ 批次3 五个 medium — f064330..a2f4e87（615 测试，APPROVE / 0 must-fix）
+     host 强制签名（ErrUnsignedHeaders 400）/ ListObjectsV2+ListObjectVersions encoding-type=url（顺带修 SigV4Request 签名 path 双编码 bug，特殊字符 key 真正可用）/ CopyObject COPY 保留源元数据+tags / PutBucketPolicy 拒绝未支持条件算子；fidelity 复检加 encoding-type=url 斜杠保留 + 策略 Condition 接受集修正
+   ◇ 评估路线 B P2–P7（sidecar 权威翻转：读→列→写）← 下一步（更大的架构跃迁，需用户拍板）
 ```
+
+### ✅ MinIO 保真审计 13 项偏离全部清零（2026-06-09）
+
+用户「有偏离就修改」已完整兑现。回溯审计发现的 **1 critical + 7 high + 5 medium** 偏离全部修复并独立验证（critical→路线B P1→high→medium 编排）：
+
+- **615 测试全绿、`compile --warnings-as-errors` 零警告**（从批次1 前的 510 增至 615，+105 多为保真回归断言）。
+- **批次1 critical**：DeleteObjects 版本化数据丢失（`c07a6b4`）。
+- **路线 B P1 无悔架构修正**：锁横跨双写接缝 / 原子 temp-rename+fsync / distinct-node 校验 / sidecar v2 脚手架（`8b41b59`..`b5d2928`）。
+- **批次2 七个 high**：CopyObject 版本化×2 / SigV4 +号 raw-query / PutBucketPolicy ARN 校验 / CORS Allow-Credentials / DeleteObjects 对象级授权 / 授权回归锁（`1456e99`..`21bcac1`）。
+- **批次3 五个 medium**：host 强制签名 / encoding-type=url ×2 / COPY 元数据保留 / 未支持条件算子拒绝（`f064330`..`a2f4e87`）。
+- 12 个 low 偏离仍文档化 defer（错误码字符串差异、ACL grant 静默降级、cosmetic 头、max-keys 未夹 1000、SlowDown-vs-RequestTimeout Code 等）。
+- **每批均经独立 verify + code-review + 新增的 MinIO Fidelity 复检组**（对照 AWS 文档 + minio 源码），实现者绝不自审。Fidelity 组本身多次当场抓出并修正额外偏离（SlowDownWrite 503、CopyObject delete-marker 404、encoding-type 斜杠保留等）。
+
+**保真度结论**：常规非版本化路径本就高保真；此轮系统性消除了 versioning/copy/auth/CORS 的「保真悬崖」，maxio 现已是接近完整的 S3/MinIO 行为兼容实现（真实 aws-sdk/boto3/minio-go/mc 客户端的核心路径不再被这些偏离破坏）。
 
 **P1 遗留（已排入后续，非阻塞）**：CopyObject/CompleteMPU 的 `put_metadata` 硬编码 `version_id:null`（= 批次2 FX-H1/H2 + 路线 B P4 范畴）；max-keys 未夹到 1000（小项）；锁竞争 503 用 Code `SlowDown` 而 MinIO 用 `RequestTimeout`（状态 503 已对，仅 Code 字符串，小项）。LIST 静默欠截断已在 `b5d2928` 当场修复。
 
