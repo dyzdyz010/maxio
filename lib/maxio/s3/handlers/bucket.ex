@@ -89,7 +89,11 @@ defmodule Maxio.S3.Handlers.Bucket do
       # ROUTE B P3：drive-walk shadow 比对（best-effort，不改返回/控制流；分歧记结构化日志，自吞绝不破坏列举）。
       # 透传桶 versioning：shadow 门控到 Unversioned 桶（见 Maxio.ObjectMeta.list_shadow），
       # 避免 versioned/suspended 桶上纯 PG delete marker 在盘无痕迹导致的保证性伪分歧。
-      _ = Maxio.ObjectMeta.list_shadow(bucket, list_opts, pg: res, bucket_versioning: versioning_of(b))
+      _ =
+        Maxio.ObjectMeta.list_shadow(bucket, list_opts,
+          pg: res,
+          bucket_versioning: versioning_of(b)
+        )
 
       objects =
         Enum.map(res.objects, fn o ->

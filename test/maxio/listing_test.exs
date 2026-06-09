@@ -149,6 +149,7 @@ defmodule Maxio.ListingTest do
     r1 = Listing.list_objects_v2("b", %{max_keys: 2}, opts(topo))
     assert Enum.map(r1.objects, & &1.key) == ["a", "b"]
     assert r1.is_truncated == true
+
     # 续点必须是【裸 key】"b"（与权威 Objects 路径逐字对齐，objects_test.exs:66），绝非 base64。
     assert r1.next_continuation_token == "b"
 
@@ -214,6 +215,7 @@ defmodule Maxio.ListingTest do
     tok = Maxio.Listing.Continuation.encode("photos/x.jpg")
     assert tok == "photos/x.jpg"
     assert {:ok, "photos/x.jpg"} = Maxio.Listing.Continuation.decode(tok)
+
     # 关键回归：权威 Objects 发的裸 key（如 "key1"/"photos/2006/"）必须被当成 key 游标原样接收，
     # 绝不再当成 base64 解码成乱码或报 :error 而回落 start_after=nil 走全桶（伪分歧根因）。
     assert {:ok, "key1"} = Maxio.Listing.Continuation.decode("key1")

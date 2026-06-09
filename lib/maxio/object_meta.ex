@@ -109,14 +109,16 @@ defmodule Maxio.ObjectMeta do
 
     case MetaReconcile.reconcile(copies, rq, target) do
       {:ok, entry, divergent} ->
-        if divergent != [],
-          do:
-            Log.warn("sidecar divergence (heal pending)",
-              bucket: bucket,
-              key: key,
-              version_id: version_id,
-              divergent: inspect(divergent)
-            )
+        if divergent != [] do
+          Log.warn("sidecar divergence -> scheduling heal",
+            bucket: bucket,
+            key: key,
+            version_id: version_id,
+            divergent: inspect(divergent)
+          )
+
+          schedule_heal(bucket, key, eff_vid, entry, divergent, copies, opts)
+        end
 
         compare(bucket, key, version_id, pg, Sidecar.to_view(bucket, key, entry))
 
@@ -275,6 +277,49 @@ defmodule Maxio.ObjectMeta do
   end
 
   defp compare_list(_bucket, _pg, _walk), do: :ok
+
+  # divergent != [] 时 best-effort 调度 heal（B4-1）：取 canonical **完整 meta**（含 versions 数组）
+  # 写回 divergent 端点的 sidecar。reconcile 仅返回单版本 entry，故 canonical 完整 meta 取自「持有该
+  # 权威版本（entry 签名相符）的 quorum 端点之一的完整 sidecar」（计划文档化的最简取法：reconcile 的
+  # canonical entry 所在端点的完整 meta）。endpoints 由 `endpoints_for/3` 重算（纯函数，对同一
+  # bucket/key/topology 确定性，与 read_endpoint_sidecars 用的同一组，无漂移）。同步调用（非 Task）
+  # 规避 DB sandbox / 连接所有权问题；heal 仅在分歧时低频触发，且 SidecarHeal.heal_divergent 自身
+  # best-effort 容错——再裹一层 try/rescue 确保绝不阻塞/破坏读路径（铁律 3）。
+  defp schedule_heal(bucket, key, eff_vid, entry, divergent, copies, opts) do
+    case canonical_full_meta(entry, copies) do
+      nil ->
+        :ok
+
+      canon ->
+        endpoints = endpoints_for(bucket, key, opts)
+        info = %{canonical_meta: canon, divergent_endpoints: divergent, endpoints: endpoints}
+        _ = Maxio.SidecarHeal.heal_divergent(bucket, key, eff_vid || "null", info, opts)
+        :ok
+    end
+  rescue
+    e -> Log.warn("sidecar heal scheduling error", bucket: bucket, key: key, reason: inspect(e))
+  catch
+    kind, reason ->
+      Log.warn("sidecar heal scheduling caught",
+        bucket: bucket,
+        key: key,
+        reason: inspect({kind, reason})
+      )
+  end
+
+  # canonical 完整 meta：在 copies 中找「其 versions 数组含与 canonical entry 同签名版本」的端点完整 meta。
+  # 同签名即同版本体（signature 是身份字段哈希），保证写回的是权威版本所在的完整 sidecar。无匹配 -> nil。
+  defp canonical_full_meta(entry, copies) do
+    sig = Sidecar.signature(entry)
+
+    Enum.find_value(copies, fn
+      %{meta: %{"versions" => versions} = meta} when is_list(versions) ->
+        if Enum.any?(versions, fn v -> Sidecar.signature(v) == sig end), do: meta, else: nil
+
+      _ ->
+        nil
+    end)
+  end
 
   # 读全 N 端点 sidecar -> [%{node, drive, meta} | :missing]。eff_vid 已是落盘版本（"null" 或 ULID），
   # 与 Storage.get(bucket, key, object.version_id, ...) 的字节/sidecar 落点一致（方案 B 每版本独立目录）。

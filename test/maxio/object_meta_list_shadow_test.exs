@@ -155,7 +155,14 @@ defmodule Maxio.ObjectMetaListShadowTest do
   test "Enabled 桶 list shadow 门控短路：不记分歧（盘上有 key、PG 无）", %{topo: topo, eps: eps} do
     # drive 上有 key（旧版本字节残留），PG 空（当前版本是纯 PG delete marker）-> 修复前会伪报分歧。
     put_drive(eps, "lsb", "deleted.txt")
-    pg = %{objects: [], common_prefixes: [], is_truncated: false, next_continuation_token: nil, key_count: 0}
+
+    pg = %{
+      objects: [],
+      common_prefixes: [],
+      is_truncated: false,
+      next_continuation_token: nil,
+      key_count: 0
+    }
 
     log =
       capture_log(fn ->
@@ -173,7 +180,14 @@ defmodule Maxio.ObjectMetaListShadowTest do
 
   test "Suspended 桶 list shadow 同样门控短路：不记分歧", %{topo: topo, eps: eps} do
     put_drive(eps, "lsb", "stale-null.txt")
-    pg = %{objects: [], common_prefixes: [], is_truncated: false, next_continuation_token: nil, key_count: 0}
+
+    pg = %{
+      objects: [],
+      common_prefixes: [],
+      is_truncated: false,
+      next_continuation_token: nil,
+      key_count: 0
+    }
 
     log =
       capture_log(fn ->
