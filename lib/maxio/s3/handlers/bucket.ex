@@ -125,6 +125,7 @@ defmodule Maxio.S3.Handlers.Bucket do
       max_keys = parse_int(Map.get(qp, "max-keys"), 1000)
       key_marker = Map.get(qp, "key-marker")
       version_id_marker = Map.get(qp, "version-id-marker")
+      encoding_type = Map.get(qp, "encoding-type")
 
       res =
         Objects.list_object_versions(bucket, %{
@@ -147,7 +148,8 @@ defmodule Maxio.S3.Handlers.Bucket do
           next_key_marker: res.next_key_marker,
           next_version_id_marker: res.next_version_id_marker,
           versions: res.versions,
-          common_prefixes: res.common_prefixes
+          common_prefixes: res.common_prefixes,
+          encoding_type: encoding_type
         })
 
       Log.info("list object versions", action: :list_object_versions, bucket: bucket)

@@ -42,4 +42,33 @@ defmodule Maxio.S3.EncodingTypeE2ETest do
     refute res.resp_body =~ "<EncodingType>"
     assert res.resp_body =~ "<Key>plain.txt</Key>"
   end
+
+  test "ListObjectVersions encoding-type=url → <EncodingType>url</EncodingType> 且 Key percent-encode" do
+    SigV4Request.signed_conn(:put, "/encv1") |> call()
+    body = ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
+    SigV4Request.signed_conn(:put, "/encv1", query: %{"versioning" => ""}, body: body) |> call()
+    SigV4Request.signed_conn(:put, "/encv1/test%20v%283%29.png", body: "x") |> call()
+
+    res =
+      SigV4Request.signed_conn(:get, "/encv1",
+        query: %{"versions" => "", "encoding-type" => "url"}
+      )
+      |> call()
+
+    assert res.status == 200
+    assert res.resp_body =~ "<EncodingType>url</EncodingType>"
+    assert res.resp_body =~ "test%20v%283%29.png"
+  end
+
+  test "ListObjectVersions 无 encoding-type → 不发 <EncodingType>，Key 原样" do
+    SigV4Request.signed_conn(:put, "/encv2") |> call()
+    body = ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
+    SigV4Request.signed_conn(:put, "/encv2", query: %{"versioning" => ""}, body: body) |> call()
+    SigV4Request.signed_conn(:put, "/encv2/plain.txt", body: "x") |> call()
+
+    res = SigV4Request.signed_conn(:get, "/encv2", query: %{"versions" => ""}) |> call()
+    assert res.status == 200
+    refute res.resp_body =~ "<EncodingType>"
+    assert res.resp_body =~ "<Key>plain.txt</Key>"
+  end
 end
