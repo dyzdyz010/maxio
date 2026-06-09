@@ -103,4 +103,29 @@ defmodule Maxio.S3.BucketPolicyTest do
 
     assert res.status == 204
   end
+
+  test "PutBucketPolicy 含未支持 Condition 算子 → 400 MalformedPolicy" do
+    SigV4Request.signed_conn(:put, "/pbc1") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbc1/*"],"Condition":{"NumericLessThan":{"s3:max-keys":"10"}}}]})
+
+    res =
+      SigV4Request.signed_conn(:put, "/pbc1", query: %{"policy" => ""}, body: policy) |> call()
+
+    assert res.status == 400
+    assert res.resp_body =~ "MalformedPolicy"
+  end
+
+  test "PutBucketPolicy 含受支持 Condition 算子（Bool）→ 204" do
+    SigV4Request.signed_conn(:put, "/pbc2") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::pbc2/*"],"Condition":{"Bool":{"aws:SecureTransport":"true"}}}]})
+
+    res =
+      SigV4Request.signed_conn(:put, "/pbc2", query: %{"policy" => ""}, body: policy) |> call()
+
+    assert res.status == 204
+  end
 end

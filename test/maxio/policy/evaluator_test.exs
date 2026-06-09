@@ -188,11 +188,19 @@ defmodule Maxio.Policy.EvaluatorTest do
            ) == {:deny, :implicit_deny}
   end
 
-  test "未知（defer）条件算子 → 保守不命中" do
-    stmts =
-      parse!(
-        ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"NumericLessThan":{"s3:max-keys":"10"}}}})
-      )
+  test "未知（defer）条件算子 → 评估期保守不命中（纵深防御）" do
+    # FX-M5 后 PutBucketPolicy parse 期已拒绝未支持算子（见 statement_test/bucket_policy_test），
+    # 故无法再经 parse_policy 构造含未知算子的策略。此处直接构造 Statement 结构验证
+    # Condition.hold?/2 的评估期 fail-closed 守卫（@known 之外算子 → 不命中），确保纵深防御不回归（铁律 3）。
+    stmts = [
+      %Statement{
+        effect: :allow,
+        actions: ["s3:GetObject"],
+        resources: ["arn:aws:s3:::b/*"],
+        principals: :any,
+        conditions: %{"NumericLessThan" => %{"s3:max-keys" => "10"}}
+      }
+    ]
 
     assert Evaluator.evaluate(
              anon_ctx("s3:GetObject", "arn:aws:s3:::b/k", %{"s3:max-keys" => "5"}),

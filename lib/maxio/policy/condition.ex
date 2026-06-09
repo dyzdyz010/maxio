@@ -18,6 +18,10 @@ defmodule Maxio.Policy.Condition do
 
   @known ~w(StringEquals StringLike Bool IpAddress DateGreaterThan)
 
+  @doc "本 MVP 支持的 Condition 算子集合（PutBucketPolicy parse 期校验复用，单一事实来源）。"
+  @spec supported_operators() :: [String.t()]
+  def supported_operators, do: @known
+
   @doc "Condition 块是否全部成立。conditions = 请求上下文条件键值 map。"
   @spec hold?(map() | nil, map()) :: boolean()
   def hold?(nil, _ctx), do: true

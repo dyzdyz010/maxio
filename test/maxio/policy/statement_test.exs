@@ -111,4 +111,18 @@ defmodule Maxio.Policy.StatementTest do
 
     assert {:ok, [_]} = Statement.parse_policy(json)
   end
+
+  test "parse_conditions 拒绝未支持算子（StringEqualsIgnoreCase）→ malformed" do
+    json =
+      ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEqualsIgnoreCase":{"s3:prefix":"x"}}}]})
+
+    assert {:error, :malformed} = Statement.parse_policy(json, "b")
+  end
+
+  test "parse_conditions 接受支持算子（Bool）" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"Bool":{"aws:SecureTransport":"true"}}}]})
+
+    assert {:ok, [_]} = Statement.parse_policy(json, "b")
+  end
 end

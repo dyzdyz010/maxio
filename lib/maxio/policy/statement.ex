@@ -159,8 +159,21 @@ defmodule Maxio.Policy.Statement do
   defp parse_principal(nil), do: {:error, :malformed}
   defp parse_principal(_), do: {:error, :malformed}
 
+  # Condition 校验：算子必须在受支持集合内（复用 Maxio.Policy.Condition.supported_operators/0，
+  # 单一事实来源），否则 {:error, :malformed} → PutBucketPolicy 回 400 MalformedPolicy（铁律 3/5，
+  # 对齐 minio condition.UnmarshalJSON 在 parse 期拒绝未知算子，绝不存「行为与所写不符」的策略）。
   defp parse_conditions(nil), do: {:ok, %{}}
-  defp parse_conditions(%{} = cond_map), do: {:ok, cond_map}
+
+  defp parse_conditions(%{} = cond_map) do
+    supported = MapSet.new(Maxio.Policy.Condition.supported_operators())
+
+    if Enum.all?(Map.keys(cond_map), &MapSet.member?(supported, &1)) do
+      {:ok, cond_map}
+    else
+      {:error, :malformed}
+    end
+  end
+
   defp parse_conditions(_), do: {:error, :malformed}
 
   @doc "便于测试/调试：判断某 action 串是否被本 statement 的 Action 命中（大小写不敏感）。"
