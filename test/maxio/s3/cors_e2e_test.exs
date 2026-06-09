@@ -95,4 +95,30 @@ defmodule Maxio.S3.CorsE2ETest do
     assert get_resp_header(get, "access-control-allow-origin") == ["http://www.example.com"]
     assert "Origin" in get_resp_header(get, "vary")
   end
+
+  test "预检命中 → 回 Access-Control-Allow-Credentials: true" do
+    SigV4Request.signed_conn(:put, "/cbc1") |> call()
+    SigV4Request.signed_conn(:put, "/cbc1", query: %{"cors" => ""}, body: @cors) |> call()
+
+    pre =
+      SigV4Request.anon_conn(:options, "/cbc1/obj.txt",
+        headers: [{"origin", "http://www.example.com"}, {"access-control-request-method", "PUT"}]
+      )
+      |> call()
+
+    assert pre.status == 200
+    assert get_resp_header(pre, "access-control-allow-credentials") == ["true"]
+  end
+
+  test "实际跨源响应 → 回 Access-Control-Allow-Credentials: true" do
+    SigV4Request.signed_conn(:put, "/cbc2") |> call()
+    SigV4Request.signed_conn(:put, "/cbc2", query: %{"cors" => ""}, body: @cors) |> call()
+    SigV4Request.signed_conn(:put, "/cbc2/o.txt", body: "x") |> call()
+
+    res =
+      SigV4Request.signed_conn(:get, "/cbc2/o.txt", headers: [{"origin", "http://www.example.com"}])
+      |> call()
+
+    assert get_resp_header(res, "access-control-allow-credentials") == ["true"]
+  end
 end
