@@ -270,7 +270,10 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
      Sidecar.to_view/3 / Maxio.MetaReconcile（纯函数跨端点 quorum 仲裁，无 quorum 报错绝不猜，真值表硬测）/ Maxio.ObjectMeta dual-read shadow（PG 仍权威 + 分歧结构化日志 + 读路径绝不被破坏，authoritative_source[:read]=:pg 默认）+ GET/HEAD shadow 接线；executor 修正计划的 get_metadata 返回类型 + 2 fidelity 修复（modtime-first 选组 / shadow 按 topology 门控）
 ✅ 路线 B P3（drive-walk LIST · shadow）— 65a4540..a9c43f2（658 测试，precommit 绿）
      Transport.list_dir/ShardServer.list_dir（单端点走盘原语）/ Maxio.Listing（跨 set 递归走盘 + delimiter 折叠 + walk-position 续点，从构造消除 LIST 无 SQL LIMIT DoS）/ ObjectMeta.list_shadow（PG 仍权威 + drive-walk vs PG key集/common-prefix 分歧日志 + 绝不破坏列举，authoritative_source[:list]=:pg）+ ListObjectsV2 接线；fidelity 复检加 .versions 枚举+排除 delete marker + 续点游标对齐
-   ◇ 评估路线 B P4（原子写权威 + 翻转读/列权威 + sidecar heal 回写）← 下一步（需用户拍板；这是真正去 PG-SPOF 的临门一脚）
+⚠ 路线 B P4（翻转读/列/写权威 · 去 PG-SPOF）— B4-1..B4-4 已落 181edb7..deb4609 + fidelity 修复 acb4f26 + format-tail 20045a1（681→673 测试随阶段；compile 零警告）
+     B4-1 Maxio.SidecarHeal（分歧 sidecar 原子回写 canonical + 读路径调度）/ B4-2 写路径 PG 降 best-effort（:write=:sidecar 下 PG 失败非致命、对象在 sidecar 仍耐久；传输完整性失败仍致命+回滚孤儿）/ B4-3 翻读权威（reconcile 结果权威、read-quorum 不足 503 绝不猜、acb4f26 加 resolve_sidecar_version→discover_current_version 走盘发现 Enabled 桶当前版本、SlowDownRead/x-amz-delete-marker 头保真）/ B4-4 翻列权威（drive-walk + per-key quorum 确认）
+     ❗ **code-review CHANGES_REQUESTED — 发现 critical 集成断裂（must_fix #1）**：写路径 build_meta 仍产**扁平 v1 meta**（无 format/versions），而 reconcile 经 Sidecar.latest/find_version（`when is_list(versions)`）对 v1 返回 nil → 真实 PutObject 写出的对象在分布式拓扑 + :read/:list=:sidecar 下 GET 503 / LIST 丢对象。新增 5 测试手搓 maxio/2 fixture 绕过真实 Storage.put（虚假信心）。默认 :pg 安全，但翻权威能力对真实对象不可用。
+   ◇ 路线 B B4-5（写路径产出 maxio/2 版本化 sidecar）← **进行中**：让 Storage.put 经 Sidecar.migrate_v1 产出含 versions 的完整 sidecar（透传 content_type/tags/sse/acl/storage_class/user_metadata）+ 真实 PUT→翻权威→GET/LIST 端到端取证（Unversioned/Versioned/SSE）。计划 `plans/2026-06-09-routeB-b4-5-write-path-maxio2-sidecar.md`。同时关闭 must_fix #2（版本桶 latest 读：discover 发现版本目录后需 v2 entry 才能 reconcile）。
 
 > **网络教训（本机当前）**：长时运行的 subagent（尤其重 WebFetch 的研究/规划 agent）会因 `socket connection was closed` / 证书错误被掐断，特征是任务 `subagent_tokens=0`、跑数分钟后中断；短探针 agent 可过。对策：① 规划/设计文档改由 orchestrator 主线直接撰写（CLAUDE.md 允许，已用于 P2 计划）；② 实现 workflow 的 executor 逐单元（比长研究 agent 短）+ 每单元独立提交，被掐断只丢当前单元、可续；③ 遇 `subagent_tokens=0` 失败先探针确认连接再重启，绝不盲目重跑。
 ```
