@@ -24,4 +24,8 @@ defmodule Maxio.Policy.ActionMapTest do
   test "未知 action → nil" do
     assert ActionMap.for_action(:nonexistent) == nil
   end
+
+  test "delete_objects 不再桶级粗门（授权移交 handler 逐 key）" do
+    assert ActionMap.for_action(:delete_objects) == nil
+  end
 end

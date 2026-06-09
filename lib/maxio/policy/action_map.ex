@@ -28,8 +28,9 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:head_object), do: {"s3:GetObject", :object}
   def for_action(:delete_object), do: {"s3:DeleteObject", :object}
 
-  # DeleteObjects 批删：Authz 用桶级 s3:DeleteObject 作粗粒度门（细粒度逐 key 检查 defer，文档化）。
-  def for_action(:delete_objects), do: {"s3:DeleteObject", :bucket}
+  # DeleteObjects 批删：授权在 handler 内逐 key 对对象 ARN 评估（s3:DeleteObject on bucket/key），
+  # 故此处返回 nil（dispatcher 层 Authz 放行，绝不在桶 ARN 上粗粒度门控——桶 ARN 不授予对象动作）。
+  def for_action(:delete_objects), do: nil
 
   def for_action(:create_multipart_upload), do: {"s3:PutObject", :object}
   def for_action(:upload_part), do: {"s3:PutObject", :object}

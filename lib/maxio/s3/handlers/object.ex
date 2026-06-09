@@ -335,11 +335,23 @@ defmodule Maxio.S3.Handlers.Object do
 
     versioning = bucket_versioning(bucket)
 
+    # 逐 key 对象级授权（铁律 2：复用 Authz 单一授权路径，仅资源 ARN 改成每个 key 的对象 ARN）。
+    # 无权 key 回 per-key <Error>AccessDenied</Error>（HTTP 200 混合结果）且绝不删；有权 key 才删。
+    principal = conn.assigns[:principal]
+    authenticated? = principal != :anonymous
+    conditions = Maxio.S3.Authz.conditions_for(conn, authenticated?)
+    owner? = Maxio.S3.Authz.owner?(principal, bucket)
+
     {deleted, errors} =
       Enum.reduce(objects, {[], []}, fn obj, {dacc, eacc} ->
-        case delete_one(bucket, obj, versioning) do
-          {:ok, entry} -> {[entry | dacc], eacc}
-          {:error, err} -> {dacc, [err | eacc]}
+        if delete_authorized?(bucket, obj.key, principal, authenticated?, owner?, conditions) do
+          case delete_one(bucket, obj, versioning) do
+            {:ok, entry} -> {[entry | dacc], eacc}
+            {:error, err} -> {dacc, [err | eacc]}
+          end
+        else
+          err = %{key: obj.key, code: "AccessDenied", message: "Access Denied"}
+          {dacc, [err | eacc]}
         end
       end)
 
@@ -407,6 +419,29 @@ defmodule Maxio.S3.Handlers.Object do
         :ok = Objects.delete_metadata(bucket, key)
         _ = Storage.delete(bucket, key)
         {:ok, %{key: key}}
+    end
+  end
+
+  # 单 key 是否被授权删除：owner/root 短路放行；否则对该 key 的对象 ARN 跑 Evaluator（s3:DeleteObject）。
+  # 复用 Maxio.S3.Authz 暴露的同源零件（conditions/object_statements/Evaluator），绝不另起授权逻辑。
+  defp delete_authorized?(_bucket, _key, _principal, _authenticated?, true, _conditions), do: true
+
+  defp delete_authorized?(bucket, key, principal, authenticated?, _owner?, conditions) do
+    resource = Maxio.Policy.Arn.object_arn(bucket, key)
+    statements = Maxio.S3.Authz.object_statements(bucket, key, principal)
+
+    ctx = %Maxio.Policy.RequestContext{
+      principal: principal,
+      authenticated?: authenticated?,
+      owner?: false,
+      action: "s3:DeleteObject",
+      resource: resource,
+      conditions: conditions
+    }
+
+    case Maxio.Policy.Evaluator.evaluate(ctx, statements) do
+      :allow -> true
+      {:deny, _reason} -> false
     end
   end
 

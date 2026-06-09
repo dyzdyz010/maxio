@@ -63,18 +63,37 @@ defmodule Maxio.S3.Authz do
     end
   end
 
-  # ── owner 短路判定（单租户）──
-  defp owner?(:anonymous, _bucket), do: false
-  defp owner?(%{type: :root}, _bucket), do: true
+  @doc """
+  供批量 handler（如 DeleteObjects 逐 key）复用：抽取请求条件键（与单请求授权同源）。
+  与 do_authorize/4 内调用同一私有实现，绝不重复授权逻辑（铁律 2/4.1）。
+  """
+  @spec conditions_for(Plug.Conn.t(), boolean()) :: map()
+  def conditions_for(conn, authenticated?), do: extract_conditions(conn, authenticated?)
 
-  defp owner?(%{arn: arn}, bucket) when is_binary(bucket) do
+  @doc """
+  供批量 handler（如 DeleteObjects 逐 key）复用：合并某对象的 bucket policy + 对象 ACL 派生 +
+  identity statements（与单请求对象级授权同源）。
+  """
+  @spec object_statements(String.t(), String.t(), map() | :anonymous) :: [
+          Maxio.Policy.Statement.t()
+        ]
+  def object_statements(bucket, key, principal),
+    do: gather_statements(:object, bucket, key, principal)
+
+  # ── owner 短路判定（单租户）──
+  @doc "principal 是否为该桶 owner 或 root（短路放行）。供批量 handler 复用，语义同单请求授权。"
+  @spec owner?(map() | :anonymous, String.t() | nil) :: boolean()
+  def owner?(:anonymous, _bucket), do: false
+  def owner?(%{type: :root}, _bucket), do: true
+
+  def owner?(%{arn: arn}, bucket) when is_binary(bucket) do
     case Buckets.lookup(bucket) do
       {:ok, %{owner: ^arn}} -> true
       _ -> false
     end
   end
 
-  defp owner?(_principal, _bucket), do: false
+  def owner?(_principal, _bucket), do: false
 
   # ── 资源 ARN ──
   defp resource_arn(:account, _bucket, _key), do: Arn.account_arn()
