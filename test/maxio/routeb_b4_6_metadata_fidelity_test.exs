@@ -150,7 +150,7 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
     test "PutObject >2 KB x-amz-meta-* → 400 MetadataTooLarge" do
       SigV4Request.signed_conn(:put, "/d2a") |> call()
 
-      # 单个 value 2049 字节（key "big" 3 字节 + value 2049 = 2052 > 2048）。
+      # 单个 value 2049 字节。含前缀计量：byte_size("x-amz-meta-big")=14 + 2049 = 2063 > 2048。
       big_value = String.duplicate("x", 2049)
 
       conn =
@@ -166,11 +166,12 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
       assert {:error, :not_found} = Objects.get_metadata("d2a", "k.txt")
     end
 
-    test "PutObject ≤2 KB x-amz-meta-* 通过（200）" do
+    test "PutObject 含前缀计量边界：x-amz-meta-big + 2034B（=2048）通过（200）" do
       SigV4Request.signed_conn(:put, "/d2b") |> call()
 
-      # key "big" 3 + value 2045 = 2048（恰好 ≤2048）。
-      ok_value = String.duplicate("x", 2045)
+      # 镜像 MinIO isHTTPHeaderSizeTooLarge：完整 key byte_size("x-amz-meta-big")=14
+      # + value 2034 = 2048（恰好 ≤2048，含前缀计量的上界）。
+      ok_value = String.duplicate("x", 2034)
 
       conn =
         SigV4Request.signed_conn(:put, "/d2b/k.txt",
@@ -182,6 +183,26 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
       assert conn.status == 200
       {:ok, obj} = Objects.get_metadata("d2b", "k.txt")
       assert obj.metadata == %{"big" => ok_value}
+    end
+
+    test "PutObject 含前缀计量边界：x-amz-meta-big + 2035B（=2049）→ 400 MetadataTooLarge" do
+      SigV4Request.signed_conn(:put, "/d2b1") |> call()
+
+      # 完整 key 14 + value 2035 = 2049 > 2048，超 1 字节即拒（边界严格对齐 MinIO；
+      # 若不计 x-amz-meta- 前缀则误算 2038 而错误放行——本断言钉死前缀必须计入）。
+      over_value = String.duplicate("x", 2035)
+
+      conn =
+        SigV4Request.signed_conn(:put, "/d2b1/k.txt",
+          body: "payload",
+          headers: [{"x-amz-meta-big", over_value}]
+        )
+        |> call()
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "MetadataTooLarge"
+      # 失败 pre-commit：对象未落库（无孤儿）。
+      assert {:error, :not_found} = Objects.get_metadata("d2b1", "k.txt")
     end
 
     test "CopyObject(REPLACE) >2 KB x-amz-meta-* → 400 MetadataTooLarge" do
@@ -210,7 +231,8 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
       SigV4Request.signed_conn(:put, "/d2d") |> call()
       SigV4Request.signed_conn(:put, "/d2d/src.txt", body: "x") |> call()
 
-      ok_value = String.duplicate("y", 2045)
+      # 含前缀计量：byte_size("x-amz-meta-big")=14 + value 2034 = 2048（恰好 ≤2048）。
+      ok_value = String.duplicate("y", 2034)
 
       conn =
         SigV4Request.signed_conn(:put, "/d2d/dst.txt",
