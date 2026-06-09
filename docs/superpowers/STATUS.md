@@ -276,7 +276,10 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
    ✅ 路线 B B4-5（写路径产出 maxio/2 版本化 sidecar）— 5dd510c（686 测试，APPROVE_WITH_NOTES，precommit 绿）
      Storage.put/5 新增 :object_meta opts 契约（不改 arity）；ErasureCoded/Distributed build_meta 增 version_id+opts 形参、构造 v1 core 后经 Sidecar.migrate_v1 产出含 versions 的完整 maxio/2 sidecar（耐久 ec/shards/size/etag/sha256/parts 字节不变）；handler do_put + CopyObject 组 object_meta（content_type/tags/sse/acl/storage_class/user_metadata，复用 parse_user_metadata）经 Storage.put 透传；modtime 单次计算保 N 份 signature 一致。**真实 PUT→翻 :read/:list=:sidecar→GET/LIST 端到端取证**（distributed+InProcess+注入 topology；Case A Unversioned 盘上 sidecar maxio/2+富字段、ObjectMeta.get 返 %Object{} 而非 read_quorum、Listing key+ETag/Size 正确；Case B Versioned latest 经 discover_current_version+reconcile 解析当前版本=**关闭 must_fix #2**；Case C SSE 信封携带+解密成功）。**严禁手搓 sidecar**。计划 `plans/2026-06-09-routeB-b4-5-write-path-maxio2-sidecar.md`。
      → B4-5 独立 MinIO-fidelity 审计（3 lenses）报 3 medium + 1 low（无 critical/high），排入 B4-6（见下「B4-6 backlog」）。
-   ◇ 路线 B B4-6（写路径元数据保真补全）← **下一步**：修 fidelity 3 个 medium。计划 `plans/2026-06-09-routeB-b4-6-write-path-metadata-fidelity.md`。
+   ✅ 路线 B B4-6（写路径元数据保真补全）— 583697a + fidelity-fix f856c7e（700 测试，APPROVE_WITH_NOTES，verify 绿）
+     修 3 medium：D1 多段 complete 透传 content_type/user_metadata 进 sidecar（Multipart.complete→Storage.assemble→build_meta opts）/ D2 新建 Maxio.Metadata.validate_size!（2KB）+ MetadataTooLarge 400 错误码，do_put 与 copy(REPLACE) pre-commit 闸（无孤儿）/ D3 PutObject user_metadata 也写 PG（与 sidecar 锁步、消除读分裂）。
+     **B4-6 fidelity 又抓 2 high → fidelity-fix f856c7e 当场修**：x-amz-meta-* 写→读 round-trip——(1) put_common_object_headers 现 GET/HEAD 回显 x-amz-meta-*（此前写了不可读）；(2) CreateMultipartUpload 现解析 x-amz-meta-*+create-time 2KB 闸、complete 把 metadata 传 PG（消 MPU 分裂）；铁律 2 单一来源 Maxio.Metadata.parse_headers/1；加 HTTP 级 e2e D4a-f 证往返。计划 `plans/2026-06-09-routeB-b4-6-write-path-metadata-fidelity.md`。
+   ◇ 路线 B B4-7（元数据 2KB 上限含 x-amz-meta- 前缀）← **下一步**：修 B4-6 fidelity 残留 1 medium（E1：validate_size! 剥前缀后计量少算 11B/头，边界请求被错误接受 vs MinIO len(key 含前缀)+len(value)）+ docstring low（E2：引用不存在的 s3-tests 函数）。基线设 583697a 使 review/fidelity 一并覆盖未独立审查的 f856c7e。计划 `plans/2026-06-09-routeB-b4-7-metadata-size-prefix.md`。
 
 > **路线 B 主目标达成**：sidecar(meta.json) 已是对象元数据真值源、真实 PUT 对象在 `:read/:list/:write=:sidecar` 下完整可读/可列/可写（端到端取证），PG 降为可派生索引——**PG 单点故障从构造上消除**。默认 `:pg` 全程不变、字节级可回滚。剩余 B4-6 为元数据富度/一致性保真（非阻塞主目标）；生产默认翻 :sidecar 前需 P7 backfill/迁移（既有 v1 对象升 maxio/2）。
 
@@ -287,7 +290,9 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 
 #### low 偏离 defer（与既有 12 项 low 同级，文档化留后续）
 - **D4（low）**：CopyObject sidecar 硬编码 private/STANDARD 忽略 x-amz-acl/x-amz-storage-class——预存在且与 PG 路径一致（PG copy 也硬编码），非 B4-5 引入。留 CopyObject directive 完整化里程碑统一处理（届时 sidecar 与 PG 锁步）。
-- **响应层缺口**：put_common_object_headers 不发 x-amz-meta-*/x-amz-storage-class 响应头（两路共有、预存在）。留响应层里程碑。
+- **E3（low）**：缺 8 KB 总请求头上限 + 不识别 x-minio-meta- 前缀（MinIO 两者皆 → MetadataTooLarge 400，在 setRequestLimitMiddleware 层）。属请求管线 plug scope，留「镜像 isHTTPHeaderSizeTooLarge」中间件里程碑。
+- **系统头 follow-up**：PutObject/CopyObject/MPU 未捕获/回显 Content-Disposition/Content-Encoding/Cache-Control/Expires（真实 S3/MinIO 对象系统元数据）。x-amz-meta-* round-trip 已由 f856c7e 闭合；这批系统头留响应/写路径系统头里程碑。
+- **x-amz-storage-class 响应头**：put_common_object_headers 不发（STANDARD 时 AWS 本就省略，非默认 storage-class 才需）。CopyObject directive 里程碑一并处理。
 - **shadow-list 健壮性**：precommit 见一条 `Protocol.UndefinedError{value: :not_a_list}` list shadow error（被 catch+日志、默认 :pg 列举不受影响、非 B4-5 引入）。留 shadow 比对健壮性跟进。
 
 > **网络教训（本机当前）**：长时运行的 subagent（尤其重 WebFetch 的研究/规划 agent）会因 `socket connection was closed` / 证书错误被掐断，特征是任务 `subagent_tokens=0`、跑数分钟后中断；短探针 agent 可过。对策：① 规划/设计文档改由 orchestrator 主线直接撰写（CLAUDE.md 允许，已用于 P2 计划）；② 实现 workflow 的 executor 逐单元（比长研究 agent 短）+ 每单元独立提交，被掐断只丢当前单元、可续；③ 遇 `subagent_tokens=0` 失败先探针确认连接再重启，绝不盲目重跑。
