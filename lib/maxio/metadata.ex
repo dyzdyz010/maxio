@@ -13,6 +13,26 @@ defmodule Maxio.Metadata do
   # AWS 用户元数据总量上限：2 KB（2048 字节）。
   @max_size 2048
 
+  @doc """
+  从请求头解析用户自定义元数据：`x-amz-meta-<name>` → `%{name => value}`
+  （去掉 `x-amz-meta-` 前缀，name 小写；空 name 跳过）。
+
+  这是 PutObject / CopyObject(REPLACE) / CreateMultipartUpload 三处写路径的**单一**用户元数据
+  解析器（铁律 2：同源，绝不各自手搓），保证三条入口对 `x-amz-meta-*` 的提取语义完全一致。
+  入参为 Plug.Conn 的 `req_headers`（`[{name, value}]`，name 可能任意大小写）。
+  """
+  @spec parse_headers([{String.t(), String.t()}]) :: %{optional(String.t()) => String.t()}
+  def parse_headers(req_headers) when is_list(req_headers) do
+    req_headers
+    |> Enum.flat_map(fn {k, v} ->
+      case String.downcase(k) do
+        "x-amz-meta-" <> name when name != "" -> [{name, v}]
+        _ -> []
+      end
+    end)
+    |> Map.new()
+  end
+
   @doc "用户元数据上限（字节），供测试/文档引用。"
   @spec max_size() :: pos_integer()
   def max_size, do: @max_size

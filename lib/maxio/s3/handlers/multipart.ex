@@ -29,8 +29,20 @@ defmodule Maxio.S3.Handlers.Multipart do
     content_type = header(conn, "content-type") || "binary/octet-stream"
     owner = conn.assigns.principal.arn
 
+    # ROUTE B B4-6 fidelity：CreateMultipartUpload 须捕获客户端 x-amz-meta-*（与 PutObject 同源解析器），
+    # 落进会话 metadata，使 CompleteMultipartUpload 后的最终对象 HEAD/GET 回显这些用户元数据
+    # （对齐 AWS/MinIO：CreateMultipartUpload Request Syntax 显式列出 x-amz-meta-<key>）。
+    # 写会话之前先做 2 KB 大小闸（与 PutObject 同阈值/同语义）——超限 → 400 MetadataTooLarge、
+    # 失败 pre-create、无孤儿会话（铁律 3）。
+    user_metadata = Maxio.Metadata.parse_headers(conn.req_headers)
+    :ok = Maxio.Metadata.validate_size!(user_metadata)
+
     {:ok, upload} =
-      Multipart.initiate(bucket, key, %{content_type: content_type, owner: owner})
+      Multipart.initiate(bucket, key, %{
+        content_type: content_type,
+        owner: owner,
+        metadata: user_metadata
+      })
 
     Log.info("create multipart upload",
       action: :create_multipart_upload,
@@ -105,7 +117,11 @@ defmodule Maxio.S3.Handlers.Multipart do
                 size: size,
                 etag: etag,
                 content_type: upload.content_type,
-                storage_class: upload.storage_class
+                storage_class: upload.storage_class,
+                # ROUTE B B4-6 fidelity：会话捕获的 user_metadata 也写入 PG 索引行，
+                # 消除已完成多段对象在 :pg(默认) 读路径下 metadata=%{} 的 D3-style 分裂——
+                # 与 sidecar 透传（assemble_object_meta.user_metadata）保持两路一致。
+                metadata: upload.metadata || %{}
               })
 
             _ = Multipart.abort(upload)

@@ -215,6 +215,7 @@ defmodule Maxio.S3.Handlers.Object do
                 |> put_resp_header("last-modified", http_date(object.updated_at))
                 |> put_resp_header("accept-ranges", "bytes")
                 |> put_resp_header("content-length", Integer.to_string(byte_size(plain)))
+                |> put_user_metadata_headers(object)
                 |> maybe_tagging_count(object)
                 |> send_resp(200, plain)
 
@@ -768,17 +769,9 @@ defmodule Maxio.S3.Handlers.Object do
   defp sse_meta(nil, _envelope), do: nil
   defp sse_meta(algo, envelope), do: %{"algo" => algo, "envelope" => envelope}
 
-  # x-amz-meta-* 头 → %{"name" => "value"}（去掉 "x-amz-meta-" 前缀，名小写；空名跳过）。
-  defp parse_user_metadata(conn) do
-    conn.req_headers
-    |> Enum.flat_map(fn {k, v} ->
-      case String.downcase(k) do
-        "x-amz-meta-" <> name when name != "" -> [{name, v}]
-        _ -> []
-      end
-    end)
-    |> Map.new()
-  end
+  # x-amz-meta-* 头 → %{"name" => "value"}：复用 Maxio.Metadata 的单一解析器
+  # （PutObject / CopyObject(REPLACE) / CreateMultipartUpload 同源，铁律 2）。
+  defp parse_user_metadata(conn), do: Maxio.Metadata.parse_headers(conn.req_headers)
 
   # 条件头求值用的对象元信息（etag 无引号 hex；last_modified 用 updated_at）。
   defp meta(object), do: %{etag: object.etag, last_modified: object.updated_at}
@@ -886,8 +879,23 @@ defmodule Maxio.S3.Handlers.Object do
     |> put_resp_header("last-modified", http_date(object.updated_at))
     |> put_resp_header("accept-ranges", "bytes")
     |> put_resp_header("content-length", Integer.to_string(content_length))
+    |> put_user_metadata_headers(object)
     |> maybe_tagging_count(object)
   end
+
+  # ROUTE B B4-6 fidelity：把对象持久化的用户元数据原样回显为 x-amz-meta-<name> 响应头
+  # （name 已去前缀、小写），闭合 PutObject/CopyObject/MPU 写入 → GET/HEAD 读回的 round-trip。
+  # AWS S3/MinIO 在 GET 与 HEAD 都返回全部 user-defined metadata 为 x-amz-meta-* 头
+  # （HeadObject 是检索对象元数据的标准方式）；否则真实 SDK 读不回已存元数据（铁律 3：写了必可读）。
+  # 此 helper 同时被 GET（send_object/put_common_object_headers）与 HEAD（put_common_object_headers）
+  # 复用；SSE GET 分支单独走 put_resp_header 管线，故那里也显式调用本 helper（见 get/1 AES256 分支）。
+  defp put_user_metadata_headers(conn, %{metadata: metadata}) when is_map(metadata) do
+    Enum.reduce(metadata, conn, fn {name, value}, acc ->
+      put_resp_header(acc, "x-amz-meta-" <> to_string(name), to_string(value))
+    end)
+  end
+
+  defp put_user_metadata_headers(conn, _object), do: conn
 
   # GET/HEAD object：tag 数 > 0 才出现 x-amz-tagging-count（对齐 AWS）。
   defp maybe_tagging_count(conn, %{tags: tags}) when is_map(tags) and map_size(tags) > 0 do

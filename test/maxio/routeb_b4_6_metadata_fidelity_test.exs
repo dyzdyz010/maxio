@@ -14,6 +14,8 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
   """
   use Maxio.DataCase, async: false
 
+  import Plug.Conn, only: [get_resp_header: 2]
+
   alias Maxio.{Multipart, ObjectMeta, Objects, Sidecar, Storage}
   alias Maxio.Cluster.{Paths, Transport.InProcess}
   alias Maxio.Test.SigV4Request
@@ -348,5 +350,177 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
     end
   end
 
+  # ── D4：x-amz-meta-* round-trip（PutObject/CopyObject/MPU 写 → HEAD/GET 回显）──
+  #
+  # 修 B4-6 审计的 2 个 high 偏离：
+  #   (a) GET/HEAD 从不回显 x-amz-meta-* → 真实 SDK 读不回已存元数据（写了不可读）。
+  #   (b) CreateMultipartUpload HTTP handler 丢弃 x-amz-meta-* → 多段对象 HEAD/GET 无用户元数据。
+  describe "D4 — x-amz-meta-* HTTP round-trip（写入即可经 HEAD/GET 读回）" do
+    setup do
+      File.rm_rf(@data_dir)
+      File.mkdir_p!(@data_dir)
+      prev = Application.get_env(:maxio, :s3)
+      Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
+      Application.put_env(:maxio, :multipart_min_part_size, 1)
+
+      on_exit(fn ->
+        Application.put_env(:maxio, :s3, prev)
+        Application.delete_env(:maxio, :multipart_min_part_size)
+        File.rm_rf(@data_dir)
+      end)
+
+      :ok
+    end
+
+    test "PutObject(x-amz-meta-*) → HEAD 回显 x-amz-meta-* 响应头" do
+      SigV4Request.signed_conn(:put, "/d4a") |> call()
+
+      SigV4Request.signed_conn(:put, "/d4a/k.txt",
+        body: "hello",
+        headers: [{"x-amz-meta-foo", "bar"}, {"x-amz-meta-color", "blue"}]
+      )
+      |> call()
+
+      head = SigV4Request.signed_conn(:head, "/d4a/k.txt") |> call()
+      assert head.status == 200
+      assert get_resp_header(head, "x-amz-meta-foo") == ["bar"]
+      assert get_resp_header(head, "x-amz-meta-color") == ["blue"]
+    end
+
+    test "PutObject(x-amz-meta-*) → GET 回显 x-amz-meta-* 响应头" do
+      SigV4Request.signed_conn(:put, "/d4b") |> call()
+
+      SigV4Request.signed_conn(:put, "/d4b/k.txt",
+        body: "hello",
+        headers: [{"x-amz-meta-author", "alice"}]
+      )
+      |> call()
+
+      get = SigV4Request.signed_conn(:get, "/d4b/k.txt") |> call()
+      assert get.status == 200
+      assert get_resp_header(get, "x-amz-meta-author") == ["alice"]
+    end
+
+    test "CopyObject(REPLACE, x-amz-meta-*) → 目标 HEAD 回显新元数据，不继承源" do
+      SigV4Request.signed_conn(:put, "/d4c") |> call()
+
+      SigV4Request.signed_conn(:put, "/d4c/src.txt",
+        body: "x",
+        headers: [{"x-amz-meta-src", "original"}]
+      )
+      |> call()
+
+      SigV4Request.signed_conn(:put, "/d4c/dst.txt",
+        headers: [
+          {"x-amz-copy-source", "/d4c/src.txt"},
+          {"x-amz-metadata-directive", "REPLACE"},
+          {"x-amz-meta-dst", "replaced"}
+        ]
+      )
+      |> call()
+
+      head = SigV4Request.signed_conn(:head, "/d4c/dst.txt") |> call()
+      assert head.status == 200
+      assert get_resp_header(head, "x-amz-meta-dst") == ["replaced"]
+      # REPLACE 不继承源 x-amz-meta-src。
+      assert get_resp_header(head, "x-amz-meta-src") == []
+    end
+
+    test "CopyObject(COPY 默认) → 目标 HEAD 回显从源继承的元数据" do
+      SigV4Request.signed_conn(:put, "/d4d") |> call()
+
+      SigV4Request.signed_conn(:put, "/d4d/src.txt",
+        body: "x",
+        headers: [{"x-amz-meta-src", "inherited"}]
+      )
+      |> call()
+
+      SigV4Request.signed_conn(:put, "/d4d/dst.txt",
+        headers: [{"x-amz-copy-source", "/d4d/src.txt"}]
+      )
+      |> call()
+
+      head = SigV4Request.signed_conn(:head, "/d4d/dst.txt") |> call()
+      assert head.status == 200
+      assert get_resp_header(head, "x-amz-meta-src") == ["inherited"]
+    end
+
+    test "Multipart：Create(x-amz-meta-*) → Complete → HEAD/GET 回显用户元数据（PG 路径）" do
+      SigV4Request.signed_conn(:put, "/d4e") |> call()
+
+      init =
+        SigV4Request.signed_conn(:post, "/d4e/mp.bin",
+          query: %{"uploads" => ""},
+          headers: [{"content-type", "image/png"}, {"x-amz-meta-author", "alice"}]
+        )
+        |> call()
+
+      assert init.status == 200
+      uid = upload_id(init.resp_body)
+
+      up =
+        SigV4Request.signed_conn(:put, "/d4e/mp.bin",
+          query: %{"partNumber" => "1", "uploadId" => uid},
+          body: "multipart payload"
+        )
+        |> call()
+
+      assert up.status == 200
+      [etag1] = get_resp_header(up, "etag")
+
+      complete_xml =
+        "<CompleteMultipartUpload>" <>
+          "<Part><PartNumber>1</PartNumber><ETag>#{etag1}</ETag></Part>" <>
+          "</CompleteMultipartUpload>"
+
+      complete =
+        SigV4Request.signed_conn(:post, "/d4e/mp.bin",
+          query: %{"uploadId" => uid},
+          body: complete_xml
+        )
+        |> call()
+
+      assert complete.status == 200
+
+      # 完成对象的 PG 行 metadata 自描述（消除 MPU PG 侧 metadata=%{} 的分裂）。
+      {:ok, obj} = Objects.get_metadata("d4e", "mp.bin")
+      assert obj.metadata == %{"author" => "alice"}
+      assert obj.content_type == "image/png"
+
+      # HEAD/GET 回显 x-amz-meta-author（真实 SDK 多段上传 round-trip 可读）。
+      head = SigV4Request.signed_conn(:head, "/d4e/mp.bin") |> call()
+      assert head.status == 200
+      assert get_resp_header(head, "x-amz-meta-author") == ["alice"]
+      assert get_resp_header(head, "content-type") == ["image/png"]
+
+      get = SigV4Request.signed_conn(:get, "/d4e/mp.bin") |> call()
+      assert get.status == 200
+      assert get_resp_header(get, "x-amz-meta-author") == ["alice"]
+    end
+
+    test "CreateMultipartUpload >2 KB x-amz-meta-* → 400 MetadataTooLarge（create-time 闸）" do
+      SigV4Request.signed_conn(:put, "/d4f") |> call()
+
+      big_value = String.duplicate("x", 2049)
+
+      init =
+        SigV4Request.signed_conn(:post, "/d4f/mp.bin",
+          query: %{"uploads" => ""},
+          headers: [{"x-amz-meta-big", big_value}]
+        )
+        |> call()
+
+      assert init.status == 400
+      assert init.resp_body =~ "MetadataTooLarge"
+    end
+  end
+
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
+
+  # 从 InitiateMultipartUploadResult 抠 UploadId（简单字符串切，无需 XML 解析依赖）。
+  defp upload_id(xml) do
+    [_, rest] = String.split(xml, "<UploadId>")
+    [id, _] = String.split(rest, "</UploadId>")
+    id
+  end
 end
