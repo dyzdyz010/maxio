@@ -19,6 +19,11 @@ defmodule Maxio.Cluster.Transport do
   @callback heal_shard(node(), String.t(), %{non_neg_integer() => binary()}, pos_integer(), map()) ::
               {:ok, non_neg_integer()}
 
+  # 原子提交（ROUTE B B1-2）：begin_tmp 在端点 drive_root 下建同卷 temp obj-dir；逐块 put_shard /
+  # put_sidecar 写进该 tmp_dir；commit_object fsync + 数据先于元数据原子 rename 到 final。
+  @callback begin_tmp(node(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  @callback commit_object(node(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+
   @doc "当前配置的传输实现（test 经 opts[:transport] 覆盖；缺省 config :maxio, :shard_transport）。"
   @spec impl(keyword()) :: module()
   def impl(opts \\ []) do
@@ -73,6 +78,16 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def heal_shard(node, dir, block_map, shard_len, meta) do
     call(node, :heal_shard, [dir, block_map, shard_len, meta], fn -> {:ok, 0} end)
+  end
+
+  @impl true
+  def begin_tmp(node, drive_root) do
+    call(node, :begin_tmp, [drive_root], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def commit_object(node, tmp_dir, final_obj_dir, opts) do
+    call(node, :commit, [tmp_dir, final_obj_dir, opts], fn -> {:error, :unavailable} end)
   end
 
   # 本地直接调；远端 :erpc。任何宕机/超时/异常 -> on_fail 兜底（铁律 3：结构化降级，绝不上抛）。

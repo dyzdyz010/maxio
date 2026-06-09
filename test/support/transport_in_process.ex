@@ -73,4 +73,16 @@ defmodule Maxio.Cluster.Transport.InProcess do
   def heal_shard(node, dir, block_map, shard_len, meta) do
     if down?(node), do: {:ok, 0}, else: ShardServer.heal_shard(dir, block_map, shard_len, meta)
   end
+
+  @impl true
+  def begin_tmp(node, drive_root) do
+    if down?(node), do: {:error, :unavailable}, else: ShardServer.begin_tmp(drive_root)
+  end
+
+  @impl true
+  def commit_object(node, tmp_dir, final_obj_dir, opts) do
+    if down?(node),
+      do: {:error, :unavailable},
+      else: ShardServer.commit(tmp_dir, final_obj_dir, opts)
+  end
 end

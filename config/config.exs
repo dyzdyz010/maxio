@@ -100,6 +100,11 @@ config :maxio, :policy_store, Maxio.Policy.Store.EctoStore
 # M7 分片传输实现（prod = :erpc 到每节点 ShardServer；test 经 opts[:transport] 覆盖为 InProcess）。
 config :maxio, :shard_transport, Maxio.Cluster.Transport.Erpc
 
+# ROUTE B B1-2 耐久性：写路径 temp-then-rename 提交时是否 fsync（part.0 文件 + final 目录）。
+# 默认 true（prod 掉电不丢已确认写；fsync-before-quorum 让 write_quorum 不是耐久谎言）；
+# test 关闭以提速（见 test.exs）。可经此 flag 整体回退 fsync。
+config :maxio, :durability, fsync: true
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

@@ -10,8 +10,13 @@ defmodule Maxio.Storage.Distributed do
   RS 数学/流式/quorum/校验 全部复用 M6，一行不重写——只把「分片 i 写本地盘 i」换成
   「分片 i 经 Transport 写端点 i」。
 
-  put：逐块流式编码（Codec.split_block），分片 i 写端点 i，成功端点数 >= write_quorum 才 {:ok}，
-       否则 {:error,:write_quorum}（铁律 3）。
+  put：逐块流式编码（Codec.split_block），分片 i 写端点 i 的 temp obj-dir，流尾 sidecar 写 temp，
+       最后各端点 commit_object（数据先于元数据原子 rename 到 final，B1-2），成功端点数 >= write_quorum
+       才 {:ok}；否则清理全部 temp + {:error,:write_quorum}（铁律 3）。
+  原子提交（B1-2）：写路径绝不就地覆盖 final 的 part.0/meta.json——每端点先 begin_tmp 得同卷
+       `<drive>/.tmp/<uuid>` temp obj-dir，逐块 put_shard 进 temp，commit_object fsync + temp->final
+       原子 rename（crash 任意点要么旧要么新，绝不撕裂）。fsync-before-quorum 让 write_quorum 在掉电下
+       不再是耐久谎言。
   对象锁（B1-1）由 handler 层 `Maxio.Lock` 横跨「字节 + 元数据」提交 seam 单点持有；本后端不自持
   对象锁——否则 handler 已持同名 {bucket,key} 锁、后端再 `:global.trans` 同资源会死等自己
   （`:global.trans` 非重入）。锁是请求编排关注点，不是字节后端关注点（铁律 2）。非 handler 的直接
@@ -114,6 +119,63 @@ defmodule Maxio.Storage.Distributed do
   defp endpoint_dirs(endpoints, obj_rel),
     do: Enum.map(endpoints, fn {node, drive} -> {node, Path.join(drive, obj_rel)} end)
 
+  # ── 原子提交编排（B1-2）──
+  # 每端点 begin_tmp（drive_root = endpoint drive，与 final 同卷保证 rename 原子）；返回保序的
+  # %{node, final_dir, tmp_dir}（begin_tmp 失败 -> tmp_dir=nil，写时跳过、commit 不计入 quorum）。
+  defp begin_commit_targets(tx, endpoints, obj_rel) do
+    Enum.map(endpoints, fn {node, drive} ->
+      final_dir = Path.join(drive, obj_rel)
+
+      tmp_dir =
+        case tx.begin_tmp(node, drive) do
+          {:ok, tmp} -> tmp
+          {:error, _} -> nil
+        end
+
+      %{node: node, final_dir: final_dir, tmp_dir: tmp_dir}
+    end)
+  end
+
+  # 保序 N 元素 (node, tmp_dir | nil)：分片 i 写端点 i 的 temp；begin_tmp 失败端点 -> nil（写时跳过）。
+  defp ordered_tmp_dirs(targets) do
+    Enum.map(targets, fn %{node: node, tmp_dir: tmp} -> {node, tmp} end)
+  end
+
+  # 各端点 commit_object（temp -> final 数据先于元数据原子 rename）；返回成功端点数（write quorum 判定）。
+  defp commit_all(tx, targets, opts) do
+    commit_opts = Keyword.take(opts, [:fsync])
+
+    targets
+    |> Enum.filter(& &1.tmp_dir)
+    |> Task.async_stream(
+      fn %{node: node, tmp_dir: tmp, final_dir: final} ->
+        case tx.commit_object(node, tmp, final, commit_opts) do
+          :ok -> :ok
+          _ -> :error
+        end
+      end,
+      timeout: :infinity,
+      max_concurrency: max(length(targets), 1)
+    )
+    |> Enum.count(fn
+      {:ok, :ok} -> true
+      _ -> false
+    end)
+  end
+
+  # write_quorum 未达：回滚此次写参与（begin_tmp 成功）的端点——删其 temp obj-dir + 已 commit 到 final
+  # 的 obj-dir（某些端点可能已原子 rename 到 final，但整体未达 quorum；删 final 保证「quorum 失败 =>
+  # 对象不存在」不变量，绝不留低于 read_quorum 的撕裂半对象给后续 GET）。未参与端点（begin_tmp 失败）
+  # 从未触碰 final，不删（保其旧值不变）。
+  defp cleanup_tmp(tx, targets) do
+    targets
+    |> Enum.filter(& &1.tmp_dir)
+    |> Enum.each(fn %{node: node, tmp_dir: tmp, final_dir: final} ->
+      tx.delete_shard(node, tmp)
+      tx.delete_shard(node, final)
+    end)
+  end
+
   # ── PUT（逐块流式编码；分片 i -> 端点 i）──
   # 不自持对象锁：B1-1 起锁由 handler 层 Maxio.Lock 横跨字节+元数据 seam 单点持有（避免双锁/非重入死等）。
 
@@ -130,9 +192,15 @@ defmodule Maxio.Storage.Distributed do
   defp put_locked(bucket, key, obj_rel, chunks, opts) do
     c = cfg(opts)
     endpoints = endpoints_for(bucket, key, opts)
-    dirs = endpoint_dirs(endpoints, obj_rel)
     tx = transport(opts)
     n = Config.total(c)
+
+    # B1-2 原子提交：每端点先 begin_tmp（同卷 .tmp obj-dir），逐块流式写进 temp，最后 commit
+    # 数据先于元数据原子 rename 到 final。begin_tmp 失败的端点（node down）记 tmp=nil，写时跳过。
+    commit_targets = begin_commit_targets(tx, endpoints, obj_rel)
+
+    # 保序 N 元素 (node, tmp_dir | nil)：分片 i 必须写端点 i 的 temp（down 端点 nil 跳过，绝不错位）。
+    tmp_dirs = ordered_tmp_dirs(commit_targets)
 
     acc0 = %{
       md5: :crypto.hash_init(:md5),
@@ -142,7 +210,7 @@ defmodule Maxio.Storage.Distributed do
       block_hashes: List.duplicate([], n),
       buffer: <<>>,
       block_index: 0,
-      dirs: dirs,
+      dirs: tmp_dirs,
       tx: tx
     }
 
@@ -163,7 +231,10 @@ defmodule Maxio.Storage.Distributed do
         Enum.map(acc.block_hashes, &Enum.reverse/1)
       )
 
-    ok_endpoints = write_sidecars(tx, dirs, meta)
+    # sidecar 写进各端点 temp（与 part.0 同 temp obj-dir，一并原子提交）。
+    _ = write_sidecars(tx, tmp_dirs, meta)
+
+    ok_endpoints = commit_all(tx, commit_targets, opts)
 
     if ok_endpoints >= c.write_quorum do
       {:ok, %{size: acc.size, etag: etag, sha256: sha256}}
@@ -174,6 +245,7 @@ defmodule Maxio.Storage.Distributed do
         reason: "ok_endpoints=#{ok_endpoints} < write_quorum=#{c.write_quorum}"
       )
 
+      cleanup_tmp(tx, commit_targets)
       {:error, :write_quorum}
     end
   end
@@ -227,9 +299,11 @@ defmodule Maxio.Storage.Distributed do
   end
 
   # 写 block j 的 N 个分片到 N 个端点（并行，铁律 4 一条消息一个分片）；返回成功端点数。
+  # dirs 为保序 N 元素 (node, tmp_dir | nil)；nil 端点（begin_tmp 失败/down）跳过，绝不错位分片。
   defp write_block_shards(tx, dirs, j, shards, shard_len) do
     dirs
     |> Enum.zip(shards)
+    |> Enum.reject(fn {{_node, dir}, _shard} -> is_nil(dir) end)
     |> Task.async_stream(
       fn {{node, dir}, shard} ->
         case tx.put_shard(node, dir, j, shard, shard_len) do
@@ -238,7 +312,7 @@ defmodule Maxio.Storage.Distributed do
         end
       end,
       timeout: :infinity,
-      max_concurrency: length(dirs)
+      max_concurrency: max(length(dirs), 1)
     )
     |> Enum.count(fn
       {:ok, :ok} -> true
@@ -270,9 +344,10 @@ defmodule Maxio.Storage.Distributed do
     }
   end
 
-  # sidecar 写全部 N 端点（并行），返回成功端点数（write quorum 判定）。
+  # sidecar 写各端点（并行），返回成功端点数。dirs 可能含 nil（begin_tmp 失败端点）-> 跳过。
   defp write_sidecars(tx, dirs, meta) do
     dirs
+    |> Enum.reject(fn {_node, dir} -> is_nil(dir) end)
     |> Task.async_stream(
       fn {node, dir} ->
         case tx.put_sidecar(node, dir, meta) do
@@ -281,7 +356,7 @@ defmodule Maxio.Storage.Distributed do
         end
       end,
       timeout: :infinity,
-      max_concurrency: length(dirs)
+      max_concurrency: max(length(dirs), 1)
     )
     |> Enum.count(fn
       {:ok, :ok} -> true
@@ -621,9 +696,12 @@ defmodule Maxio.Storage.Distributed do
   defp assemble_locked(bucket, key, upload_id, obj_rel, part_numbers, opts) do
     c = cfg(opts)
     endpoints = endpoints_for(bucket, key, opts)
-    dirs = endpoint_dirs(endpoints, obj_rel)
     tx = transport(opts)
     n = Config.total(c)
+
+    # B1-2 原子提交：组装的对象同样先写各端点 temp obj-dir，commit 数据先于元数据原子 rename 到 final。
+    commit_targets = begin_commit_targets(tx, endpoints, obj_rel)
+    tmp_dirs = ordered_tmp_dirs(commit_targets)
 
     acc0 = %{
       md5: :crypto.hash_init(:md5),
@@ -633,7 +711,7 @@ defmodule Maxio.Storage.Distributed do
       block_hashes: List.duplicate([], n),
       buffer: <<>>,
       block_index: 0,
-      dirs: dirs,
+      dirs: tmp_dirs,
       tx: tx
     }
 
@@ -660,8 +738,22 @@ defmodule Maxio.Storage.Distributed do
         Enum.map(acc.block_hashes, &Enum.reverse/1)
       )
 
-    _ = write_sidecars(tx, dirs, meta)
-    {:ok, %{size: acc.size}}
+    _ = write_sidecars(tx, tmp_dirs, meta)
+
+    ok_endpoints = commit_all(tx, commit_targets, opts)
+
+    if ok_endpoints >= c.write_quorum do
+      {:ok, %{size: acc.size}}
+    else
+      Logger.error("distributed assemble below write quorum",
+        bucket: bucket,
+        key: key,
+        reason: "ok_endpoints=#{ok_endpoints} < write_quorum=#{c.write_quorum}"
+      )
+
+      cleanup_tmp(tx, commit_targets)
+      {:error, :write_quorum}
+    end
   end
 
   defp do_abort_upload(bucket, _key, upload_id, opts) do

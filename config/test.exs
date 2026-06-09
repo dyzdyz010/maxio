@@ -48,3 +48,6 @@ config :maxio, :credential_store, Maxio.Auth.CredentialStore.MemoryStore
 
 # M7：test 不起 libcluster（进程内 transport 注入即可覆盖分布式逻辑）；:peer 集成测试自行起节点。
 config :maxio, Maxio.Cluster, topologies: []
+
+# B1-2：test 默认关 fsync 提速（fsync 单测显式传 opts[:fsync] true 断言 :file.sync 被调用）。
+config :maxio, :durability, fsync: false

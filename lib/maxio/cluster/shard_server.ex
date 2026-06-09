@@ -7,6 +7,26 @@ defmodule Maxio.Cluster.ShardServer do
 
   铁律 4：put_shard/get_shard 逐块有界（一次一个 ~block_size/K 的分片），绝不一次传整对象/整文件。
   这些函数是「本机执行」纯操作，可直接被 :erpc 调用；GenServer 仅为命名锚点 + 限流/fd 缓存演进位。
+
+  ## 原子提交原语（ROUTE B B1-2）
+
+  写路径不再「就地」覆盖 final obj-dir 的 part.0/meta.json（crash 在分片写与 sidecar 写之间留撕裂
+  对象，且就地覆盖对并发读者非原子，更无 fsync = write-quorum 在掉电下是耐久谎言）。改为
+  **temp-dir + 原子 rename + fsync-before-quorum**：
+
+    * `begin_tmp/1`：在 `<drive_root>/.tmp/<uuid>` 建空 temp obj-dir（与 final 同 drive 卷 -> rename 原子）。
+      调用方随后用既有 `put_shard/4`、`put_sidecar/2` 把 part.0 / meta.json 逐块流式写进 **temp**。
+    * `commit/3`：fsync part.0 文件 -> 原子 rename part.0 到 final（**数据先于元数据**，对齐 MinIO PR
+      #10734）-> fsync final 目录 -> 原子 rename meta.json 到 final -> fsync final 目录 -> 删 temp。
+      crash 在两 rename 之间：数据在、meta 旧/无（harmless，旧值或交 heal），**绝不 meta 指向不存在数据**。
+    * `prepare_commit/5`：把整对象 block_map + sidecar 一次写进 temp（小对象/单测用原语；不流式）。
+
+  Windows rename-over-open-file：`:file.rename/2` 覆盖既有 target 在 Windows 上若 reader 持文件打开会
+  失败（busy）。落地：temp 与 final 同卷保证 rename 是原子重命名；rename busy -> 有界重试后
+  `{:error, :rename_busy}`（调用方映射 503，绝不静默写坏，铁律 3）。fsync 目录在 Windows 上
+  `:file.open` 目录可能失败 -> best-effort `:ok`（诚实文档化，对齐 MinIO Windows 行为）。
+  fsync 开关由 `config :maxio, :durability, fsync:`（prod true / test false）控制；每次 `:file.sync`
+  成功发 `[:maxio, :durability, :fsync]` 遥测（可观测 + 单测断言点）。
   """
   use GenServer
 
@@ -14,6 +34,8 @@ defmodule Maxio.Cluster.ShardServer do
 
   @part_file "part.0"
   @meta_file "meta.json"
+  @tmp_root ".tmp"
+  @rename_retries 5
 
   def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
@@ -92,6 +114,197 @@ defmodule Maxio.Cluster.ShardServer do
   @spec delete_shard(String.t()) :: :ok
   def delete_shard(drive_obj_dir) do
     _ = File.rm_rf(drive_obj_dir)
+    :ok
+  end
+
+  # ── 原子提交原语（ROUTE B B1-2）──
+
+  @doc """
+  建一个与 final obj-dir 同卷的 temp obj-dir：`<drive_root>/.tmp/<uuid>`。返回 {:ok, tmp_dir}。
+  调用方随后用既有 put_shard/4、put_sidecar/2（drive_obj_dir 形参传 tmp_dir）把 part.0 / meta.json
+  逐块流式写进 temp，最后 commit/3 原子 rename 到 final。drive_root = 端点 drive（与 final 同卷）。
+  """
+  @spec begin_tmp(String.t()) :: {:ok, String.t()} | {:error, term()}
+  def begin_tmp(drive_root) do
+    tmp = Path.join([drive_root, @tmp_root, uuid()])
+
+    case File.mkdir_p(tmp) do
+      :ok -> {:ok, tmp}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  原子提交准备（一次写整对象，小对象/单测用原语；流式写路径用 begin_tmp + put_shard + commit）：
+  整对象所有 block 分片（block_map=%{block_index=>shard_bytes}）+ sidecar 写到 `<drive_root>/.tmp/<uuid>/`，
+  fsync（opts[:fsync] 缺省读 durability 配置）。返回 {:ok, tmp_dir}。drive_root 由调用方传入（端点 drive 根，
+  定位同卷 .tmp 保证 rename 原子）。
+  """
+  @spec prepare_commit(
+          String.t(),
+          %{non_neg_integer() => binary()},
+          pos_integer(),
+          map(),
+          keyword()
+        ) ::
+          {:ok, String.t()} | {:error, term()}
+  def prepare_commit(_drive_obj_dir, block_map, shard_len, meta, opts) do
+    drive_root = Keyword.fetch!(opts, :drive_root)
+    fsync? = fsync?(opts)
+    {:ok, tmp} = begin_tmp(drive_root)
+
+    path = Path.join(tmp, @part_file)
+    {:ok, fd} = :file.open(String.to_charlist(path), [:read, :write, :binary, :raw])
+
+    try do
+      Enum.each(block_map, fn {j, shard} -> :ok = :file.pwrite(fd, j * shard_len, shard) end)
+      if fsync?, do: sync_fd(fd)
+    after
+      :file.close(fd)
+    end
+
+    File.write!(Path.join(tmp, @meta_file), Meta.encode(meta))
+    if fsync?, do: sync_path(Path.join(tmp, @meta_file))
+    {:ok, tmp}
+  end
+
+  @doc """
+  原子提交：temp obj-dir 的 part.0（数据先）再 meta.json（元数据后）原子 rename 到 final obj-dir。
+  同卷 :file.rename 原子；MinIO PR #10734「数据先于元数据」=> crash 在两 rename 之间绝不 meta 指向
+  不存在数据。每 rename 后 fsync final 目录（fsync? = opts[:fsync] 缺省读 durability 配置）。
+  rename busy（target 被 reader 打开，Windows 语义）-> 有界重试后 {:error, :rename_busy}（绝不静默写坏，
+  调用方映射 503）。成功删 temp。
+  """
+  @spec commit(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def commit(tmp_dir, drive_obj_dir, opts) do
+    fsync? = fsync?(opts)
+    rename_fun = rename_fun(opts)
+    File.mkdir_p!(drive_obj_dir)
+
+    src_part = Path.join(tmp_dir, @part_file)
+    if fsync? and File.exists?(src_part), do: sync_path(src_part)
+
+    with :ok <- rename_atomic(rename_fun, src_part, Path.join(drive_obj_dir, @part_file)),
+         :ok <- maybe_sync_dir(fsync?, drive_obj_dir),
+         :ok <-
+           rename_atomic(
+             rename_fun,
+             Path.join(tmp_dir, @meta_file),
+             Path.join(drive_obj_dir, @meta_file)
+           ),
+         :ok <- maybe_sync_dir(fsync?, drive_obj_dir) do
+      _ = File.rm_rf(tmp_dir)
+      :ok
+    end
+  end
+
+  @doc """
+  单文件原子提交（FS 后端用：对象是单个文件而非 obj-dir）：fsync src 文件 -> 原子 rename 覆盖到
+  dst（同卷保证原子）-> fsync dst 所在目录。rename busy -> 有界重试后 {:error, :rename_busy}。
+  """
+  @spec commit_file(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def commit_file(src, dst, opts) do
+    fsync? = fsync?(opts)
+    rename_fun = rename_fun(opts)
+    File.mkdir_p!(Path.dirname(dst))
+    if fsync? and File.exists?(src), do: sync_path(src)
+
+    with :ok <- rename_atomic(rename_fun, src, dst),
+         :ok <- maybe_sync_dir(fsync?, Path.dirname(dst)) do
+      :ok
+    end
+  end
+
+  # opts[:fsync] 显式覆盖；否则读 config :maxio, :durability, fsync:（prod true / test false）。
+  defp fsync?(opts) do
+    case Keyword.fetch(opts, :fsync) do
+      {:ok, v} -> v
+      :error -> Application.get_env(:maxio, :durability, [])[:fsync] || false
+    end
+  end
+
+  # rename 注入点（缺省 :file.rename/2）。耐久性测试经此注入 busy 错误，确定性验证有界重试 ->
+  # :rename_busy 映射（与 :transport/:topology/:drives 同款 opts 依赖注入，绝非 prod 旁路）。
+  defp rename_fun(opts) do
+    Keyword.get(opts, :rename_fun, fn src, dst ->
+      :file.rename(String.to_charlist(src), String.to_charlist(dst))
+    end)
+  end
+
+  defp uuid, do: :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
+
+  defp rename_atomic(rename_fun, src, dst),
+    do: rename_atomic(rename_fun, src, dst, @rename_retries)
+
+  defp rename_atomic(rename_fun, src, dst, 0) do
+    case rename_fun.(src, dst) do
+      :ok -> :ok
+      {:error, reason} when reason in [:eacces, :eexist, :ebusy] -> {:error, :rename_busy}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp rename_atomic(rename_fun, src, dst, n) do
+    case rename_fun.(src, dst) do
+      :ok ->
+        :ok
+
+      {:error, reason} when reason in [:eacces, :eexist, :ebusy] ->
+        rename_atomic(rename_fun, src, dst, n - 1)
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp maybe_sync_dir(false, _dir), do: :ok
+  defp maybe_sync_dir(true, dir), do: sync_dir(dir)
+
+  # fsync 一个已打开的文件 fd（提交前确保 part.0 字节落盘）。
+  defp sync_fd(fd) do
+    case :file.sync(fd) do
+      :ok ->
+        emit_fsync(:file)
+        :ok
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  # 打开路径短持 + fsync（part.0 文件/meta.json 文件落盘）。
+  defp sync_path(path) do
+    case :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
+      {:ok, fd} ->
+        _ = sync_fd(fd)
+        :file.close(fd)
+        :ok
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  # fsync 目录 fd（POSIX：open dir + fsync；Windows：open 目录可能失败 -> best-effort :ok）。
+  defp sync_dir(dir) do
+    case :file.open(String.to_charlist(dir), [:read, :raw]) do
+      {:ok, fd} ->
+        case :file.sync(fd) do
+          :ok -> emit_fsync(:dir)
+          {:error, _} -> :ok
+        end
+
+        :file.close(fd)
+        :ok
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  # 每次 fsync 成功发遥测（可观测 + 单测断言点）。
+  defp emit_fsync(kind) do
+    :telemetry.execute([:maxio, :durability, :fsync], %{count: 1}, %{kind: kind})
     :ok
   end
 
