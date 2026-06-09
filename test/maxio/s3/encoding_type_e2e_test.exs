@@ -23,6 +23,7 @@ defmodule Maxio.S3.EncodingTypeE2ETest do
 
   test "ListObjectsV2 encoding-type=url → MinIO s3URLEncode：保留 key 内字面 '/'，空格→'+'，括号→%XX" do
     SigV4Request.signed_conn(:put, "/enc1") |> call()
+
     # key 含嵌套斜杠/空格/括号：sub a/test file(3).png（key 内字面 '/' 必须保留，不得编为 %2F）
     SigV4Request.signed_conn(:put, "/enc1/sub%20a/test%20file%283%29.png", body: "x") |> call()
 
@@ -31,6 +32,7 @@ defmodule Maxio.S3.EncodingTypeE2ETest do
 
     assert res.status == 200
     assert res.resp_body =~ "<EncodingType>url</EncodingType>"
+
     # 全 <Key> 断言：key 内 '/' 保留字面，空格→'+'，括号→%28/%29（对齐 AWS/MinIO 线上字节，非 %2F）。
     assert res.resp_body =~ "<Key>sub+a/test+file%283%29.png</Key>"
     refute res.resp_body =~ "%2F"
@@ -38,6 +40,7 @@ defmodule Maxio.S3.EncodingTypeE2ETest do
 
   test "ListObjectsV2 encoding-type=url + delimiter='/' → <Delimiter>/</Delimiter> 且 CommonPrefixes 保留 '/'" do
     SigV4Request.signed_conn(:put, "/enc3") |> call()
+
     # 伪目录：sub dir/leaf.txt —— delimiter '/' 应原样、CommonPrefixes 前缀末 '/' 应原样、空格→'+'。
     SigV4Request.signed_conn(:put, "/enc3/sub%20dir/leaf.txt", body: "x") |> call()
 
@@ -79,6 +82,7 @@ defmodule Maxio.S3.EncodingTypeE2ETest do
 
     assert res.status == 200
     assert res.resp_body =~ "<EncodingType>url</EncodingType>"
+
     # 全 <Key> 断言：key 内字面 '/' 保留，空格→'+'，括号→%XX（对齐 AWS/MinIO，非 %2F）。
     assert res.resp_body =~ "<Key>sub+v/test+v%283%29.png</Key>"
     refute res.resp_body =~ "%2F"

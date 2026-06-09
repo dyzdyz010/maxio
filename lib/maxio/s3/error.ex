@@ -24,8 +24,7 @@ defmodule Maxio.S3.Error do
     # MinIO extractSignedHeaders 在验签前的硬性检查：SignedHeaders 漏强制 host →
     # ErrUnsignedHeaders（Code AccessDenied，但 HTTP 400，区别于上面 403 的 access_denied）。
     unsigned_headers:
-      {"AccessDenied", 400,
-       "There were headers present in the request which were not signed"},
+      {"AccessDenied", 400, "There were headers present in the request which were not signed"},
     signature_does_not_match:
       {"SignatureDoesNotMatch", 403,
        "The request signature that the server calculated does not match the signature that you provided. Check your AWS secret access key and signing method."},
@@ -71,20 +70,14 @@ defmodule Maxio.S3.Error do
     not_implemented:
       {"NotImplemented", 501,
        "A header that you provided implies functionality that is not implemented."},
-    slow_down:
-      {"SlowDown", 503,
-       "Please reduce your request rate."},
+    slow_down: {"SlowDown", 503, "Please reduce your request rate."},
     # MinIO 区分写/读 quorum 不足为可重试的 503（cmd/api-errors.go:
     # errErasureWriteQuorum -> ErrSlowDownWrite{Code:"SlowDownWrite",503}；
     # errErasureReadQuorum -> ErrSlowDownRead{Code:"SlowDownRead",503}）。SDK 标准重试策略
     # 把 503 SlowDown* 视为限流并指数退避，依赖此路径在集群降级/瞬时争用下自愈；
     # 绝不能退化成 500 InternalError（被多数客户端当硬失败、跳过退避）。
-    slow_down_write:
-      {"SlowDownWrite", 503,
-       "Please reduce your write request rate."},
-    slow_down_read:
-      {"SlowDownRead", 503,
-       "Please reduce your read request rate."},
+    slow_down_write: {"SlowDownWrite", 503, "Please reduce your write request rate."},
+    slow_down_read: {"SlowDownRead", 503, "Please reduce your read request rate."},
     internal_error: {"InternalError", 500, "An internal error occurred. Try again."},
     authorization_header_malformed:
       {"AuthorizationHeaderMalformed", 400,

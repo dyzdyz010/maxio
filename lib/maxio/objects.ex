@@ -404,7 +404,18 @@ defmodule Maxio.Objects do
     end
   end
 
-  defp do_collapse_versions([obj | rest], prefix, delimiter, max, vers, seen, cps, _lk, _lv, capped?) do
+  defp do_collapse_versions(
+         [obj | rest],
+         prefix,
+         delimiter,
+         max,
+         vers,
+         seen,
+         cps,
+         _lk,
+         _lv,
+         capped?
+       ) do
     count = length(vers) + MapSet.size(seen)
 
     cond do
@@ -430,7 +441,18 @@ defmodule Maxio.Objects do
 
           cp ->
             if MapSet.member?(seen, cp) do
-              do_collapse_versions(rest, prefix, delimiter, max, vers, seen, cps, cp, nil, capped?)
+              do_collapse_versions(
+                rest,
+                prefix,
+                delimiter,
+                max,
+                vers,
+                seen,
+                cps,
+                cp,
+                nil,
+                capped?
+              )
             else
               do_collapse_versions(
                 rest,
@@ -491,6 +513,7 @@ defmodule Maxio.Objects do
     # 上限 sql_hard_limit（默认 100_000）防 DoS。B3 drive-walk 上线后保留为兜底。
     fetch_limit = list_fetch_limit(max_keys)
     candidates = Repo.all(limit(base_query, ^fetch_limit))
+
     # 若候选数恰好等于 fetch_limit，SQL 可能在攒够 max_keys 个 distinct 结果前就被截断；
     # 此时无法证明列举完整，须强制 is_truncated=true + 续点（正确性优先于伪完整）。
     capped? = length(candidates) == fetch_limit
@@ -538,7 +561,17 @@ defmodule Maxio.Objects do
       true ->
         case common_prefix_of(obj.key, prefix, delimiter) do
           nil ->
-            do_collapse(rest, prefix, delimiter, max, [obj | objs], seen_set, cps, obj.key, capped?)
+            do_collapse(
+              rest,
+              prefix,
+              delimiter,
+              max,
+              [obj | objs],
+              seen_set,
+              cps,
+              obj.key,
+              capped?
+            )
 
           cp ->
             if MapSet.member?(seen_set, cp) do

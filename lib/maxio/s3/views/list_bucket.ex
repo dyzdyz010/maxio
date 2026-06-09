@@ -25,7 +25,9 @@ defmodule Maxio.S3.Views.ListBucket do
       |> maybe(data.is_truncated && data.next_continuation_token, fn t ->
         element("NextContinuationToken", [], characters(t))
       end)
-      |> maybe(data[:start_after], fn s -> element("StartAfter", [], characters(encode(s, enc))) end)
+      |> maybe(data[:start_after], fn s ->
+        element("StartAfter", [], characters(encode(s, enc)))
+      end)
 
     contents = Enum.map(data.objects, &content_elem(&1, enc))
 

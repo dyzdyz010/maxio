@@ -116,7 +116,9 @@ defmodule Maxio.S3.CorsE2ETest do
     SigV4Request.signed_conn(:put, "/cbc2/o.txt", body: "x") |> call()
 
     res =
-      SigV4Request.signed_conn(:get, "/cbc2/o.txt", headers: [{"origin", "http://www.example.com"}])
+      SigV4Request.signed_conn(:get, "/cbc2/o.txt",
+        headers: [{"origin", "http://www.example.com"}]
+      )
       |> call()
 
     assert get_resp_header(res, "access-control-allow-credentials") == ["true"]

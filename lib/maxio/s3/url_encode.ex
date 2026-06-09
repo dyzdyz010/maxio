@@ -29,9 +29,14 @@ defmodule Maxio.S3.URLEncode do
 
   defp encode_byte(byte) do
     cond do
-      unescaped?(byte) -> <<byte>>
-      byte == ?\s -> "+"
-      true -> "%" <> (byte |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(2, "0"))
+      unescaped?(byte) ->
+        <<byte>>
+
+      byte == ?\s ->
+        "+"
+
+      true ->
+        "%" <> (byte |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(2, "0"))
     end
   end
 

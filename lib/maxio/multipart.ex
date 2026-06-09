@@ -270,7 +270,17 @@ defmodule Maxio.Multipart do
       true ->
         case common_prefix_of(u.key, prefix, delimiter) do
           nil ->
-            do_collapse_uploads(rest, prefix, delimiter, max, [u | ups], seen, cps, u.key, capped?)
+            do_collapse_uploads(
+              rest,
+              prefix,
+              delimiter,
+              max,
+              [u | ups],
+              seen,
+              cps,
+              u.key,
+              capped?
+            )
 
           cp ->
             if MapSet.member?(seen, cp) do

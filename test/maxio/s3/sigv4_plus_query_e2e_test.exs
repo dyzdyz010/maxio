@@ -25,9 +25,7 @@ defmodule Maxio.S3.SigV4PlusQueryE2ETest do
     SigV4Request.signed_conn(:put, "/plusb") |> call()
     # list-type=2 + 一个含 '+' 的自定义查询值，二者都参与签名
     res =
-      SigV4Request.signed_conn(:get, "/plusb",
-        query: %{"list-type" => "2", "x-token" => "a+b+c"}
-      )
+      SigV4Request.signed_conn(:get, "/plusb", query: %{"list-type" => "2", "x-token" => "a+b+c"})
       |> call()
 
     refute res.resp_body =~ "SignatureDoesNotMatch"

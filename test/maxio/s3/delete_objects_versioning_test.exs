@@ -25,7 +25,9 @@ defmodule Maxio.S3.DeleteObjectsVersioningTest do
 
   defp enable_versioning(bucket) do
     body = ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
-    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"versioning" => ""}, body: body) |> call()
+
+    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"versioning" => ""}, body: body)
+    |> call()
   end
 
   defp delete_objects(bucket, body) do

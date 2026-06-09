@@ -18,7 +18,7 @@ defmodule Maxio.Cluster.TopologyDistinctNodeTest do
         %{
           id: 0,
           sets: [
-            %{id: 0, endpoints: [{:"a@h", "/d0"}, {:"a@h", "/d1"}, {:"b@h", "/d2"}]}
+            %{id: 0, endpoints: [{:a@h, "/d0"}, {:a@h, "/d1"}, {:b@h, "/d2"}]}
           ]
         }
       ]
@@ -39,7 +39,7 @@ defmodule Maxio.Cluster.TopologyDistinctNodeTest do
         %{
           id: 0,
           sets: [
-            %{id: 0, endpoints: [{:"a@h", "/d0"}, {:"a@h", "/d1"}, {:"a@h", "/d2"}]}
+            %{id: 0, endpoints: [{:a@h, "/d0"}, {:a@h, "/d1"}, {:a@h, "/d2"}]}
           ]
         }
       ]
@@ -57,7 +57,7 @@ defmodule Maxio.Cluster.TopologyDistinctNodeTest do
         %{
           id: 0,
           sets: [
-            %{id: 0, endpoints: [{:"a@h", "/d0"}, {:"b@h", "/d1"}, {:"c@h", "/d2"}]}
+            %{id: 0, endpoints: [{:a@h, "/d0"}, {:b@h, "/d1"}, {:c@h, "/d2"}]}
           ]
         }
       ]
@@ -75,8 +75,8 @@ defmodule Maxio.Cluster.TopologyDistinctNodeTest do
         %{
           id: 0,
           sets: [
-            %{id: 0, endpoints: [{:"a@h", "/d0"}, {:"b@h", "/d1"}, {:"c@h", "/d2"}]},
-            %{id: 1, endpoints: [{:"d@h", "/d0"}, {:"d@h", "/d1"}, {:"e@h", "/d2"}]}
+            %{id: 0, endpoints: [{:a@h, "/d0"}, {:b@h, "/d1"}, {:c@h, "/d2"}]},
+            %{id: 1, endpoints: [{:d@h, "/d0"}, {:d@h, "/d1"}, {:e@h, "/d2"}]}
           ]
         }
       ]
