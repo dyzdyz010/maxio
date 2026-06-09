@@ -420,8 +420,11 @@ defmodule Maxio.S3.Handlers.Object do
     dest_key = conn.assigns.s3_key
     _ = ensure_bucket!(dest_bucket)
 
-    {src_bucket, src_key} = parse_copy_source!(header(conn, "x-amz-copy-source"))
-    {src_obj, _total} = object_or_raise(src_bucket, src_key)
+    {src_bucket, src_key, src_version_id} =
+      parse_copy_source!(header(conn, "x-amz-copy-source"))
+
+    # 源对象按真实版本解析（默认 current/latest，?versionId= 选特定版本）。
+    {src_obj, _total} = object_or_raise(src_bucket, src_key, src_version_id)
 
     # 源条件头（对源对象求值；失败 412）。
     case eval_copy_source_conditions(conn, src_obj) do
@@ -457,7 +460,15 @@ defmodule Maxio.S3.Handlers.Object do
     # B1-1：目标提交 seam（目标字节写 + Objects.put_metadata）纳入「目标对象锁」单点。
     # 源读（含自拷贝先写临时 key）在锁外完成 —— 仅目标 dest_key 持目标锁，绝不在源读上持目标锁，
     # 避免跨 key 死锁 + :global.trans 非重入死等（铁律 2：锁是请求编排关注点）。
-    src_stream = prepare_copy_source(self_copy?, src_bucket, src_key, dest_bucket, dest_key)
+    src_stream =
+      prepare_copy_source(
+        self_copy?,
+        src_bucket,
+        src_key,
+        src_obj.version_id,
+        dest_bucket,
+        dest_key
+      )
 
     commit_result =
       Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
@@ -504,17 +515,20 @@ defmodule Maxio.S3.Handlers.Object do
     |> send_resp(200, body)
   end
 
-  # 非自拷贝：直接返回源对象流（锁外打开，目标写时消费）。:tmp_key=nil 表示无临时副本需清理。
-  defp prepare_copy_source(false, src_bucket, src_key, _dest_bucket, _dest_key) do
-    {:ok, src_stream} = Storage.get(src_bucket, src_key, "null", nil)
+  # 非自拷贝：直接返回源对象「真实版本」流（锁外打开，目标写时消费）。
+  # src_version_id 为源对象的真实版本路径（版本化源 ULID、未版本化源 "null"），绝不再硬编码 "null"
+  # （否则版本化源读不到字节 → 静默产生空目标，铁律 5）。:tmp_key=nil 表示无临时副本需清理。
+  defp prepare_copy_source(false, src_bucket, src_key, src_version_id, _dest_bucket, _dest_key) do
+    {:ok, src_stream} = Storage.get(src_bucket, src_key, src_version_id, nil)
     %{stream: src_stream, dest_bucket: nil, tmp_key: nil}
   end
 
-  # 自拷贝（src==dest）：锁外先把源流式写到唯一临时 key（避免目标写截断源），返回临时流供目标写消费。
-  defp prepare_copy_source(true, src_bucket, src_key, dest_bucket, dest_key) do
+  # 自拷贝（src==dest）：锁外先把源「真实版本」流式写到唯一临时 key（避免目标写截断源），
+  # 返回临时流供目标写消费。
+  defp prepare_copy_source(true, src_bucket, src_key, src_version_id, dest_bucket, dest_key) do
     suffix = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
     tmp_key = dest_key <> ".maxio-copytmp-" <> suffix
-    {:ok, src_stream} = Storage.get(src_bucket, src_key, "null", nil)
+    {:ok, src_stream} = Storage.get(src_bucket, src_key, src_version_id, nil)
 
     case Storage.put(dest_bucket, tmp_key, "null", src_stream) do
       {:ok, _tmp} ->
@@ -539,16 +553,33 @@ defmodule Maxio.S3.Handlers.Object do
   # 条件头求值用的对象元信息（etag 无引号 hex；last_modified 用 updated_at）。
   defp meta(object), do: %{etag: object.etag, last_modified: object.updated_at}
 
-  # x-amz-copy-source 解析："/srcBucket/srcKey" | "srcBucket/srcKey"（URL 编码；忽略 ?versionId=）。
+  # x-amz-copy-source 解析："/srcBucket/srcKey[?versionId=v]" | "srcBucket/srcKey[?versionId=v]"
+  # （URL 编码）。返回 {bucket, key, version_id | nil}：默认标识源的当前版本，?versionId= 选特定版本
+  # （对齐 AWS CopyObject，铁律 5）。
   defp parse_copy_source!(raw) do
     decoded = URI.decode(raw)
     trimmed = String.replace_prefix(decoded, "/", "")
-    # 去掉 ?versionId=...（M2 无 versioning）。
-    [path | _] = String.split(trimmed, "?", parts: 2)
+
+    {path, version_id} =
+      case String.split(trimmed, "?", parts: 2) do
+        [p] -> {p, nil}
+        [p, q] -> {p, copy_source_version_id(q)}
+      end
 
     case String.split(path, "/", parts: 2) do
-      [bucket, key] when key != "" -> {bucket, key}
+      [bucket, key] when key != "" -> {bucket, key, version_id}
       _ -> raise Error.new(:invalid_argument, message: "Invalid x-amz-copy-source")
+    end
+  end
+
+  # 从 copy-source 查询串提取 versionId（无/空 → nil）。
+  defp copy_source_version_id(query) do
+    query
+    |> URI.decode_query()
+    |> Map.get("versionId")
+    |> case do
+      v when is_binary(v) and v != "" -> v
+      _ -> nil
     end
   end
 
@@ -688,10 +719,21 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  defp object_or_raise(bucket, key) do
+  # version_id == nil → 取当前版本（latest）；否则取指定版本行。缺失 → NoSuchKey。
+  # src_obj.version_id 即源真实字节所在版本路径（版本化源为 ULID，未版本化源为 "null"）。
+  defp object_or_raise(bucket, key, nil) do
     _ = ensure_bucket!(bucket)
 
     case Objects.get_metadata(bucket, key) do
+      {:ok, object} -> {object, object.size}
+      {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  defp object_or_raise(bucket, key, version_id) do
+    _ = ensure_bucket!(bucket)
+
+    case Objects.get_version(bucket, key, version_id) do
       {:ok, object} -> {object, object.size}
       {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
     end
