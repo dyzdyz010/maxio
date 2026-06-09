@@ -182,4 +182,120 @@ defmodule Maxio.S3.CopyObjectVersionTest do
     assert g.status == 200
     assert g.resp_body == "z"
   end
+
+  # ── 源当前版本是 delete marker → 404 NoSuchKey（绝不 500）──
+
+  test "复制源当前版本是 delete marker → 404 NoSuchKey（对齐 AWS：视作已删除，绝不 500）" do
+    SigV4Request.signed_conn(:put, "/cpdm1") |> call()
+    assert enable_versioning("cpdm1").status == 200
+    SigV4Request.signed_conn(:put, "/cpdm1/src.txt", body: "before-delete") |> call()
+
+    # DELETE 在 Enabled 桶上插入 delete marker（latest 变为 delete marker）。
+    del = SigV4Request.signed_conn(:delete, "/cpdm1/src.txt") |> call()
+    assert del.status == 204
+
+    # GET 当前版本 → 404（既有正确语义，作对照）。
+    g_src = SigV4Request.signed_conn(:get, "/cpdm1/src.txt") |> call()
+    assert g_src.status == 404
+
+    # COPY 源当前版本（delete marker）→ 必须 404 NoSuchKey，绝不 500 InternalError。
+    cp =
+      SigV4Request.signed_conn(:put, "/cpdm1/dst.txt",
+        headers: [{"x-amz-copy-source", "/cpdm1/src.txt"}]
+      )
+      |> call()
+
+    assert cp.status == 404
+    assert cp.resp_body =~ "NoSuchKey"
+    refute cp.resp_body =~ "InternalError"
+
+    # 目标绝不被静默创建。
+    g_dst = SigV4Request.signed_conn(:get, "/cpdm1/dst.txt") |> call()
+    assert g_dst.status == 404
+  end
+
+  # ── tagging-directive：默认 COPY 继承源 tag-set；REPLACE 用 x-amz-tagging ──
+
+  test "默认 tagging-directive=COPY → 目标继承源 tag-set" do
+    SigV4Request.signed_conn(:put, "/cptag1") |> call()
+
+    SigV4Request.signed_conn(:put, "/cptag1/src.txt",
+      body: "tagged",
+      headers: [{"x-amz-tagging", "env=prod&team=core"}]
+    )
+    |> call()
+
+    cp =
+      SigV4Request.signed_conn(:put, "/cptag1/dst.txt",
+        headers: [{"x-amz-copy-source", "/cptag1/src.txt"}]
+      )
+      |> call()
+
+    assert cp.status == 200
+
+    # 目标 GET 应携带 x-amz-tagging-count=2（继承源两个 tag）。
+    g = SigV4Request.signed_conn(:get, "/cptag1/dst.txt") |> call()
+    assert g.status == 200
+    assert get_resp_header(g, "x-amz-tagging-count") == ["2"]
+
+    # 目标 ?tagging 应回源的精确 tag-set。
+    t = SigV4Request.signed_conn(:get, "/cptag1/dst.txt", query: %{"tagging" => ""}) |> call()
+    assert t.status == 200
+    assert t.resp_body =~ "<Key>env</Key><Value>prod</Value>"
+    assert t.resp_body =~ "<Key>team</Key><Value>core</Value>"
+  end
+
+  test "tagging-directive=REPLACE → 用 x-amz-tagging 覆盖（不继承源 tag）" do
+    SigV4Request.signed_conn(:put, "/cptag2") |> call()
+
+    SigV4Request.signed_conn(:put, "/cptag2/src.txt",
+      body: "tagged",
+      headers: [{"x-amz-tagging", "env=prod"}]
+    )
+    |> call()
+
+    cp =
+      SigV4Request.signed_conn(:put, "/cptag2/dst.txt",
+        headers: [
+          {"x-amz-copy-source", "/cptag2/src.txt"},
+          {"x-amz-tagging-directive", "REPLACE"},
+          {"x-amz-tagging", "stage=qa"}
+        ]
+      )
+      |> call()
+
+    assert cp.status == 200
+
+    t = SigV4Request.signed_conn(:get, "/cptag2/dst.txt", query: %{"tagging" => ""}) |> call()
+    assert t.status == 200
+    assert t.resp_body =~ "<Key>stage</Key><Value>qa</Value>"
+    refute t.resp_body =~ "env"
+    refute t.resp_body =~ "prod"
+  end
+
+  test "tagging-directive=REPLACE 且无 x-amz-tagging → 目标空 tag-set" do
+    SigV4Request.signed_conn(:put, "/cptag3") |> call()
+
+    SigV4Request.signed_conn(:put, "/cptag3/src.txt",
+      body: "tagged",
+      headers: [{"x-amz-tagging", "env=prod"}]
+    )
+    |> call()
+
+    cp =
+      SigV4Request.signed_conn(:put, "/cptag3/dst.txt",
+        headers: [
+          {"x-amz-copy-source", "/cptag3/src.txt"},
+          {"x-amz-tagging-directive", "REPLACE"}
+        ]
+      )
+      |> call()
+
+    assert cp.status == 200
+
+    # 目标无 tag → GET 不出现 x-amz-tagging-count。
+    g = SigV4Request.signed_conn(:get, "/cptag3/dst.txt") |> call()
+    assert g.status == 200
+    assert get_resp_header(g, "x-amz-tagging-count") == []
+  end
 end

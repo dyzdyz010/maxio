@@ -461,6 +461,14 @@ defmodule Maxio.S3.Handlers.Object do
     # 源对象按真实版本解析（默认 current/latest，?versionId= 选特定版本）。
     {src_obj, _total} = object_or_raise(src_bucket, src_key, src_version_id)
 
+    # 源当前版本是 delete marker（src_version_id == nil 即取 latest）→ 对齐 AWS/MinIO：
+    # 「If the current version is a delete marker, Amazon S3 behaves as if the object was deleted」
+    # → 404 NoSuchKey（铁律 3：已知条件绝不静默 500）。get_metadata 会返回 delete-marker 行
+    # （objects.ex 文档），copy 必须像 GET 处理器一样显式判 is_delete_marker，否则后续读不到字节会崩成 500。
+    if src_version_id == nil and src_obj.is_delete_marker do
+      raise Error.new(:no_such_key, resource: "/#{src_bucket}/#{src_key}")
+    end
+
     # 源条件头（对源对象求值；失败 412）。
     case eval_copy_source_conditions(conn, src_obj) do
       :proceed ->
@@ -486,6 +494,16 @@ defmodule Maxio.S3.Handlers.Object do
       case directive do
         "REPLACE" -> header(conn, "content-type") || "binary/octet-stream"
         _ -> src_obj.content_type
+      end
+
+    # tagging-directive 默认 COPY（对齐 AWS/MinIO）：COPY → 目标继承源 tag-set；
+    # REPLACE → 用 x-amz-tagging 头解析的新 tag-set（复用 PutObject helper，非法 → InvalidTag 400）。
+    tagging_directive = header(conn, "x-amz-tagging-directive") || "COPY"
+
+    tags =
+      case tagging_directive do
+        "REPLACE" -> parse_tagging_header!(conn)
+        _ -> src_obj.tags || %{}
       end
 
     # 拷贝字节（铁律 4 不全缓冲）。自拷贝（src==dest，此处必为 REPLACE）必须避免
@@ -526,7 +544,8 @@ defmodule Maxio.S3.Handlers.Object do
             size: size,
             etag: etag,
             content_type: content_type,
-            storage_class: "STANDARD"
+            storage_class: "STANDARD",
+            tags: tags
           })
 
         {size, etag, obj}
