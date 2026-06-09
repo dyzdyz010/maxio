@@ -53,7 +53,12 @@ defmodule Maxio.Test.SigV4Request do
 
     canonical_req = %{
       method: to_string(method) |> String.upcase(),
-      path: path,
+      # 签名用**已解码**路径（与服务端 RawPath.decoded_path 契约一致）：Plug.Test.conn/3 会把
+      # full_path 单次解码进 conn.request_path，SigV4 plug 再 decode_once + canonical_uri 单次编码。
+      # 客户端若传 percent-encoded 路径（如 test%20file%283%29.png），这里须先单次解码再交给
+      # canonical_request（其内部 canonical_uri 单次编码），否则字面 '%' 被二次编码致签名不匹配。
+      # 普通无 '%' 路径下 URI.decode/1 为恒等，既有用例不受影响（铁律 5：签名路径忠于服务端重建）。
+      path: URI.decode(path),
       query: query,
       headers: base_headers,
       payload_hash: payload_hash

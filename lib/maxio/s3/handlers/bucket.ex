@@ -74,6 +74,7 @@ defmodule Maxio.S3.Handlers.Bucket do
       max_keys = parse_int(Map.get(qp, "max-keys"), 1000)
       continuation = Map.get(qp, "continuation-token")
       start_after = Map.get(qp, "start-after")
+      encoding_type = Map.get(qp, "encoding-type")
 
       res =
         Objects.list_objects_v2(bucket, %{
@@ -100,7 +101,8 @@ defmodule Maxio.S3.Handlers.Bucket do
           next_continuation_token: res.next_continuation_token,
           start_after: start_after,
           objects: objects,
-          common_prefixes: res.common_prefixes
+          common_prefixes: res.common_prefixes,
+          encoding_type: encoding_type
         })
 
       Log.info("list objects v2", action: :list_objects_v2, bucket: bucket)
