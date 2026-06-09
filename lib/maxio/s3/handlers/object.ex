@@ -301,15 +301,23 @@ defmodule Maxio.S3.Handlers.Object do
       raise Error.new(:malformed_xml, message: "A maximum of 1000 keys may be specified")
     end
 
+    versioning = bucket_versioning(bucket)
+
     {deleted, errors} =
-      Enum.reduce(objects, {[], []}, fn %{key: key}, {dacc, eacc} ->
-        # 缺失 key 也算 success（S3 语义）；删元数据 + 字节皆幂等。
-        :ok = Objects.delete_metadata(bucket, key)
-        _ = Storage.delete(bucket, key)
-        {[key | dacc], eacc}
+      Enum.reduce(objects, {[], []}, fn obj, {dacc, eacc} ->
+        case delete_one(bucket, obj, versioning) do
+          {:ok, entry} -> {[entry | dacc], eacc}
+          {:error, err} -> {dacc, [err | eacc]}
+        end
       end)
 
-    Log.info("delete objects", action: :delete_objects, bucket: bucket, size: length(objects))
+    Log.info("delete objects",
+      action: :delete_objects,
+      bucket: bucket,
+      size: length(objects),
+      deleted: length(deleted),
+      errors: length(errors)
+    )
 
     body =
       DeleteResult.render(%{
@@ -321,6 +329,58 @@ defmodule Maxio.S3.Handlers.Object do
     |> put_resp_content_type("application/xml")
     |> send_resp(200, body)
   end
+
+  # 单个 <Object> 删除：镜像 Object.delete/1 的 versioning 分支（铁律 2 复用既有正确语义）。
+  # 返回 {:ok, deleted_entry_map} | {:error, error_entry_map}。
+  # deleted_entry_map 字段：:key 必有；:version_id / :delete_marker / :delete_marker_version_id 可选。
+  # S3 DeleteObjects 的失败是 per-key 的（回 <Error>），单 key 出错绝不让整批 500（铁律 3：不静默、
+  # 不连坐丢成功项）。故底层 DB/Storage 抛错时降级为该 key 的结构化 <Error> 条目并打日志。
+  defp delete_one(bucket, %{key: key, version_id: version_id}, versioning) do
+    do_delete_one(bucket, key, version_id, versioning)
+  rescue
+    err ->
+      s3err = as_s3_error(err)
+
+      Log.warn("delete object failed",
+        action: :delete_objects,
+        bucket: bucket,
+        key: key,
+        code: s3err.code,
+        reason: Exception.message(err)
+      )
+
+      {:error, %{key: key, code: s3err.code, message: s3err.message}}
+  end
+
+  defp do_delete_one(bucket, key, version_id, versioning) do
+    cond do
+      version_id != nil ->
+        # 永久删指定版本（含 delete marker）。幂等：删不存在的版本也算成功。
+        case Objects.delete_version(bucket, key, version_id) do
+          {:ok, %{was_delete_marker: dm?}} ->
+            _ = Storage.delete(bucket, key, version_id)
+            {:ok, %{key: key, version_id: version_id, delete_marker: dm?}}
+
+          {:error, :not_found} ->
+            {:ok, %{key: key, version_id: version_id, delete_marker: false}}
+        end
+
+      versioning in ["Enabled", "Suspended"] ->
+        # 无 VersionId 且版本化桶 → 插 delete marker（绝不硬删历史版本）。
+        {:ok, %{version_id: dm_vid}} = Objects.insert_delete_marker(bucket, key, versioning)
+        {:ok, %{key: key, delete_marker: true, delete_marker_version_id: dm_vid}}
+
+      true ->
+        # 未版本化桶 → 硬删（删 null 行 + 字节）。缺失 key 也算成功（S3 语义）。
+        :ok = Objects.delete_metadata(bucket, key)
+        _ = Storage.delete(bucket, key)
+        {:ok, %{key: key}}
+    end
+  end
+
+  # 把任意 rescue 到的异常归一为 S3 错误（已是 Error 则原样，否则兜底 InternalError）。
+  defp as_s3_error(%Error{} = err), do: err
+  defp as_s3_error(err), do: Error.new(:internal_error, message: Exception.message(err))
 
   @spec copy(Plug.Conn.t()) :: Plug.Conn.t()
   def copy(conn) do
