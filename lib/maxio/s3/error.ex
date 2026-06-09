@@ -47,6 +47,10 @@ defmodule Maxio.S3.Error do
       {"InvalidTag", 400,
        "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation."},
     invalid_bucket_name: {"InvalidBucketName", 400, "The specified bucket is not valid."},
+    # AWS/MinIO 用户元数据（x-amz-meta-*）总量 2 KB 硬上限超限 → MetadataTooLarge(400)
+    # （对齐 AWS ErrorResponses + MinIO ErrMetadataTooLarge；s3-tests test_object_set_get_metadata_overflow_*）。
+    metadata_too_large:
+      {"MetadataTooLarge", 400, "Your metadata headers exceed the maximum allowed metadata size."},
     entity_too_small:
       {"EntityTooSmall", 400,
        "Your proposed upload is smaller than the minimum allowed object size."},

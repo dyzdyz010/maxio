@@ -761,13 +761,14 @@ defmodule Maxio.Storage.Distributed do
     shard_len = acc.shard_len || 0
 
     # 多段 assemble 的最终对象落 null 布局（Paths.object_rel(..., "null")）；同样产 maxio/2 sidecar
-    # 使其 sidecar-可读/可列。富 object_meta（content_type/user_metadata）此处够不到（Multipart.complete
-    # 不经 Storage.assemble 透传），用 migrate_v1 默认兜底 —— 富元数据透传见 notes B4-6 跟进。
+    # 使其 sidecar-可读/可列。ROUTE B B4-6 D1：透传 assemble 的 opts（携 opts[:object_meta]，由
+    # Multipart.complete 从 upload 会话取 content_type/user_metadata 构造），version_opts 据此自描述
+    # 真实 content_type/user_metadata（替换原硬编码 []，消除多段 :sidecar 读 content-type 错误）。
     meta =
       build_meta(
         c,
         "null",
-        [],
+        opts,
         acc.size,
         etag,
         sha256,

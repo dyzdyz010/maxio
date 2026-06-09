@@ -43,6 +43,12 @@ defmodule Maxio.S3.Handlers.Object do
     # SSE-S3：请求头或桶默认加密 = AES256 → 真实加密字节；非 AES256/SSE-C → 501（绝不静默）。
     sse_requested = resolve_sse!(conn, bucket)
 
+    # ROUTE B B4-6 D2/D3：用户元数据（x-amz-meta-*）解析一次，喂两路（sidecar object_meta + PG attrs），
+    # 消除 :pg/:sidecar 读分裂（D3）。写任何字节/sidecar 之前先做 2 KB 大小闸（D2）——超限 →
+    # MetadataTooLarge 400、失败 pre-commit、无孤儿（铁律 3，与 parse_tagging_header!/resolve_sse! 并列）。
+    user_metadata = parse_user_metadata(conn)
+    :ok = Maxio.Metadata.validate_size!(user_metadata)
+
     {chunks, sse_envelope} =
       case sse_requested do
         "AES256" -> Maxio.Crypto.SSE.wrap_stream(chunks)
@@ -54,7 +60,7 @@ defmodule Maxio.S3.Handlers.Object do
     # PutObject 当前未捕获 x-amz-meta-*，此处用既有 parse_user_metadata/1 解析并入 sidecar（自描述完整）；
     # PG 索引侧 attrs 保持不变（:pg 默认路径字节级可回滚，user_metadata 仅注入 sidecar）。
     object_meta =
-      build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope)
+      build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope, user_metadata)
 
     # B1-1：把整个提交 seam（字节经 Storage.put + 元数据经 Objects.put_version_with_id）纳入
     # 同一对象锁，消灭并发同 key 写的「A 字节 + B 元数据」交错（静默 ETag/bytes 分歧）。
@@ -84,6 +90,9 @@ defmodule Maxio.S3.Handlers.Object do
                   content_type: content_type,
                   storage_class: "STANDARD",
                   acl_canned: header(conn, "x-amz-acl") || "private",
+                  # ROUTE B B4-6 D3：user metadata 也写入 PG 索引（键 :metadata，与 CopyObject 的
+                  # metadata: meta_map 对齐），消除 :pg(默认) 与 :sidecar 两路读 user metadata 的分裂。
+                  metadata: user_metadata,
                   tags: tags_map,
                   sse_algorithm: sse_requested,
                   sse_envelope: sse_envelope
@@ -536,6 +545,11 @@ defmodule Maxio.S3.Handlers.Object do
     # COPY（默认）保留源对象 metadata；REPLACE 用请求头 x-amz-meta-* 头（不继承源）。
     meta_map = copy_user_metadata(conn, src_obj, directive)
 
+    # ROUTE B B4-6 D2：仅 REPLACE 时请求头 x-amz-meta-* 生效，做 2 KB 大小闸（与 PutObject 同阈值/同语义）。
+    # 在写任何字节/sidecar 之前 → 超限 MetadataTooLarge 400、失败 pre-commit、无孤儿（铁律 3）。
+    # COPY（继承源 metadata）不校验：源对象写入时已过闸，避免对历史对象误判。
+    if directive == "REPLACE", do: :ok = Maxio.Metadata.validate_size!(meta_map)
+
     # tags 受 tagging-directive 独立控制（与 metadata-directive 正交，对齐 AWS/MinIO，铁律 5）：
     # COPY（默认）→ 目标继承源 tag-set；REPLACE → 用 x-amz-tagging 头解析的新 tag-set
     # （复用 PutObject helper，非法 → InvalidTag 400）。
@@ -739,14 +753,14 @@ defmodule Maxio.S3.Handlers.Object do
   # 各字段均来自 do_put/copy 已就绪的计算值（content_type/tags/acl/storage_class/sse），加
   # 用户 metadata（x-amz-meta-*，PutObject 现注入 sidecar 使其自描述完整）。sse 形状须匹配
   # Sidecar.to_view 读 e["sse"]["algo"] / e["sse"]["envelope"]（信封随读视图携带，绝不丢）。
-  defp build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope) do
+  defp build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope, user_metadata) do
     %{
       content_type: content_type,
       tags: tags_map,
       acl_canned: header(conn, "x-amz-acl") || "private",
       storage_class: "STANDARD",
       sse: sse_meta(sse_requested, sse_envelope),
-      user_metadata: parse_user_metadata(conn)
+      user_metadata: user_metadata
     }
   end
 

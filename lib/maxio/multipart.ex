@@ -140,7 +140,21 @@ defmodule Maxio.Multipart do
       md5_raws = Enum.map(ordered, fn p -> Base.decode16!(p.etag, case: :mixed) end)
       etag = multipart_etag(md5_raws)
 
-      case Maxio.Storage.assemble(upload.bucket_name, upload.key, upload.upload_id, part_numbers) do
+      # ROUTE B B4-6 D1：从 upload 会话取真实 content_type/user_metadata 构造 object_meta，经
+      # Storage.assemble 透传给后端，使多段完成对象的 maxio/2 sidecar 自描述真实 content_type/user_metadata
+      # （消除 :sidecar 读多段对象 content-type 回落 binary/octet-stream 的偏离）。caller opts（如测试注入的
+      # transport/topology）一并转发到后端，object_meta 覆盖任何同名键（会话才是元数据权威）。
+      # NOTE(defer)：多段对象版本化（assemble 无 version_id 形参、CompleteMPU 在 Enabled 桶不建新版本）
+      # 是预存在基础设施限制，非本单元目标——故 assemble 仍落 "null" 布局，version_id 通道留后续里程碑。
+      assemble_opts = Keyword.put(opts, :object_meta, assemble_object_meta(upload))
+
+      case Maxio.Storage.assemble(
+             upload.bucket_name,
+             upload.key,
+             upload.upload_id,
+             part_numbers,
+             assemble_opts
+           ) do
         {:ok, %{size: size}} ->
           # part 字节清理 + 会话/分块元数据删除统一由调用方 handler 的 Multipart.abort/1 负责
           # （单一职责，不在此重复 abort_upload）。
@@ -172,6 +186,22 @@ defmodule Maxio.Multipart do
   end
 
   # ── 内部 ──
+
+  # ROUTE B B4-6 D1：从 upload 会话构造透传给 Storage.assemble 的 object_meta（形状对齐
+  # Maxio.Storage.Backend 的 :object_meta 契约）。content_type/storage_class/user_metadata 取自
+  # CreateMultipartUpload 落盘的会话行（handlers/multipart.ex initiate）；MPU MVP 不支持 SSE/per-key ACL
+  # 故 sse=nil、acl_canned 默认 private；会话表无 tags 列故 tags=%{}（多段 tagging 留后续里程碑）。
+  defp assemble_object_meta(%Upload{} = upload) do
+    %{
+      content_type: upload.content_type || "binary/octet-stream",
+      tags: %{},
+      sse: nil,
+      acl_canned: "private",
+      storage_class: upload.storage_class || "STANDARD",
+      user_metadata: upload.metadata || %{}
+    }
+  end
+
   defp list_all_parts(%Upload{id: uid}) do
     Repo.all(from p in Part, where: p.upload_id == ^uid, order_by: [asc: p.part_number])
   end
