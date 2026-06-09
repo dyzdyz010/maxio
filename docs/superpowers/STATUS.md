@@ -266,7 +266,11 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
      CopyObject 版本感知源读 + 目标建版本+x-amz-version-id/copy-source-version-id（消化 P1 version_id:null 遗留）/ SigV4 +号 raw-query 规范化（AWS 向量无回归）/ PutBucketPolicy 跨桶 ARN→400 / CORS Allow-Credentials / DeleteObjects 对象级授权 / CopyObject 授权回归锁；fidelity 复检加 CopyObject delete-marker 源→404 + tagging-directive COPY
 ✅ 批次3 五个 medium — f064330..a2f4e87（615 测试，APPROVE / 0 must-fix）
      host 强制签名（ErrUnsignedHeaders 400）/ ListObjectsV2+ListObjectVersions encoding-type=url（顺带修 SigV4Request 签名 path 双编码 bug，特殊字符 key 真正可用）/ CopyObject COPY 保留源元数据+tags / PutBucketPolicy 拒绝未支持条件算子；fidelity 复检加 encoding-type=url 斜杠保留 + 策略 Condition 接受集修正
-   ◇ 评估路线 B P2–P7（sidecar 权威翻转：读→列→写）← 下一步（更大的架构跃迁，需用户拍板）
+✅ 路线 B P2（sidecar 权威翻转 · shadow 读）— a0dfe1c..a184ffe（630 测试，precommit 绿）
+     Sidecar.to_view/3 / Maxio.MetaReconcile（纯函数跨端点 quorum 仲裁，无 quorum 报错绝不猜，真值表硬测）/ Maxio.ObjectMeta dual-read shadow（PG 仍权威 + 分歧结构化日志 + 读路径绝不被破坏，authoritative_source[:read]=:pg 默认）+ GET/HEAD shadow 接线；executor 修正计划的 get_metadata 返回类型 + 2 fidelity 修复（modtime-first 选组 / shadow 按 topology 门控）
+   ◇ 评估路线 B P3（drive-walk LIST）/ P4（原子写权威 + 翻转读权威 + sidecar heal 回写）← 下一步（需用户拍板）
+
+> **网络教训（本机当前）**：长时运行的 subagent（尤其重 WebFetch 的研究/规划 agent）会因 `socket connection was closed` / 证书错误被掐断，特征是任务 `subagent_tokens=0`、跑数分钟后中断；短探针 agent 可过。对策：① 规划/设计文档改由 orchestrator 主线直接撰写（CLAUDE.md 允许，已用于 P2 计划）；② 实现 workflow 的 executor 逐单元（比长研究 agent 短）+ 每单元独立提交，被掐断只丢当前单元、可续；③ 遇 `subagent_tokens=0` 失败先探针确认连接再重启，绝不盲目重跑。
 ```
 
 ### ✅ MinIO 保真审计 13 项偏离全部清零（2026-06-09）
