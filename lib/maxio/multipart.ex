@@ -102,10 +102,13 @@ defmodule Maxio.Multipart do
     base = if key_marker, do: where(base, [u], u.key > ^key_marker), else: base
 
     # ROUTE B B1-3 临时硬 LIMIT 闸（同 Objects.list_objects_v2）：有界 SQL 取数防大桶 DoS。
-    candidates = Repo.all(limit(base, ^list_fetch_limit(max_uploads)))
+    # capped? 时候选被截断，须强制截断+续点（不能宣称完整）。
+    fetch_limit = list_fetch_limit(max_uploads)
+    candidates = Repo.all(limit(base, ^fetch_limit))
+    capped? = length(candidates) == fetch_limit
 
     {uploads, common_prefixes, truncated, next_key} =
-      collapse_uploads(candidates, prefix, delimiter, max_uploads)
+      collapse_uploads(candidates, prefix, delimiter, max_uploads, capped?)
 
     %{
       uploads: uploads,
@@ -241,14 +244,22 @@ defmodule Maxio.Multipart do
   end
 
   # ListMultipartUploads 的 delimiter 折叠（与 Objects.list_objects_v2 同构）。
-  defp collapse_uploads(candidates, prefix, delimiter, max) do
-    do_collapse_uploads(candidates, prefix, delimiter, max, [], MapSet.new(), [])
+  # capped? = SQL 候选被 fetch_limit 截断；候选耗尽却未达 max 时不能宣称完整。
+  defp collapse_uploads(candidates, prefix, delimiter, max, capped?) do
+    do_collapse_uploads(candidates, prefix, delimiter, max, [], MapSet.new(), [], nil, capped?)
   end
 
-  defp do_collapse_uploads([], _prefix, _delim, _max, ups, _seen, cps),
-    do: {Enum.reverse(ups), Enum.reverse(cps), false, nil}
+  # 候选耗尽。capped? 为真说明 SQL LIMIT 可能在攒满 max 前就截断了候选——无法证明完整，
+  # 强制 is_truncated=true + 续点（最后已折叠 key），否则才 false。
+  defp do_collapse_uploads([], _prefix, _delim, _max, ups, _seen, cps, last, capped?) do
+    if capped? do
+      {Enum.reverse(ups), Enum.reverse(cps), true, last || previous_key(ups, cps)}
+    else
+      {Enum.reverse(ups), Enum.reverse(cps), false, nil}
+    end
+  end
 
-  defp do_collapse_uploads([u | rest], prefix, delimiter, max, ups, seen, cps) do
+  defp do_collapse_uploads([u | rest], prefix, delimiter, max, ups, seen, cps, _last, capped?) do
     count = length(ups) + MapSet.size(seen)
 
     cond do
@@ -259,15 +270,23 @@ defmodule Maxio.Multipart do
       true ->
         case common_prefix_of(u.key, prefix, delimiter) do
           nil ->
-            do_collapse_uploads(rest, prefix, delimiter, max, [u | ups], seen, cps)
+            do_collapse_uploads(rest, prefix, delimiter, max, [u | ups], seen, cps, u.key, capped?)
 
           cp ->
             if MapSet.member?(seen, cp) do
-              do_collapse_uploads(rest, prefix, delimiter, max, ups, seen, cps)
+              do_collapse_uploads(rest, prefix, delimiter, max, ups, seen, cps, cp, capped?)
             else
-              do_collapse_uploads(rest, prefix, delimiter, max, ups, MapSet.put(seen, cp), [
-                cp | cps
-              ])
+              do_collapse_uploads(
+                rest,
+                prefix,
+                delimiter,
+                max,
+                ups,
+                MapSet.put(seen, cp),
+                [cp | cps],
+                cp,
+                capped?
+              )
             end
         end
     end

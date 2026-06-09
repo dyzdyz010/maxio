@@ -290,6 +290,12 @@ defmodule Maxio.S3.Handlers.Multipart do
     do: Error.new(:entity_too_small, resource: "/#{b}/#{k}")
 
   defp complete_error(:no_parts, b, k), do: Error.new(:malformed_xml, resource: "/#{b}/#{k}")
+
+  # 写 quorum 不足 / 原子 rename 争用 = 瞬时写限流，对齐 MinIO 的 SlowDownWrite(503)，
+  # SDK 据此退避重试自愈（与 object.ex PUT 一致）；绝不退化成 500 InternalError。
+  defp complete_error(reason, b, k) when reason in [:write_quorum, :rename_busy],
+    do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+
   defp complete_error(_other, b, k), do: Error.new(:internal_error, resource: "/#{b}/#{k}")
 
   defp parse_part_number!(str) do

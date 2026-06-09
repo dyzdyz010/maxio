@@ -359,10 +359,13 @@ defmodule Maxio.Objects do
       end
 
     # ROUTE B B1-3 临时硬 LIMIT 闸（同 list_objects_v2）：有界 SQL 取数防大桶 DoS。
-    candidates = Repo.all(limit(base, ^list_fetch_limit(max_keys)))
+    # capped? 时候选被截断，须强制截断+续点（不能宣称完整）。
+    fetch_limit = list_fetch_limit(max_keys)
+    candidates = Repo.all(limit(base, ^fetch_limit))
+    capped? = length(candidates) == fetch_limit
 
     {versions, common_prefixes, truncated, last_key, last_vid} =
-      collapse_versions(candidates, prefix, delimiter, max_keys)
+      collapse_versions(candidates, prefix, delimiter, max_keys, capped?)
 
     %{
       versions: versions,
@@ -374,15 +377,34 @@ defmodule Maxio.Objects do
   end
 
   # 折叠 delimiter 公共前缀 + 截断判断（与 list_objects_v2 同构，但游标是二维 (key, version_id)）。
-  defp collapse_versions(candidates, prefix, delimiter, max_keys) do
-    do_collapse_versions(candidates, prefix, delimiter, max_keys, [], MapSet.new(), [], nil, nil)
+  # capped? = SQL 候选被 fetch_limit 截断；候选耗尽却未达 max_keys 时不能宣称完整。
+  defp collapse_versions(candidates, prefix, delimiter, max_keys, capped?) do
+    do_collapse_versions(
+      candidates,
+      prefix,
+      delimiter,
+      max_keys,
+      [],
+      MapSet.new(),
+      [],
+      nil,
+      nil,
+      capped?
+    )
   end
 
-  defp do_collapse_versions([], _prefix, _delim, _max, vers, _seen, cps, lk, lv) do
-    {Enum.reverse(vers), Enum.reverse(cps), false, lk, lv}
+  # 候选耗尽。capped? 为真说明 SQL LIMIT 可能在攒满 max_keys 前就截断了候选——无法证明完整，
+  # 强制 is_truncated=true + 二维续点（最后已折叠项），否则才 false。
+  defp do_collapse_versions([], _prefix, _delim, _max, vers, _seen, cps, lk, lv, capped?) do
+    if capped? do
+      {lk2, lv2} = if lk, do: {lk, lv}, else: previous_version_token(vers, cps)
+      {Enum.reverse(vers), Enum.reverse(cps), true, lk2, lv2}
+    else
+      {Enum.reverse(vers), Enum.reverse(cps), false, lk, lv}
+    end
   end
 
-  defp do_collapse_versions([obj | rest], prefix, delimiter, max, vers, seen, cps, _lk, _lv) do
+  defp do_collapse_versions([obj | rest], prefix, delimiter, max, vers, seen, cps, _lk, _lv, capped?) do
     count = length(vers) + MapSet.size(seen)
 
     cond do
@@ -402,12 +424,13 @@ defmodule Maxio.Objects do
               seen,
               cps,
               obj.key,
-              obj.version_id
+              obj.version_id,
+              capped?
             )
 
           cp ->
             if MapSet.member?(seen, cp) do
-              do_collapse_versions(rest, prefix, delimiter, max, vers, seen, cps, cp, nil)
+              do_collapse_versions(rest, prefix, delimiter, max, vers, seen, cps, cp, nil, capped?)
             else
               do_collapse_versions(
                 rest,
@@ -418,7 +441,8 @@ defmodule Maxio.Objects do
                 MapSet.put(seen, cp),
                 [cp | cps],
                 cp,
-                nil
+                nil,
+                capped?
               )
             end
         end
@@ -463,12 +487,16 @@ defmodule Maxio.Objects do
     base_query = if cursor, do: where(base_query, [o], o.key > ^cursor), else: base_query
 
     # ROUTE B B1-3 临时硬 LIMIT 闸：PG 权威期无界 Repo.all 大桶 = DoS。给 SQL 加有界 limit，
-    # 折叠 delimiter 时一个公共前缀可能吃掉很多行（max_keys+1 不够），取 max_keys*4+1000 经验余量，
+    # 折叠 delimiter 时一个公共前缀可吃掉任意多行（无固定 max_keys 倍数能保证填满一页），
     # 上限 sql_hard_limit（默认 100_000）防 DoS。B3 drive-walk 上线后保留为兜底。
-    candidates = Repo.all(limit(base_query, ^list_fetch_limit(max_keys)))
+    fetch_limit = list_fetch_limit(max_keys)
+    candidates = Repo.all(limit(base_query, ^fetch_limit))
+    # 若候选数恰好等于 fetch_limit，SQL 可能在攒够 max_keys 个 distinct 结果前就被截断；
+    # 此时无法证明列举完整，须强制 is_truncated=true + 续点（正确性优先于伪完整）。
+    capped? = length(candidates) == fetch_limit
 
     {objects, common_prefixes, truncated, next_token} =
-      collapse(candidates, prefix, delimiter, max_keys)
+      collapse(candidates, prefix, delimiter, max_keys, capped?)
 
     key_count = length(objects) + length(common_prefixes)
 
@@ -482,15 +510,23 @@ defmodule Maxio.Objects do
   end
 
   # 折叠 delimiter 公共前缀 + 截断判断。逐条扫描升序候选，累计到 max_keys。
-  defp collapse(candidates, prefix, delimiter, max_keys) do
-    do_collapse(candidates, prefix, delimiter, max_keys, [], MapSet.new(), [], nil)
+  # capped? = SQL 候选被 fetch_limit 截断；候选耗尽却未达 max_keys 时不能宣称完整。
+  defp collapse(candidates, prefix, delimiter, max_keys, capped?) do
+    do_collapse(candidates, prefix, delimiter, max_keys, [], MapSet.new(), [], nil, capped?)
   end
 
-  defp do_collapse([], _prefix, _delim, _max, objs, _seen_set, cps, _last) do
-    {Enum.reverse(objs), Enum.reverse(cps), false, nil}
+  # 候选耗尽。capped? 为真说明 SQL LIMIT 可能在攒满 max_keys 前就截断了候选流——无法证明
+  # 列举完整，强制 is_truncated=true + 续点（last 已折叠的最后结果），让客户端再查；
+  # 否则（确实扫到 keyspace 末尾）才是 is_truncated=false。
+  defp do_collapse([], _prefix, _delim, _max, objs, _seen_set, cps, last, capped?) do
+    if capped? do
+      {Enum.reverse(objs), Enum.reverse(cps), true, last || previous_token(objs, cps)}
+    else
+      {Enum.reverse(objs), Enum.reverse(cps), false, nil}
+    end
   end
 
-  defp do_collapse([obj | rest], prefix, delimiter, max, objs, seen_set, cps, _last) do
+  defp do_collapse([obj | rest], prefix, delimiter, max, objs, seen_set, cps, _last, capped?) do
     count = length(objs) + MapSet.size(seen_set)
 
     cond do
@@ -502,12 +538,12 @@ defmodule Maxio.Objects do
       true ->
         case common_prefix_of(obj.key, prefix, delimiter) do
           nil ->
-            do_collapse(rest, prefix, delimiter, max, [obj | objs], seen_set, cps, obj.key)
+            do_collapse(rest, prefix, delimiter, max, [obj | objs], seen_set, cps, obj.key, capped?)
 
           cp ->
             if MapSet.member?(seen_set, cp) do
               # 已折叠过的公共前缀，跳过该对象不计数
-              do_collapse(rest, prefix, delimiter, max, objs, seen_set, cps, cp)
+              do_collapse(rest, prefix, delimiter, max, objs, seen_set, cps, cp, capped?)
             else
               do_collapse(
                 rest,
@@ -517,7 +553,8 @@ defmodule Maxio.Objects do
                 objs,
                 MapSet.put(seen_set, cp),
                 [cp | cps],
-                cp
+                cp,
+                capped?
               )
             end
         end

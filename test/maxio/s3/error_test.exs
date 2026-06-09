@@ -33,6 +33,20 @@ defmodule Maxio.S3.ErrorTest do
     assert Error.new(:missing_security_header).http_status == 400
   end
 
+  test "SlowDown / SlowDownWrite / SlowDownRead 均为可重试 503（对齐 MinIO）" do
+    sd = Error.new(:slow_down)
+    assert sd.code == "SlowDown"
+    assert sd.http_status == 503
+
+    sdw = Error.new(:slow_down_write)
+    assert sdw.code == "SlowDownWrite"
+    assert sdw.http_status == 503
+
+    sdr = Error.new(:slow_down_read)
+    assert sdr.code == "SlowDownRead"
+    assert sdr.http_status == 503
+  end
+
   test "未知错误码兜底 InternalError 500" do
     err = Error.new(:totally_unknown_code_xyz)
     assert err.code == "InternalError"

@@ -117,6 +117,12 @@ defmodule Maxio.S3.Handlers.Object do
       {:ok, {:error, :invalid_key}} ->
         raise Error.new(:invalid_argument, resource: "/#{bucket}/#{key}", message: "Invalid key")
 
+      # 写 quorum 不足 / 原子 rename 争用 = 瞬时写限流，对齐 MinIO 的 SlowDownWrite(503)
+      # （cmd/api-errors.go: errErasureWriteQuorum -> ErrSlowDownWrite）。SDK 据此指数退避重试，
+      # 集群降级/争用得以自愈；绝不能映射成 500 InternalError（被客户端当硬失败）。
+      {:ok, {:error, reason}} when reason in [:write_quorum, :rename_busy] ->
+        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+
       {:ok, {:error, reason}} ->
         raise Error.new(:internal_error, message: inspect(reason))
 

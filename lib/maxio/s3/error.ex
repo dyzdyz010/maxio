@@ -69,6 +69,17 @@ defmodule Maxio.S3.Error do
     slow_down:
       {"SlowDown", 503,
        "Please reduce your request rate."},
+    # MinIO 区分写/读 quorum 不足为可重试的 503（cmd/api-errors.go:
+    # errErasureWriteQuorum -> ErrSlowDownWrite{Code:"SlowDownWrite",503}；
+    # errErasureReadQuorum -> ErrSlowDownRead{Code:"SlowDownRead",503}）。SDK 标准重试策略
+    # 把 503 SlowDown* 视为限流并指数退避，依赖此路径在集群降级/瞬时争用下自愈；
+    # 绝不能退化成 500 InternalError（被多数客户端当硬失败、跳过退避）。
+    slow_down_write:
+      {"SlowDownWrite", 503,
+       "Please reduce your write request rate."},
+    slow_down_read:
+      {"SlowDownRead", 503,
+       "Please reduce your read request rate."},
     internal_error: {"InternalError", 500, "An internal error occurred. Try again."},
     authorization_header_malformed:
       {"AuthorizationHeaderMalformed", 400,
