@@ -326,6 +326,33 @@ defmodule Maxio.ObjectMeta do
   defp field_diff(field, pg_v, sc_v), do: {field, pg: pg_v, sidecar: sc_v}
 
   @doc """
+  ROUTE B B4-4 —— ListObjectsV2 元数据门面，按 `authoritative_source(:list)` 分流（opts 可覆盖 for tests）：
+
+    * `:pg`（默认）→ 现状：`Objects.list_objects_v2`（PG SQL 权威）+ best-effort drive-walk
+      `list_shadow` 比对（门控 Unversioned 桶，分歧记日志，自吞绝不破坏列举），返回 PG list_result。
+    * `:sidecar`（翻 list 权威）→ `Maxio.Listing.list_objects_v2(..., require_quorum: true)` 直接返回
+      drive-walk 结果（每 key 当前版本须 ≥ read_quorum 个端点确认存在；去掉 P3 shadow 宽松门）。
+
+  返回值逐字段一致（`objects, common_prefixes, is_truncated, next_continuation_token, key_count`）；
+  `:pg` 分支的 `objects` 为 `%Objects.Object{}`（富元数据），`:sidecar` 分支为 `%{key: ...}`（走盘只到
+  key 级，无 LastModified/ETag/Size——见 `Maxio.Listing` 边界说明）。handler 据两者统一的 `.key`
+  渲染（富字段缺失时由 handler 兜底/留空，翻权威后读 sidecar 富集留后续）。`opts` 透传给底层
+  （`:transport` / `:topology` / `:bucket_versioning` / `:pg`）。
+  """
+  @spec list(String.t(), map(), keyword()) :: map()
+  def list(bucket, list_opts, opts \\ []) do
+    case authoritative_source(:list, opts) do
+      :sidecar ->
+        Maxio.Listing.list_objects_v2(bucket, list_opts, Keyword.put(opts, :require_quorum, true))
+
+      _pg ->
+        res = Objects.list_objects_v2(bucket, list_opts)
+        _ = list_shadow(bucket, list_opts, Keyword.put(opts, :pg, res))
+        res
+    end
+  end
+
+  @doc """
   ROUTE B P3 —— ListObjectsV2 的 drive-walk shadow（best-effort，不翻 list 权威）。
 
   比对 PG SQL 结果（`opts[:pg]`）与 `Maxio.Listing` 跨端点走盘结果的 **key 集 + common_prefixes**

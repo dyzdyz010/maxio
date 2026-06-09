@@ -84,20 +84,22 @@ defmodule Maxio.S3.Handlers.Bucket do
         start_after: start_after
       }
 
-      res = Objects.list_objects_v2(bucket, list_opts)
+      # ROUTE B B4-4：ListObjectsV2 经元数据门面分流（默认 :pg → SQL 权威 + drive-walk shadow 比对；
+      # :list=:sidecar → drive-walk + quorum 确认权威返回）。透传桶 versioning：:pg 分支 shadow 门控到
+      # Unversioned 桶（见 Maxio.ObjectMeta.list_shadow），避免 versioned/suspended 桶上纯 PG delete
+      # marker 在盘无痕迹导致的保证性伪分歧。默认 :pg 行为与 P3 完全一致（向后兼容、可回滚）。
+      res = Maxio.ObjectMeta.list(bucket, list_opts, bucket_versioning: versioning_of(b))
 
-      # ROUTE B P3：drive-walk shadow 比对（best-effort，不改返回/控制流；分歧记结构化日志，自吞绝不破坏列举）。
-      # 透传桶 versioning：shadow 门控到 Unversioned 桶（见 Maxio.ObjectMeta.list_shadow），
-      # 避免 versioned/suspended 桶上纯 PG delete marker 在盘无痕迹导致的保证性伪分歧。
-      _ =
-        Maxio.ObjectMeta.list_shadow(bucket, list_opts,
-          pg: res,
-          bucket_versioning: versioning_of(b)
-        )
-
+      # objects 元素：:pg 分支为 %Objects.Object{}（富元数据）；:sidecar 分支为 %{key: ...}（走盘只到
+      # key 级，无 LastModified/ETag/Size）。统一用 Map.get 取，富字段缺失留 nil（翻权威读 sidecar 富集留后续）。
       objects =
         Enum.map(res.objects, fn o ->
-          %{key: o.key, last_modified: o.updated_at, etag: o.etag, size: o.size}
+          %{
+            key: o.key,
+            last_modified: Map.get(o, :updated_at) || Map.get(o, :last_modified),
+            etag: Map.get(o, :etag),
+            size: Map.get(o, :size)
+          }
         end)
 
       body =

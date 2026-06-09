@@ -38,8 +38,10 @@ defmodule Maxio.Listing do
   MVP 已知边界（B3 范围，正确性优先于极致惰性，真·流式惰性走盘留后续优化）：
     * 候选 key 集大小 = 桶内对象数——走盘先把全部候选 key 收进 `MapSet` 去重再排序折叠；`max_keys`
       + 续点只把**输出**有界，候选集仍可能大。这是 MVP 已知边界（端点游标 + 堆归并按需产出留后续）。
-    * shadow 阶段不强制 quorum 门：某 key 在任一端点命中（含 meta.json）即收为候选，避免与 PG
-      误报分歧；quorum 确认（每对象须 read_quorum 个端点确认存在）留 B4 翻 list 权威时收紧。
+    * quorum 门由 `opts[:require_quorum]` 控制（B4-4 落地）：默认 false = P3 shadow 宽松（某 key
+      在任一端点命中即收为候选，避免与 PG 误报分歧）；true（翻 list 权威）= 每 key 的当前版本须
+      被 ≥ read_quorum 个不同端点确认存在才纳入（去掉「命中≥1 即收」的宽松门，未达 quorum 的 key
+      不可信、绝不返回）。read_quorum 取自 opts[:topology] 的 data_shards（与 ObjectMeta 同源）。
     * 走盘只到 key 级——list_result 的 `objects` 元素仅含 `:key`（无 LastModified/ETag/Size）；
       B3-3 shadow 比对只比 key 集 + common_prefixes，不比对象元数据。翻权威时再读 sidecar 富集（P4）。
 
@@ -57,6 +59,7 @@ defmodule Maxio.Listing do
   """
 
   alias Maxio.Cluster.{Topology, Transport}
+  alias Maxio.Storage.Erasure.Config
 
   @versions_prefix ".versions"
 
@@ -128,41 +131,86 @@ defmodule Maxio.Listing do
   #   1. null 布局：<bucket>/<key>/meta.json -> key（当前版本 = null）；
   #   2. 版本树：.versions/<bucket>/<key>/<version_id>/meta.json -> {key, version_id}；
   # 两源合并后按 key 收敛到当前版本（max ULID，null 为对等），剔除当前版本为 delete marker 的 key。
+  #
+  # quorum 确认（B4-4 翻 list 权威）：每个走过的 {key, version} 候选随其来源**端点序号**带回（不再 walk
+  # 阶段即丢端点身份）。收敛到当前版本后，统计该 {key, current_vid} 被多少个**不同端点**确认存在；
+  # opts[:require_quorum]==true 时仅保留 count >= read_quorum 的 key（去掉 P3 shadow「命中≥1 即收」
+  # 的宽松门——drive-walk 成为权威列举源时，未达 quorum 的 key 不可信，绝不返回）。默认 false 保持 P3。
   defp collect_keys(bucket, opts) do
     transport = Transport.impl(opts)
     topo = Keyword.get(opts, :topology)
     set_ids = if topo, do: Topology.all_set_ids_from(topo), else: Topology.all_set_ids()
 
-    {null_keys, versioned} =
+    # 每条候选：{key, version, endpoint_index}（null 源 version="null"；版本树为各 ULID）。
+    # endpoint_index 全局唯一（跨 set 累加），用于 quorum 端点计数（同一端点重复命中只计一次）。
+    candidates =
       set_ids
-      |> Enum.flat_map(fn set_id ->
-        endpoints =
-          if topo, do: Topology.endpoints_from(topo, set_id), else: Topology.endpoints(set_id)
+      |> endpoints_with_index(topo)
+      |> Enum.flat_map(fn {{node, drive}, ep_idx} ->
+        null_layout = walk(transport, node, Path.join(drive, bucket), "")
+        ver_layout = walk_versions(transport, node, versions_root(drive, bucket), "")
 
-        Enum.flat_map(endpoints, fn {node, drive} ->
-          null_layout = walk(transport, node, Path.join(drive, bucket), "")
-          ver_layout = walk_versions(transport, node, versions_root(drive, bucket), "")
-          Enum.map(null_layout, &{:null, &1}) ++ Enum.map(ver_layout, &{:versioned, &1})
-        end)
+        Enum.map(null_layout, &{&1, "null", ep_idx}) ++
+          Enum.map(ver_layout, fn {key, vid} -> {key, vid, ep_idx} end)
       end)
-      |> Enum.split_with(fn {kind, _} -> kind == :null end)
 
-    null_set = MapSet.new(null_keys, fn {:null, key} -> key end)
+    # 按 key 归集所有 {version, endpoint_index} 候选；先解析当前版本，再对当前版本做端点 quorum 计数。
+    by_key = Enum.group_by(candidates, fn {key, _vid, _ep} -> key end)
 
-    # 按 key 归集所有版本候选（null 源以 "null" 版本参与；版本树以各 ULID 参与），去重。
-    by_key =
-      versioned
-      |> Enum.map(fn {:versioned, {key, vid}} -> {key, vid} end)
-      |> Enum.concat(Enum.map(MapSet.to_list(null_set), &{&1, "null"}))
-      |> Enum.group_by(fn {key, _vid} -> key end, fn {_key, vid} -> vid end)
+    require_quorum = Keyword.get(opts, :require_quorum, false)
+    rq = if require_quorum, do: read_quorum(opts), else: 1
 
     by_key
-    |> Enum.map(fn {key, vids} -> {key, current_version(vids)} end)
-    |> Enum.reject(fn {key, current_vid} ->
+    |> Enum.map(fn {key, entries} ->
+      current_vid = current_version(Enum.map(entries, fn {_k, vid, _ep} -> vid end))
+      endpoints_with_current = endpoint_count_for_version(entries, current_vid)
+      {key, current_vid, endpoints_with_current}
+    end)
+    |> Enum.reject(fn {key, current_vid, _count} ->
       delete_marker_current?(transport, opts, bucket, key, current_vid)
     end)
-    |> Enum.map(fn {key, _vid} -> key end)
+    |> Enum.filter(fn {_key, _current_vid, count} -> count >= rq end)
+    |> Enum.map(fn {key, _vid, _count} -> key end)
     |> Enum.uniq()
+  end
+
+  # 跨 set 的全部端点，附带全局唯一递增序号（quorum 端点计数用；同一物理端点只出现一次）。
+  defp endpoints_with_index(set_ids, topo) do
+    set_ids
+    |> Enum.flat_map(fn set_id ->
+      if topo, do: Topology.endpoints_from(topo, set_id), else: Topology.endpoints(set_id)
+    end)
+    |> Enum.with_index()
+  end
+
+  # 该 {key} 的候选里，确认了 current_vid 的不同端点数（同端点重复命中只计一次）。
+  defp endpoint_count_for_version(entries, current_vid) do
+    entries
+    |> Enum.filter(fn {_k, vid, _ep} -> vid == current_vid end)
+    |> Enum.map(fn {_k, _vid, ep} -> ep end)
+    |> Enum.uniq()
+    |> length()
+  end
+
+  # read_quorum = K（data_shards）。来源优先级（与 Maxio.ObjectMeta.read_quorum 同语义、铁律 5）：
+  #   1) opts[:topology] 的 data_shards（翻列权威时走的端点正由该拓扑定义，必须用其 K）；
+  #   2) 否则 Config.load!（opts 覆盖 + 全局 :erasure 配置）；
+  #   3) 兜底 opts[:read_quorum] || 1。
+  defp read_quorum(opts) do
+    case Keyword.get(opts, :topology) do
+      %{data_shards: k} when is_integer(k) and k > 0 ->
+        k
+
+      _ ->
+        config_read_quorum(opts)
+    end
+  end
+
+  defp config_read_quorum(opts) do
+    cfg = Config.load!(Keyword.take(opts, [:drives, :data_shards, :parity_shards, :block_size]))
+    cfg.read_quorum
+  rescue
+    _ -> Keyword.get(opts, :read_quorum, 1)
   end
 
   defp versions_root(drive, bucket), do: Path.join([drive, @versions_prefix, bucket])
