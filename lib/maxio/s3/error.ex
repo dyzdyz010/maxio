@@ -78,6 +78,12 @@ defmodule Maxio.S3.Error do
     # 绝不能退化成 500 InternalError（被多数客户端当硬失败、跳过退避）。
     slow_down_write: {"SlowDownWrite", 503, "Please reduce your write request rate."},
     slow_down_read: {"SlowDownRead", 503, "Please reduce your read request rate."},
+    # ROUTE B B4-3：翻读权威（:read=:sidecar）后，sidecar reconcile 不足 read_quorum（端点宕机 /
+    # 副本分歧）→ 对象当前不可读、绝不返回猜测副本（铁律 3）。映射为可重试的 503 ServiceUnavailable
+    # （对齐 AWS S3 ServiceUnavailable：临时性，SDK 据此退避重试，集群恢复 quorum 后自愈）。
+    service_unavailable:
+      {"ServiceUnavailable", 503,
+       "Reduce your request rate or try again later; the service is temporarily unable to satisfy your request."},
     internal_error: {"InternalError", 500, "An internal error occurred. Try again."},
     authorization_header_malformed:
       {"AuthorizationHeaderMalformed", 400,

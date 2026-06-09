@@ -16,24 +16,173 @@ defmodule Maxio.ObjectMeta do
   alias Maxio.Storage.Erasure.Config
   alias Maxio.S3.Log
 
-  @doc "读/列/写的元数据权威来源（读 config，可经 opts 覆盖 for tests）。"
-  @spec authoritative_source(:read | :list | :write) :: :pg | :sidecar
-  def authoritative_source(kind) do
+  @doc """
+  读/列/写的元数据权威来源（读 config，可经 opts 覆盖 for tests）。
+
+  opts[:authoritative_source]（test 注入）优先于 `config :maxio, :authoritative_source`——
+  让单测无需改全局 Application env（不污染并发用例）即可逐用例翻权威。缺省 :pg（向后兼容）。
+  """
+  @spec authoritative_source(:read | :list | :write, keyword()) :: :pg | :sidecar
+  def authoritative_source(kind, opts \\ []) do
+    case Keyword.get(opts, :authoritative_source) do
+      override when is_list(override) ->
+        Keyword.get(override, kind, app_authoritative_source(kind))
+
+      _ ->
+        app_authoritative_source(kind)
+    end
+  end
+
+  defp app_authoritative_source(kind) do
     Application.get_env(:maxio, :authoritative_source, read: :pg)
     |> Keyword.get(kind, :pg)
   end
 
   @doc """
-  读对象元数据。SHADOW 模式：返回 PG 权威 `%Object{}`（或 `{:error,:not_found}`），
-  并 best-effort 跨端点 sidecar reconcile + 分歧日志（不影响返回值、不抛错）。
+  读对象元数据。按 `authoritative_source(:read)` 分流（opts 可覆盖 for tests）：
+
+    * `:pg`（默认）→ SHADOW 模式：返回 PG 权威 `%Object{}`（或 `{:error,:not_found}`），
+      并 best-effort 跨端点 sidecar reconcile + 分歧日志（不影响返回值、不抛错；含 B4-1 heal 调度）。
+    * `:sidecar`（B4-3 翻读权威）→ 读全 N 端点 sidecar -> `MetaReconcile.reconcile`：
+        - `{:ok, entry, divergent}` → 调度 heal（B4-1）；entry 是 delete_marker 且 version_id==nil
+          → `{:error, :not_found}`（latest 是删除标记，未带 versionId 的 GET 应 404）；否则返回
+          `Sidecar.to_view` 补全为与 `%Object{}` 兼容的结构（不依赖 PG 读回，去 PG 读 SPOF）。
+        - `{:error, :read_quorum}` → 若**所有端点确实缺该对象**（genuinely absent）→ `{:error, :not_found}`；
+          否则（部分端点有但 < quorum / 分歧）→ `{:error, :read_quorum}`（handler 映射 503，绝不猜）。
+        - sidecar 路径完全不可达（无拓扑 / object_rel 非法 / 读 sidecar 抛异常）→ 降级 PG fallback +
+          `Log.warn`（绝不因 sidecar 不可达而让对象读不出，PG 索引兜底）。
+
   version_id=nil 读 latest；否则读指定版本。
   """
   @spec get(String.t(), String.t(), String.t() | nil, keyword()) ::
-          Objects.Object.t() | {:error, :not_found}
+          Objects.Object.t() | {:error, :not_found | :read_quorum}
   def get(bucket, key, version_id \\ nil, opts \\ []) do
-    pg = pg_read(bucket, key, version_id)
-    shadow_check(bucket, key, version_id, pg, opts)
-    pg
+    case authoritative_source(:read, opts) do
+      :sidecar ->
+        sidecar_read(bucket, key, version_id, opts)
+
+      _pg ->
+        pg = pg_read(bucket, key, version_id)
+        shadow_check(bucket, key, version_id, pg, opts)
+        pg
+    end
+  end
+
+  # B4-3 —— 读权威 :sidecar：读全 N 端点 sidecar -> reconcile，返回值取自 sidecar（不依赖 PG）。
+  # 完全不可达（无拓扑 / object_rel 非法 / 读 sidecar 抛异常）→ 降级 PG fallback（记 Log.warn）。
+  defp sidecar_read(bucket, key, version_id, opts) do
+    # latest 读（version_id=nil）对应盘上「null」目录或 :latest target；显式版本走 .versions 路径。
+    # sidecar 权威下无 PG 行可解析有效版本，故 latest 直接用 "null" 目录 + :latest reconcile target
+    # （方案 B 每版本独立目录：latest 视图落在 null/当前目录，与写路径 do_put version_id 落点一致）。
+    eff_vid = version_id || "null"
+    target = if version_id == nil, do: :latest, else: {:version, version_id}
+
+    try do
+      copies = read_endpoint_sidecars(bucket, key, eff_vid, opts)
+
+      if copies == [] do
+        # endpoints_for / object_rel 失败（无拓扑 / 非法 key）→ 降级 PG fallback。
+        sidecar_unreachable_fallback(bucket, key, version_id)
+      else
+        reconcile_sidecar_read(bucket, key, version_id, eff_vid, target, copies, opts)
+      end
+    rescue
+      e ->
+        Log.warn("read authority sidecar unreachable, falling back to PG index",
+          bucket: bucket,
+          key: key,
+          reason: inspect(e)
+        )
+
+        pg_read(bucket, key, version_id)
+    catch
+      kind, reason ->
+        Log.warn("read authority sidecar caught, falling back to PG index",
+          bucket: bucket,
+          key: key,
+          reason: inspect({kind, reason})
+        )
+
+        pg_read(bucket, key, version_id)
+    end
+  end
+
+  defp reconcile_sidecar_read(bucket, key, version_id, eff_vid, target, copies, opts) do
+    rq = read_quorum(opts)
+
+    case MetaReconcile.reconcile(copies, rq, target) do
+      {:ok, entry, divergent} ->
+        if divergent != [] do
+          Log.warn("sidecar divergence -> scheduling heal",
+            bucket: bucket,
+            key: key,
+            version_id: version_id,
+            divergent: inspect(divergent)
+          )
+
+          schedule_heal(bucket, key, eff_vid, entry, divergent, copies, opts)
+        end
+
+        view_or_not_found(bucket, key, version_id, entry)
+
+      {:error, :read_quorum} ->
+        # 区分「确实不存在」与「不足 quorum」：所有端点都 :missing（无任何 sidecar 副本）→ not_found；
+        # 否则（部分端点有该对象但未达 quorum / 分歧）→ read_quorum 错误（绝不猜，handler 映射 503）。
+        if Enum.all?(copies, &(&1 == :missing)) do
+          {:error, :not_found}
+        else
+          {:error, :read_quorum}
+        end
+    end
+  end
+
+  # 把 reconcile 出的权威 entry 翻成与 %Object{} 兼容的读视图；latest 是 delete_marker 且未带
+  # versionId → not_found（GET/HEAD 应 404）；显式 versionId 指向 delete_marker 时仍返回视图
+  # （handler 据 is_delete_marker 走 405 分支，与 :pg 路径一致）。
+  defp view_or_not_found(_bucket, _key, nil, %{"type" => "delete_marker"}),
+    do: {:error, :not_found}
+
+  defp view_or_not_found(bucket, key, _version_id, entry) do
+    view = Sidecar.to_view(bucket, key, entry)
+
+    %Objects.Object{
+      bucket_name: bucket,
+      key: key,
+      version_id: view.version_id,
+      size: view.size,
+      etag: view.etag,
+      content_type: view.content_type,
+      metadata: view.metadata,
+      storage_class: view.storage_class,
+      acl_canned: view.acl_canned,
+      tags: view.tags,
+      sse_algorithm: view.sse_algorithm,
+      sse_envelope: nil,
+      is_latest: view.is_latest,
+      is_delete_marker: view.is_delete_marker,
+      updated_at: entry_modtime_to_datetime(entry)
+    }
+  end
+
+  # entry modtime（int64 纳秒）→ DateTime（响应头 last-modified 用）。缺失/非整数 → 当前时刻兜底。
+  defp entry_modtime_to_datetime(%{"modtime" => ns}) when is_integer(ns) do
+    case DateTime.from_unix(ns, :nanosecond) do
+      {:ok, dt} -> dt
+      {:error, _} -> DateTime.utc_now()
+    end
+  end
+
+  defp entry_modtime_to_datetime(_), do: DateTime.utc_now()
+
+  # sidecar 路径完全不可达（无拓扑 / object_rel 非法）→ 降级 PG 索引兜底（best-effort），记 Log.warn。
+  defp sidecar_unreachable_fallback(bucket, key, version_id) do
+    Log.warn("read authority sidecar unreachable, falling back to PG index",
+      bucket: bucket,
+      key: key,
+      version_id: version_id
+    )
+
+    pg_read(bucket, key, version_id)
   end
 
   # PG 权威读：get_metadata/get_version 均返回 {:ok, %Object{}} | {:error, :not_found}，
@@ -355,7 +504,22 @@ defmodule Maxio.ObjectMeta do
     end
   end
 
+  # read_quorum = K（data_shards）。来源优先级（铁律 5：quorum 是「服务该对象的 set」的属性）：
+  #   1) opts[:topology] 的 data_shards（翻读/列权威时读的端点正由该拓扑定义，必须用其 K，
+  #      绝不用与之无关的全局 :erasure 配置——否则 N≠全局 N 的 set 会算出错误 quorum）；
+  #   2) 否则 Config.load!（opts 覆盖 + 全局 :erasure 配置）；
+  #   3) 兜底 opts[:read_quorum] || 1。
   defp read_quorum(opts) do
+    case Keyword.get(opts, :topology) do
+      %{data_shards: k} when is_integer(k) and k > 0 ->
+        k
+
+      _ ->
+        config_read_quorum(opts)
+    end
+  end
+
+  defp config_read_quorum(opts) do
     cfg = Config.load!(Keyword.take(opts, [:drives, :data_shards, :parity_shards, :block_size]))
     cfg.read_quorum
   rescue

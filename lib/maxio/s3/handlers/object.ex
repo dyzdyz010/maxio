@@ -145,11 +145,10 @@ defmodule Maxio.S3.Handlers.Object do
     _ = ensure_bucket!(bucket)
 
     version_id = Map.get(conn.query_params, "versionId")
+    # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口）。
+    #   :pg（默认）→ 返回 PG %Object{} + 内部 best-effort sidecar shadow（行为不变）；
+    #   :read=:sidecar（B4-3）→ 返回 reconcile 的 sidecar 视图，read_quorum 不足 → 503（绝不猜）。
     {object, total} = resolve_object_for_get!(bucket, key, version_id)
-
-    # ROUTE B P2 dual-read SHADOW：PG 取到对象后追加 best-effort sidecar reconcile 比对
-    # （已 try/rescue 自吞，绝不改返回/控制流，绝不破坏读路径）。
-    _ = Maxio.ObjectMeta.shadow_check(bucket, key, version_id, object, [])
 
     cond do
       object.is_delete_marker and version_id == nil ->
@@ -225,12 +224,10 @@ defmodule Maxio.S3.Handlers.Object do
     conn = fetch_query_params(conn)
     version_id = Map.get(conn.query_params, "versionId")
 
+    # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口；:pg 默认含内部 shadow，行为不变）。
+    # HEAD 无 body：缺失/read_quorum 不足都只回状态 + 头（read_quorum 不足 → 503 ServiceUnavailable）。
     with {:ok, _b} <- Buckets.lookup(bucket),
          {:ok, object} <- fetch_for_head(bucket, key, version_id) do
-      # ROUTE B P2 dual-read SHADOW：PG 取到对象后追加 best-effort sidecar reconcile 比对
-      # （已 try/rescue 自吞，绝不改返回/控制流，绝不破坏读路径）。
-      _ = Maxio.ObjectMeta.shadow_check(bucket, key, version_id, object, [])
-
       cond do
         object.is_delete_marker and version_id == nil ->
           conn
@@ -267,11 +264,28 @@ defmodule Maxio.S3.Handlers.Object do
         # HEAD 无 body：缺失桶/对象只回状态 + 头，绝不发 XML body（与 head_bucket 一致）。
         Log.info("head object miss", action: :head_object, bucket: bucket, key: key)
         send_resp(conn, 404, "")
+
+      {:error, :read_quorum} ->
+        # 仅 :read=:sidecar 时可达：sidecar reconcile 不足 read_quorum → 503（绝不猜，铁律 3）。
+        # HEAD 无 body：只回 503 状态（与 GET 的 ServiceUnavailable 同源，SDK 据此退避重试）。
+        Log.warn("head object unavailable: sidecar read_quorum unmet",
+          action: :head_object,
+          bucket: bucket,
+          key: key,
+          reason: :read_quorum
+        )
+
+        send_resp(conn, 503, "")
     end
   end
 
-  defp fetch_for_head(bucket, key, nil), do: Objects.get_metadata(bucket, key)
-  defp fetch_for_head(bucket, key, version_id), do: Objects.get_version(bucket, key, version_id)
+  # 经 ObjectMeta.get 统一读权威分流：%Object{} → {:ok, object}；错误元组原样透传给 head/1 的 else。
+  defp fetch_for_head(bucket, key, version_id) do
+    case Maxio.ObjectMeta.get(bucket, key, version_id, []) do
+      %Objects.Object{} = object -> {:ok, object}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   @spec delete(Plug.Conn.t()) :: Plug.Conn.t()
   def delete(conn) do
@@ -900,18 +914,27 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  # version_id == nil → 取当前版本（latest）；否则取指定版本行。缺失 → NoSuchKey。
-  defp resolve_object_for_get!(bucket, key, nil) do
-    case Objects.get_metadata(bucket, key) do
-      {:ok, object} -> {object, object.size}
-      {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
-    end
-  end
-
+  # version_id == nil → 取当前版本（latest）；否则取指定版本行。经 ObjectMeta.get 统一读权威分流：
+  #   %Object{} → {object, object.size}；
+  #   {:error,:not_found} → NoSuchKey 404（既有语义）；
+  #   {:error,:read_quorum}（仅 :read=:sidecar 时可达）→ 503 ServiceUnavailable（绝不返回猜测副本，铁律 3）。
   defp resolve_object_for_get!(bucket, key, version_id) do
-    case Objects.get_version(bucket, key, version_id) do
-      {:ok, object} -> {object, object.size}
-      {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+    case Maxio.ObjectMeta.get(bucket, key, version_id, []) do
+      %Objects.Object{} = object ->
+        {object, object.size}
+
+      {:error, :not_found} ->
+        raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+
+      {:error, :read_quorum} ->
+        Log.warn("object read unavailable: sidecar read_quorum unmet",
+          action: :get_object,
+          bucket: bucket,
+          key: key,
+          reason: :read_quorum
+        )
+
+        raise Error.new(:service_unavailable, resource: "/#{bucket}/#{key}")
     end
   end
 
