@@ -107,4 +107,79 @@ defmodule Maxio.S3.CopyObjectVersionTest do
     assert g.status == 200
     assert g.resp_body == "plain-bytes"
   end
+
+  # ── FX-H2：目标 versioning 感知 + 版本响应头 ──
+
+  test "复制进 Enabled 目标桶 → 回 x-amz-version-id 且每次产生新版本" do
+    SigV4Request.signed_conn(:put, "/cpd1") |> call()
+    SigV4Request.signed_conn(:put, "/cpd1/src.txt", body: "payload") |> call()
+    SigV4Request.signed_conn(:put, "/cpd2") |> call()
+    assert enable_versioning("cpd2").status == 200
+
+    cp1 =
+      SigV4Request.signed_conn(:put, "/cpd2/dst.txt",
+        headers: [{"x-amz-copy-source", "/cpd1/src.txt"}]
+      )
+      |> call()
+
+    assert cp1.status == 200
+    assert [vid1] = get_resp_header(cp1, "x-amz-version-id")
+    assert vid1 != "null"
+
+    cp2 =
+      SigV4Request.signed_conn(:put, "/cpd2/dst.txt",
+        headers: [{"x-amz-copy-source", "/cpd1/src.txt"}]
+      )
+      |> call()
+
+    assert cp2.status == 200
+    assert [vid2] = get_resp_header(cp2, "x-amz-version-id")
+    assert vid2 != vid1
+
+    # 两个版本字节都可经 ?versionId 取回（Enabled 目标每次 copy 落新版本，绝不互相覆盖）。
+    g1 = SigV4Request.signed_conn(:get, "/cpd2/dst.txt", query: %{"versionId" => vid1}) |> call()
+    assert g1.status == 200
+    assert g1.resp_body == "payload"
+    g2 = SigV4Request.signed_conn(:get, "/cpd2/dst.txt", query: %{"versionId" => vid2}) |> call()
+    assert g2.status == 200
+    assert g2.resp_body == "payload"
+  end
+
+  test "复制版本化源 → 回 x-amz-copy-source-version-id（等于源版本 id）" do
+    SigV4Request.signed_conn(:put, "/cps1") |> call()
+    assert enable_versioning("cps1").status == 200
+    p1 = SigV4Request.signed_conn(:put, "/cps1/src.txt", body: "src") |> call()
+    [src_vid] = get_resp_header(p1, "x-amz-version-id")
+    assert src_vid != "null"
+    SigV4Request.signed_conn(:put, "/cps1/dst") |> call()
+
+    cp =
+      SigV4Request.signed_conn(:put, "/cps1/dst/o.txt",
+        headers: [{"x-amz-copy-source", "/cps1/src.txt"}]
+      )
+      |> call()
+
+    assert cp.status == 200
+    assert get_resp_header(cp, "x-amz-copy-source-version-id") == [src_vid]
+  end
+
+  test "复制进未版本化目标桶 → 不回 x-amz-version-id（保留旧语义）" do
+    SigV4Request.signed_conn(:put, "/cpu1") |> call()
+    SigV4Request.signed_conn(:put, "/cpu1/src.txt", body: "z") |> call()
+
+    cp =
+      SigV4Request.signed_conn(:put, "/cpu1/dst.txt",
+        headers: [{"x-amz-copy-source", "/cpu1/src.txt"}]
+      )
+      |> call()
+
+    assert cp.status == 200
+    assert get_resp_header(cp, "x-amz-version-id") == []
+    # 未版本化源 → 也绝不回 x-amz-copy-source-version-id（"null" 不回显）。
+    assert get_resp_header(cp, "x-amz-copy-source-version-id") == []
+
+    g = SigV4Request.signed_conn(:get, "/cpu1/dst.txt") |> call()
+    assert g.status == 200
+    assert g.resp_body == "z"
+  end
 end

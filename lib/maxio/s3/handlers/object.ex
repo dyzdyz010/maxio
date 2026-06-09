@@ -457,7 +457,15 @@ defmodule Maxio.S3.Handlers.Object do
     # 「截断 dest 早于读 source」的数据丢失：先流式写到唯一临时 key，再流式搬到 dest，最后删临时。
     self_copy? = src_bucket == dest_bucket and src_key == dest_key
 
-    # B1-1：目标提交 seam（目标字节写 + Objects.put_metadata）纳入「目标对象锁」单点。
+    # FX-H2：目标版本按目标桶 versioning 决定（Enabled→新 ULID，否则 "null"，与 do_put 一致，铁律 5）。
+    # 目标字节落该 version_id 路径、落库用同一 version_id（put_version_with_id 尊重外部 id），
+    # Enabled 桶每次 copy 产生新版本并回 x-amz-version-id；Unversioned 仍 upsert null 行不回版本头。
+    dest_versioning = bucket_versioning(dest_bucket)
+
+    dest_version_id =
+      if dest_versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
+
+    # B1-1：目标提交 seam（目标字节写 + Objects.put_version_with_id）纳入「目标对象锁」单点。
     # 源读（含自拷贝先写临时 key）在锁外完成 —— 仅目标 dest_key 持目标锁，绝不在源读上持目标锁，
     # 避免跨 key 死锁 + :global.trans 非重入死等（铁律 2：锁是请求编排关注点）。
     src_stream =
@@ -473,13 +481,13 @@ defmodule Maxio.S3.Handlers.Object do
     commit_result =
       Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
         {size, etag} =
-          case Storage.put(dest_bucket, dest_key, "null", src_stream.stream) do
+          case Storage.put(dest_bucket, dest_key, dest_version_id, src_stream.stream) do
             {:ok, %{size: size, etag: etag}} -> {size, etag}
             {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
           end
 
         {:ok, obj} =
-          Objects.put_metadata(dest_bucket, dest_key, %{
+          Objects.put_version_with_id(dest_bucket, dest_key, dest_version_id, %{
             size: size,
             etag: etag,
             content_type: content_type,
@@ -510,8 +518,12 @@ defmodule Maxio.S3.Handlers.Object do
     body =
       Maxio.S3.Views.CopyObjectResult.render(%{etag: etag, last_modified: obj.updated_at})
 
+    # Enabled 目标回 x-amz-version-id（"null" 不回显）；版本化源回 x-amz-copy-source-version-id
+    # （"null" 未版本化源不回显），对齐 AWS CopyObject 响应头（铁律 5）。
     conn
     |> put_resp_content_type("application/xml")
+    |> maybe_put_version_id(obj.version_id)
+    |> maybe_put_copy_source_version_id(src_obj.version_id)
     |> send_resp(200, body)
   end
 
@@ -767,6 +779,13 @@ defmodule Maxio.S3.Handlers.Object do
 
   defp maybe_put_version_id(conn, version_id),
     do: put_resp_header(conn, "x-amz-version-id", version_id)
+
+  # 源是版本化对象（version_id != "null"）时回 x-amz-copy-source-version-id；
+  # 未版本化源（"null"）不回显（对齐 AWS CopyObject 响应，铁律 5）。
+  defp maybe_put_copy_source_version_id(conn, "null"), do: conn
+
+  defp maybe_put_copy_source_version_id(conn, version_id),
+    do: put_resp_header(conn, "x-amz-copy-source-version-id", version_id)
 
   # 决定 SSE：请求头优先；其次桶默认加密配置。非 AES256/SSE-C → 501（绝不静默，铁律 3）。
   defp resolve_sse!(conn, bucket) do
