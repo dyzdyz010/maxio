@@ -73,6 +73,10 @@ defmodule Maxio.Storage.ErasureCoded do
   def put_delete_marker(bucket, key, version_id, entry_opts \\ [], opts \\ []),
     do: do_put_delete_marker(bucket, key, version_id, entry_opts, opts)
 
+  @impl true
+  def delete_version(bucket, key, version_id \\ "null", opts \\ []),
+    do: do_delete_version(bucket, key, version_id, opts)
+
   # part 在盘 d 下的目录。
   defp part_dirs(bucket, upload_id, part_number, cfg) do
     sub = Path.join([".uploads", bucket, upload_id, Integer.to_string(part_number)])
@@ -727,6 +731,35 @@ defmodule Maxio.Storage.ErasureCoded do
     with {:ok, dirs} <- object_dirs(bucket, key, version_id, cfg) do
       Enum.each(dirs, fn dir -> _ = File.rm_rf(dir) end)
       :ok
+    end
+  end
+
+  # ROUTE B fidelity —— DELETE ?versionId 的权威 quorum 删除（Backend.delete_version/4 契约）：
+  # 逐盘 rm_rf 版本 obj-dir 后确认 meta.json 显式 missing（本地盘恒「可达」；rm_rf 失败/残留
+  # meta.json 的盘不计确认）。确认数 >= write_quorum → :ok；否则 {:error, :write_quorum}
+  # （绝不在权威介质仍持有该版本时宣告删除成功）。幂等：本就缺失的盘计入确认。
+  defp do_delete_version(bucket, key, version_id, opts) do
+    cfg = Config.load!(opts)
+
+    with {:ok, dirs} <- object_dirs(bucket, key, version_id, cfg) do
+      confirmed =
+        Enum.count(dirs, fn dir ->
+          _ = File.rm_rf(dir)
+          not File.regular?(Path.join(dir, @meta_file))
+        end)
+
+      if confirmed >= cfg.write_quorum do
+        :ok
+      else
+        Logger.error("erasure delete_version below write quorum",
+          bucket: bucket,
+          key: key,
+          reason:
+            "confirmed=#{confirmed} < write_quorum=#{cfg.write_quorum} version_id=#{version_id}"
+        )
+
+        {:error, :write_quorum}
+      end
     end
   end
 

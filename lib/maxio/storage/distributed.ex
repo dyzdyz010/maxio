@@ -81,6 +81,10 @@ defmodule Maxio.Storage.Distributed do
   def put_delete_marker(bucket, key, version_id \\ "null", entry_opts \\ [], opts \\ []),
     do: do_put_delete_marker(bucket, key, version_id, entry_opts, opts)
 
+  @impl true
+  def delete_version(bucket, key, version_id \\ "null", opts \\ []),
+    do: do_delete_version(bucket, key, version_id, opts)
+
   # ── 端点解析（对象 -> set -> [{node, drive}]）──
 
   defp topology(opts), do: Keyword.get(opts, :topology)
@@ -853,6 +857,60 @@ defmodule Maxio.Storage.Distributed do
   # （Maxio.Storage.DeleteMarker.sidecar/2，单一形态来源）；modtime 单次计算所有端点同值 → signature 一致。
   defp build_delete_marker_meta(version_id, entry_opts) do
     Maxio.Storage.DeleteMarker.sidecar(version_id, entry_opts)
+  end
+
+  # ── DELETE ?versionId 的权威 quorum 删除（ROUTE B fidelity，Backend.delete_version/4 契约）──
+  #
+  # 与 do_delete 的 best-effort 清理删除不同：每端点删版本 obj-dir 后经 list_dir 探针**确认**
+  # 「端点可达且版本目录显式 missing」（transport 的 delete_shard 把宕机塌缩成 :ok——契约如此，
+  # 故确认必须经 list_dir 的结构性 {:error,:unavailable}，与 Maxio.Storage.Scanner.probe_endpoint
+  # 同源判定，铁律 3 绝不把不可达当已删除）。确认数 >= write_quorum → :ok；否则
+  # {:error, :write_quorum}（绝不静默成功——否则 scanner forward 会从幸存 sidecar 复活该版本）。
+  # 幂等：版本本就缺失的端点同样计入确认。
+  defp do_delete_version(bucket, key, version_id, opts) do
+    case Paths.object_rel(bucket, key, version_id) do
+      {:error, :invalid_key} ->
+        {:error, :invalid_key}
+
+      {:ok, obj_rel} ->
+        c = cfg(opts)
+        tx = transport(opts)
+
+        confirmed =
+          bucket
+          |> endpoints_for(key, opts)
+          |> Enum.count(fn {node, drive} ->
+            dir = Path.join(drive, obj_rel)
+            _ = tx.delete_shard(node, dir)
+            version_deleted?(tx, node, dir)
+          end)
+
+        if confirmed >= c.write_quorum do
+          :ok
+        else
+          Logger.error("distributed delete_version below write quorum",
+            bucket: bucket,
+            key: key,
+            reason:
+              "confirmed=#{confirmed} < write_quorum=#{c.write_quorum} version_id=#{version_id}"
+          )
+
+          {:error, :write_quorum}
+        end
+    end
+  end
+
+  # 单端点删除确认探针：列版本目录的父目录——可达（{:ok, entries}，目录不存在为 {:ok,[]}）且无
+  # 「名为版本末段且含 meta.json（object?=true）」的子目录 = 确认已删除；{:error,_}（宕机/异常）=
+  # 不可达，绝不计入确认。
+  defp version_deleted?(tx, node, dir) do
+    parent = Path.dirname(dir)
+    base = Path.basename(dir)
+
+    case tx.list_dir(node, parent, []) do
+      {:ok, entries} -> not Enum.any?(entries, &(&1.name == base and &1.object?))
+      {:error, _} -> false
+    end
   end
 
   # ── 辅助 ──

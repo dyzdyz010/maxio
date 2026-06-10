@@ -501,6 +501,26 @@ defmodule Maxio.Objects do
     end
   end
 
+  @doc """
+  ROUTE B fidelity —— best-effort 版本删除索引维护（与 delete_version/3 同语义，但行不存在与成功
+  都归一 `:ok`，异常捕获返回 `{:error, term}` 而非抛出）。
+
+  用于 `authoritative_source(:write) == :sidecar` 的 DELETE ?versionId：盘上版本目录的 quorum 删除
+  （`Maxio.Storage.delete_version/4`）才是权威提交，PG 行删除仅派生索引维护，故 PG 失败**非致命**——
+  调用方据 `:ok | {:error, reason}` 记 Log.error 而非让 DELETE 失败（漂移留待 scanner reverse-GC
+  收敛：盘上已全端点显式 missing 的行会被下一轮 GC）。`:pg` 默认权威仍走 delete_version/3 的
+  权威语义。与 put_version_index/4、insert_delete_marker_index/3 同一 `*_index` best-effort 契约。
+  """
+  @spec delete_version_index(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def delete_version_index(bucket_name, key, version_id) do
+    case delete_version(bucket_name, key, version_id) do
+      {:ok, _} -> :ok
+      {:error, :not_found} -> :ok
+    end
+  rescue
+    e -> {:error, e}
+  end
+
   # 把该 (bucket,key) 现有 latest 行全部置 false（写新版本前调用，事务内）。
   defp unset_latest(bucket_id, key) do
     from(o in Object, where: o.bucket_id == ^bucket_id and o.key == ^key and o.is_latest == true)

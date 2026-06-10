@@ -20,8 +20,9 @@ defmodule Maxio.Listing do
 
     * 递归 `.versions/<bucket>/` 收集每个含 meta.json 的叶目录 `{key, version_id}`
       （key = 叶路径去掉末段 `/<version_id>`，逐字对齐 `Heal.scan_versioned`）；
-    * 同 key 的多个版本**收敛到当前版本**：ULID 字典序 = 时间序，max ULID = newest（null 版本作为
-      对等参与，被任何更晚的 ULID 写覆盖；纯 null（无 ULID）则 null 即当前）；
+    * 同 key 的多个版本**收敛到当前版本**：写时间序（`current_version/4`，对齐 MinIO
+      sortByModTime——纯 ULID 集 max ULID = newest；null 与 ULID 并存时比 sidecar modtime，
+      晚写的 null 版本/marker 胜出；纯 null（无 ULID）则 null 即当前）；
     * **当前版本是 delete marker 的 key 直接剔除**（ListObjectsV2 不返回逻辑删除的 key，对齐 AWS：
       当前版本为 delete marker 时 GET 返回 404、ListObjectsV2 视同对象不存在）；当前版本的
       `is_delete_marker` 取自其落盘 sidecar meta（`build_meta` 现恒带该字段，缺省 false）；
@@ -120,8 +121,9 @@ defmodule Maxio.Listing do
   null 路径为空 → 系统性 404）。本函数枚举两源候选版本：
     1. null 布局：`<bucket>/<key>/meta.json` 存在 → 候选 "null"；
     2. 版本树：`.versions/<bucket>/<key>/<version_id>/meta.json` 每个 → 候选 version_id；
-  跨端点收敛（任一端点命中即为候选，与 `collect_keys` 的版本枚举同源），按 `current_version`
-  语义（max ULID = newest，null 为对等）选出当前版本 id。盘上无任何版本 → nil。
+  跨端点收敛（任一端点命中即为候选，与 `collect_keys` 的版本枚举同源），按 `current_version/4`
+  语义（写时间序：纯 ULID 集 max ULID = newest；null 与 ULID 并存比 sidecar modtime，晚写者胜）
+  选出当前版本 id。盘上无任何版本 → nil。
 
   仅枚举版本 id（不读 meta、不做 quorum 计数）；quorum / 签名仲裁仍由调用方
   （`MetaReconcile.reconcile`）在解析出的当前版本路径上做（绝不在此猜副本，铁律 3）。
@@ -130,13 +132,13 @@ defmodule Maxio.Listing do
   def discover_current_version(bucket, key, opts \\ []) do
     case version_ids(bucket, key, opts) do
       [] -> nil
-      vids -> current_version(vids)
+      vids -> current_version(bucket, key, vids, opts)
     end
   end
 
   @doc """
   ROUTE B B5-2 —— 单 key 在盘上的**全部候选版本 id**（null 候选 ∪ `.versions` 版本树，跨全端点
-  并集去重，任一端点命中即收）。`discover_current_version/3` 即本列表经 `current_version/1` 收敛；
+  并集去重，任一端点命中即收）。`discover_current_version/3` 即本列表经 `current_version/4` 收敛；
   scanner 用其逐版本 reconcile（每个版本独立 quorum 仲裁，绝不只看当前版本）。
   端点宕机/读失败 → 该端点候选为空（铁律 3 结构化降级；reverse-GC 的「端点不可达绝不删」判定
   不依赖本枚举，见 `Maxio.Storage.Scanner` 的 list_dir 探针）。
@@ -243,7 +245,8 @@ defmodule Maxio.Listing do
   # 收集桶下所有对象的【当前版本】key（跨 set 全端点递归走盘 + 版本树枚举，去重）：
   #   1. null 布局：<bucket>/<key>/meta.json -> key（当前版本 = null）；
   #   2. 版本树：.versions/<bucket>/<key>/<version_id>/meta.json -> {key, version_id}；
-  # 两源合并后按 key 收敛到当前版本（max ULID，null 为对等），剔除当前版本为 delete marker 的 key。
+  # 两源合并后按 key 收敛到当前版本（current_version/4 写时间序——纯 ULID 集 max ULID；null 与
+  # ULID 并存比 sidecar modtime，晚写的 null marker/版本胜出），剔除当前版本为 delete marker 的 key。
   #
   # quorum 确认（B4-4 翻 list 权威）：每个走过的 {key, version} 候选随其来源**端点序号**带回（不再 walk
   # 阶段即丢端点身份）。收敛到当前版本后，统计该 {key, current_vid} 被多少个**不同端点**确认存在；
@@ -275,7 +278,8 @@ defmodule Maxio.Listing do
 
     by_key
     |> Enum.map(fn {key, entries} ->
-      current_vid = current_version(Enum.map(entries, fn {_k, vid, _ep} -> vid end))
+      vids = entries |> Enum.map(fn {_k, vid, _ep} -> vid end) |> Enum.uniq()
+      current_vid = current_version(bucket, key, vids, opts)
       endpoints_with_current = endpoint_count_for_version(entries, current_vid)
       {key, current_vid, endpoints_with_current}
     end)
@@ -391,15 +395,81 @@ defmodule Maxio.Listing do
   defp versions_root(drive, bucket), do: Path.join([drive, @versions_prefix, bucket])
 
   @doc """
-  当前版本语义（单一事实来源，B5-2 起 public 供 scanner 复用）：ULID 字典序 = 时间序，
-  max ULID = newest（null 作为对等参与）。仅 null（无任何 ULID）→ null 即当前；
-  有 ULID → 取字典序最大者（晚于 null 写的版本胜出）。
+  当前版本语义（单一事实来源：读权威 `discover_current_version`、LIST 每 key 当前版本收敛、
+  B5-2 scanner `reconcile_key` 共用）——**写时间序**，对齐 MinIO `sortByModTime`/`sortsBefore`
+  （cmd/xl-storage-format-v2.go：versions 严格按 ModTime 降序，index 0 = latest，**与
+  version-id 形态无关**）与 AWS「the delete marker becomes the current version of the object」
+  （含 versioning-suspended 桶对既有真实版本写 null marker / null 版本的场景）：
+
+    * 纯 ULID 候选：ULID 字典序 = 生成时间序（48-bit ms 前缀），max ULID = newest（零读盘）。
+    * 仅 "null"：null 即当前。
+    * "null" 与 ULID 并存（Suspended 桶带 Enabled 历史）：**必须比真实写时间**——null 版本 /
+      null delete marker 的写时间只存在于其盘上 sidecar entry 的 `modtime`（int64 纳秒），与
+      max-ULID 的 sidecar modtime 比较（该 sidecar 暂不可读时回退 ULID 自带 ms 时间戳下界），
+      晚写者胜；平手 ULID 胜（与 MinIO sortsBefore 在 ModTime 并列时的确定性 tiebreak 同旨）。
+      **绝不再无条件剔除 "null"**——那会让后写的 null delete marker / null 版本永远当不上当前
+      版本：Suspended DELETE 后 GET 仍 200、LIST 仍列出（已删对象复活），且 scanner 会把正确的
+      PG marker latest 翻回旧 ULID 版本（B5-2 审计 critical/high）。
+
+  null 的 sidecar modtime 不可读（端点全失败 / 旧 v1 扁平 meta 无 modtime）→ 保守取 max ULID
+  （结构化降级，绝不猜）。空候选 → nil。
   """
-  @spec current_version([String.t()]) :: String.t()
-  def current_version(vids) do
+  @spec current_version(String.t(), String.t(), [String.t()], keyword()) :: String.t() | nil
+  def current_version(bucket, key, vids, opts) do
     case Enum.reject(vids, &(&1 == "null")) do
-      [] -> "null"
-      ulids -> Enum.max(ulids)
+      [] ->
+        if vids == [], do: nil, else: "null"
+
+      ulids ->
+        max_ulid = Enum.max(ulids)
+
+        if "null" in vids do
+          pick_latest_of_null_and_ulid(bucket, key, max_ulid, opts)
+        else
+          max_ulid
+        end
+    end
+  end
+
+  # null 与 ULID 并存时的写时间序裁决：读两者 sidecar entry modtime（任一端点命中即可），
+  # null 严格更晚才胜出（平手 ULID 胜，确定性 tiebreak）。ULID sidecar 不可读 → 回退 ULID
+  # 自带 ms 时间戳（生成早于写完成，是 modtime 下界）；null modtime 不可读 → 保守取 ULID。
+  defp pick_latest_of_null_and_ulid(bucket, key, max_ulid, opts) do
+    transport = Transport.impl(opts)
+    null_mt = sidecar_version_modtime(transport, opts, bucket, key, "null")
+
+    ulid_mt =
+      sidecar_version_modtime(transport, opts, bucket, key, max_ulid) || ulid_floor_ns(max_ulid)
+
+    cond do
+      null_mt == nil -> max_ulid
+      ulid_mt != nil and null_mt <= ulid_mt -> max_ulid
+      true -> "null"
+    end
+  end
+
+  # ULID 生成时刻（ms → ns）。非法 ULID（版本树目录名理论上恒为合法 ULID）→ nil。
+  defp ulid_floor_ns(vid) do
+    case Maxio.Versioning.VersionId.timestamp_ms(vid) do
+      {:ok, ms} -> ms * 1_000_000
+      :error -> nil
+    end
+  end
+
+  # 任一端点读该版本 sidecar entry 的写时间（int64 纳秒）：v2 meta 取对应 version entry
+  # （缺位退 latest entry，version_entry/2 同源）；旧扁平 v1 meta 退顶层 "modtime"；都缺 → nil。
+  defp sidecar_version_modtime(transport, opts, bucket, key, vid) do
+    case current_version_meta(transport, opts, bucket, key, vid) do
+      nil ->
+        nil
+
+      meta ->
+        entry = version_entry(meta, vid)
+
+        case entry["modtime"] || meta["modtime"] do
+          ns when is_integer(ns) -> ns
+          _ -> nil
+        end
     end
   end
 

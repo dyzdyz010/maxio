@@ -317,23 +317,18 @@ defmodule Maxio.S3.Handlers.Object do
 
     cond do
       version_id != nil ->
-        # 永久删除指定版本（含 delete marker）。
-        case Objects.delete_version(bucket, key, version_id) do
-          {:ok, %{was_delete_marker: dm?}} ->
-            _ = Storage.delete(bucket, key, version_id)
-            Log.info("delete object version", action: :delete_object, bucket: bucket, key: key)
+        # 永久删除指定版本（含 delete marker）。ROUTE B fidelity：按写权威分流的单一提交路径
+        # commit_version_delete（:sidecar → 盘上 quorum 删除即权威提交，quorum 不足 503 绝不 204；
+        # :pg → PG 删行权威先行），与 DeleteObjects 的 do_delete_one 共用。幂等：不存在也 204。
+        %{was_delete_marker: dm?} = commit_version_delete(bucket, key, version_id)
+        Log.info("delete object version", action: :delete_object, bucket: bucket, key: key)
 
-            conn
-            |> put_resp_header("x-amz-version-id", version_id)
-            |> then(fn c ->
-              if dm?, do: put_resp_header(c, "x-amz-delete-marker", "true"), else: c
-            end)
-            |> send_resp(204, "")
-
-          {:error, :not_found} ->
-            # 幂等：删不存在的版本也回 204（对齐 AWS）。
-            conn |> put_resp_header("x-amz-version-id", version_id) |> send_resp(204, "")
-        end
+        conn
+        |> put_resp_header("x-amz-version-id", version_id)
+        |> then(fn c ->
+          if dm?, do: put_resp_header(c, "x-amz-delete-marker", "true"), else: c
+        end)
+        |> send_resp(204, "")
 
       versioning in ["Enabled", "Suspended"] ->
         # 插入 delete marker（Enabled 新 ULID；Suspended null）。ROUTE B B5-0：先盘上落
@@ -446,15 +441,11 @@ defmodule Maxio.S3.Handlers.Object do
   defp do_delete_one(bucket, key, version_id, versioning) do
     cond do
       version_id != nil ->
-        # 永久删指定版本（含 delete marker）。幂等：删不存在的版本也算成功。
-        case Objects.delete_version(bucket, key, version_id) do
-          {:ok, %{was_delete_marker: dm?}} ->
-            _ = Storage.delete(bucket, key, version_id)
-            {:ok, %{key: key, version_id: version_id, delete_marker: dm?}}
-
-          {:error, :not_found} ->
-            {:ok, %{key: key, version_id: version_id, delete_marker: false}}
-        end
+        # 永久删指定版本（含 delete marker）。幂等：删不存在的版本也算成功。ROUTE B fidelity：
+        # 与单删 delete/1 同一 commit_version_delete 提交路径（:sidecar 写权威下盘上 quorum 删除
+        # 即权威提交；quorum 不足上抛 SlowDownWrite，由 delete_one 的 rescue 降为该 key 的 <Error>）。
+        %{was_delete_marker: dm?} = commit_version_delete(bucket, key, version_id)
+        {:ok, %{key: key, version_id: version_id, delete_marker: dm?}}
 
       versioning in ["Enabled", "Suspended"] ->
         # 无 VersionId 且版本化桶 → 插 delete marker（绝不硬删历史版本）。ROUTE B B5-0：与单删
@@ -746,6 +737,122 @@ defmodule Maxio.S3.Handlers.Object do
       {:error, :locked} ->
         raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
     end
+  end
+
+  # ROUTE B fidelity —— DELETE ?versionId 永久删除指定版本，按写权威分流（镜像 B5-0
+  # commit_delete_marker 的提交 split，铁律 2 单一提交路径：单删 delete/1 与批量 do_delete_one 共用）。
+  #
+  # 根因（B5-2 审计 high）：版本删除从前 PG-first（Objects.delete_version 权威、盘上删除结果静默
+  # 丢弃；PG 行缺失时甚至完全不触盘就回 204）→ `authoritative_source(:write)=:sidecar` 下盘上才是
+  # 权威介质，「204 但权威盘上版本仍在」会被 B5-2 scanner forward 从幸存 sidecar 忠实 re-upsert 回
+  # PG（**已永久删除的版本复活**），且 reverse-GC「盘上确有 → 绝不删」守恒保证该行永不消失。
+  #
+  #   * `:sidecar` → 盘上版本目录的 quorum 删除即权威提交（`Storage.delete_version`：确认删除 =
+  #     端点可达且版本目录显式 missing，≥ write_quorum 端点确认才 :ok；不足 →
+  #     {:error,:write_quorum} → 503 SlowDownWrite，**绝不在权威介质仍持有该版本时回 204**——对齐
+  #     MinIO DeleteVersion 的 write-quorum 语义：errErasureWriteQuorum → ErrSlowDownWrite，
+  #     cmd/api-errors.go）。PG 行删除降 best-effort 索引维护（Objects.delete_version_index，失败
+  #     Log.error 非致命，scanner reverse-GC 后续收敛）。x-amz-delete-marker 响应头的 marker 性经
+  #     读权威单一入口（ObjectMeta.get）在删除前 best-effort 判定（删的是 marker 时回 true，对齐 AWS）。
+  #   * `:pg`（默认）→ 维持既有语义：Objects.delete_version 权威先行（{:error,:not_found} 幂等
+  #     204、不触盘——PG 即事实来源，无行 = 版本不存在）；盘上字节删除 best-effort 但结果**不再
+  #     静默丢弃**（失败 Log.warn 归因，铁律 3 不静默；PG 权威下盘上残留对读/列不可见，仅垃圾字节）。
+  #
+  # 幂等：版本不存在（盘上全端点显式 missing / PG 无行）也回 204（对齐 AWS）。
+  # 获锁失败 → 503 SlowDown；盘 quorum 不足 → 503 SlowDownWrite（铁律 3）。
+  defp commit_version_delete(bucket, key, version_id) do
+    result =
+      Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        case Maxio.ObjectMeta.authoritative_source(:write) do
+          :sidecar -> commit_version_delete_sidecar(bucket, key, version_id)
+          _pg -> commit_version_delete_pg(bucket, key, version_id)
+        end
+      end)
+
+    case result do
+      {:ok, {:ok, dm?}} ->
+        %{was_delete_marker: dm?}
+
+      {:ok, {:error, reason}} when reason in [:write_quorum, :rename_busy] ->
+        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+
+      {:ok, {:error, reason}} ->
+        raise Error.new(:internal_error, message: inspect(reason))
+
+      {:error, :locked} ->
+        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  # :sidecar 写权威：盘上版本目录的 quorum 删除即权威提交；PG 行删除 best-effort 索引维护。
+  # marker 性在删除前判定（删后盘上无从判定）。{:error,:invalid_key}（路径守卫拒绝的 key 在盘上
+  # 不可能存在任何版本）→ 视同不存在（幂等 204，对齐 AWS 删除不存在版本）。
+  defp commit_version_delete_sidecar(bucket, key, version_id) do
+    dm? = version_is_delete_marker?(bucket, key, version_id)
+
+    case Storage.delete_version(bucket, key, version_id) do
+      :ok ->
+        case Objects.delete_version_index(bucket, key, version_id) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Log.error(
+              "pg version-delete index update failed (version durably deleted on disk quorum)",
+              action: :delete_object,
+              bucket: bucket,
+              key: key,
+              reason: inspect(reason)
+            )
+        end
+
+        {:ok, dm?}
+
+      {:error, :invalid_key} ->
+        {:ok, false}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # :pg（默认）写权威：PG 删行权威先行（既有语义/状态码不变）；盘上字节删除 best-effort 但失败
+  # 必 Log.warn 归因（绝不再静默丢弃结果，铁律 3）。
+  defp commit_version_delete_pg(bucket, key, version_id) do
+    case Objects.delete_version(bucket, key, version_id) do
+      {:ok, %{was_delete_marker: dm?}} ->
+        case Storage.delete(bucket, key, version_id) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Log.warn("version bytes delete failed after authoritative PG row delete (left for GC)",
+              action: :delete_object,
+              bucket: bucket,
+              key: key,
+              reason: inspect(reason)
+            )
+        end
+
+        {:ok, dm?}
+
+      {:error, :not_found} ->
+        # 幂等：删不存在的版本也回 204（对齐 AWS）。:pg 权威下 PG 即事实来源，无行 = 版本不存在。
+        {:ok, false}
+    end
+  end
+
+  # marker 性 best-effort 判定（仅响应头 x-amz-delete-marker 用）：经读权威单一入口取该版本视图；
+  # 取不到（not_found / read_quorum / 任何异常）→ false（头缺省，绝不阻断删除本身）。
+  defp version_is_delete_marker?(bucket, key, version_id) do
+    case Maxio.ObjectMeta.get(bucket, key, version_id, []) do
+      %Objects.Object{is_delete_marker: dm?} -> dm? == true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  catch
+    _, _ -> false
   end
 
   # :sidecar 写权威：盘上 marker sidecar 即权威提交。Suspended 的 null 替换必须删在写前

@@ -16,9 +16,10 @@ defmodule Maxio.Storage.Scanner do
          * quorum 不足/分歧 → 计 divergent + 日志，**绝不写**（铁律 3 绝不在分歧中挑一个）。
        **is_latest 跨版本收敛**：方案 B 每版本独立 sidecar，entry 的 is_latest 是**写时缓存**
        （旧版本 sidecar 不会因新版本写入而更新，跨版本可能多个 true）。scanner 以
-       `Maxio.Listing.current_version/1`（与读权威 `discover_current_version` 同一语义源）跨版本
-       判定当前版本，按其覆盖 entry is_latest 后再比对/upsert——PG 的 latest 标记向「盘上版本集
-       整体」收敛，与处理顺序无关。
+       `Maxio.Listing.current_version/4`（与读权威 `discover_current_version` 同一语义源；
+       写时间序——null 与 ULID 并存比 sidecar modtime，晚写的 null marker/版本胜出，对齐 MinIO
+       sortByModTime / AWS suspended-bucket delete marker 语义）跨版本判定当前版本，按其覆盖
+       entry is_latest 后再比对/upsert——PG 的 latest 标记向「盘上版本集整体」收敛，与处理顺序无关。
     2. **reverse-GC（PG → 盘）**：每桶 keyset 分页（batch_size）扫 PG 行，forward 未在盘上见过的
        行逐端点经 `list_dir` 探针确认：**仅当所有端点全部可达且全部显式 missing**（版本目录无
        meta.json——meta.json 即版本记录本体，对齐 MinIO xl.meta）→ 删该 PG 行 + 日志
@@ -251,9 +252,11 @@ defmodule Maxio.Storage.Scanner do
   defp reconcile_key(bucket, key, dry_run, opts, {counts, seen}) do
     vids = Listing.version_ids(bucket, key, opts)
 
-    # 当前版本跨版本判定（与读权威 discover_current_version 同一语义源）：entry 的 is_latest 是
-    # 写时缓存（每版本独立 sidecar，跨版本可能多个 true），PG latest 必须向版本集整体收敛。
-    current_vid = Listing.current_version(vids)
+    # 当前版本跨版本判定（与读权威 discover_current_version 同一语义源，current_version/4 写时间序：
+    # null 与 ULID 并存比 sidecar modtime，晚写的 null marker/版本胜出——绝不把正确的 PG marker
+    # latest 翻回旧 ULID 版本）：entry 的 is_latest 是写时缓存（每版本独立 sidecar，跨版本可能
+    # 多个 true），PG latest 必须向版本集整体收敛。
+    current_vid = Listing.current_version(bucket, key, vids, opts)
 
     Enum.reduce(vids, {counts, seen}, fn vid, {c, s} ->
       c2 = reconcile_version(bucket, key, vid, vid == current_vid, dry_run, opts, c)

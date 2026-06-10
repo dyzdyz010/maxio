@@ -70,4 +70,15 @@ defmodule Maxio.Storage do
           :ok | {:error, term()}
   def put_delete_marker(bucket, key, version_id, entry_opts \\ [], opts \\ []),
     do: backend().put_delete_marker(bucket, key, version_id, entry_opts, opts)
+
+  @doc """
+  ROUTE B fidelity —— DELETE ?versionId 的**权威盘上版本删除**（quorum 确认才 `:ok`，见
+  `Maxio.Storage.Backend.delete_version/4`）。与 `delete/3`（best-effort 清理删除，无 quorum 语义、
+  恒 `:ok`）不同：本函数用于 `authoritative_source(:write)=:sidecar` 下「盘上删除即权威提交」，
+  quorum 不足 → `{:error, :write_quorum}`（handler 映射 503 SlowDownWrite，绝不静默 204）。
+  `opts` 透传给后端（test 经 `:transport`/`:topology` 注入）。
+  """
+  @spec delete_version(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def delete_version(bucket, key, version_id, opts \\ []),
+    do: backend().delete_version(bucket, key, version_id, opts)
 end

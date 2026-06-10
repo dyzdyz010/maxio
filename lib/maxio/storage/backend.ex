@@ -117,4 +117,30 @@ defmodule Maxio.Storage.Backend do
               entry_opts :: keyword(),
               opts :: keyword()
             ) :: :ok | {:error, term()}
+
+  # ── 版本永久删除回调（ROUTE B fidelity：DELETE ?versionId 在 sidecar 写权威下的权威提交）──
+
+  @doc """
+  永久删除 `version_id` 的盘上版本记录（版本 obj-dir：meta.json + 字节分片），**quorum 确认**才 `:ok`。
+
+  根因：DELETE ?versionId 从前 PG-first、盘上删除结果被静默丢弃（PG 行缺失时甚至完全不触盘）——
+  `authoritative_source(:write)=:sidecar` 下盘上才是权威介质，「客户端拿到 204 但权威盘上版本仍在」
+  会被 B5-2 scanner forward 从幸存 sidecar 忠实 re-upsert 回派生索引（**已永久删除的版本复活**），
+  且 reverse-GC 的「盘上确有 → 绝不删」守恒保证该行永不消失。删除是写操作，必须在权威介质上
+  quorum 提交（与 `put_delete_marker/5` 的 B5-0 既定原则同源）。
+
+  确认语义（必须结构性区分「已删除」与「端点不可达」——transport 的 `delete_shard` 把宕机塌缩成
+  `:ok`，绝不可直接计数）：每端点先删版本 obj-dir，再经 `list_dir` 探针确认「端点可达且版本目录
+  显式 missing（无 meta.json——meta.json 即版本记录本体）」；确认端点数 ≥ write_quorum → `:ok`，
+  否则 `{:error, :write_quorum}`（handler 回 503 SlowDownWrite，绝不在权威介质仍持有该版本时宣告
+  删除成功）。幂等：版本本就不存在的端点同样计入确认（对齐 AWS 删除不存在版本回 204）。
+
+  对齐 MinIO DeleteObject/DeleteVersion 的 write-quorum 语义（cmd/erasure-object.go；quorum 不足 →
+  errErasureWriteQuorum → ErrSlowDownWrite，cmd/api-errors.go——绝不返回成功后又被 scanner/healer 复活）。
+
+  **FS 后端**（单副本本地盘）：唯一副本的删除即权威提交（rm 成功 / 本就不存在 → `:ok`；IO 错误 →
+  `{:error, term}`）。
+  """
+  @callback delete_version(bucket(), key(), version_id :: String.t(), opts :: keyword()) ::
+              :ok | {:error, :write_quorum | term()}
 end

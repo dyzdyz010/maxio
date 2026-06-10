@@ -72,6 +72,13 @@ defmodule Maxio.Storage.FS do
   def put_delete_marker(_bucket, _key, _version_id, _entry_opts, _opts),
     do: {:error, :not_supported}
 
+  # ROUTE B fidelity —— DELETE ?versionId 的权威删除（Backend.delete_version/4 契约）。FS 单副本
+  # 本地盘：唯一副本的删除即权威提交（无 quorum 语义）——rm 成功 / 本就不存在 → :ok（幂等）；
+  # IO 错误 → {:error, term}（handler 据此绝不回 204，铁律 3 不静默）。
+  @impl true
+  def delete_version(bucket, key, version_id \\ "null", opts \\ []),
+    do: do_delete(bucket, key, version_id, opts)
+
   defp do_put(bucket, key, version_id, chunks, opts) do
     with {:ok, path} <- object_path(bucket, key, version_id, opts) do
       # B1-2 原子提交：先流式写同卷 temp 文件，fsync，再原子 rename 覆盖 final（crash 前 final 保旧值/缺失）。

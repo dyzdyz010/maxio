@@ -22,6 +22,34 @@ defmodule Maxio.Versioning.VersionId do
   @spec null_sentinel() :: String.t()
   def null_sentinel, do: "null"
 
+  @doc """
+  解析 ULID 的 48-bit 毫秒时间戳（前 10 字符 Crockford base32 = 2 个 pad 0 bit + 48-bit ms）。
+
+  用于跨版本「当前版本」写时间序比较（`Maxio.Listing.current_version/4`）：盘上 sidecar modtime
+  暂不可读时的回退**下界**——ULID 在写入前生成，其时间戳 ≤ 写完成 modtime。
+  非 26 字符 / 含非 Crockford 字符（含保留串 "null"，其无时间戳语义）→ `:error`（绝不猜）。
+  """
+  @spec timestamp_ms(String.t()) :: {:ok, non_neg_integer()} | :error
+  def timestamp_ms(<<head::binary-size(10), _rest::binary-size(16)>>) do
+    head
+    |> String.to_charlist()
+    |> Enum.reduce_while({:ok, 0}, fn ch, {:ok, acc} ->
+      case decode_char(ch) do
+        {:ok, v} -> {:cont, {:ok, acc * 32 + v}}
+        :error -> {:halt, :error}
+      end
+    end)
+  end
+
+  def timestamp_ms(_other), do: :error
+
+  defp decode_char(ch) do
+    case Enum.find_index(@crockford, &(&1 == ch)) do
+      nil -> :error
+      idx -> {:ok, idx}
+    end
+  end
+
   # 把 128-bit 整数编码为 26 字符 Crockford base32（高位在前）。
   defp encode(int) do
     # 26 * 5 = 130 bit；左侧补 2 个 0 bit 到 130 再切 26 组。

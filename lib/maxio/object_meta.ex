@@ -155,7 +155,8 @@ defmodule Maxio.ObjectMeta do
   # 解析 read=:sidecar 下的「有效落盘版本 + reconcile target」。
   #   * 显式 versionId（is_binary）→ 直接走该版本（target = {:version, vid}）。
   #   * latest（nil）→ 经 `Maxio.Listing.discover_current_version` 跨端点走盘发现当前版本
-  #     （max ULID = newest，null 为对等；reuse list 权威同一版本发现逻辑，去 PG SPOF）。
+  #     （current_version/4 写时间序：纯 ULID 集 max ULID = newest；null 与 ULID 并存比 sidecar
+  #     modtime，晚写的 null marker/版本胜出；reuse list 权威同一版本发现逻辑，去 PG SPOF）。
   #     - 发现到 ULID 当前版本 → {vid, {:version, vid}}（在该版本路径做 quorum 仲裁）。
   #     - 发现到 "null"（Unversioned 当前布局）→ {"null", :latest}（null 路径 meta 的 latest entry）。
   #     - 盘上无任何版本（nil）→ {"null", :latest}（读空 null 路径 → all-missing → not_found，
