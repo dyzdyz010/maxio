@@ -826,7 +826,8 @@ defmodule Maxio.S3.Handlers.Object do
             :ok
 
           {:error, reason} ->
-            Log.warn("version bytes delete failed after authoritative PG row delete (left for GC)",
+            Log.warn(
+              "version bytes delete failed after authoritative PG row delete (left for GC)",
               action: :delete_object,
               bucket: bucket,
               key: key,

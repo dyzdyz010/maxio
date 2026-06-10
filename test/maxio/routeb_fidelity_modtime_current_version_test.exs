@@ -91,7 +91,13 @@ defmodule Maxio.RouteBFidelityModtimeCurrentVersionTest do
 
   defp real_put(topo, key, version_id, body) do
     {:ok, %{etag: etag}} =
-      Storage.put(@bucket, key, version_id, [body], [object_meta: object_meta()] ++ put_opts(topo))
+      Storage.put(
+        @bucket,
+        key,
+        version_id,
+        [body],
+        [object_meta: object_meta()] ++ put_opts(topo)
+      )
 
     etag
   end

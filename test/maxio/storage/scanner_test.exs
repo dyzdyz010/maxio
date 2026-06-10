@@ -314,7 +314,9 @@ defmodule Maxio.Storage.ScannerTest do
         Objects.put_version_with_id(@bucket, "k-gate-ghost", vid, %{size: 1, etag: "\"g\""})
 
       {result, log} =
-        with_log(fn -> Scanner.run_once(transport: InProcess, topology: topo, bucket: @bucket) end)
+        with_log(fn ->
+          Scanner.run_once(transport: InProcess, topology: topo, bucket: @bucket)
+        end)
 
       assert {:ok, report} = result
       assert report.status == :authority_mismatch
