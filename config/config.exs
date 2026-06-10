@@ -117,6 +117,12 @@ config :maxio, :listing, sql_hard_limit: 100_000
 # PG 故障非致命：记 Log.error + 不回滚字节 + 请求仍成功，去 PG 写路径 SPOF）。
 config :maxio, :authoritative_source, read: :pg, list: :pg, write: :pg
 
+# ROUTE B B5-1 PREFER 索引读门控（默认关）：仅当 authoritative_source(:read)=:sidecar 时生效——
+# true → 单对象读先查 PG 派生索引（scanner 维护新鲜度），命中即返回（快路径），miss 走盘 sidecar；
+# false（默认）→ 纯走盘正确性优先。P7-3 cutover 经 shadow 驱零取证后才开。
+# LIST 的 PREFER 显式 defer 到 P7（续点 token 形态不同，见 Maxio.ObjectMeta.list/3）。
+config :maxio, :read_prefer_index, false
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

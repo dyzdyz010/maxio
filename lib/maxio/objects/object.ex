@@ -23,6 +23,11 @@ defmodule Maxio.Objects.Object do
     field :sse_algorithm, :string
     field :sse_envelope, :map
 
+    # ROUTE B B5-1 —— PG 派生索引同步追踪：synced_at = 最后一次与盘上 sidecar 权威确认同步的时刻
+    # （NULL=尚未经 scanner 确认）；index_generation = 同步时对应的 sidecar 版本 generation（判 stale 用）。
+    field :synced_at, :utc_datetime_usec
+    field :index_generation, :integer, default: 0
+
     belongs_to :bucket, Maxio.Buckets.Bucket
 
     timestamps(type: :utc_datetime_usec)
@@ -43,7 +48,9 @@ defmodule Maxio.Objects.Object do
     :is_delete_marker,
     :tags,
     :sse_algorithm,
-    :sse_envelope
+    :sse_envelope,
+    :synced_at,
+    :index_generation
   ]
   # etag 仅对真实对象版本必填；delete marker 无字节、无 etag（空串），故 etag 从必填中排除。
   @required [:bucket_id, :bucket_name, :key, :size]

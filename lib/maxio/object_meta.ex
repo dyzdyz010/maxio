@@ -55,6 +55,12 @@ defmodule Maxio.ObjectMeta do
         - sidecar 路径完全不可达（无拓扑 / object_rel 非法 / 读 sidecar 抛异常）→ 降级 PG fallback +
           `Log.warn`（绝不因 sidecar 不可达而让对象读不出，PG 索引兜底）。
 
+  ROUTE B B5-1 —— PREFER 索引读门控（默认关）：`:read==:sidecar` **且** `read_prefer_index==true`
+  （opts[:read_prefer_index] 覆盖优先，缺省读 `config :maxio, :read_prefer_index`，默认 false）时：
+  先 `pg_read` 派生索引（scanner 维护新鲜度），命中即返回（快路径，免跨端点 reconcile）；
+  miss → 走盘 `sidecar_read`（权威，现有路径）。默认 false = 纯走盘正确性优先，
+  P7-3 cutover 经 shadow 驱零取证后才开。
+
   version_id=nil 读 latest；否则读指定版本。
   """
   @spec get(String.t(), String.t(), String.t() | nil, keyword()) ::
@@ -62,12 +68,44 @@ defmodule Maxio.ObjectMeta do
   def get(bucket, key, version_id \\ nil, opts \\ []) do
     case authoritative_source(:read, opts) do
       :sidecar ->
-        sidecar_read(bucket, key, version_id, opts)
+        if read_prefer_index?(opts) do
+          prefer_index_read(bucket, key, version_id, opts)
+        else
+          sidecar_read(bucket, key, version_id, opts)
+        end
 
       _pg ->
         pg = pg_read(bucket, key, version_id)
         shadow_check(bucket, key, version_id, pg, opts)
         pg
+    end
+  end
+
+  # B5-1 —— PREFER 索引快路径：PG 命中即返回；miss → 盘上 sidecar 权威（现有路径）。
+  # PG 异常（DB down 等）绝不让读失败——盘上才是权威，PG 仅派生索引快路径：降级 sidecar_read +
+  # Log.warn（去 PG 读路径 SPOF，铁律 3 不静默）。
+  defp prefer_index_read(bucket, key, version_id, opts) do
+    case pg_read(bucket, key, version_id) do
+      %Objects.Object{} = obj -> obj
+      {:error, :not_found} -> sidecar_read(bucket, key, version_id, opts)
+    end
+  rescue
+    e ->
+      Log.warn("prefer-index pg read failed, falling back to sidecar authority",
+        bucket: bucket,
+        key: key,
+        reason: inspect(e)
+      )
+
+      sidecar_read(bucket, key, version_id, opts)
+  end
+
+  # PREFER 门控开关：opts[:read_prefer_index]（test/调用方逐请求覆盖，显式 false 可压过全局 true）
+  # 优先；缺省读 config :maxio, :read_prefer_index（默认 false = 行为不变）。
+  defp read_prefer_index?(opts) do
+    case Keyword.get(opts, :read_prefer_index) do
+      nil -> Application.get_env(:maxio, :read_prefer_index, false) == true
+      v -> v == true
     end
   end
 
@@ -386,6 +424,10 @@ defmodule Maxio.ObjectMeta do
   def list(bucket, list_opts, opts \\ []) do
     case authoritative_source(:list, opts) do
       :sidecar ->
+        # ROUTE B B5-1：LIST 的 PREFER 索引快路径**显式 defer 到 P7**（路线图既定，绝不静默）——
+        # 续点 token 形态不同：PG SQL 的 continuation token 是 key 游标、drive-walk 是版本树游标，
+        # 混读两源会产生不可续的分页断点。read_prefer_index 仅作用于单对象 get/4；
+        # LIST 在 :sidecar 权威下恒走盘（正确性优先）。
         Maxio.Listing.list_objects_v2(bucket, list_opts, Keyword.put(opts, :require_quorum, true))
 
       _pg ->

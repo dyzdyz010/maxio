@@ -8,7 +8,28 @@ defmodule Maxio.Objects do
   alias Maxio.Repo
   alias Maxio.Buckets
   alias Maxio.Objects.Object
+  alias Maxio.Sidecar
   alias Maxio.Versioning.VersionId
+
+  # ROUTE B B5-1 —— reconcile upsert 的 on_conflict 全字段替换集：scanner 以盘上 sidecar 为权威
+  # 收敛 PG 行，**所有读可见字段**都必须被替换（含 tags/sse/metadata——与写路径 upsert 的最小替换集
+  # 不同：写路径各字段由请求显式给出，reconcile 则须整行向 sidecar 收敛），外加同步追踪列。
+  @reconcile_replace [
+    :size,
+    :etag,
+    :content_type,
+    :metadata,
+    :storage_class,
+    :acl_canned,
+    :tags,
+    :sse_algorithm,
+    :sse_envelope,
+    :is_latest,
+    :is_delete_marker,
+    :synced_at,
+    :index_generation,
+    :updated_at
+  ]
 
   @type list_opts :: %{
           optional(:prefix) => String.t(),
@@ -47,7 +68,11 @@ defmodule Maxio.Objects do
         acl_canned: Map.get(attrs, :acl_canned, "private"),
         version_id: "null",
         is_latest: true,
-        is_delete_marker: false
+        is_delete_marker: false,
+        # ROUTE B B5-1：写穿即视作与盘上 sidecar 同步（写路径盘先 PG 后，提交时盘上已权威落盘）；
+        # generation 来自 attrs（MPU complete 当前恒缺省 0），B5-2 scanner 据此判 stale。
+        synced_at: DateTime.utc_now(),
+        index_generation: Map.get(attrs, :generation, 0)
       }
 
       Repo.transaction(fn ->
@@ -68,6 +93,8 @@ defmodule Maxio.Objects do
                  :acl_canned,
                  :is_latest,
                  :is_delete_marker,
+                 :synced_at,
+                 :index_generation,
                  :updated_at
                ]},
             conflict_target: [:bucket_id, :key, :version_id]
@@ -76,6 +103,26 @@ defmodule Maxio.Objects do
         obj
       end)
     end
+  end
+
+  @doc """
+  ROUTE B B5-1 —— best-effort 索引写（与 put_metadata/3 同参数/同语义，但捕获异常返回
+  `{:error, term}` 而非抛出，成功归一为 `:ok`）。
+
+  用于 `authoritative_source(:write) == :sidecar` 的 CompleteMultipartUpload：盘上 assemble 已写出
+  权威 maxio/2 sidecar（达 write_quorum），PG 仅作派生索引，故 PG 写失败**非致命**——调用方据
+  `:ok | {:error, reason}` 记 Log.error 而非让 Complete 失败（去 PG 写路径 SPOF，铁律 3 绝不静默）。
+  `:pg` 默认权威仍走 put_metadata/3 的致命语义。与 put_version_index/4、insert_delete_marker_index/3
+  同一 `*_index` best-effort 包装契约。
+  """
+  @spec put_metadata_index(String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def put_metadata_index(bucket_name, key, attrs) do
+    case put_metadata(bucket_name, key, attrs) do
+      {:ok, _obj} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, e}
   end
 
   @doc "更新对象的 canned ACL（PutObjectAcl）。对象不存在 → :not_found。"
@@ -190,7 +237,11 @@ defmodule Maxio.Objects do
           etag: Map.fetch!(attrs, :etag),
           version_id: version_id,
           is_latest: true,
-          is_delete_marker: false
+          is_delete_marker: false,
+          # ROUTE B B5-1：写穿即视作与盘上 sidecar 同步（写路径盘先 PG 后，提交时盘上已权威落盘）；
+          # generation 来自 attrs（PUT/Copy 路径当前恒缺省 0），B5-2 scanner 据此判 stale。
+          synced_at: DateTime.utc_now(),
+          index_generation: Map.get(attrs, :generation, 0)
         })
 
       Repo.transaction(fn ->
@@ -210,6 +261,8 @@ defmodule Maxio.Objects do
                     :acl_canned,
                     :is_latest,
                     :is_delete_marker,
+                    :synced_at,
+                    :index_generation,
                     :updated_at
                   ]},
                conflict_target: [:bucket_id, :key, :version_id]
@@ -273,7 +326,10 @@ defmodule Maxio.Objects do
         etag: "",
         version_id: version_id,
         is_latest: true,
-        is_delete_marker: true
+        is_delete_marker: true,
+        # ROUTE B B5-1：写穿即视作同步；delete marker sidecar entry generation 恒 0（B5-0 既定）。
+        synced_at: DateTime.utc_now(),
+        index_generation: 0
       }
 
       Repo.transaction(fn ->
@@ -283,7 +339,17 @@ defmodule Maxio.Objects do
           %Object{}
           |> Object.changeset(base)
           |> Repo.insert(
-            on_conflict: {:replace, [:size, :etag, :is_latest, :is_delete_marker, :updated_at]},
+            on_conflict:
+              {:replace,
+               [
+                 :size,
+                 :etag,
+                 :is_latest,
+                 :is_delete_marker,
+                 :synced_at,
+                 :index_generation,
+                 :updated_at
+               ]},
             conflict_target: [:bucket_id, :key, :version_id]
           )
       end)
@@ -310,6 +376,105 @@ defmodule Maxio.Objects do
   rescue
     e -> {:error, e}
   end
+
+  @doc """
+  ROUTE B B5-1 —— 标记某 PG 索引行已与盘上 sidecar 权威确认同步（B5-2 Scanner 契约函数）。
+  更新 synced_at=now、index_generation=generation；**不**触碰 updated_at（同步确认不是对象内容变更，
+  绝不漂移 Last-Modified 语义）。行不存在 → {:error, :not_found}。
+  """
+  @spec mark_synced(String.t(), String.t(), String.t(), integer()) :: :ok | {:error, :not_found}
+  def mark_synced(bucket_name, key, version_id, generation) when is_integer(generation) do
+    {count, _} =
+      from(o in Object,
+        where: o.bucket_name == ^bucket_name and o.key == ^key and o.version_id == ^version_id
+      )
+      |> Repo.update_all(set: [synced_at: DateTime.utc_now(), index_generation: generation])
+
+    if count > 0, do: :ok, else: {:error, :not_found}
+  end
+
+  @doc """
+  ROUTE B B5-1 —— 以盘上 sidecar 权威版本 entry 收敛 PG 派生索引行（B5-2 Scanner 契约函数）。
+
+  `Sidecar.to_object_attrs/3` 把 entry 翻成行 attrs 后按 (bucket_id,key,version_id) upsert
+  **全读可见字段**（`@reconcile_replace`，含 tags/sse/metadata/is_latest/is_delete_marker——
+  reconcile 必须整行向盘收敛，与写路径请求驱动的最小替换集不同），并在**同一 upsert 内**置
+  synced_at=now、index_generation=entry generation（mark_synced 语义原子融合，免二次往返/部分更新窗口）。
+  entry is_latest=true 时先 unset 该 key 其余 latest 行（与写路径同事务语义）；is_latest=false
+  （历史版本 reconcile）不触碰其他行。
+
+  best-effort 契约（scanner 逐版本调用，单行失败绝不炸整轮）：成功 `:ok`；桶缺失
+  `{:error, :no_such_bucket}`；changeset/DB 异常 → `{:error, term}`（绝不抛，铁律 3 由调用方记日志）。
+  """
+  @spec reconcile_from_sidecar(String.t(), String.t(), Sidecar.version_entry()) ::
+          :ok | {:error, term()}
+  def reconcile_from_sidecar(bucket_name, key, %{} = entry) do
+    with {:ok, bucket} <- bucket_or_error(bucket_name) do
+      attrs = Sidecar.to_object_attrs(bucket_name, key, entry)
+
+      base =
+        Map.merge(attrs, %{
+          bucket_id: bucket.id,
+          bucket_name: bucket_name,
+          key: key,
+          synced_at: DateTime.utc_now(),
+          index_generation: entry_generation(entry)
+        })
+
+      result =
+        Repo.transaction(fn ->
+          if base[:is_latest], do: unset_latest(bucket.id, key)
+
+          case %Object{}
+               |> Object.changeset(base)
+               |> Repo.insert(
+                 on_conflict: {:replace, @reconcile_replace},
+                 conflict_target: [:bucket_id, :key, :version_id]
+               ) do
+            {:ok, _obj} -> :ok
+            {:error, cs} -> Repo.rollback(cs)
+          end
+        end)
+
+      case result do
+        {:ok, :ok} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  rescue
+    e -> {:error, e}
+  end
+
+  @doc """
+  ROUTE B B5-1 —— PG 索引行相对盘上 sidecar 权威 entry 是否过期（B5-2 Scanner 契约函数）。
+
+  比对 generation（row.index_generation vs entry generation）+ 读可见字段集（etag/size/content_type/
+  metadata/tags/storage_class/acl_canned/sse/is_latest/is_delete_marker——Sidecar.signature/1 身份
+  字段的 PG 可表达超集；modtime 无 PG 列不比，version_id 即查找键不比）。任一不一致 → true（stale，
+  scanner 走 reconcile_from_sidecar/3 收敛）。
+  """
+  @spec stale?(Object.t(), Sidecar.version_entry()) :: boolean()
+  def stale?(%Object{} = row, %{} = entry) do
+    attrs = Sidecar.to_object_attrs(row.bucket_name, row.key, entry)
+
+    # attrs 侧 to_object_attrs 已对 metadata/tags 兜底 %{}（绝不 nil）；row 侧列可空，须 || %{} 归一。
+    row.index_generation != entry_generation(entry) or
+      row.etag != attrs.etag or
+      row.size != attrs.size or
+      row.content_type != attrs.content_type or
+      (row.metadata || %{}) != attrs.metadata or
+      (row.tags || %{}) != attrs.tags or
+      row.storage_class != attrs.storage_class or
+      row.acl_canned != attrs.acl_canned or
+      row.sse_algorithm != attrs.sse_algorithm or
+      row.sse_envelope != attrs.sse_envelope or
+      row.is_latest != attrs.is_latest or
+      row.is_delete_marker != attrs.is_delete_marker
+  end
+
+  # sidecar 版本 entry 的 generation（缺失/非整数 → 0，与 Sidecar 排序键同兜底）。
+  defp entry_generation(%{"generation" => g}) when is_integer(g), do: g
+  defp entry_generation(_entry), do: 0
 
   @doc """
   永久删除某特定版本行（DELETE ?versionId）。删后若被删的是当时的 latest，则把该 key 余下

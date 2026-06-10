@@ -611,15 +611,25 @@ defmodule Maxio.S3.Handlers.Object do
             {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
           end
 
-        {:ok, obj} =
-          Objects.put_version_with_id(dest_bucket, dest_key, dest_version_id, %{
-            size: size,
-            etag: etag,
-            content_type: content_type,
-            storage_class: "STANDARD",
-            metadata: meta_map,
-            tags: tags
-          })
+        # ROUTE B B5-1：CopyObject 元数据提交收敛到与 do_put 同一 commit_metadata 分流
+        # （铁律 2 单一提交路径）：:pg（默认）→ put_version_with_id 致命（{:ok,obj} 匹配失败上抛），
+        # 字节级不变；:sidecar → put_version_index best-effort（失败 Log.error 非致命——目标 sidecar
+        # 已随 Storage.put 达 write_quorum 权威落盘）+ build_put_view 内存构造响应视图（不依赖 PG 读回）。
+        obj =
+          commit_metadata(
+            dest_bucket,
+            dest_key,
+            dest_version_id,
+            %{
+              size: size,
+              etag: etag,
+              content_type: content_type,
+              storage_class: "STANDARD",
+              metadata: meta_map,
+              tags: tags
+            },
+            :copy_object
+          )
 
         {size, etag, obj}
       end)
@@ -752,7 +762,7 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  # PG delete-marker 索引提交，按写权威分流（镜像 commit_metadata/4）：
+  # PG delete-marker 索引提交，按写权威分流（镜像 commit_metadata/5）：
   #   :sidecar → best-effort（盘上 marker 已权威）：失败 Log.error 不致命（铁律 3 绝不静默）。
   #   :pg（默认）→ 致命（PG 即权威）：insert_delete_marker_with_id 失败由内部 {:ok,_} 匹配失败上抛。
   defp commit_delete_marker_index(bucket, key, version_id) do
@@ -787,7 +797,10 @@ defmodule Maxio.S3.Handlers.Object do
   #     put_version_index best-effort：失败 -> Log.error（绝不静默，铁律 3）+ **不回滚字节、不失败请求**
   #     （对象耐久存于 sidecar，PG 索引滞后由后续 scanner reconcile）；响应视图由 version_id + 已知 attrs
   #     在内存构造（build_put_view，不依赖 PG 读回，去 PG 写/读回路径 SPOF）。
-  defp commit_metadata(bucket, key, version_id, attrs) do
+  #
+  # ROUTE B B5-1：CopyObject 也收敛到本分流单点（铁律 2），action 参数仅供结构化日志归因
+  # （:put_object / :copy_object），两路语义逐字一致。
+  defp commit_metadata(bucket, key, version_id, attrs, action \\ :put_object) do
     case Maxio.ObjectMeta.authoritative_source(:write) do
       :sidecar ->
         case Objects.put_version_index(bucket, key, version_id, attrs) do
@@ -796,7 +809,7 @@ defmodule Maxio.S3.Handlers.Object do
 
           {:error, reason} ->
             Log.error("pg index update failed (object durably stored in sidecars)",
-              action: :put_object,
+              action: action,
               bucket: bucket,
               key: key,
               reason: inspect(reason)
@@ -825,6 +838,9 @@ defmodule Maxio.S3.Handlers.Object do
       content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
       storage_class: Map.get(attrs, :storage_class, "STANDARD"),
       acl_canned: Map.get(attrs, :acl_canned, "private"),
+      # B5-1：user metadata 随视图携带（PutObject/CopyObject attrs 均含 :metadata），与 :pg 分支
+      # 返回的 PG 行同构（视图字段越全，下游对两权威分支的读取越不分裂）。
+      metadata: Map.get(attrs, :metadata, %{}),
       tags: Map.get(attrs, :tags, %{}),
       sse_algorithm: Map.get(attrs, :sse_algorithm),
       sse_envelope: Map.get(attrs, :sse_envelope),

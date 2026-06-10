@@ -112,8 +112,9 @@ defmodule Maxio.S3.Handlers.Multipart do
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
         case Multipart.complete(upload, requested) do
           {:ok, %{etag: etag, size: size}} ->
-            {:ok, _obj} =
-              Objects.put_metadata(bucket, key, %{
+            # ROUTE B B5-1：元数据提交按写权威分流（与 object.ex commit_metadata 同模式）。
+            :ok =
+              commit_complete_metadata(bucket, key, %{
                 size: size,
                 etag: etag,
                 content_type: upload.content_type,
@@ -264,6 +265,41 @@ defmodule Maxio.S3.Handlers.Multipart do
   end
 
   # ── helpers ──
+
+  # ROUTE B B5-1 —— CompleteMultipartUpload 元数据提交按写权威分流
+  # （镜像 object.ex 的 commit_metadata/5，铁律 2 同一分流模式）：
+  #
+  #   :pg（默认）→ 维持既有致命语义：put_metadata 失败则 {:ok,_} 模式匹配失败上抛
+  #     （PG 即权威，绝不静默接受落库失败，铁律 3）——字节级不变。
+  #
+  #   :sidecar → 盘上 assemble 已写出权威 maxio/2 sidecar（达 write_quorum = 最终对象已耐久落盘）；
+  #     PG 仅派生索引，用 put_metadata_index best-effort：失败 → Log.error（绝不静默）+ 不失败请求
+  #     （索引滞后由 B5-2 scanner reconcile）。响应（etag/size）来自 Multipart.complete，
+  #     本就不依赖 PG 读回，无需内存视图。
+  defp commit_complete_metadata(bucket, key, attrs) do
+    case Maxio.ObjectMeta.authoritative_source(:write) do
+      :sidecar ->
+        case Objects.put_metadata_index(bucket, key, attrs) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Log.error("pg index update failed (object durably stored in sidecars)",
+              action: :complete_multipart_upload,
+              bucket: bucket,
+              key: key,
+              reason: inspect(reason)
+            )
+
+            :ok
+        end
+
+      _pg ->
+        {:ok, _obj} = Objects.put_metadata(bucket, key, attrs)
+        :ok
+    end
+  end
+
   defp ensure_bucket!(bucket) do
     case Buckets.lookup(bucket) do
       {:ok, b} -> b
