@@ -14,6 +14,9 @@ defmodule Maxio.Application do
           Maxio.Repo,
           {DNSCluster, query: Application.get_env(:maxio, :dns_cluster_query) || :ignore},
           {Phoenix.PubSub, name: Maxio.PubSub},
+          # ROUTE B B5-2：派生索引周期 reconcile scanner（默认 disabled——启动但不调度，
+          # init 显式日志声明状态；config :maxio, :scanner, enabled: true 开启周期轮）。
+          Maxio.Storage.Scanner,
           # Start a worker by calling: Maxio.Worker.start_link(arg)
           # {Maxio.Worker, arg},
           # Start to serve requests, typically the last entry

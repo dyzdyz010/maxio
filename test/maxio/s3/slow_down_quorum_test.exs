@@ -53,6 +53,8 @@ defmodule Maxio.S3.SlowDownQuorumTest do
     def get_part_stream(b, k, u, n, o), do: Maxio.Storage.FS.get_part_stream(b, k, u, n, o)
     @impl true
     def abort_upload(b, k, u, o), do: Maxio.Storage.FS.abort_upload(b, k, u, o)
+    @impl true
+    def put_delete_marker(b, k, v, eo, o), do: Maxio.Storage.FS.put_delete_marker(b, k, v, eo, o)
   end
 
   setup do

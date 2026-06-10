@@ -117,6 +117,13 @@ config :maxio, :listing, sql_hard_limit: 100_000
 # PG 故障非致命：记 Log.error + 不回滚字节 + 请求仍成功，去 PG 写路径 SPOF）。
 config :maxio, :authoritative_source, read: :pg, list: :pg, write: :pg
 
+# ROUTE B B5-2 派生索引周期 reconcile scanner（默认关——先发布不改行为，可整体回滚）：
+# enabled: true 时 Maxio.Storage.Scanner 每 interval_ms 跑一轮「盘上 sidecar 权威 → PG 派生索引」
+# reconcile（缺行 upsert / stale 修正）+ 保守 reverse-GC（PG 孤儿行仅在所有端点可达且全部显式
+# missing 时删除，任一端点 down → skip 绝不猜）。batch_size 限定每批 reconcile 工作量（铁律 4 有界）。
+# 手动触发/取证：mix maxio.reconcile_index [--dry-run] [--bucket <name>]。
+config :maxio, :scanner, enabled: false, interval_ms: 86_400_000, batch_size: 500
+
 # ROUTE B B5-1 PREFER 索引读门控（默认关）：仅当 authoritative_source(:read)=:sidecar 时生效——
 # true → 单对象读先查 PG 派生索引（scanner 维护新鲜度），命中即返回（快路径），miss 走盘 sidecar；
 # false（默认）→ 纯走盘正确性优先。P7-3 cutover 经 shadow 驱零取证后才开。

@@ -128,25 +128,63 @@ defmodule Maxio.Listing do
   """
   @spec discover_current_version(String.t(), String.t(), keyword()) :: String.t() | nil
   def discover_current_version(bucket, key, opts \\ []) do
+    case version_ids(bucket, key, opts) do
+      [] -> nil
+      vids -> current_version(vids)
+    end
+  end
+
+  @doc """
+  ROUTE B B5-2 —— 单 key 在盘上的**全部候选版本 id**（null 候选 ∪ `.versions` 版本树，跨全端点
+  并集去重，任一端点命中即收）。`discover_current_version/3` 即本列表经 `current_version/1` 收敛；
+  scanner 用其逐版本 reconcile（每个版本独立 quorum 仲裁，绝不只看当前版本）。
+  端点宕机/读失败 → 该端点候选为空（铁律 3 结构化降级；reverse-GC 的「端点不可达绝不删」判定
+  不依赖本枚举，见 `Maxio.Storage.Scanner` 的 list_dir 探针）。
+  """
+  @spec version_ids(String.t(), String.t(), keyword()) :: [String.t()]
+  def version_ids(bucket, key, opts \\ []) do
     transport = Transport.impl(opts)
     topo = Keyword.get(opts, :topology)
     set_ids = if topo, do: Topology.all_set_ids_from(topo), else: Topology.all_set_ids()
 
-    vids =
-      set_ids
-      |> Enum.flat_map(fn set_id ->
-        if topo, do: Topology.endpoints_from(topo, set_id), else: Topology.endpoints(set_id)
-      end)
-      |> Enum.flat_map(fn {node, drive} ->
-        null_candidate(transport, node, drive, bucket, key) ++
-          version_candidates(transport, node, drive, bucket, key)
-      end)
-      |> Enum.uniq()
+    set_ids
+    |> Enum.flat_map(fn set_id ->
+      if topo, do: Topology.endpoints_from(topo, set_id), else: Topology.endpoints(set_id)
+    end)
+    |> Enum.flat_map(fn {node, drive} ->
+      null_candidate(transport, node, drive, bucket, key) ++
+        version_candidates(transport, node, drive, bucket, key)
+    end)
+    |> Enum.uniq()
+  end
 
-    case vids do
-      [] -> nil
-      _ -> current_version(vids)
-    end
+  @doc """
+  ROUTE B B5-2 —— scanner 走盘枚举原语：桶下所有「盘上存在任一版本」的对象 key
+  （null 布局 ∪ `.versions` 版本树，跨 set 全端点并集去重，升序）。
+
+  与 LIST 路径的 `collect_keys` 不同：**不剔除** delete-marker 当前版本的 key（scanner 必须
+  reconcile 删除标记行）、**不做 quorum 门**（quorum 仲裁由 scanner 逐版本经 `Maxio.MetaReconcile`
+  做，绝不在枚举层猜）、不读任何 sidecar（纯目录走盘）。候选集全量进内存后排序——与本模块 LIST 的
+  MVP 已知边界同源（真·流式惰性走盘留后续优化）；scanner 的有界性由调用方按 batch_size 分批
+  reconcile 保证。端点宕机/读失败 → 该端点子树跳过（铁律 3 结构化降级）。
+  """
+  @spec scan_keys(String.t(), keyword()) :: [String.t()]
+  def scan_keys(bucket, opts \\ []) do
+    transport = Transport.impl(opts)
+    topo = Keyword.get(opts, :topology)
+    set_ids = if topo, do: Topology.all_set_ids_from(topo), else: Topology.all_set_ids()
+
+    set_ids
+    |> Enum.flat_map(fn set_id ->
+      if topo, do: Topology.endpoints_from(topo, set_id), else: Topology.endpoints(set_id)
+    end)
+    |> Enum.flat_map(fn {node, drive} ->
+      null_layout = walk(transport, node, Path.join(drive, bucket), "")
+      ver_layout = walk_versions(transport, node, versions_root(drive, bucket), "")
+      null_layout ++ Enum.map(ver_layout, fn {key, _vid} -> key end)
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   # null 布局候选：`<bucket>/<key>/meta.json` 在该端点存在 → ["null"]，否则 []。
@@ -352,9 +390,13 @@ defmodule Maxio.Listing do
 
   defp versions_root(drive, bucket), do: Path.join([drive, @versions_prefix, bucket])
 
-  # 当前版本：ULID 字典序 = 时间序，max ULID = newest（null 作为对等参与）。
-  # 仅 null（无任何 ULID）-> null 即当前；有 ULID -> 取字典序最大者（晚于 null 写的版本胜出）。
-  defp current_version(vids) do
+  @doc """
+  当前版本语义（单一事实来源，B5-2 起 public 供 scanner 复用）：ULID 字典序 = 时间序，
+  max ULID = newest（null 作为对等参与）。仅 null（无任何 ULID）→ null 即当前；
+  有 ULID → 取字典序最大者（晚于 null 写的版本胜出）。
+  """
+  @spec current_version([String.t()]) :: String.t()
+  def current_version(vids) do
     case Enum.reject(vids, &(&1 == "null")) do
       [] -> "null"
       ulids -> Enum.max(ulids)
