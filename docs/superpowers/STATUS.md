@@ -284,6 +284,8 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 
 > **✅ 路线 B 写路径元数据保真面收敛（B4-5→B4-7 + f856c7e）**：critical/high/medium 全清零。真实 PUT/Copy/MPU 对象的 content_type/user_metadata 在 `:pg` 与 `:sidecar` 两路一致自描述、x-amz-meta-* 写→读 round-trip 闭合、2KB MetadataTooLarge 边界对齐 MinIO。剩余仅 low（见下），按既定政策文档化 defer。
 
+   ◇ 路线 B P5（PG 降为受维护派生索引）← **进行中**（用户拍板「继续 P5→P7 收官」）。**勘探新发现 critical 权威完整性缺口（B5-0 根因）**：delete marker 从不落盘（insert_delete_marker 纯 PG、build_meta 恒 is_delete_marker=false）→ `:read/:list=:sidecar` 下 DeleteObject 后已删对象**复活**（GET 仍 200 应 404+marker 头；LIST 仍列出）。读侧 B4-3/4 已就绪，只缺写侧。P5 = B5-0（Storage.put_delete_marker 落盘 quorum 原子 + handler 同锁盘先 PG 后 + Suspended null 替换语义 + e2e 不复活取证）→ B5-1（objects 加 synced_at/index_generation 迁移 + copy/MPU best-effort 分流补全 + Objects.mark_synced/reconcile_from_sidecar/stale? + read_prefer_index 门控默认关）→ B5-2（Maxio.Storage.Scanner reconcile 索引 + 保守 reverse-GC（全端点可达且全 :missing 才删，down 即 skip）+ mix maxio.reconcile_index --dry-run/--bucket）。计划 `plans/2026-06-10-routeB-phase5-derived-index.md`。
+
 > **路线 B 主目标达成**：sidecar(meta.json) 已是对象元数据真值源、真实 PUT 对象在 `:read/:list/:write=:sidecar` 下完整可读/可列/可写（端到端取证），PG 降为可派生索引——**PG 单点故障从构造上消除**。默认 `:pg` 全程不变、字节级可回滚。剩余 B4-6 为元数据富度/一致性保真（非阻塞主目标）；生产默认翻 :sidecar 前需 P7 backfill/迁移（既有 v1 对象升 maxio/2）。
 
 #### B4-6 backlog（B4-5 fidelity 审计的 medium，按「全部修 medium」处理）
