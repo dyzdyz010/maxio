@@ -34,6 +34,16 @@ defmodule Maxio.Storage.Scanner do
   「盘上确有」时绝不删（present → skip），删除竞态由「全端点显式 missing」前置条件 + 删后下一轮
   forward 再收敛兜底。scanner 是**收敛器**而非事务参与者，所有动作幂等。
 
+  **写权威前置条件（安全闸，强制）**：reconcile 的方向是「盘 → PG」，只在
+  `authoritative_source(:write)=:sidecar` 下成立。默认 `:pg` 权威下 PG 才是事实来源，而
+  PG-only delete marker（B5-0 之前的全部存量 marker；`:pg` 模式下 best-effort
+  `Storage.put_delete_marker` 失败的 marker）盘上**没有** sidecar——跑一轮会让 forward 把被
+  marker 遮蔽的旧版本重新提成 is_latest=true（已删对象在 PG 权威 GET/LIST 下复活 = B5-0 修的
+  critical 原样重现），reverse-GC 会把权威 marker 行当孤儿删掉。故 `run_once`（周期轮、
+  `mix maxio.reconcile_index`、**含 --dry-run**——其 would-计数同样基于错误的盘权威假设，纯误导）
+  在写权威非 `:sidecar` 时一律拒绝（status: :authority_mismatch 零计数 + Log.warn），仅显式
+  `opts[:force]`（CLI `--force`）越闸。
+
   默认 `config :maxio, :scanner, enabled: false`：GenServer 启动但不调度（显式日志声明），
   行为零变更；interval_ms 默认 86_400_000（每日一轮），batch_size 默认 500（铁律 4 有界批量）。
   无分布式拓扑（单机 FS / dev）时 `run_once` 安全 no-op（status: :no_topology + 日志，绝不
@@ -43,7 +53,7 @@ defmodule Maxio.Storage.Scanner do
 
   import Ecto.Query
 
-  alias Maxio.{Buckets, Listing, MetaReconcile, Objects, Repo}
+  alias Maxio.{Buckets, Listing, MetaReconcile, ObjectMeta, Objects, Repo}
   alias Maxio.Cluster.{Paths, Router, Topology, Transport}
   alias Maxio.Objects.Object
   alias Maxio.S3.Log
@@ -52,7 +62,7 @@ defmodule Maxio.Storage.Scanner do
   @count_keys [:scanned, :upserted, :gc, :skipped, :divergent]
 
   @type report :: %{
-          status: :ok | :no_topology,
+          status: :ok | :no_topology | :authority_mismatch,
           dry_run: boolean(),
           buckets: non_neg_integer(),
           scanned: non_neg_integer(),
@@ -123,42 +133,71 @@ defmodule Maxio.Storage.Scanner do
     * `:dry_run`（默认 false）——只报告（would-计数）绝不写 PG；
     * `:bucket`——仅扫指定桶（nil = 全部 PG buckets）；
     * `:batch_size`——覆盖 config 批量（默认 `config :maxio, :scanner` 的 batch_size）；
-    * `:transport` / `:topology`——test 注入（与读/列路径同款依赖注入）。
+    * `:force`（默认 false）——`authoritative_source(:write) != :sidecar` 时本函数一律拒绝
+      （status: :authority_mismatch 零计数，**含 dry-run**）；force: true 显式越闸，仅当你明确
+      接受「以盘为权威重写 PG 索引」的后果（PG-only delete marker 会被复活 + 被 reverse-GC）；
+    * `:transport` / `:topology` / `:authoritative_source`——test 注入（与读/列路径同款依赖注入）。
 
-  返回 `{:ok, report}`（见 `t:report/0`）。无分布式拓扑 → status: :no_topology 零计数（安全 no-op）。
+  返回 `{:ok, report}`（见 `t:report/0`）。写权威非 :sidecar 且未 force → status:
+  :authority_mismatch 零计数（拒绝）；无分布式拓扑 → status: :no_topology 零计数（安全 no-op）。
   """
   @spec run_once(keyword()) :: {:ok, report()}
   def run_once(opts \\ []) do
     dry_run = Keyword.get(opts, :dry_run, false)
     batch_size = Keyword.get(opts, :batch_size, config()[:batch_size])
 
-    if topology_available?(opts) do
-      buckets = bucket_names(Keyword.get(opts, :bucket))
+    cond do
+      not authority_allows_run?(opts) ->
+        Log.warn(
+          "scanner refused: authoritative_source(:write) != :sidecar — disk sidecars are not " <>
+            "the write authority, so disk-driven reconcile would resurrect versions shadowed " <>
+            "by PG-only delete markers and reverse-GC authoritative PG rows (the exact B5-0 " <>
+            "critical); pass --force / opts[:force] only if you explicitly accept disk as " <>
+            "the authority",
+          action: :reconcile_index
+        )
 
-      report =
-        buckets
-        |> Enum.reduce(zero_report(dry_run, :ok), fn bucket, acc ->
-          merge_counts(acc, scan_bucket(bucket, batch_size, dry_run, opts))
-        end)
-        |> Map.put(:buckets, length(buckets))
+        {:ok, zero_report(dry_run, :authority_mismatch)}
 
-      Log.info(
-        "scanner round complete: buckets=#{report.buckets} scanned=#{report.scanned} " <>
-          "upserted=#{report.upserted} gc=#{report.gc} skipped=#{report.skipped} " <>
-          "divergent=#{report.divergent} dry_run=#{report.dry_run}",
-        action: :reconcile_index
-      )
+      not topology_available?(opts) ->
+        Log.warn(
+          "scanner skipped: no distributed topology configured (drive-walk reconcile requires " <>
+            "Maxio.Cluster.Topology or opts[:topology]); derived-index reconcile is a no-op",
+          action: :reconcile_index
+        )
 
-      {:ok, report}
-    else
-      Log.warn(
-        "scanner skipped: no distributed topology configured (drive-walk reconcile requires " <>
-          "Maxio.Cluster.Topology or opts[:topology]); derived-index reconcile is a no-op",
-        action: :reconcile_index
-      )
+        {:ok, zero_report(dry_run, :no_topology)}
 
-      {:ok, zero_report(dry_run, :no_topology)}
+      true ->
+        buckets = bucket_names(Keyword.get(opts, :bucket))
+
+        report =
+          buckets
+          |> Enum.reduce(zero_report(dry_run, :ok), fn bucket, acc ->
+            merge_counts(acc, scan_bucket(bucket, batch_size, dry_run, opts))
+          end)
+          |> Map.put(:buckets, length(buckets))
+
+        Log.info(
+          "scanner round complete: buckets=#{report.buckets} scanned=#{report.scanned} " <>
+            "upserted=#{report.upserted} gc=#{report.gc} skipped=#{report.skipped} " <>
+            "divergent=#{report.divergent} dry_run=#{report.dry_run}",
+          action: :reconcile_index
+        )
+
+        {:ok, report}
     end
+  end
+
+  # 写权威安全闸：scanner 的全部语义（forward 把 PG 向盘收敛、reverse-GC 把盘上不存在的 PG 行
+  # 当孤儿删）都建立在「盘上 sidecar = 写权威」之上。authoritative_source(:write) != :sidecar
+  # （默认 :pg）时 PG 才是权威：PG-only delete marker（B5-0 之前的存量 marker / :pg 模式下
+  # best-effort 盘 marker 写失败）盘上没有 sidecar——forward 会复活被 marker 遮蔽的已删对象、
+  # reverse-GC 会删掉权威 marker 行。故一律拒绝（含 dry-run：would-计数同样基于错误的权威假设，
+  # 纯误导），除非显式 opts[:force]。opts[:authoritative_source] 与 ObjectMeta 同款 test 注入。
+  defp authority_allows_run?(opts) do
+    Keyword.get(opts, :force, false) == true or
+      ObjectMeta.authoritative_source(:write, opts) == :sidecar
   end
 
   # opts[:topology]（test 注入）优先；否则须有真集群拓扑（与 ObjectMeta.shadow_enabled? 同语义）。

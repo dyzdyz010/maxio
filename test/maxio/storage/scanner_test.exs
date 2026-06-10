@@ -12,7 +12,10 @@ defmodule Maxio.Storage.ScannerTest do
     * 任一端点 down → skip 绝不删（铁律 3 绝不把不可达当不存在）；
     * --dry-run → 只报告（would-计数）零 PG 写入；
     * delete marker 版本（B5-0 落盘 sidecar）→ is_delete_marker 行 + 跨版本 latest 收敛；
-    * 默认 disabled：GenServer 启动但不调度；无拓扑 run_once 安全 no-op。
+    * 默认 disabled：GenServer 启动但不调度；无拓扑 run_once 安全 no-op；
+    * 写权威闸：authoritative_source(:write) != :sidecar（默认 :pg）→ run_once 一律拒绝
+      （status: :authority_mismatch 零计数零写入，含 dry-run），仅显式 force: true 越闸——
+      :pg 权威下 PG-only delete marker 盘上无 sidecar，跑一轮会复活已删对象 + GC 权威 marker 行。
 
   `async: false`：InProcess down 表全局 + 切全局 :storage_backend。
   """
@@ -62,8 +65,16 @@ defmodule Maxio.Storage.ScannerTest do
     {:ok, eps: eps, topo: topo}
   end
 
+  # scanner 仅在 authoritative_source(:write)=:sidecar 下有意义（盘 = 写权威）——经 opts 注入
+  # 写权威（与 ObjectMeta 同款 test 注入）过写权威闸；闸本身由「写权威闸」describe 单独取证。
   defp scan_opts(topo, extra \\ []),
-    do: [transport: InProcess, topology: topo, bucket: @bucket] ++ extra
+    do:
+      [
+        transport: InProcess,
+        topology: topo,
+        bucket: @bucket,
+        authoritative_source: [write: :sidecar]
+      ] ++ extra
 
   # test 全局 logger level 是 :warning（config/test.exs）——scanner 的逐对象动作日志是 info 级
   # （action: :reconcile_index / :reverse_gc），断言它们须临时降 level 到 :info（async: false 安全）。
@@ -277,7 +288,9 @@ defmodule Maxio.Storage.ScannerTest do
     end
 
     test "无拓扑（单机 FS / dev）→ run_once 安全 no-op（status: :no_topology 零计数）" do
-      {result, log} = with_log(fn -> Scanner.run_once([]) end)
+      # 写权威闸在拓扑检查之前——注入 :sidecar 写权威以抵达拓扑分支（闸见下个 describe）。
+      {result, log} =
+        with_log(fn -> Scanner.run_once(authoritative_source: [write: :sidecar]) end)
 
       assert {:ok, report} = result
       assert report.status == :no_topology
@@ -285,6 +298,67 @@ defmodule Maxio.Storage.ScannerTest do
       assert report.upserted == 0
       assert report.gc == 0
       assert log =~ "no distributed topology"
+    end
+  end
+
+  describe "写权威闸（authoritative_source(:write) != :sidecar → 拒绝，仅 force 越闸）" do
+    test "默认 :pg 写权威 → 拒绝（status: :authority_mismatch 零计数零写入，绝不复活/GC）", %{
+      topo: topo
+    } do
+      # 盘上有 PG 缺（forward 会 upsert 的素材）+ PG 孤儿行（reverse-GC 会删的素材）——
+      # 闸生效 = 两者都分毫未动。
+      _ = disk_put!(topo, "k-gate-disk", "null", "disk only")
+      vid = VersionId.generate()
+
+      {:ok, _} =
+        Objects.put_version_with_id(@bucket, "k-gate-ghost", vid, %{size: 1, etag: "\"g\""})
+
+      {result, log} =
+        with_log(fn -> Scanner.run_once(transport: InProcess, topology: topo, bucket: @bucket) end)
+
+      assert {:ok, report} = result
+      assert report.status == :authority_mismatch
+      assert report.buckets == 0
+      assert report.scanned == 0
+      assert report.upserted == 0
+      assert report.gc == 0
+      assert log =~ "scanner refused"
+      assert log =~ "authoritative_source(:write) != :sidecar"
+
+      # 拒绝 = 不写：PG 缺行仍缺（不复活）、孤儿行仍在（不 GC 权威行）。
+      assert {:error, :not_found} = Objects.get_version(@bucket, "k-gate-disk", "null")
+      assert {:ok, _} = Objects.get_version(@bucket, "k-gate-ghost", vid)
+    end
+
+    test ":pg 写权威 + dry_run 同样拒绝（would-计数基于错误的盘权威假设，纯误导）", %{topo: topo} do
+      _ = disk_put!(topo, "k-gate-dr", "null", "disk only dr")
+
+      {result, _log} =
+        with_log(fn ->
+          Scanner.run_once(transport: InProcess, topology: topo, bucket: @bucket, dry_run: true)
+        end)
+
+      assert {:ok, report} = result
+      assert report.status == :authority_mismatch
+      assert report.dry_run == true
+      assert report.scanned == 0
+      assert report.upserted == 0
+    end
+
+    test ":pg 写权威 + force: true → 显式越闸执行（status: :ok）", %{topo: topo} do
+      _ = disk_put!(topo, "k-gate-force", "null", "forced")
+
+      assert {:ok, report} =
+               Scanner.run_once(
+                 transport: InProcess,
+                 topology: topo,
+                 bucket: @bucket,
+                 force: true
+               )
+
+      assert report.status == :ok
+      assert report.upserted == 1
+      assert {:ok, _} = Objects.get_version(@bucket, "k-gate-force", "null")
     end
   end
 end

@@ -30,6 +30,13 @@ defmodule Maxio.S3.VersioningObjectTest do
     |> call()
   end
 
+  defp suspend_versioning(bucket) do
+    body = ~s(<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>)
+
+    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"versioning" => ""}, body: body)
+    |> call()
+  end
+
   test "未版本化桶：PUT 不回 x-amz-version-id；GET 取当前" do
     SigV4Request.signed_conn(:put, "/uvb") |> call()
     put = SigV4Request.signed_conn(:put, "/uvb/k.txt", body: "v1") |> call()
@@ -95,6 +102,51 @@ defmodule Maxio.S3.VersioningObjectTest do
     assert get.status == 200
     assert get.resp_body == "alive"
     assert get_resp_header(get, "x-amz-version-id") == [vid1]
+  end
+
+  test "Suspended：DELETE 插入 null delete marker（替换 null 版本）；GET → 404" do
+    SigV4Request.signed_conn(:put, "/suspok") |> call()
+    assert suspend_versioning("suspok").status == 200
+    put = SigV4Request.signed_conn(:put, "/suspok/k.txt", body: "to be replaced") |> call()
+    assert put.status == 200
+
+    del = SigV4Request.signed_conn(:delete, "/suspok/k.txt") |> call()
+    assert del.status == 204
+    assert get_resp_header(del, "x-amz-delete-marker") == ["true"]
+
+    {:ok, row} = Maxio.Objects.get_version("suspok", "k.txt", "null")
+    assert row.is_delete_marker == true
+    assert row.is_latest == true
+
+    get = SigV4Request.signed_conn(:get, "/suspok/k.txt") |> call()
+    assert get.status == 404
+    assert get_resp_header(get, "x-amz-delete-marker") == ["true"]
+  end
+
+  test "Suspended + :pg 写权威：PG marker 提交失败 → 500 且字节分毫未动（绝无撕裂态）" do
+    SigV4Request.signed_conn(:put, "/susptorn") |> call()
+    assert suspend_versioning("susptorn").status == 200
+    put = SigV4Request.signed_conn(:put, "/susptorn/k.txt", body: "alive bytes") |> call()
+    assert put.status == 200
+
+    # 注入 PG 故障（sandbox 事务内 DDL，测试结束随事务回滚；失败查询经 sandbox savepoint 隔离，
+    # 不毒化外层事务）：objects 表改名 → :pg 权威的权威提交 insert_delete_marker_with_id 必败。
+    Repo.query!("ALTER TABLE objects RENAME TO objects_pg_down")
+    del = SigV4Request.signed_conn(:delete, "/susptorn/k.txt") |> call()
+    Repo.query!("ALTER TABLE objects_pg_down RENAME TO objects")
+
+    # 权威提交失败 → 500（绝不静默吞），权威 PG 行原样存活（对象仍 live，非 delete marker）。
+    assert del.status == 500
+    {:ok, row} = Maxio.Objects.get_version("susptorn", "k.txt", "null")
+    assert row.is_delete_marker == false
+    assert row.is_latest == true
+
+    # 关键取证：null 版本字节未被破坏——GET 仍 200 原文。
+    # （修前：commit_delete_marker 在权威提交前先 Storage.delete 毁字节，PG 提交失败 = 永久撕裂态：
+    #  权威 PG 说对象存活而字节已无 → GET 5xx。）
+    get = SigV4Request.signed_conn(:get, "/susptorn/k.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "alive bytes"
   end
 
   test "Enabled：GET ?versionId 指向 delete marker → 405" do
