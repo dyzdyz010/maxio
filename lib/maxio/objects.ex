@@ -244,13 +244,27 @@ defmodule Maxio.Objects do
   插入删除标记（DELETE 无 versionId，桶 Enabled/Suspended）。
   Enabled → 新 ULID delete marker 置 latest；Suspended → "null" delete marker upsert 置 latest。
   返回 {:ok, %{version_id}}。
+
+  注：version_id 在内部生成。**ROUTE B B5-0**：当 handler 需先把同一 version_id 的 delete marker
+  落盘（sidecar 权威的删除完整性），改走 `insert_delete_marker_with_id/4`（外部已生成 version_id），
+  使盘上 marker sidecar 与 PG 索引行 version_id 一致。本函数保留供 `:pg` 默认权威下的纯 PG 路径。
   """
   @spec insert_delete_marker(String.t(), String.t(), String.t()) ::
           {:ok, %{version_id: String.t()}} | {:error, :no_such_bucket}
   def insert_delete_marker(bucket_name, key, versioning) do
-    with {:ok, bucket} <- bucket_or_error(bucket_name) do
-      version_id = if versioning == "Enabled", do: VersionId.generate(), else: "null"
+    version_id = if versioning == "Enabled", do: VersionId.generate(), else: "null"
+    insert_delete_marker_with_id(bucket_name, key, version_id)
+  end
 
+  @doc """
+  ROUTE B B5-0 —— 用外部已生成的 version_id 插入删除标记（marker 字节/sidecar 已按此 version_id
+  落盘，PG 索引须用同 version_id 保持盘/PG 一致）。Enabled 传新 ULID，Suspended 传 "null"
+  （null marker 替换既有 null 版本，AWS 语义）。返回 {:ok, %{version_id}}。
+  """
+  @spec insert_delete_marker_with_id(String.t(), String.t(), String.t()) ::
+          {:ok, %{version_id: String.t()}} | {:error, :no_such_bucket}
+  def insert_delete_marker_with_id(bucket_name, key, version_id) do
+    with {:ok, bucket} <- bucket_or_error(bucket_name) do
       base = %{
         bucket_id: bucket.id,
         bucket_name: bucket_name,
@@ -276,6 +290,25 @@ defmodule Maxio.Objects do
 
       {:ok, %{version_id: version_id}}
     end
+  end
+
+  @doc """
+  ROUTE B B5-0 —— best-effort 删除标记索引写（与 insert_delete_marker_with_id/3 同语义，但捕获异常
+  返回 `{:error, term}` 而非抛出，成功归一为 `:ok`）。
+
+  用于 `authoritative_source(:write) == :sidecar`：盘上 delete-marker sidecar 已达 write_quorum =
+  删除已耐久落盘权威记录，PG 仅作派生索引，故 PG 写失败**非致命**——调用方据 `:ok | {:error,reason}`
+  记 Log.error 而非让 DELETE 失败（去 PG 写路径 SPOF，铁律 3 绝不静默）。`:pg` 默认权威仍走
+  insert_delete_marker_with_id/3 的致命语义。
+  """
+  @spec insert_delete_marker_index(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def insert_delete_marker_index(bucket_name, key, version_id) do
+    case insert_delete_marker_with_id(bucket_name, key, version_id) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, e}
   end
 
   @doc """

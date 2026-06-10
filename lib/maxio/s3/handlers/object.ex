@@ -336,8 +336,9 @@ defmodule Maxio.S3.Handlers.Object do
         end
 
       versioning in ["Enabled", "Suspended"] ->
-        # 插入 delete marker（Enabled 新 ULID；Suspended null）。
-        {:ok, %{version_id: dm_vid}} = Objects.insert_delete_marker(bucket, key, versioning)
+        # 插入 delete marker（Enabled 新 ULID；Suspended null）。ROUTE B B5-0：先盘上落
+        # delete-marker sidecar（sidecar 权威下的删除完整性，quorum 致命），再 PG 索引（best-effort）。
+        dm_vid = commit_delete_marker(bucket, key, versioning)
         Log.info("delete object marker", action: :delete_object, bucket: bucket, key: key)
 
         conn
@@ -456,8 +457,9 @@ defmodule Maxio.S3.Handlers.Object do
         end
 
       versioning in ["Enabled", "Suspended"] ->
-        # 无 VersionId 且版本化桶 → 插 delete marker（绝不硬删历史版本）。
-        {:ok, %{version_id: dm_vid}} = Objects.insert_delete_marker(bucket, key, versioning)
+        # 无 VersionId 且版本化桶 → 插 delete marker（绝不硬删历史版本）。ROUTE B B5-0：与单删
+        # delete/1 同路径——先盘上落 delete-marker sidecar（quorum 致命），再 PG 索引（best-effort）。
+        dm_vid = commit_delete_marker(bucket, key, versioning)
         {:ok, %{key: key, delete_marker: true, delete_marker_version_id: dm_vid}}
 
       true ->
@@ -686,6 +688,94 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   # ── helpers ──
+
+  # ROUTE B B5-0 —— delete marker 提交（DELETE 无 versionId，桶 Enabled/Suspended）。
+  #
+  # 根因：`insert_delete_marker` 纯 PG、盘上从不落 delete-marker sidecar →
+  # `authoritative_source(:read|:list)=:sidecar` 下 DeleteObject 后盘上旧对象 sidecar 仍在
+  # → GET 仍 200、LIST 仍列出 = **已删对象复活**（critical）。修法：删除是写操作，必须被盘上权威记录。
+  #
+  # 对象锁内（B1-1：盘 + PG 同锁，与 do_put 一致顺序——盘先 PG 后），**先**盘上 `Storage.put_delete_marker`
+  # **再** PG 索引：
+  #   * `authoritative_source(:write)==:sidecar` → 盘上 marker sidecar 达 write_quorum = 删除已耐久权威；
+  #     quorum 不足 → {:error,:write_quorum} → 503 SlowDownWrite（绝不静默）。PG 索引降 best-effort
+  #     （insert_delete_marker_index 失败 Log.error 不致命，scanner 后续 reconcile）。
+  #   * `:pg`（默认）→ 维持现状：PG insert_delete_marker_with_id 致命（PG 即权威）；盘上 marker 为
+  #     best-effort（FS 后端返回 :not_supported，纠删/分布式后端有则锦上添花，无正确性依赖）。
+  #
+  # Suspended 桶：null delete marker **替换**既有 null 版本（AWS 语义）——先删 null 版本字节 + sidecar
+  # 再写 marker sidecar 到 null 路径（PG 侧 upsert 的 Suspended 语义已有）。
+  #
+  # 返回 delete marker 的 version_id；获锁失败 → 503 SlowDown，盘 quorum 不足 → 503 SlowDownWrite（铁律 3）。
+  defp commit_delete_marker(bucket, key, versioning) do
+    version_id =
+      if versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
+
+    result =
+      Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        # Suspended：null marker 替换既有 null 版本 → 先删 null 版本字节 + sidecar（绝不与新 marker 共存）。
+        if versioning == "Suspended", do: Storage.delete(bucket, key, "null")
+
+        with :ok <- write_disk_delete_marker(bucket, key, version_id) do
+          commit_delete_marker_index(bucket, key, version_id)
+          :ok
+        end
+      end)
+
+    case result do
+      {:ok, :ok} ->
+        version_id
+
+      {:ok, {:error, reason}} when reason in [:write_quorum, :rename_busy] ->
+        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+
+      {:ok, {:error, reason}} ->
+        raise Error.new(:internal_error, message: inspect(reason))
+
+      {:error, :locked} ->
+        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  # 盘上落 delete-marker sidecar。按写权威分流：
+  #   :sidecar → 盘上 marker 是权威，quorum 致命（{:error,reason} 上抛 → 503 SlowDownWrite）。
+  #   :pg（默认）→ 盘上 marker best-effort：FS :not_supported / 后端写失败均忽略（PG 才是权威），
+  #     成功则锦上添花（让纠删/分布式后端盘上与 PG 一致）。返回 :ok（绝不让 :pg 路径因盘失败而失败）。
+  defp write_disk_delete_marker(bucket, key, version_id) do
+    case Maxio.ObjectMeta.authoritative_source(:write) do
+      :sidecar ->
+        Storage.put_delete_marker(bucket, key, version_id)
+
+      _pg ->
+        _ = Storage.put_delete_marker(bucket, key, version_id)
+        :ok
+    end
+  end
+
+  # PG delete-marker 索引提交，按写权威分流（镜像 commit_metadata/4）：
+  #   :sidecar → best-effort（盘上 marker 已权威）：失败 Log.error 不致命（铁律 3 绝不静默）。
+  #   :pg（默认）→ 致命（PG 即权威）：insert_delete_marker_with_id 失败由内部 {:ok,_} 匹配失败上抛。
+  defp commit_delete_marker_index(bucket, key, version_id) do
+    case Maxio.ObjectMeta.authoritative_source(:write) do
+      :sidecar ->
+        case Objects.insert_delete_marker_index(bucket, key, version_id) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Log.error("pg delete-marker index update failed (marker durably stored in sidecars)",
+              action: :delete_object,
+              bucket: bucket,
+              key: key,
+              reason: inspect(reason)
+            )
+        end
+
+      _pg ->
+        {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id)
+        :ok
+    end
+  end
 
   # ROUTE B B4-2 —— 元数据提交按写权威分流（authoritative_source(:write)）：
   #

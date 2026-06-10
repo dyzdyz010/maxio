@@ -207,29 +207,43 @@ defmodule Maxio.Cluster.ShardServer do
   不存在数据。每 rename 后 fsync final 目录（fsync? = opts[:fsync] 缺省读 durability 配置）。
   rename busy（target 被 reader 打开，Windows 语义）-> 有界重试后 {:error, :rename_busy}（绝不静默写坏，
   调用方映射 503）。成功删 temp。
+
+  ROUTE B B5-0 —— `opts[:meta_only]`（缺省 false）：**显式纯元数据提交声明**。delete marker 是
+  无字节版本（temp 只有 meta.json、合法无 part.0），声明 `meta_only: true` 则跳过 part.0 rename，
+  只提交 meta.json（meta.json 即数据本体 → fsync 它再原子 rename + sync final 目录，fsync-before-quorum
+  对 marker 同样成立）。**默认（正常对象提交）缺 part.0 仍立即 `{:error, :enoent}`**——写时早失败优于
+  读时才发现撕裂（铁律 3 绝不静默把「忘写数据」当成功提交）。
   """
   @spec commit(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def commit(tmp_dir, drive_obj_dir, opts) do
     fsync? = fsync?(opts)
     rename_fun = rename_fun(opts)
+    meta_only? = Keyword.get(opts, :meta_only, false)
     File.mkdir_p!(drive_obj_dir)
 
     src_part = Path.join(tmp_dir, @part_file)
+    src_meta = Path.join(tmp_dir, @meta_file)
     if fsync? and File.exists?(src_part), do: sync_path(src_part)
 
-    with :ok <- rename_atomic(rename_fun, src_part, Path.join(drive_obj_dir, @part_file)),
+    # meta_only 提交：meta.json 即数据本体（delete marker 无 part.0）→ 提交前 fsync 它，
+    # 使 write_quorum 对纯元数据版本同样不是耐久谎言。
+    if fsync? and meta_only?, do: sync_path(src_meta)
+
+    with :ok <- commit_part(meta_only?, rename_fun, src_part, drive_obj_dir),
          :ok <- maybe_sync_dir(fsync?, drive_obj_dir),
-         :ok <-
-           rename_atomic(
-             rename_fun,
-             Path.join(tmp_dir, @meta_file),
-             Path.join(drive_obj_dir, @meta_file)
-           ),
+         :ok <- rename_atomic(rename_fun, src_meta, Path.join(drive_obj_dir, @meta_file)),
          :ok <- maybe_sync_dir(fsync?, drive_obj_dir) do
       _ = File.rm_rf(tmp_dir)
       :ok
     end
   end
+
+  # part.0 提交步：meta_only（纯元数据版本，B5-0 delete marker）显式跳过——temp 无 part.0 合法；
+  # 默认必须 rename，缺 src 由 :file.rename 的 {:error, :enoent} 立即失败（绝不静默）。
+  defp commit_part(true, _rename_fun, _src_part, _final_dir), do: :ok
+
+  defp commit_part(false, rename_fun, src_part, final_dir),
+    do: rename_atomic(rename_fun, src_part, Path.join(final_dir, @part_file))
 
   @doc """
   单文件原子提交（FS 后端用：对象是单个文件而非 obj-dir）：fsync src 文件 -> 原子 rename 覆盖到

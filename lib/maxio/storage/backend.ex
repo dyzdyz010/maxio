@@ -88,4 +88,33 @@ defmodule Maxio.Storage.Backend do
   @doc "删除该 upload 的所有 part 字节与临时目录（Abort / Complete 后清理）。幂等。"
   @callback abort_upload(bucket(), key(), upload_id(), opts :: keyword()) ::
               :ok | {:error, term()}
+
+  # ── delete marker 落盘回调（ROUTE B B5-0；铁律 1：删除是写操作，sidecar 权威则删除必须被盘上权威记录）──
+
+  @doc """
+  在 `version_id` 对应盘上路径写一个**纯 delete-marker maxio/2 sidecar**，达 write_quorum 才 `:ok`，
+  否则 `{:error, :write_quorum}`（handler 据此回 503 SlowDownWrite，绝不静默）。
+
+  根因（B5-0）：`Objects.insert_delete_marker/3` 纯 PG，盘上从不落 delete-marker sidecar →
+  `authoritative_source(:read|:list)=:sidecar` 下 DeleteObject 后盘上旧对象 sidecar 仍在
+  → GET 仍 200、LIST 仍列出 = **已删对象复活**。本回调让删除被盘上权威记录，与 PUT 同级耐久。
+
+  写出的 sidecar 形态 = `%{"format"=>"maxio/2","versions"=>[entry]}`，entry：
+    * `type="delete_marker"` / 给定 `version_id` / `modtime`（单次纳秒，所有端点同值 → signature 一致）
+    * `generation:0` / `is_latest:true`
+    * **无 part.0 字节、无 ec/shards 耐久 core**——delete marker 无字节，合法（对齐 MinIO xl.meta delete-marker version）。
+
+  `entry_opts`（keyword，可选）：`:modtime`（覆盖单次纳秒，默认实现自算）等版本头覆盖；缺省全默认。
+  写到 write_quorum 个端点（temp→rename 原子，复用 PUT 同级原语）。
+
+  **FS 后端**：返回 `{:error, :not_supported}`（FS 无多端点拓扑、仅在 `:pg` 权威下使用，故无正确性影响；
+  FS sidecar/delete-marker 接线见 B6-1，铁律 3 显式文档化绝不静默 no-op）。
+  """
+  @callback put_delete_marker(
+              bucket(),
+              key(),
+              version_id :: String.t(),
+              entry_opts :: keyword(),
+              opts :: keyword()
+            ) :: :ok | {:error, term()}
 end

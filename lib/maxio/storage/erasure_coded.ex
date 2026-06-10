@@ -69,6 +69,10 @@ defmodule Maxio.Storage.ErasureCoded do
   def abort_upload(bucket, key, upload_id, opts \\ []),
     do: do_abort_upload(bucket, key, upload_id, opts)
 
+  @impl true
+  def put_delete_marker(bucket, key, version_id, entry_opts \\ [], opts \\ []),
+    do: do_put_delete_marker(bucket, key, version_id, entry_opts, opts)
+
   # part 在盘 d 下的目录。
   defp part_dirs(bucket, upload_id, part_number, cfg) do
     sub = Path.join([".uploads", bucket, upload_id, Integer.to_string(part_number)])
@@ -263,6 +267,38 @@ defmodule Maxio.Storage.ErasureCoded do
     :ok
   end
 
+  # ── delete marker 落盘（ROUTE B B5-0）──
+  # 在 version_id 对应盘上对象目录写**纯 delete-marker maxio/2 sidecar**（无 part.0、无 ec/shards
+  # core），与 PUT 同级 temp→rename 原子提交：各盘先 begin_tmp，sidecar 写 temp，commit 数据先于元数据
+  # 原子 rename 到 final，成功盘数 >= write_quorum 才 :ok，否则回滚 + {:error,:write_quorum}（铁律 3）。
+  defp do_put_delete_marker(bucket, key, version_id, entry_opts, opts) do
+    cfg = Config.load!(opts)
+
+    with {:ok, commit_pairs} <- commit_pairs(bucket, key, version_id, cfg) do
+      tmps = Enum.map(commit_pairs, fn {drive_root, _final} -> begin_tmp!(drive_root) end)
+      meta = build_delete_marker_meta(version_id, entry_opts)
+
+      write_tmp_sidecars(tmps, meta)
+
+      # 纯元数据提交声明（ShardServer.commit/3 :meta_only）：temp 只有 meta.json 无 part.0 →
+      # 跳过 part rename 只提交 meta.json（仍 fsync + 原子 rename + sync dir）。
+      ok_drives = commit_drives(tmps, commit_pairs, Keyword.put(opts, :meta_only, true))
+
+      if ok_drives >= cfg.write_quorum do
+        :ok
+      else
+        Logger.error("erasure put_delete_marker below write quorum",
+          bucket: bucket,
+          key: key,
+          reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
+        )
+
+        rollback_commit(tmps, commit_pairs)
+        {:error, :write_quorum}
+      end
+    end
+  end
+
   # ── 对象目录布局（每盘一份）──
 
   # 对象在盘 d 下的目录：<d>/<bucket>/<rel>（null 版本）或 <d>/.versions/<bucket>/<rel>/<version_id>。
@@ -325,8 +361,10 @@ defmodule Maxio.Storage.ErasureCoded do
   end
 
   # 各盘 commit（temp -> final 数据先于元数据原子 rename + fsync）；返回成功盘数（write quorum 判定）。
+  # :meta_only 仅 do_put_delete_marker 注入（纯元数据提交声明，B5-0）；do_put/assemble 不注入 →
+  # 缺省 false → 缺 part.0 仍立即失败（绝不静默把「忘写数据」当成功提交）。
   defp commit_drives(tmps, commit_pairs, opts) do
-    commit_opts = Keyword.take(opts, [:fsync])
+    commit_opts = Keyword.take(opts, [:fsync, :meta_only])
 
     tmps
     |> Enum.zip(commit_pairs)
@@ -527,6 +565,14 @@ defmodule Maxio.Storage.ErasureCoded do
         {:error, _} -> ok
       end
     end)
+  end
+
+  # ROUTE B B5-0：纯 delete-marker maxio/2 sidecar（无 part.0 字节、无 ec/shards 耐久 core——delete
+  # marker 无字节，合法）。entry：type="delete_marker"/version_id/modtime（单次纳秒，所有盘同值 →
+  # N 份 Sidecar.signature 一致）/generation:0/is_latest:true。读侧 ObjectMeta.view_or_not_found /
+  # Maxio.Listing 的 delete_marker 处理（B4-3/B4-4）据此 latest marker→404+头 / LIST 排除。
+  defp build_delete_marker_meta(version_id, entry_opts) do
+    Maxio.Storage.DeleteMarker.sidecar(version_id, entry_opts)
   end
 
   # ── GET：逐块流式重建 ──

@@ -58,4 +58,16 @@ defmodule Maxio.Storage do
   @spec abort_upload(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def abort_upload(bucket, key, upload_id, opts \\ []),
     do: backend().abort_upload(bucket, key, upload_id, opts)
+
+  # ── delete marker 落盘门面（ROUTE B B5-0，转发到 backend）──
+
+  @doc """
+  在 `version_id` 盘上路径写纯 delete-marker maxio/2 sidecar（达 write_quorum 才 `:ok`，否则
+  `{:error, :write_quorum}`；FS 后端 `{:error, :not_supported}`）。见 `Maxio.Storage.Backend.put_delete_marker/5`。
+  `entry_opts` 携版本头覆盖（默认空全默认）；`opts` 透传给后端（test 经 `:transport`/`:topology` 注入）。
+  """
+  @spec put_delete_marker(String.t(), String.t(), String.t(), keyword(), keyword()) ::
+          :ok | {:error, term()}
+  def put_delete_marker(bucket, key, version_id, entry_opts \\ [], opts \\ []),
+    do: backend().put_delete_marker(bucket, key, version_id, entry_opts, opts)
 end

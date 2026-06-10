@@ -63,6 +63,15 @@ defmodule Maxio.Storage.FS do
   def abort_upload(bucket, key, upload_id, opts \\ []),
     do: do_abort_upload(bucket, key, upload_id, opts)
 
+  # ROUTE B B5-0：delete marker 落盘。FS 单机后端无多端点拓扑、无 maxio/2 sidecar（对象即裸字节文件），
+  # 且仅在 `authoritative_source=:pg`（默认）权威下使用——`:sidecar` 读/列权威永不命中 FS（那是
+  # 纠删/分布式后端的事），故 FS 不落 delete-marker sidecar 无正确性影响。**显式返回 :not_supported**
+  # （铁律 3：绝不静默 no-op :ok 假装写成功）；handler 在 `:pg` 权威下不调用本回调（PG insert_delete_marker
+  # 即权威），故此返回不触达。FS 的 sidecar/delete-marker 接线推迟到 B6-1（文档化非目标）。
+  @impl true
+  def put_delete_marker(_bucket, _key, _version_id, _entry_opts, _opts),
+    do: {:error, :not_supported}
+
   defp do_put(bucket, key, version_id, chunks, opts) do
     with {:ok, path} <- object_path(bucket, key, version_id, opts) do
       # B1-2 原子提交：先流式写同卷 temp 文件，fsync，再原子 rename 覆盖 final（crash 前 final 保旧值/缺失）。

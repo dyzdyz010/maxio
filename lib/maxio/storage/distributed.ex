@@ -77,6 +77,10 @@ defmodule Maxio.Storage.Distributed do
   def abort_upload(bucket, key, upload_id, opts \\ []),
     do: do_abort_upload(bucket, key, upload_id, opts)
 
+  @impl true
+  def put_delete_marker(bucket, key, version_id \\ "null", entry_opts \\ [], opts \\ []),
+    do: do_put_delete_marker(bucket, key, version_id, entry_opts, opts)
+
   # ── 端点解析（对象 -> set -> [{node, drive}]）──
 
   defp topology(opts), do: Keyword.get(opts, :topology)
@@ -143,8 +147,10 @@ defmodule Maxio.Storage.Distributed do
   end
 
   # 各端点 commit_object（temp -> final 数据先于元数据原子 rename）；返回成功端点数（write quorum 判定）。
+  # :meta_only 仅 do_put_delete_marker 注入（纯元数据提交声明，B5-0）；do_put/assemble 不注入 →
+  # 缺省 false → 缺 part.0 仍立即失败（绝不静默把「忘写数据」当成功提交）。
   defp commit_all(tx, targets, opts) do
-    commit_opts = Keyword.take(opts, [:fsync])
+    commit_opts = Keyword.take(opts, [:fsync, :meta_only])
 
     targets
     |> Enum.filter(& &1.tmp_dir)
@@ -801,6 +807,52 @@ defmodule Maxio.Storage.Distributed do
     tx = transport(opts)
     Enum.each(dirs, fn {node, dir} -> tx.delete_shard(node, dir) end)
     :ok
+  end
+
+  # ── delete marker 落盘（ROUTE B B5-0）──
+  # 在 version_id 对应盘上对象目录写**纯 delete-marker maxio/2 sidecar**（无 part.0、无 ec/shards
+  # core），与 PUT 同级 B1-2 原子提交：各端点先 begin_tmp，sidecar 写 temp obj-dir，commit 数据先于
+  # 元数据原子 rename 到 final，成功端点数 >= write_quorum 才 :ok，否则回滚 + {:error,:write_quorum}
+  # （绝不静默，铁律 3）。单次 build_delete_marker_meta、同一份 meta 发所有端点 → N 份 signature 一致。
+  defp do_put_delete_marker(bucket, key, version_id, entry_opts, opts) do
+    case Paths.object_rel(bucket, key, version_id) do
+      {:error, :invalid_key} ->
+        {:error, :invalid_key}
+
+      {:ok, obj_rel} ->
+        c = cfg(opts)
+        endpoints = endpoints_for(bucket, key, opts)
+        tx = transport(opts)
+
+        commit_targets = begin_commit_targets(tx, endpoints, obj_rel)
+        tmp_dirs = ordered_tmp_dirs(commit_targets)
+        meta = build_delete_marker_meta(version_id, entry_opts)
+
+        _ = write_sidecars(tx, tmp_dirs, meta)
+
+        # 纯元数据提交声明（ShardServer.commit/3 :meta_only）：temp 只有 meta.json 无 part.0 →
+        # 跳过 part rename 只提交 meta.json（仍 fsync + 原子 rename + sync dir）。
+        ok_endpoints = commit_all(tx, commit_targets, Keyword.put(opts, :meta_only, true))
+
+        if ok_endpoints >= c.write_quorum do
+          :ok
+        else
+          Logger.error("distributed put_delete_marker below write quorum",
+            bucket: bucket,
+            key: key,
+            reason: "ok_endpoints=#{ok_endpoints} < write_quorum=#{c.write_quorum}"
+          )
+
+          cleanup_tmp(tx, commit_targets)
+          {:error, :write_quorum}
+        end
+    end
+  end
+
+  # ROUTE B B5-0：纯 delete-marker maxio/2 sidecar（无字节、无耐久 core）。与 ErasureCoded 同源
+  # （Maxio.Storage.DeleteMarker.sidecar/2，单一形态来源）；modtime 单次计算所有端点同值 → signature 一致。
+  defp build_delete_marker_meta(version_id, entry_opts) do
+    Maxio.Storage.DeleteMarker.sidecar(version_id, entry_opts)
   end
 
   # ── 辅助 ──
