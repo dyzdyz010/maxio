@@ -283,6 +283,12 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
 
   describe "R6 — put_delete_marker 默认参对齐" do
     test "Distributed.put_delete_marker 最小 arity = 3（version_id 必须显式传）" do
+      # function_exported?/3 不触发模块加载（懒加载 .beam 下未加载模块一律 false）——
+      # 先显式 ensure_loaded，否则本测试随用例执行顺序漂移（审计中实测 flaky）。
+      for mod <- [Maxio.Storage.Distributed, Maxio.Storage.ErasureCoded, Maxio.Storage] do
+        Code.ensure_loaded!(mod)
+      end
+
       refute function_exported?(Maxio.Storage.Distributed, :put_delete_marker, 2)
       assert function_exported?(Maxio.Storage.Distributed, :put_delete_marker, 3)
       # ErasureCoded / Storage 门面本就如此（对齐基准）。
