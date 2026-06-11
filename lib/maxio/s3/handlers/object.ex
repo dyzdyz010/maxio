@@ -141,8 +141,8 @@ defmodule Maxio.S3.Handlers.Object do
         |> send_resp(200, "")
 
       {:ok, {:error, :invalid_key}} ->
-        # 入口守卫之外仍可达：空段 key（"a//b" 等，AWS 合法）在 sidecar 盘上布局无法无碰撞表达，
-        # 后端经 Paths.object_rel 结构化拒绝 → 同样映射 400 XMinioInvalidObjectName（绝不静默折叠）。
+        # backstop：后端 Paths.encode_key 对非法 key（空 key / 点段，如守卫部署前遗留的在途
+        # multipart 会话）结构化拒绝 → 同样映射 400 XMinioInvalidObjectName（绝不 500/静默折叠）。
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       # 写 quorum 不足 / 原子 rename 争用 = 瞬时写限流，对齐 MinIO 的 SlowDownWrite(503)
@@ -1207,11 +1207,12 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  # B5-3 R3/R4 —— 对象 key 入口守卫（PUT/GET/HEAD/DELETE/Copy 源与目标统一；multipart 门由
-  # Handlers.Multipart.create_multipart_upload 同构守卫，保证「可建即可达」）：保留布局名段
-  # （meta.json/part.0/.versions/.uploads/.tmp 精确匹配）或 ./.. 点段 → 400 XMinioInvalidObjectName
-  # （对齐 MinIO ErrInvalidObjectName，在任何查找/写入之前校验）。单一事实来源 =
-  # Maxio.Cluster.Paths.validate_key/1（与盘上路径构造同源），handler 仅做错误映射（铁律 2）。
+  # 对象 key 入口守卫（PUT/GET/HEAD/DELETE/Copy 源与目标统一；multipart 门由
+  # Handlers.Multipart.create_multipart_upload 同构守卫，保证「可建即可达」）：仅拒
+  # MinIO/AWS 都拒的形态——空 key / `.` `..` 点段 → 400 XMinioInvalidObjectName（对齐 MinIO
+  # ErrInvalidObjectName，在任何查找/写入之前校验）。布局保留名段（meta.json/part.0/...）是
+  # MinIO/AWS 均接受的普通 key，**不**在 API 层拒绝——盘上碰撞由 Paths.encode_key 段编码
+  # 结构化消除。单一事实来源 = Maxio.Cluster.Paths.validate_key/1，handler 仅做错误映射（铁律 2）。
   defp validate_object_key!(bucket, key) do
     case Maxio.Cluster.Paths.validate_key(key) do
       :ok ->

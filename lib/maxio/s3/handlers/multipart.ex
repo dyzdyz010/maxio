@@ -26,12 +26,11 @@ defmodule Maxio.S3.Handlers.Multipart do
     key = conn.assigns.s3_key
     _ = ensure_bucket!(bucket)
 
-    # B5-3 R3/R4（review-fix）：multipart 门与单 key 写路径共用同一入口守卫——保留布局名段
-    # （meta.json/part.0/.versions/.uploads/.tmp）或 ./.. 点段 key 在 CreateMultipartUpload 即
-    # 400 XMinioInvalidObjectName（对齐 MinIO：对象名校验同样作用于 CreateMultipartUpload，
-    # ErrInvalidObjectName）。失败 pre-initiate：零会话、零 part 字节、无孤儿（铁律 3）。
-    # 否则 FS 后端的 safe_relative 不识保留名 → Complete 会造出单 key GET/HEAD/DELETE 全被
-    # 入口守卫 400 拒绝的「可建不可达」对象。单一事实来源 = Paths.validate_key/1（铁律 2）。
+    # multipart 门与单 key 写路径共用同一入口守卫——空 key / ./.. 点段 key 在
+    # CreateMultipartUpload 即 400 XMinioInvalidObjectName（对齐 MinIO：对象名校验同样作用于
+    # CreateMultipartUpload，ErrInvalidObjectName）。失败 pre-initiate：零会话、零 part 字节、
+    # 无孤儿（铁律 3）。布局保留名段（meta.json 等）是 MinIO/AWS 均接受的普通 key——不拒，
+    # 盘上碰撞由 Paths.encode_key 段编码消除。单一事实来源 = Paths.validate_key/1（铁律 2）。
     :ok = validate_object_key!(bucket, key)
 
     content_type = header(conn, "content-type") || "binary/octet-stream"

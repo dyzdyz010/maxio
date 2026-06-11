@@ -9,12 +9,14 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
       失败 → 503 SlowDownWrite 且旧 null 对象完好（GET 仍 200）；成功 → marker 生效 + 孤儿
       part.0 被 GC。distributed 后端 + InProcess transport + persistent_term 注入 topology
       （与 get_head_sidecar_read_e2e_test 同范式）。
-    * R3/R4（端点级）：保留布局名段（meta.json/part.0/.versions/.uploads/.tmp 精确匹配）与
-      `.`/`..` 点段 key → 400 `XMinioInvalidObjectName`（对齐 MinIO ErrInvalidObjectName），
-      绝不 500；正常含点 key / part.1 等近似名不受影响；空段 key（"a//b"、"dir/"）在 :pg+FS
-      下维持既有合法行为（铁律 5，integration_test 锁死）。review-fix：multipart 门同一守卫——
-      CreateMultipartUpload 即 400（零孤儿会话，杜绝「可建不可达」对象）；守卫前遗留在途会话的
-      UploadPart/Complete 经 :invalid_key backstop 同映射 400（绝不 500）。
+    * R3/R4（端点级，MinIO-fidelity 修订）：`.`/`..` 点段 key → 400 `XMinioInvalidObjectName`
+      （对齐 MinIO ErrInvalidObjectName），绝不 500。布局保留名段
+      （meta.json/part.0/.versions/.uploads/.tmp）是 MinIO/AWS 均接受的**普通合法 key**——
+      原 B5-3 R3 的 API 层 400 拒绝是保真偏离，已撤销：现 PUT/GET/HEAD/DELETE/Copy/
+      CreateMultipartUpload 全部成功 round-trip（盘上碰撞由 `Paths.encode_key` 段编码结构化
+      消除）；不存在的此类 key GET/HEAD → 404 NoSuchKey（不再 400）。空段 key（"a//b"、"dir/"）
+      维持合法（铁律 5，integration_test 锁死）且不再与折叠 key 互相覆写字节。守卫前遗留
+      在途会话（点段 key）的 UploadPart/Complete 经 :invalid_key backstop 同映射 400（绝不 500）。
     * R5（端点级 e2e）：Enabled + `:write=:sidecar` 的签名 DELETE——成功 204 +
       x-amz-delete-marker:true + `:read=:sidecar` GET 404；down 端点 quorum 失败 → 503
       `<Code>SlowDownWrite</Code>`。
@@ -106,9 +108,10 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
     end
   end
 
-  # ── R3/R4：保留段 / 点段 key → 400 XMinioInvalidObjectName（FS 默认后端 + :pg 默认权威）──
+  # ── R3/R4（MinIO-fidelity 修订）：点段 key → 400；保留布局名段 key = 普通合法 key
+  #    （FS 默认后端 + :pg 默认权威；盘上碰撞由 Paths.encode_key 段编码消除）──
 
-  describe "R3/R4 — 保留布局名段与点段 key → 400 结构化错误（绝不 500）" do
+  describe "R3/R4 — 点段 key → 400；保留布局名段 key 合法 round-trip（对齐 MinIO/AWS）" do
     setup do
       data_dir =
         Path.join(System.tmp_dir!(), "maxio_b53_key_#{System.unique_integer([:positive])}")
@@ -127,25 +130,42 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
       :ok
     end
 
-    test "PUT/GET/DELETE 保留段 key（a/meta.json/b）→ 400 + XMinioInvalidObjectName" do
-      for method <- [:put, :get, :delete] do
-        res = SigV4Request.signed_conn(method, "/rb53key/a/meta.json/b") |> call()
-        assert res.status == 400
-        assert res.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
-      end
+    test "保留段 key（a/meta.json/b）PUT/GET/DELETE 完整 round-trip（MinIO/AWS 均接受此类 key）" do
+      put =
+        SigV4Request.signed_conn(:put, "/rb53key/a/meta.json/b", body: "reserved ok") |> call()
+
+      assert put.status == 200
+
+      get = SigV4Request.signed_conn(:get, "/rb53key/a/meta.json/b") |> call()
+      assert get.status == 200
+      assert get.resp_body == "reserved ok"
+
+      del = SigV4Request.signed_conn(:delete, "/rb53key/a/meta.json/b") |> call()
+      assert del.status == 204
+
+      miss = SigV4Request.signed_conn(:get, "/rb53key/a/meta.json/b") |> call()
+      assert miss.status == 404
+      assert miss.resp_body =~ "<Code>NoSuchKey</Code>"
     end
 
-    test "HEAD 保留段 key → 400（HEAD 无 body，仅状态码）" do
-      res = SigV4Request.signed_conn(:head, "/rb53key/part.0") |> call()
-      assert res.status == 400
-      assert res.resp_body == ""
+    test "不存在的保留段 key GET/HEAD → 404（曾 400；NoSuchKey 对齐 MinIO/AWS）" do
+      get = SigV4Request.signed_conn(:get, "/rb53key/ghost/meta.json") |> call()
+      assert get.status == 404
+      assert get.resp_body =~ "<Code>NoSuchKey</Code>"
+
+      head = SigV4Request.signed_conn(:head, "/rb53key/part.0") |> call()
+      assert head.status == 404
+      assert head.resp_body == ""
     end
 
-    test "全部保留名段逐一被拦（精确匹配）" do
+    test "全部保留名段逐一合法 round-trip（盘上经段编码无碰撞）" do
       for seg <- ["meta.json", "part.0", ".versions", ".uploads", ".tmp"] do
-        res = SigV4Request.signed_conn(:put, "/rb53key/p/#{seg}/x", body: "x") |> call()
-        assert res.status == 400, "segment #{seg} must be rejected"
-        assert res.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+        put = SigV4Request.signed_conn(:put, "/rb53key/p/#{seg}/x", body: "v " <> seg) |> call()
+        assert put.status == 200, "segment #{seg} must be accepted"
+
+        get = SigV4Request.signed_conn(:get, "/rb53key/p/#{seg}/x") |> call()
+        assert get.status == 200
+        assert get.resp_body == "v " <> seg
       end
     end
 
@@ -164,41 +184,99 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
       refute del.resp_body =~ "InternalError"
     end
 
-    test "Copy 源与目标 key 都被拦 → 400" do
-      dest =
-        SigV4Request.signed_conn(:put, "/rb53key/dest/.tmp/x",
-          headers: [{"x-amz-copy-source", "/rb53key/src.txt"}]
-        )
-        |> call()
+    test "Copy 保留段源/目标合法；点段源/目标 400" do
+      put = SigV4Request.signed_conn(:put, "/rb53key/a/meta.json/b", body: "copy me") |> call()
+      assert put.status == 200
 
-      assert dest.status == 400
-      assert dest.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
-
-      src =
+      # 保留段源 → 普通目标：成功。
+      dest1 =
         SigV4Request.signed_conn(:put, "/rb53key/dest.txt",
           headers: [{"x-amz-copy-source", "/rb53key/a/meta.json/b"}]
         )
         |> call()
 
-      assert src.status == 400
-      assert src.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+      assert dest1.status == 200
+      get1 = SigV4Request.signed_conn(:get, "/rb53key/dest.txt") |> call()
+      assert get1.resp_body == "copy me"
+
+      # 普通源 → 保留段目标：成功 round-trip。
+      dest2 =
+        SigV4Request.signed_conn(:put, "/rb53key/dest/.tmp/x",
+          headers: [{"x-amz-copy-source", "/rb53key/dest.txt"}]
+        )
+        |> call()
+
+      assert dest2.status == 200
+      get2 = SigV4Request.signed_conn(:get, "/rb53key/dest/.tmp/x") |> call()
+      assert get2.resp_body == "copy me"
+
+      # 点段（真正非法）源与目标仍被拦 → 400。
+      bad_dst =
+        SigV4Request.signed_conn(:put, "/rb53key/a/../b",
+          headers: [{"x-amz-copy-source", "/rb53key/dest.txt"}]
+        )
+        |> call()
+
+      assert bad_dst.status == 400
+      assert bad_dst.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+
+      bad_src =
+        SigV4Request.signed_conn(:put, "/rb53key/dest2.txt",
+          headers: [{"x-amz-copy-source", "/rb53key/a/../b"}]
+        )
+        |> call()
+
+      assert bad_src.status == 400
+      assert bad_src.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
     end
 
-    test "CreateMultipartUpload 保留段/点段 key → 400 XMinioInvalidObjectName，零孤儿会话（multipart 门同一入口守卫）" do
-      for key <- ["a/meta.json/b", "a/../b"] do
-        init =
-          SigV4Request.signed_conn(:post, "/rb53key/#{key}", query: %{"uploads" => ""}) |> call()
+    test "CreateMultipartUpload 点段 key → 400 零孤儿会话；保留段 key 全程 multipart round-trip（可建即可达）" do
+      init_bad =
+        SigV4Request.signed_conn(:post, "/rb53key/a/../b", query: %{"uploads" => ""}) |> call()
 
-        assert init.status == 400, "CreateMultipartUpload for #{key} must be rejected"
-        assert init.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
-        refute init.resp_body =~ "InternalError"
-      end
+      assert init_bad.status == 400
+      assert init_bad.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+      refute init_bad.resp_body =~ "InternalError"
 
       # 失败 pre-initiate：无孤儿会话（端点级 ListMultipartUploads + context 双取证）。
       list = SigV4Request.signed_conn(:get, "/rb53key", query: %{"uploads" => ""}) |> call()
       assert list.status == 200
-      refute list.resp_body =~ "meta.json"
       assert Maxio.Multipart.list_uploads("rb53key", %{}).uploads == []
+
+      # 保留段 key：initiate → upload part → complete → GET 全程成功（对齐 MinIO/AWS）。
+      init =
+        SigV4Request.signed_conn(:post, "/rb53key/a/meta.json/b", query: %{"uploads" => ""})
+        |> call()
+
+      assert init.status == 200
+      [_, upload_id] = Regex.run(~r|<UploadId>([^<]+)</UploadId>|, init.resp_body)
+
+      up =
+        SigV4Request.signed_conn(:put, "/rb53key/a/meta.json/b",
+          query: %{"partNumber" => "1", "uploadId" => upload_id},
+          body: "mpu reserved bytes"
+        )
+        |> call()
+
+      assert up.status == 200
+      [etag] = get_resp_header(up, "etag")
+
+      xml =
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>" <>
+          "<ETag>#{etag}</ETag></Part></CompleteMultipartUpload>"
+
+      comp =
+        SigV4Request.signed_conn(:post, "/rb53key/a/meta.json/b",
+          query: %{"uploadId" => upload_id},
+          body: xml
+        )
+        |> call()
+
+      assert comp.status == 200
+
+      get = SigV4Request.signed_conn(:get, "/rb53key/a/meta.json/b") |> call()
+      assert get.status == 200
+      assert get.resp_body == "mpu reserved bytes"
     end
 
     test "守卫前遗留在途会话（点段 key）→ UploadPart/Complete 400 绝不 500（backstop）" do
@@ -249,30 +327,36 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
     end
   end
 
-  # ── Paths 单元面：validate_key（API 层）与 object_rel（盘路径层，空段额外拒绝）──
+  # ── Paths 单元面：validate_key（API 层，仅拒 MinIO/AWS 都拒的形态）与 object_rel
+  #    （盘路径层，段编码无碰撞表达保留名/空段/尾斜杠；完整 codec 取证在 paths_test.exs）──
 
-  describe "Paths.validate_key / object_rel（R3 单一来源）" do
-    test "validate_key：保留段/点段拒绝；空段（合法 S3 key）放行" do
-      assert {:error, :invalid_key} = Paths.validate_key("a/meta.json/b")
-      assert {:error, :invalid_key} = Paths.validate_key("part.0")
-      assert {:error, :invalid_key} = Paths.validate_key(".versions/x")
+  describe "Paths.validate_key / object_rel（单一来源，MinIO-fidelity 修订）" do
+    test "validate_key：点段/空 key 拒绝；保留段与空段（均为合法 S3 key）放行" do
       assert {:error, :invalid_key} = Paths.validate_key("a/./b")
       assert {:error, :invalid_key} = Paths.validate_key("a/../b")
       assert {:error, :invalid_key} = Paths.validate_key("")
 
+      # 保留布局名段是 MinIO/AWS 均接受的普通 key（盘上碰撞由段编码消除，不在 API 层拒）。
+      assert :ok = Paths.validate_key("a/meta.json/b")
+      assert :ok = Paths.validate_key("part.0")
+      assert :ok = Paths.validate_key(".versions/x")
+
       assert :ok = Paths.validate_key("a.b/c.d")
       assert :ok = Paths.validate_key("p/part.1/x")
 
-      # 空段 key 是合法 S3 key（folder marker / 连续斜杠），API 层放行（:pg+FS 忠实表达）。
+      # 空段 key 是合法 S3 key（folder marker / 连续斜杠），API 层放行（编码无碰撞落盘）。
       assert :ok = Paths.validate_key("dir/")
       assert :ok = Paths.validate_key("a//b")
     end
 
-    test "object_rel：保留段/点段/空段全拒（盘上布局无法无碰撞表达空段，绝不静默折叠）" do
-      assert {:error, :invalid_key} = Paths.object_rel("b", "a/meta.json/b", "null")
-      assert {:error, :invalid_key} = Paths.object_rel("b", "a/.tmp/x", "null")
-      assert {:error, :invalid_key} = Paths.object_rel("b", "a//b", "null")
-      assert {:error, :invalid_key} = Paths.object_rel("b", "dir/", "null")
+    test "object_rel：点段拒绝；保留段/空段/尾斜杠经段编码无碰撞落盘（绝不静默折叠）" do
+      assert {:error, :invalid_key} = Paths.object_rel("b", "a/../b", "null")
+      assert {:error, :invalid_key} = Paths.object_rel("b", "a/./b", "null")
+
+      assert {:ok, "b/a/meta.json__MXESC__/b"} = Paths.object_rel("b", "a/meta.json/b", "null")
+      assert {:ok, "b/a/.tmp__MXESC__/x"} = Paths.object_rel("b", "a/.tmp/x", "null")
+      assert {:ok, "b/a/__MXEMPTY__/b"} = Paths.object_rel("b", "a//b", "null")
+      assert {:ok, "b/dir__MXDIR__"} = Paths.object_rel("b", "dir/", "null")
 
       assert {:ok, "b/p/part.1/x"} = Paths.object_rel("b", "p/part.1/x", "null")
       assert {:ok, "b/a.b/c.d"} = Paths.object_rel("b", "a.b/c.d", "null")

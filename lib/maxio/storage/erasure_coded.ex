@@ -317,48 +317,23 @@ defmodule Maxio.Storage.ErasureCoded do
   # ── 对象目录布局（每盘一份）──
 
   # 对象在盘 d 下的目录：<d>/<bucket>/<rel>（null 版本）或 <d>/.versions/<bucket>/<rel>/<version_id>。
+  # rel 经 Maxio.Cluster.Paths.object_rel（单一事实来源，铁律 2）：空段/尾斜杠/布局保留名段
+  # 全部段编码无碰撞落盘（绝不 trim 折叠、绝不与 meta.json/part.0 布局名冲突）。
   defp object_dirs(bucket, key, version_id, cfg) do
-    case safe_relative(key) do
-      {:ok, rel} ->
-        sub =
-          if version_id == "null" do
-            Path.join([bucket, rel])
-          else
-            Path.join([".versions", bucket, rel, version_id])
-          end
-
-        {:ok, Enum.map(cfg.drives, &Path.join(&1, sub))}
-
-      :error ->
-        {:error, :invalid_key}
-    end
-  end
-
-  defp safe_relative(key) do
-    segments = key |> String.split("/", trim: true)
-
-    cond do
-      key == "" -> :error
-      Enum.any?(segments, &(&1 in ["..", "."])) -> :error
-      true -> {:ok, Path.join(segments)}
+    case Maxio.Cluster.Paths.object_rel(bucket, key, version_id) do
+      {:ok, sub} -> {:ok, Enum.map(cfg.drives, &Path.join(&1, sub))}
+      {:error, :invalid_key} -> {:error, :invalid_key}
     end
   end
 
   # ── 原子提交编排（B1-2）──
   # 每盘返回 {drive_root, final_obj_dir}：drive_root（cfg.drives 元素）下建同卷 .tmp，final 为对象目录。
   defp commit_pairs(bucket, key, version_id, cfg) do
-    case safe_relative(key) do
-      {:ok, rel} ->
-        sub =
-          if version_id == "null" do
-            Path.join([bucket, rel])
-          else
-            Path.join([".versions", bucket, rel, version_id])
-          end
-
+    case Maxio.Cluster.Paths.object_rel(bucket, key, version_id) do
+      {:ok, sub} ->
         {:ok, Enum.map(cfg.drives, fn drive -> {drive, Path.join(drive, sub)} end)}
 
-      :error ->
+      {:error, :invalid_key} ->
         {:error, :invalid_key}
     end
   end

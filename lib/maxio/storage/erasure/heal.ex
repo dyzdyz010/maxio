@@ -346,7 +346,14 @@ defmodule Maxio.Storage.Erasure.Heal do
       end
 
     if @meta_file in entries do
-      key = dir |> Path.relative_to(base) |> to_unix()
+      # 盘上目录名是编码后的段（Maxio.Cluster.Paths.encode_key）——还原为原始 key。
+      key =
+        dir
+        |> Path.relative_to(base)
+        |> to_unix()
+        |> String.split("/")
+        |> Maxio.Cluster.Paths.decode_key()
+
       [{key, vid}]
     else
       Enum.flat_map(entries, fn e ->
@@ -374,10 +381,11 @@ defmodule Maxio.Storage.Erasure.Heal do
 
     if @meta_file in entries do
       rel = dir |> Path.relative_to(base) |> to_unix()
-      # rel 形如 "<key...>/<version_id>"；拆出末段为 version_id。
+
+      # rel 形如 "<encoded-key...>/<version_id>"；拆出末段为 version_id，key 段解码还原。
       segs = String.split(rel, "/")
       {key_segs, [vid]} = Enum.split(segs, length(segs) - 1)
-      [{Enum.join(key_segs, "/"), vid}]
+      [{Maxio.Cluster.Paths.decode_key(key_segs), vid}]
     else
       Enum.flat_map(entries, fn e ->
         sub = Path.join(dir, e)
@@ -390,23 +398,11 @@ defmodule Maxio.Storage.Erasure.Heal do
 
   # ── 与 ErasureCoded 私有逻辑等价的本地辅助（heal 独立模块，避免暴露后端私有）──
 
+  # 与后端共用 Maxio.Cluster.Paths.object_rel（单一事实来源，铁律 2）：段编码（空段/尾斜杠/
+  # 布局保留名）与 ErasureCoded/Distributed 写路径逐字一致，heal 才能找到同一目录。
   defp object_dirs(bucket, key, version_id, cfg) do
-    {:ok, rel} = safe_relative(key)
-
-    sub =
-      if version_id == "null",
-        do: Path.join([bucket, rel]),
-        else: Path.join([".versions", bucket, rel, version_id])
-
+    {:ok, sub} = Maxio.Cluster.Paths.object_rel(bucket, key, version_id)
     Enum.map(cfg.drives, &Path.join(&1, sub))
-  end
-
-  defp safe_relative(key) do
-    segments = key |> String.split("/", trim: true)
-
-    if key == "" or Enum.any?(segments, &(&1 in ["..", "."])),
-      do: :error,
-      else: {:ok, Path.join(segments)}
   end
 
   defp read_any_sidecar(dirs) do

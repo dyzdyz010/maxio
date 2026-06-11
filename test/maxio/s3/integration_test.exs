@@ -186,6 +186,64 @@ defmodule Maxio.S3.IntegrationTest do
     assert get.resp_body == "L"
   end
 
+  # ── MinIO-fidelity：相邻 key 绝不在盘上互相别名（'a//b'↔'a/b'、'dir/'↔'dir' 曾静默同路径
+  #    = 后写者覆写前者字节）。Paths.encode_key 段编码使两者各落各的盘路径。──
+  test "'a//b.txt' 与 'a/b.txt' 共存：各自字节独立，互不覆写（曾盘上别名）" do
+    SigV4Request.signed_conn(:put, "/alias") |> call()
+
+    assert SigV4Request.signed_conn(:put, "/alias/a//b.txt", body: "double-slash bytes")
+           |> call()
+           |> Map.fetch!(:status) == 200
+
+    assert SigV4Request.signed_conn(:put, "/alias/a/b.txt", body: "single-slash bytes")
+           |> call()
+           |> Map.fetch!(:status) == 200
+
+    # 第二个 PUT 绝不覆写第一个 key 的字节。
+    g1 = SigV4Request.signed_conn(:get, "/alias/a//b.txt") |> call()
+    assert g1.status == 200
+    assert g1.resp_body == "double-slash bytes"
+
+    g2 = SigV4Request.signed_conn(:get, "/alias/a/b.txt") |> call()
+    assert g2.status == 200
+    assert g2.resp_body == "single-slash bytes"
+  end
+
+  test "'dir/'（folder marker）与 'dir' 共存：两个独立对象（对齐 AWS；MinIO 以 __XLDIR__ 同构区分）" do
+    SigV4Request.signed_conn(:put, "/alias2") |> call()
+
+    assert SigV4Request.signed_conn(:put, "/alias2/dir", body: "plain object")
+           |> call()
+           |> Map.fetch!(:status) == 200
+
+    assert SigV4Request.signed_conn(:put, "/alias2/dir/", body: "")
+           |> call()
+           |> Map.fetch!(:status) == 200
+
+    g1 = SigV4Request.signed_conn(:get, "/alias2/dir") |> call()
+    assert g1.status == 200
+    assert g1.resp_body == "plain object"
+
+    g2 = SigV4Request.signed_conn(:get, "/alias2/dir/") |> call()
+    assert g2.status == 200
+    assert g2.resp_body == ""
+  end
+
+  test "保留布局名 key（data/meta.json）普通 round-trip；不存在时 404 NoSuchKey（对齐 MinIO/AWS）" do
+    SigV4Request.signed_conn(:put, "/resv") |> call()
+
+    miss = SigV4Request.signed_conn(:get, "/resv/data/meta.json") |> call()
+    assert miss.status == 404
+    assert miss.resp_body =~ "<Code>NoSuchKey</Code>"
+
+    put = SigV4Request.signed_conn(:put, "/resv/data/meta.json", body: "{\"a\":1}") |> call()
+    assert put.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/resv/data/meta.json") |> call()
+    assert get.status == 200
+    assert get.resp_body == "{\"a\":1}"
+  end
+
   test "篡改签名 → 403 SignatureDoesNotMatch（非静默）" do
     # 取一个完全合法的自签请求，仅把 Authorization 头里的 Signature=<hex> 篡改为伪值，
     # 其余（scope-date 与 x-amz-date 对齐、Credential、SignedHeaders）保持合法——

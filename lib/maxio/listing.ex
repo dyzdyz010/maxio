@@ -10,8 +10,9 @@ defmodule Maxio.Listing do
 
   ## 版本树枚举（修复版本化对象 LIST 失明 —— 关键保真）
 
-  对象布局（`Maxio.Cluster.Paths.object_rel/3`）：null 版本落 `<bucket>/<key>/meta.json`；任何
-  ULID 版本落 `.versions/<bucket>/<key>/<version_id>/meta.json`。故 Enabled/Suspended 桶的「当前
+  对象布局（`Maxio.Cluster.Paths.object_rel/3`）：null 版本落 `<bucket>/<encoded-key>/meta.json`；
+  任何 ULID 版本落 `.versions/<bucket>/<encoded-key>/<version_id>/meta.json`（盘上目录名是
+  `Paths.encode_key` 的编码段，走盘经 `Paths.decode_segment/decode_key` 还原原始 key）。故 Enabled/Suspended 桶的「当前
   版本」可能只存在于 `.versions` 子树——若 drive-walk 只走 null 布局（曾经如此），会对**每个**版本化
   对象漏列（与权威 `Maxio.Objects.list_objects_v2/2` 的 is_latest 过滤产生系统性伪分歧，翻权威后更
   返回空/错列表）。对齐 MinIO 纠删后端（xl.meta 单目录承载一个 key 的全部版本）与 maxio 自身 heal
@@ -498,13 +499,16 @@ defmodule Maxio.Listing do
     end
   end
 
-  # 递归 DFS（null 布局）：dir = 端点下当前目录绝对路径；rel = 相对 bucket 根的 key 前缀。
+  # 递归 DFS（null 布局）：dir = 端点下当前目录绝对路径；rel = 相对 bucket 根的**原始 key** 前缀。
+  # 盘上目录名是编码段（Maxio.Cluster.Paths.encode_key：空段 __MXEMPTY__、尾斜杠 __MXDIR__、
+  # 保留名 __MXESC__）——逐段 decode_segment 还原原始 key（与写路径精确互逆，绝不漏列/错列）。
   # 端点宕机/读失败（{:error, _}）-> 该子树跳过（铁律 3：结构化降级，绝不上抛炸列举路径）。
   defp walk(transport, node, dir, rel) do
     case transport.list_dir(node, dir, []) do
       {:ok, entries} ->
         Enum.flat_map(entries, fn %{name: name, object?: obj?} ->
-          child_rel = if rel == "", do: name, else: rel <> "/" <> name
+          seg = Maxio.Cluster.Paths.decode_segment(name)
+          child_rel = if rel == "", do: seg, else: rel <> "/" <> seg
           child_dir = Path.join(dir, name)
           here = if obj?, do: [child_rel], else: []
           here ++ walk(transport, node, child_dir, child_rel)
@@ -533,7 +537,8 @@ defmodule Maxio.Listing do
     end
   end
 
-  # "<key...>/<version_id>" -> [{key, version_id}]；无 "/"（理论上不该出现）-> 丢弃（绝不误当 key）。
+  # "<encoded-key...>/<version_id>" -> [{key, version_id}]；key 段经 Paths.decode_key 还原原始 key
+  # （version_id 是系统生成 ULID/"null"，永不编码）。无 "/"（理论上不该出现）-> 丢弃（绝不误当 key）。
   defp split_version(rel) do
     case String.split(rel, "/") do
       [_single] ->
@@ -541,7 +546,7 @@ defmodule Maxio.Listing do
 
       segs ->
         {key_segs, [vid]} = Enum.split(segs, length(segs) - 1)
-        [{Enum.join(key_segs, "/"), vid}]
+        [{Maxio.Cluster.Paths.decode_key(key_segs), vid}]
     end
   end
 

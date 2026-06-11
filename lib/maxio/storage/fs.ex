@@ -1,7 +1,8 @@
 defmodule Maxio.Storage.FS do
   @moduledoc """
-  单机文件系统存储后端（MVP）。对象落在 `<data_dir>/<bucket>/<key>`，key 中的 `/`
-  自然映射为子目录。put 流式写入并边写边算 MD5（绝不全缓冲，铁律 4）；
+  单机文件系统存储后端（MVP）。对象落在 `<data_dir>/<bucket>/<encoded-key>`，key 中的 `/`
+  自然映射为子目录；key → 盘段编码经 `Maxio.Cluster.Paths.encode_key/1`（空段/尾斜杠/布局
+  保留名段无碰撞落盘，单一事实来源）。put 流式写入并边写边算 MD5（绝不全缓冲，铁律 4）；
   get 支持 Range，按区间用 :file.pread 分块发出；防 `..` 路径穿越。
 
   写路径（put/assemble）经 **temp-then-rename + fsync**（ROUTE B B1-2）：先流式写
@@ -14,7 +15,7 @@ defmodule Maxio.Storage.FS do
   """
   @behaviour Maxio.Storage.Backend
 
-  alias Maxio.Cluster.ShardServer
+  alias Maxio.Cluster.{Paths, ShardServer}
 
   @chunk_size 1_048_576
   @tmp_root ".tmp"
@@ -300,32 +301,26 @@ defmodule Maxio.Storage.FS do
 
   defp bucket_path(bucket, opts), do: Path.join(data_dir(opts), bucket)
 
-  # version_id == "null"（无版本）→ 落原路径 <data_dir>/<bucket>/<key>（向后兼容既有对象）。
-  # 否则落版本化路径 <data_dir>/.versions/<bucket>/<key>/<version_id>（与对象路径物理隔离，避免与 key 命名冲突）。
+  # version_id == "null"（无版本）→ 落原路径 <data_dir>/<bucket>/<encoded-key>。
+  # 否则落版本化路径 <data_dir>/.versions/<bucket>/<encoded-key>/<version_id>（与对象路径物理隔离）。
+  #
+  # key → 盘段编码经 Maxio.Cluster.Paths.encode_key（单一事实来源，铁律 2）：空段（"a//b"）、
+  # 尾斜杠 folder marker（"dir/"）、布局保留名段（meta.json 等）全部无碰撞落盘——绝不再
+  # trim 折叠空段（"a//b" 与 "a/b"、"dir/" 与 "dir" 曾静默同路径 = 跨 key 字节覆写）。
   defp object_path(bucket, key, "null", opts) do
-    case safe_relative(key) do
+    case Paths.encode_key(key) do
       {:ok, rel} -> {:ok, Path.join([data_dir(opts), bucket, rel])}
-      :error -> {:error, :invalid_key}
+      {:error, :invalid_key} -> {:error, :invalid_key}
     end
   end
 
   defp object_path(bucket, key, version_id, opts) do
-    case safe_relative(key) do
+    case Paths.encode_key(key) do
       {:ok, rel} ->
         {:ok, Path.join([data_dir(opts), ".versions", bucket, rel, version_id])}
 
-      :error ->
+      {:error, :invalid_key} ->
         {:error, :invalid_key}
-    end
-  end
-
-  defp safe_relative(key) do
-    segments = key |> String.split("/", trim: true)
-
-    cond do
-      key == "" -> :error
-      Enum.any?(segments, &(&1 in ["..", "."])) -> :error
-      true -> {:ok, Path.join(segments)}
     end
   end
 end
