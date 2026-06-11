@@ -299,7 +299,8 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 - **dot-segment Code（low）**：MinIO 用 `XMinioInvalidResourceName` 且在中间件层先于 bucket 检查；maxio 现用 XMinioInvalidObjectName 且 ensure_bucket! 在前（404 NoSuchBucket 赢 400）。cosmetic。
 - **HEAD 错误响应头（low，pre-existing）**：HEAD 错误裸状态码，无 x-minio-error-code/-desc 头（MinIO writeErrorResponseHeadersOnly 有）。
 
-> **⏸ 检查点暂停（2026-06-11，用户指示）**：B5-3 收口完成、`mix precommit` 790 测试 exit 0 权威确认。用户切换后端后继续。**续作断点**：① 可选 B5-4（上方 backlog：KeyTooLongError medium + ?versionId 路径守卫 + 2 low）；② 路线 B P6（B6-1：FS 后端也写扩展 sidecar、单机 shared-nothing、FS list_dir/quorum=1 walk + 原子提交——9747ef4 的 encode_key 已为 FS 布局铺路）；③ P7（B7-1 mix maxio.backfill_sidecars 迁移既有对象 → B7-2 shadow-compare 驱分歧到零 → B7-3 永久 cutover 翻 :sidecar 默认 + 保留 PG 快路径）。路线图 `plans/2026-06-09-routeB-shared-nothing-metadata.md`；workflow 编排用 `.omc/workflows/implement-milestone.js`（agent 已全 fable）。
+> **▶ 已从检查点恢复（2026-06-11，用户切换后端后指示继续）**。
+   ◇ 路线 B P6（FS 单机 shared-nothing）← **进行中**：B5-4（backlog 收口：KeyTooLongError 400 + ?versionId 路径守卫 InvalidArgument——VersionId.valid?/1 单一来源；defer 2 low）→ B6-1（FS 写路径换 obj-dir 布局 `<bucket>/<key>/{part.0,meta.json}` 与 EC/Distributed 同构 + maxio/2 sidecar（version_opts 同款，FS 不再忽略 object_meta）+ put_delete_marker 实装 + 旧单文件布局读回退兼容）→ B6-2（合成单端点 topology `FS.local_topology`（node=Node.self()，Erpc 本地快路径零新 transport）quorum=1，使 ObjectMeta/Listing/Scanner 全机器在 FS 逐字复用；e2e：FS + `:read/:list=:sidecar` 真实 PUT/GET/LIST/DELETE/SSE/版本化全可用——**单机部署同样去 PG SPOF**）。**架构决策**：弃勘探建议的旁侧 `.meta/` 树（会迫使 walk/scanner/marker 全长 FS 平行逻辑，违铁律 1/2），采同构 obj-dir + 合成 topology 逐字复用；旧数据 P7 B7-1 backfill 收尾。计划 `plans/2026-06-11-routeB-phase6-fs-shared-nothing.md`。
 
 > **路线 B 主目标达成**：sidecar(meta.json) 已是对象元数据真值源、真实 PUT 对象在 `:read/:list/:write=:sidecar` 下完整可读/可列/可写（端到端取证），PG 降为可派生索引——**PG 单点故障从构造上消除**。默认 `:pg` 全程不变、字节级可回滚。剩余 B4-6 为元数据富度/一致性保真（非阻塞主目标）；生产默认翻 :sidecar 前需 P7 backfill/迁移（既有 v1 对象升 maxio/2）。
 
