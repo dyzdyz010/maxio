@@ -19,6 +19,11 @@ defmodule Maxio.S3.Error do
   @table %{
     no_such_bucket: {"NoSuchBucket", 404, "The specified bucket does not exist."},
     no_such_key: {"NoSuchKey", 404, "The specified key does not exist."},
+    # B6-2a：DeleteObjects 的 per-key 畸形 versionId 对齐 MinIO DeleteMultipleObjectsHandler——
+    # uuid.Parse 失败 → errorCodes.ToAPIErr(ErrNoSuchVersion)（Code "NoSuchVersion"，HTTP 404，
+    # 描述逐字 cmd/api-errors.go），落 per-key <Error>（整响应仍 200）；与单删 DELETE ?versionId
+    # 的 ErrInvalidVersionID（400 InvalidArgument）分流。AWS 同 Code（ErrorResponses）。
+    no_such_version: {"NoSuchVersion", 404, "The specified version does not exist."},
     no_such_upload: {"NoSuchUpload", 404, "The specified multipart upload does not exist."},
     access_denied: {"AccessDenied", 403, "Access Denied"},
     # MinIO extractSignedHeaders 在验签前的硬性检查：SignedHeaders 漏强制 host →

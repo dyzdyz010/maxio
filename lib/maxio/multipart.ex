@@ -146,7 +146,9 @@ defmodule Maxio.Multipart do
       # transport/topology）一并转发到后端，object_meta 覆盖任何同名键（会话才是元数据权威）。
       # NOTE(defer)：多段对象版本化（assemble 无 version_id 形参、CompleteMPU 在 Enabled 桶不建新版本）
       # 是预存在基础设施限制，非本单元目标——故 assemble 仍落 "null" 布局，version_id 通道留后续里程碑。
-      assemble_opts = Keyword.put(opts, :object_meta, assemble_object_meta(upload))
+      # B6-2a：S3 多段 ETag（"...-N"）随 object_meta 透传后端——sidecar versions entry 的 S3 可见
+      # etag 必须是多段形态（耐久 core 顶层 etag 仍为整体字节 MD5，完整性校验语义不动）。
+      assemble_opts = Keyword.put(opts, :object_meta, assemble_object_meta(upload, etag))
 
       case Maxio.Storage.assemble(
              upload.bucket_name,
@@ -191,14 +193,18 @@ defmodule Maxio.Multipart do
   # Maxio.Storage.Backend 的 :object_meta 契约）。content_type/storage_class/user_metadata 取自
   # CreateMultipartUpload 落盘的会话行（handlers/multipart.ex initiate）；MPU MVP 不支持 SSE/per-key ACL
   # 故 sse=nil、acl_canned 默认 private；会话表无 tags 列故 tags=%{}（多段 tagging 留后续里程碑）。
-  defp assemble_object_meta(%Upload{} = upload) do
+  # B6-2a：:etag = S3 多段 ETag（hex(MD5(concat part MD5s))-N）——后端 version_opts 据此让 sidecar
+  # versions entry 的 S3 可见 etag 取多段形态（PG 路径早已如此；:read=:sidecar 下 GET/HEAD/LIST 的
+  # ETag 头才与 AWS/MinIO 一致）；耐久 core 顶层 etag 仍由后端写整体字节 MD5（完整性校验语义不变）。
+  defp assemble_object_meta(%Upload{} = upload, s3_etag) do
     %{
       content_type: upload.content_type || "binary/octet-stream",
       tags: %{},
       sse: nil,
       acl_canned: "private",
       storage_class: upload.storage_class || "STANDARD",
-      user_metadata: upload.metadata || %{}
+      user_metadata: upload.metadata || %{},
+      etag: s3_etag
     }
   end
 

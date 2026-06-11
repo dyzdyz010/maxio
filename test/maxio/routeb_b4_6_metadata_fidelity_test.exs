@@ -84,7 +84,7 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
 
       # complete：从会话取 content_type/user_metadata 构造 object_meta，经 Storage.assemble 透传后端。
       # caller opts（transport/topology）一并转发；min_part_size:1 放行单小 part。
-      {:ok, %{etag: _mp_etag, size: size}} =
+      {:ok, %{etag: mp_etag, size: size}} =
         Multipart.complete(
           upload,
           [%{part_number: 1, etag: part_etag}],
@@ -101,9 +101,12 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
       refute entry["content_type"] == "binary/octet-stream"
       assert entry["user_metadata"] == %{"author" => "alice", "team" => "core"}
 
-      # sidecar entry.etag = 组装后字节的 MD5（耐久核心字段，预存在行为，绝不动）；
-      # 与 complete 返回的 multipart ETag（"...-1"）形态不同，故只断言非空 hex，不与 etag 比较。
-      assert is_binary(entry["etag"]) and entry["etag"] != ""
+      # B6-2a：sidecar versions entry 的 S3 可见 etag = 多段 ETag（"...-1"，经 object_meta 透传）；
+      # 耐久 core 顶层 etag 仍为整体字节 MD5（完整性校验语义，绝不动）——两者形态不同。
+      assert entry["etag"] == mp_etag
+      assert String.ends_with?(mp_etag, "-1")
+      assert meta["etag"] =~ ~r/^[0-9a-f]{32}$/
+      refute meta["etag"] == mp_etag
       assert entry["size"] == byte_size(body)
 
       # :sidecar 读 GET 视图：content_type 正确（非 octet-stream）、metadata 自描述。

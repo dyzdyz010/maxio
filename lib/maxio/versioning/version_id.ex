@@ -23,11 +23,23 @@ defmodule Maxio.Versioning.VersionId do
   def null_sentinel, do: "null"
 
   @doc """
+  客户端 versionId **参数归一化**单一来源（B6-2a）：query/XML 给了 `versionId` 但值为空串
+  （`?versionId=` / `<VersionId></VersionId>`）在 AWS/MinIO 语义下等同**未给**（latest/普通
+  语义；MinIO `r.Form.Get(xhttp.VersionID)` 空串即 absent、DeleteMultipleObjectsHandler 对
+  `object.VersionID == ""` 跳过一切版本校验）——绝非 400。nil/空串 → nil；其余原样返回
+  （形状校验仍由 `valid?/1` 单点负责，两职责正交）。
+  """
+  @spec normalize_param(term()) :: term()
+  def normalize_param(""), do: nil
+  def normalize_param(other), do: other
+
+  @doc """
   客户端 versionId 入口校验**单一来源**（B5-4 安全守卫）：合法形状 = 保留串 `"null"` 或
   26 字符 Crockford base32 ULID（与 `generate/0` 产出同字母表 `[0-9A-HJKMNP-TV-Z]`，
   单一事实来源 = 本模块 @crockford）。其余（空串、`..`、`../x` 等路径段、任意畸形）一律 false
   ——handler 据此 400 InvalidArgument，杜绝客户端 versionId 不经校验直进
   `Maxio.Cluster.Paths.object_rel/3` 盘路径的路径穿越面。逐字节判定（非 UTF-8 安全，绝不抛）。
+  空串归一化（视为 absent）是 `normalize_param/1` 的职责——handler 先归一化再校验。
   """
   @spec valid?(term()) :: boolean()
   def valid?("null"), do: true

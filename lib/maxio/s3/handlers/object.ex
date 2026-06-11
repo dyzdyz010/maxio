@@ -176,7 +176,12 @@ defmodule Maxio.S3.Handlers.Object do
     # B5-3 R3/R4：对象 key 入口守卫（与 PUT 同源，MinIO 在任何查找前校验对象名）。
     :ok = validate_object_key!(bucket, key)
 
-    version_id = Map.get(conn.query_params, "versionId")
+    # B6-2a：空 `?versionId=` 归一化为 absent（= latest，AWS/MinIO 语义）——绝非 400；
+    # 单一来源 VersionId.normalize_param/1（GET/HEAD/DELETE/tagging 同源）。
+    version_id =
+      conn.query_params
+      |> Map.get("versionId")
+      |> Maxio.Versioning.VersionId.normalize_param()
 
     # B5-4：客户端 versionId 入口守卫（非法形状 → 400 InvalidArgument，先于任何查找/盘路径构造）。
     :ok = validate_version_id!(bucket, key, version_id)
@@ -258,7 +263,12 @@ defmodule Maxio.S3.Handlers.Object do
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
     conn = fetch_query_params(conn)
-    version_id = Map.get(conn.query_params, "versionId")
+
+    # B6-2a：空 `?versionId=` 归一化为 absent（与 GET 同源，单一来源 normalize_param/1）。
+    version_id =
+      conn.query_params
+      |> Map.get("versionId")
+      |> Maxio.Versioning.VersionId.normalize_param()
 
     # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口；:pg 默认含内部 shadow，行为不变）。
     # HEAD 无 body：缺失/read_quorum 不足都只回状态 + 头（read_quorum 不足 → 503，对齐 GET SlowDownRead）。
@@ -374,7 +384,11 @@ defmodule Maxio.S3.Handlers.Object do
     # B5-3 R3/R4：key 守卫（保留布局名段/点段 → 400，修 delete-marker 路径此前的 500 InternalError）。
     :ok = validate_object_key!(bucket, key)
 
-    version_id = Map.get(conn.query_params, "versionId")
+    # B6-2a：空 `?versionId=` 归一化为 absent（= 走 marker/普通删除分支，AWS/MinIO 语义）。
+    version_id =
+      conn.query_params
+      |> Map.get("versionId")
+      |> Maxio.Versioning.VersionId.normalize_param()
 
     # B5-4：客户端 ?versionId 入口守卫（非法形状 → 400 InvalidArgument，先于任何查找/盘路径构造
     # ——尤其 :write=:sidecar 下 Storage.delete_version 直接以 versionId 构造盘路径）。
@@ -458,7 +472,15 @@ defmodule Maxio.S3.Handlers.Object do
             {:error, err} -> {dacc, [err | eacc]}
           end
         else
-          err = %{key: obj.key, code: "AccessDenied", message: "Access Denied"}
+          # B6-2a：per-key <Error> 携带请求给的 VersionId（MinIO DeleteError 对 AccessDenied
+          # 同样回显 object.VersionID；nil 不渲染）。
+          err = %{
+            key: obj.key,
+            version_id: obj.version_id,
+            code: "AccessDenied",
+            message: "Access Denied"
+          }
+
           {dacc, [err | eacc]}
         end
       end)
@@ -501,16 +523,26 @@ defmodule Maxio.S3.Handlers.Object do
         reason: Exception.message(err)
       )
 
-      {:error, %{key: key, code: s3err.code, message: s3err.message}}
+      # B6-2a：错误条目回显请求给的 per-key VersionId（AWS Error 元素含 VersionId；
+      # MinIO DeleteError 原样回显 object.VersionID；nil 不渲染）。
+      {:error, %{key: key, version_id: version_id, code: s3err.code, message: s3err.message}}
   end
 
   defp do_delete_one(bucket, key, version_id, versioning) do
     cond do
       version_id != nil ->
-        # B5-4：批量删除的 per-key versionId 同过入口守卫（与单删 DELETE ?versionId 同源）——
-        # 非法形状 raise InvalidArgument，由 delete_one 的 rescue 降为该 key 的 <Error> 条目
-        # （DeleteObjects 的失败是 per-key 的，对齐 AWS；绝不让畸形 versionId 进盘路径）。
-        :ok = validate_version_id!(bucket, key, version_id)
+        # B6-2a（修 B5-4 的 Code 偏离）：批量删除的 per-key 畸形 versionId → 该 key
+        # <Error><Code>NoSuchVersion</Code>（对齐 MinIO DeleteMultipleObjectsHandler：
+        # uuid.Parse 失败 → ErrNoSuchVersion 落 per-key DeleteError，绝非整请求级的
+        # ErrInvalidVersionID——后者专属单删 DELETE ?versionId 的 400）。raise 由 delete_one
+        # 的 rescue 降为该 key 的 <Error> 条目（携回显 VersionId）；守卫语义不变：仍先于
+        # 任何查找/盘路径构造拦截（B5-4 安全闸，形状单一来源 VersionId.valid?/1）。
+        if not Maxio.Versioning.VersionId.valid?(version_id) do
+          raise Error.new(:no_such_version,
+                  message: "The specified version does not exist. (invalid version id specified)",
+                  resource: "/#{bucket}/#{key}"
+                )
+        end
 
         # 永久删指定版本（含 delete marker）。幂等：删不存在的版本也算成功。ROUTE B fidelity：
         # 与单删 delete/1 同一 commit_version_delete 提交路径（:sidecar 写权威下盘上 quorum 删除
@@ -1282,13 +1314,15 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  # B5-4 —— 客户端 ?versionId 入口守卫（GET/HEAD/DELETE/DeleteObjects/Copy 源统一）：
+  # B5-4 —— 客户端 ?versionId 入口守卫（GET/HEAD/DELETE/Copy 源/tagging 统一）：
   # 单一事实来源 = Maxio.Versioning.VersionId.valid?/1（"null" 或 26 位 Crockford ULID）。
-  # 非法（空串/`..`/`../x` 路径段/任意畸形）→ 400 InvalidArgument "Invalid version id specified"
+  # 非法（`..`/`../x` 路径段/任意畸形）→ 400 InvalidArgument "Invalid version id specified"
   # （对齐 AWS/MinIO ErrInvalidVersionID，cmd/api-errors.go 描述逐字），在任何查找/盘路径构造
   # 之前拦截——客户端 versionId 曾不经校验直进 Paths.object_rel 盘路径（路径穿越面，铁律 3
   # 结构化拒绝绝不静默）。合法形状但查无此版本仍走既有 404 语义不变。
-  # nil（未带参数）→ 当前版本语义，放行。
+  # nil（未带参数 / B6-2a：空串经 VersionId.normalize_param 归一化）→ 当前版本语义，放行。
+  # DeleteObjects per-key 畸形 versionId 不走本函数（B6-2a：MinIO 对批量删除用 per-key
+  # NoSuchVersion <Error> 条目，见 do_delete_one）。
   defp validate_version_id(nil), do: :ok
 
   defp validate_version_id(version_id) do

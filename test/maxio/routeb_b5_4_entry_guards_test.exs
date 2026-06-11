@@ -8,9 +8,12 @@ defmodule Maxio.RouteBB5_4EntryGuardsTest do
       分流。单一来源 = `Paths.validate_key/1`（encode_key 层折叠为 :invalid_key 仅作后端 backstop）。
     * ?versionId 守卫（安全）：客户端 versionId 曾不经校验直进 `Paths.object_rel` 盘路径
       （`../..` 路径穿越面）。单一来源 = `Maxio.Versioning.VersionId.valid?/1`（"null" 或
-      26 位 Crockford base32 ULID）；GET/HEAD/DELETE/DeleteObjects/Copy 源统一入口校验，
+      26 位 Crockford base32 ULID）；GET/HEAD/DELETE/Copy 源统一入口校验，
       非法 → 400 `InvalidArgument` "Invalid version id specified"（对齐 AWS/MinIO
       ErrInvalidVersionID）。合法形状但查无此版本仍走既有 404 语义；合法 ULID/"null" 不受影响。
+      B6-2a 修正：空 `?versionId=` 归一化为 absent（= latest，MinIO/AWS 语义）而非 400；
+      DeleteObjects 的 per-key 畸形 versionId 按 MinIO DeleteMultipleObjectsHandler 落 per-key
+      `<Error>NoSuchVersion</Error>`（非 InvalidArgument）——取证见 routeb_b6_2a_residuals_test.exs。
 
   `async: false`：setup 切换全局 :s3 data_dir（FS 默认后端 + :pg 默认权威，默认配置行为取证）。
   """
@@ -239,7 +242,9 @@ defmodule Maxio.RouteBB5_4EntryGuardsTest do
   # ── 端点级：?versionId 形状守卫（GET/HEAD/DELETE/DeleteObjects/Copy 源统一）──
 
   describe "?versionId 守卫 — 非法形状 → 400 InvalidArgument（先于任何查找/盘路径构造）" do
-    @bad_version_ids ["../x", "..", "", "not-a-valid-ulid", String.duplicate("I", 26)]
+    # B6-2a：空串不在此列——空 `?versionId=` 是 absent（= latest）而非 400（MinIO/AWS 语义），
+    # 取证见 routeb_b6_2a_residuals_test.exs。
+    @bad_version_ids ["../x", "..", "not-a-valid-ulid", String.duplicate("I", 26)]
 
     setup do
       assert SigV4Request.signed_conn(:put, "/rb54vid") |> call() |> Map.fetch!(:status) == 200
@@ -308,7 +313,7 @@ defmodule Maxio.RouteBB5_4EntryGuardsTest do
       assert miss.status == 404
     end
 
-    test "DeleteObjects per-key VersionId 非法 → 该 key <Error>InvalidArgument</Error>，其余 key 正常删（per-key 隔离）" do
+    test "DeleteObjects per-key VersionId 非法 → 该 key <Error>NoSuchVersion</Error> 携 <VersionId>，其余 key 正常删（per-key 隔离）" do
       put = SigV4Request.signed_conn(:put, "/rb54vid/ok.txt", body: "deletable") |> call()
       assert put.status == 200
 
@@ -323,8 +328,12 @@ defmodule Maxio.RouteBB5_4EntryGuardsTest do
         |> call()
 
       assert resp.status == 200
-      assert resp.resp_body =~ "<Code>InvalidArgument</Code>"
-      assert resp.resp_body =~ "Invalid version id specified"
+      # B6-2a：对齐 MinIO DeleteMultipleObjectsHandler——uuid.Parse 失败 → per-key
+      # ErrNoSuchVersion（非整请求级 InvalidArgument），<Error> 回显 <Key>+<VersionId>。
+      assert resp.resp_body =~ "<Code>NoSuchVersion</Code>"
+      assert resp.resp_body =~ "The specified version does not exist."
+      assert resp.resp_body =~ "<Key>doc.txt</Key><VersionId>../x</VersionId>"
+      refute resp.resp_body =~ "InvalidArgument"
       # 同批合法 key 正常删除（per-key 失败绝不连坐）。
       assert resp.resp_body =~ "<Deleted><Key>ok.txt</Key></Deleted>"
 

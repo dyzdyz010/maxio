@@ -10,6 +10,7 @@ defmodule Maxio.S3.Handlers.Tagging do
   alias Maxio.S3.{Error, Log}
   alias Maxio.S3.RequestParsers.Tagging, as: Parser
   alias Maxio.S3.Views.Tagging, as: View
+  alias Maxio.Versioning.VersionId
 
   @limit 1_048_576
 
@@ -102,8 +103,30 @@ defmodule Maxio.S3.Handlers.Tagging do
     key = conn.assigns.s3_key
     conn = fetch_query_params(conn)
     _ = ensure_bucket!(bucket)
-    vid = Map.get(conn.query_params, "versionId")
+
+    # B6-2a：tagging 三操作（Get/Put/DeleteObjectTagging 的 ?versionId）接入 B5-4 入口守卫
+    # （此前漏接：畸形 versionId 走老路径直达查找层）。空 `?versionId=` 归一化为 absent
+    # （= current 版本，AWS/MinIO 语义）；非法形状 → 400 InvalidArgument，先于任何查找。
+    # 单一来源 = VersionId.normalize_param/1 + valid?/1（与 Handlers.Object 同源，铁律 2）。
+    vid = conn.query_params |> Map.get("versionId") |> VersionId.normalize_param()
+    :ok = validate_version_id!(bucket, key, vid)
     {bucket, key, vid, conn}
+  end
+
+  # B5-4/B6-2a —— 客户端 ?versionId 入口守卫（与 Handlers.Object.validate_version_id!/3 同构）：
+  # 单一事实来源 = VersionId.valid?/1，handler 仅做错误映射——非法形状 → 400 InvalidArgument
+  # "Invalid version id specified"（对齐 AWS/MinIO ErrInvalidVersionID，逐字）。
+  defp validate_version_id!(_bucket, _key, nil), do: :ok
+
+  defp validate_version_id!(bucket, key, version_id) do
+    if VersionId.valid?(version_id) do
+      :ok
+    else
+      raise Error.new(:invalid_argument,
+              message: "Invalid version id specified",
+              resource: "/#{bucket}/#{key}"
+            )
+    end
   end
 
   defp parse_validate!(xml, scope) do

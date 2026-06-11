@@ -24,7 +24,11 @@ defmodule Maxio.Storage.Backend do
         sse: nil | %{"algo" => "AES256", "envelope" => map()},
         acl_canned: String.t(),
         storage_class: String.t(),
-        user_metadata: %{String.t() => String.t()}
+        user_metadata: %{String.t() => String.t()},
+        # B6-2a（仅 assemble 路径，可选）：S3 可见 ETag 覆盖——多段完成对象的 sidecar versions
+        # entry etag 必须是多段形态 hex(MD5(concat part MD5s))-N（Multipart.complete 透传）；
+        # 耐久 core 顶层 etag 仍为整体字节 MD5（完整性校验语义）。缺省/nil → entry 沿用 core etag。
+        etag: String.t() | nil
       }
 
   `sse` 形状必须匹配 `Sidecar.to_view/3` 读 `e["sse"]["algo"]` / `e["sse"]["envelope"]`（信封随读视图携带，

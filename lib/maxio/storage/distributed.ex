@@ -371,6 +371,8 @@ defmodule Maxio.Storage.Distributed do
   # 从 opts[:object_meta] 取 maxio/2 版本头字段，产出 Sidecar.migrate_v1/2 的 keyword（与
   # ErasureCoded.version_opts 逐字一致）。modtime 一次计算（同一份 meta 发所有端点 → N 份
   # signature 一致）；data_dir = version_id（方案 B 每版本独立目录）。
+  # :etag（B6-2a）：多段完成对象的 S3 多段 ETag（"...-N"，Multipart.complete 透传）覆盖 versions
+  # entry 的 S3 可见 etag；单次 PUT 无此键（nil）→ migrate_v1 沿用 core etag。
   defp version_opts(version_id, opts) do
     om = Keyword.get(opts, :object_meta, %{})
     modtime = System.os_time(:nanosecond)
@@ -379,6 +381,7 @@ defmodule Maxio.Storage.Distributed do
       version_id: version_id,
       data_dir: version_id,
       modtime: modtime,
+      etag: Map.get(om, :etag),
       content_type: Map.get(om, :content_type, "binary/octet-stream"),
       tags: Map.get(om, :tags, %{}),
       sse: Map.get(om, :sse),

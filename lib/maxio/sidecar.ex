@@ -53,8 +53,13 @@ defmodule Maxio.Sidecar do
   @doc """
   把旧 v1 meta（或已 v2 的 meta）升级为 maxio/2 形态（**幂等**）。已 v2 直接原样返回。
   opts 提供版本头字段（version_id / modtime / generation / content_type / tags / sse / acl_canned /
-  storage_class / user_metadata / data_dir / inline）。耐久字段 ec/shards/size/etag/sha256/parts
+  storage_class / user_metadata / data_dir / inline / etag）。耐久字段 ec/shards/size/etag/sha256/parts
   逐字保留（绝不污染）。
+
+  `:etag`（B6-2a，可选）：versions entry 的 **S3 可见 ETag** 覆盖——多段完成对象的 entry etag
+  必须是 `hex(MD5(concat part MD5s))-N` 形态（Multipart.complete 经 object_meta 透传），而耐久
+  core 顶层 etag 仍是整体字节 MD5（完整性校验语义，绝不动）。未给（nil）→ entry etag 沿用
+  v1 core etag（单次 PUT 两者本就同值）。
   """
   @spec migrate_v1(map(), keyword()) :: map()
   def migrate_v1(%{"format" => @format} = v2, _opts), do: v2
@@ -68,7 +73,7 @@ defmodule Maxio.Sidecar do
       "generation" => Keyword.get(opts, :generation, 0),
       "data_dir" => Keyword.get(opts, :data_dir),
       "size" => v1["size"],
-      "etag" => v1["etag"],
+      "etag" => Keyword.get(opts, :etag) || v1["etag"],
       "sha256" => v1["sha256"],
       "content_type" => Keyword.get(opts, :content_type, "binary/octet-stream"),
       "user_metadata" => Keyword.get(opts, :user_metadata, %{}),
