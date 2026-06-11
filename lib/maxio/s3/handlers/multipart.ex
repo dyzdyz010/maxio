@@ -322,7 +322,8 @@ defmodule Maxio.S3.Handlers.Multipart do
 
   # B5-3 R3/R4 —— 对象 key 入口守卫（与 Handlers.Object.validate_object_key!/2 同构）：
   # 单一事实来源 = Maxio.Cluster.Paths.validate_key/1（与盘上路径构造同源），
-  # handler 仅做错误映射 400 XMinioInvalidObjectName（铁律 2）。
+  # handler 仅做错误映射——点段/空 key → 400 XMinioInvalidObjectName；超 1024 字节
+  # → 400 KeyTooLongError（B5-4，与 PUT 同门，保证「可建即可达」）（铁律 2）。
   defp validate_object_key!(bucket, key) do
     case Maxio.Cluster.Paths.validate_key(key) do
       :ok ->
@@ -330,6 +331,9 @@ defmodule Maxio.S3.Handlers.Multipart do
 
       {:error, :invalid_key} ->
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
+
+      {:error, :key_too_long} ->
+        raise Error.new(:key_too_long, resource: "/#{bucket}/#{key}")
     end
   end
 

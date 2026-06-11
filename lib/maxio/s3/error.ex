@@ -52,6 +52,10 @@ defmodule Maxio.S3.Error do
     # cmd/api-errors.go，描述逐字对齐）。结构化 400 拒绝，绝不 500（铁律 3）。
     invalid_object_name:
       {"XMinioInvalidObjectName", 400, "Object name contains unsupported characters."},
+    # ROUTE B B5-4：对象 key（原始字节，非盘上编码后）超 1024 字节 → 对齐 MinIO
+    # ErrKeyTooLongError（Code "KeyTooLongError"，HTTP 400，cmd/api-errors.go；AWS 同 Code，
+    # 描述逐字对齐）。与 :invalid_object_name（点段/空 key）分流（B5-4 入口守卫）。
+    key_too_long: {"KeyTooLongError", 400, "Your key is too long"},
     # AWS/MinIO 用户元数据（x-amz-meta-*）总量 2 KB 硬上限超限 → MetadataTooLarge(400)。
     # 权威：AWS UsingMetadata.html（user-defined metadata 限 2 KB / 每 key+value UTF-8 字节和）+
     # minio/minio cmd/generic-handlers.go isHTTPHeaderSizeTooLarge（maxUserDataSize=2*1024，key 含前缀）。

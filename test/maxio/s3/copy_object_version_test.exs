@@ -81,7 +81,9 @@ defmodule Maxio.S3.CopyObjectVersionTest do
 
     cp =
       SigV4Request.signed_conn(:put, "/cpv3/dst.txt",
-        headers: [{"x-amz-copy-source", "/cpv3/src.txt?versionId=01BOGUSVERSIONIDXXXXXXXXX"}]
+        # B5-4 起畸形 versionId（非 null/非 26 位 Crockford ULID）在入口拦成 400 InvalidArgument；
+        # 本用例锁「形状合法但不存在」→ 404 NoSuchKey 语义，故用合法形状的不存在 ULID。
+        headers: [{"x-amz-copy-source", "/cpv3/src.txt?versionId=01HXXXXXXXXXXXXXXXXXXXXXXX"}]
       )
       |> call()
 

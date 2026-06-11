@@ -23,6 +23,22 @@ defmodule Maxio.Versioning.VersionId do
   def null_sentinel, do: "null"
 
   @doc """
+  客户端 versionId 入口校验**单一来源**（B5-4 安全守卫）：合法形状 = 保留串 `"null"` 或
+  26 字符 Crockford base32 ULID（与 `generate/0` 产出同字母表 `[0-9A-HJKMNP-TV-Z]`，
+  单一事实来源 = 本模块 @crockford）。其余（空串、`..`、`../x` 等路径段、任意畸形）一律 false
+  ——handler 据此 400 InvalidArgument，杜绝客户端 versionId 不经校验直进
+  `Maxio.Cluster.Paths.object_rel/3` 盘路径的路径穿越面。逐字节判定（非 UTF-8 安全，绝不抛）。
+  """
+  @spec valid?(term()) :: boolean()
+  def valid?("null"), do: true
+
+  def valid?(<<_::binary-size(26)>> = vid) do
+    vid |> :binary.bin_to_list() |> Enum.all?(&(&1 in @crockford))
+  end
+
+  def valid?(_other), do: false
+
+  @doc """
   解析 ULID 的 48-bit 毫秒时间戳（前 10 字符 Crockford base32 = 2 个 pad 0 bit + 48-bit ms）。
 
   用于跨版本「当前版本」写时间序比较（`Maxio.Listing.current_version/4`）：盘上 sidecar modtime

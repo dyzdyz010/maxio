@@ -170,6 +170,9 @@ defmodule Maxio.S3.Handlers.Object do
     :ok = validate_object_key!(bucket, key)
 
     version_id = Map.get(conn.query_params, "versionId")
+
+    # B5-4：客户端 versionId 入口守卫（非法形状 → 400 InvalidArgument，先于任何查找/盘路径构造）。
+    :ok = validate_version_id!(bucket, key, version_id)
     # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口）。
     #   :pg（默认）→ 返回 PG %Object{} + 内部 best-effort sidecar shadow（行为不变）；
     #   :read=:sidecar（B4-3）→ 返回 reconcile 的 sidecar 视图，read_quorum 不足 → 503（绝不猜）。
@@ -252,9 +255,11 @@ defmodule Maxio.S3.Handlers.Object do
 
     # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口；:pg 默认含内部 shadow，行为不变）。
     # HEAD 无 body：缺失/read_quorum 不足都只回状态 + 头（read_quorum 不足 → 503，对齐 GET SlowDownRead）。
-    # B5-3 R3/R4：key 守卫与 GET 同源（Paths.validate_key），HEAD 无 body 故仅回 400 状态。
+    # B5-3 R3/R4：key 守卫与 GET 同源（Paths.validate_key）；B5-4：超长 key（:key_too_long）与
+    # 客户端 versionId 形状守卫（validate_version_id）同样先于任何查找——HEAD 无 body 故仅回 400 状态。
     with {:ok, _b} <- Buckets.lookup(bucket),
          :ok <- Maxio.Cluster.Paths.validate_key(key),
+         :ok <- validate_version_id(version_id),
          {:ok, object} <- fetch_for_head(bucket, key, version_id) do
       cond do
         object.is_delete_marker and version_id == nil ->
@@ -305,6 +310,30 @@ defmodule Maxio.S3.Handlers.Object do
 
         send_resp(conn, 400, "")
 
+      {:error, :key_too_long} ->
+        # B5-4：原始 key 超 1024 字节 → 400（与 GET 的 KeyTooLongError 同因；HEAD 无 body
+        # 故仅状态码，结构化日志留痕，铁律 3 不静默）。
+        Log.info("head object key too long",
+          action: :head_object,
+          bucket: bucket,
+          key: key,
+          reason: :key_too_long
+        )
+
+        send_resp(conn, 400, "")
+
+      {:error, :invalid_version_id} ->
+        # B5-4：客户端 versionId 形状非法 → 400（与 GET 的 InvalidArgument 同因；先于任何
+        # 查找/盘路径构造；HEAD 无 body 故仅状态码，结构化日志留痕，铁律 3 不静默）。
+        Log.info("head object invalid version id",
+          action: :head_object,
+          bucket: bucket,
+          key: key,
+          reason: :invalid_version_id
+        )
+
+        send_resp(conn, 400, "")
+
       {:error, :read_quorum} ->
         # 仅 :read=:sidecar 时可达：sidecar reconcile 不足 read_quorum → 503（绝不猜，铁律 3）。
         # HEAD 无 body：只回 503 状态（与 GET 的 SlowDownRead 同源，SDK 据此退避重试；HEAD 响应无
@@ -339,6 +368,10 @@ defmodule Maxio.S3.Handlers.Object do
     :ok = validate_object_key!(bucket, key)
 
     version_id = Map.get(conn.query_params, "versionId")
+
+    # B5-4：客户端 ?versionId 入口守卫（非法形状 → 400 InvalidArgument，先于任何查找/盘路径构造
+    # ——尤其 :write=:sidecar 下 Storage.delete_version 直接以 versionId 构造盘路径）。
+    :ok = validate_version_id!(bucket, key, version_id)
     versioning = bucket_versioning(bucket)
 
     cond do
@@ -467,6 +500,11 @@ defmodule Maxio.S3.Handlers.Object do
   defp do_delete_one(bucket, key, version_id, versioning) do
     cond do
       version_id != nil ->
+        # B5-4：批量删除的 per-key versionId 同过入口守卫（与单删 DELETE ?versionId 同源）——
+        # 非法形状 raise InvalidArgument，由 delete_one 的 rescue 降为该 key 的 <Error> 条目
+        # （DeleteObjects 的失败是 per-key 的，对齐 AWS；绝不让畸形 versionId 进盘路径）。
+        :ok = validate_version_id!(bucket, key, version_id)
+
         # 永久删指定版本（含 delete marker）。幂等：删不存在的版本也算成功。ROUTE B fidelity：
         # 与单删 delete/1 同一 commit_version_delete 提交路径（:sidecar 写权威下盘上 quorum 删除
         # 即权威提交；quorum 不足上抛 SlowDownWrite，由 delete_one 的 rescue 降为该 key 的 <Error>）。
@@ -527,6 +565,10 @@ defmodule Maxio.S3.Handlers.Object do
       parse_copy_source!(header(conn, "x-amz-copy-source"))
 
     :ok = validate_object_key!(src_bucket, src_key)
+
+    # B5-4：Copy 源 versionId 入口守卫（与 GET/HEAD/DELETE 的 ?versionId 同源单一来源）——
+    # 非法形状 → 400 InvalidArgument，先于任何源查找/盘路径构造。
+    :ok = validate_version_id!(src_bucket, src_key, src_version_id)
 
     # 源对象按真实版本解析（默认 current/latest，?versionId= 选特定版本）。
     {src_obj, _total} = object_or_raise(src_bucket, src_key, src_version_id)
@@ -698,7 +740,12 @@ defmodule Maxio.S3.Handlers.Object do
   # 返回临时流供目标写消费。
   defp prepare_copy_source(true, src_bucket, src_key, src_version_id, dest_bucket, dest_key) do
     suffix = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
-    tmp_key = dest_key <> ".maxio-copytmp-" <> suffix
+
+    # B5-4：临时 key 自身必须通过 key 守卫（1024 字节长度闸）——近上限 dest_key 直接整段做前缀
+    # 会超限（曾静默通过，现会被 Paths 拒绝）。仅取 dest_key 的码点安全前缀（≤ 64 码点 ≤ 256 字节）
+    # 作归因可读性；唯一性由 16 hex 随机后缀保证；末段恒以 ".maxio-copytmp-<hex>" 结尾，
+    # 绝不构成 `.`/`..` 段——tmp_key 恒为合法 key。
+    tmp_key = String.slice(dest_key, 0, 64) <> ".maxio-copytmp-" <> suffix
     {:ok, src_stream} = Storage.get(src_bucket, src_key, src_version_id, nil)
 
     case Storage.put(dest_bucket, tmp_key, "null", src_stream) do
@@ -1210,9 +1257,11 @@ defmodule Maxio.S3.Handlers.Object do
   # 对象 key 入口守卫（PUT/GET/HEAD/DELETE/Copy 源与目标统一；multipart 门由
   # Handlers.Multipart.create_multipart_upload 同构守卫，保证「可建即可达」）：仅拒
   # MinIO/AWS 都拒的形态——空 key / `.` `..` 点段 → 400 XMinioInvalidObjectName（对齐 MinIO
-  # ErrInvalidObjectName，在任何查找/写入之前校验）。布局保留名段（meta.json/part.0/...）是
-  # MinIO/AWS 均接受的普通 key，**不**在 API 层拒绝——盘上碰撞由 Paths.encode_key 段编码
-  # 结构化消除。单一事实来源 = Maxio.Cluster.Paths.validate_key/1，handler 仅做错误映射（铁律 2）。
+  # ErrInvalidObjectName）；原始 key 超 1024 字节 → 400 KeyTooLongError（对齐 MinIO
+  # ErrKeyTooLongError / AWS 同 Code，B5-4），均在任何查找/写入之前校验。布局保留名段
+  # （meta.json/part.0/...）是 MinIO/AWS 均接受的普通 key，**不**在 API 层拒绝——盘上碰撞由
+  # Paths.encode_key 段编码结构化消除。单一事实来源 = Maxio.Cluster.Paths.validate_key/1，
+  # handler 仅做错误映射（铁律 2）。
   defp validate_object_key!(bucket, key) do
     case Maxio.Cluster.Paths.validate_key(key) do
       :ok ->
@@ -1220,6 +1269,37 @@ defmodule Maxio.S3.Handlers.Object do
 
       {:error, :invalid_key} ->
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
+
+      {:error, :key_too_long} ->
+        raise Error.new(:key_too_long, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  # B5-4 —— 客户端 ?versionId 入口守卫（GET/HEAD/DELETE/DeleteObjects/Copy 源统一）：
+  # 单一事实来源 = Maxio.Versioning.VersionId.valid?/1（"null" 或 26 位 Crockford ULID）。
+  # 非法（空串/`..`/`../x` 路径段/任意畸形）→ 400 InvalidArgument "Invalid version id specified"
+  # （对齐 AWS/MinIO ErrInvalidVersionID，cmd/api-errors.go 描述逐字），在任何查找/盘路径构造
+  # 之前拦截——客户端 versionId 曾不经校验直进 Paths.object_rel 盘路径（路径穿越面，铁律 3
+  # 结构化拒绝绝不静默）。合法形状但查无此版本仍走既有 404 语义不变。
+  # nil（未带参数）→ 当前版本语义，放行。
+  defp validate_version_id(nil), do: :ok
+
+  defp validate_version_id(version_id) do
+    if Maxio.Versioning.VersionId.valid?(version_id),
+      do: :ok,
+      else: {:error, :invalid_version_id}
+  end
+
+  defp validate_version_id!(bucket, key, version_id) do
+    case validate_version_id(version_id) do
+      :ok ->
+        :ok
+
+      {:error, :invalid_version_id} ->
+        raise Error.new(:invalid_argument,
+                message: "Invalid version id specified",
+                resource: "/#{bucket}/#{key}"
+              )
     end
   end
 

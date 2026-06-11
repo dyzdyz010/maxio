@@ -31,20 +31,27 @@ defmodule Maxio.Cluster.Paths do
   @dir_suffix "__MXDIR__"
 
   @doc """
-  S3 API 层对象 key 守卫：仅拒绝 S3/MinIO 都拒绝的形态——空 key 与 `.`/`..` 点段
-  （MinIO cmd/object-api-utils.go IsValidObjectPrefix 的 hasBadPathComponent，路径穿越守卫）
-  → `{:error, :invalid_key}`（handler 映射 400 `XMinioInvalidObjectName`）。
+  S3 API 层对象 key 守卫：仅拒绝 S3/MinIO 都拒绝的形态——
+    * 空 key 与 `.`/`..` 点段（MinIO cmd/object-api-utils.go IsValidObjectPrefix 的
+      hasBadPathComponent，路径穿越守卫）→ `{:error, :invalid_key}`
+      （handler 映射 400 `XMinioInvalidObjectName`）；
+    * **原始 key**（编码前）超 1024 字节（AWS/MinIO 对象 key 长度硬上限，MinIO
+      IsValidObjectName 的 len > 1024 检查）→ `{:error, :key_too_long}`
+      （handler 映射 400 `KeyTooLongError`，与 :invalid_key 分流，B5-4）。
 
   **不**拒绝布局保留名段（meta.json/part.0/...）——MinIO/AWS 均接受这类普通 key
   （盘上碰撞由 `encode_key/1` 段编码结构化消除）；**不**拒绝空段——尾/连续/前导斜杠 key
   （"dir/"、"a//b"、"/lead"）是合法 AWS key（铁律 5，既有端到端保真测试锁死），空段经
   `__MXEMPTY__`/`__MXDIR__` 编码无碰撞落盘（MinIO 拒 `//`，maxio 此处取 AWS 上界，文档化差异）。
   """
-  @spec validate_key(String.t()) :: :ok | {:error, :invalid_key}
+  @spec validate_key(String.t()) :: :ok | {:error, :invalid_key | :key_too_long}
   def validate_key(key) when is_binary(key) do
     cond do
       key == "" ->
         {:error, :invalid_key}
+
+      byte_size(key) > 1024 ->
+        {:error, :key_too_long}
 
       key |> String.split("/") |> Enum.any?(&(&1 in [".", ".."])) ->
         {:error, :invalid_key}
@@ -61,24 +68,32 @@ defmodule Maxio.Cluster.Paths do
   """
   @spec encode_key(String.t()) :: {:ok, String.t()} | {:error, :invalid_key}
   def encode_key(key) do
-    with :ok <- validate_key(key) do
-      segments = String.split(key, "/")
+    case validate_key(key) do
+      :ok ->
+        segments = String.split(key, "/")
 
-      {segments, dir_marker?} =
-        if List.last(segments) == "" do
-          {Enum.drop(segments, -1), true}
-        else
-          {segments, false}
-        end
+        {segments, dir_marker?} =
+          if List.last(segments) == "" do
+            {Enum.drop(segments, -1), true}
+          else
+            {segments, false}
+          end
 
-      encoded = Enum.map(segments, &encode_segment/1)
+        encoded = Enum.map(segments, &encode_segment/1)
 
-      encoded =
-        if dir_marker?,
-          do: List.update_at(encoded, -1, &(&1 <> @dir_suffix)),
-          else: encoded
+        encoded =
+          if dir_marker?,
+            do: List.update_at(encoded, -1, &(&1 <> @dir_suffix)),
+            else: encoded
 
-      {:ok, Enum.join(encoded, "/")}
+        {:ok, Enum.join(encoded, "/")}
+
+      {:error, _reason} ->
+        # 长度闸（:key_too_long）是 API 入口语义——精确错误 Code（KeyTooLongError vs
+        # XMinioInvalidObjectName）由 handler 入口守卫分流映射；盘路径层只需「不可表达即结构化
+        # 拒绝」单一契约，统一折叠为 :invalid_key——后端/backstop（FS/EC/Distributed/scanner/heal
+        # 全部匹配 {:error, :invalid_key}）契约不变。入口守卫已先行拦截，此处仅兜底（绝不静默）。
+        {:error, :invalid_key}
     end
   end
 
