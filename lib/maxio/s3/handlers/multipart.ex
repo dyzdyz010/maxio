@@ -26,6 +26,14 @@ defmodule Maxio.S3.Handlers.Multipart do
     key = conn.assigns.s3_key
     _ = ensure_bucket!(bucket)
 
+    # B5-3 R3/R4（review-fix）：multipart 门与单 key 写路径共用同一入口守卫——保留布局名段
+    # （meta.json/part.0/.versions/.uploads/.tmp）或 ./.. 点段 key 在 CreateMultipartUpload 即
+    # 400 XMinioInvalidObjectName（对齐 MinIO：对象名校验同样作用于 CreateMultipartUpload，
+    # ErrInvalidObjectName）。失败 pre-initiate：零会话、零 part 字节、无孤儿（铁律 3）。
+    # 否则 FS 后端的 safe_relative 不识保留名 → Complete 会造出单 key GET/HEAD/DELETE 全被
+    # 入口守卫 400 拒绝的「可建不可达」对象。单一事实来源 = Paths.validate_key/1（铁律 2）。
+    :ok = validate_object_key!(bucket, key)
+
     content_type = header(conn, "content-type") || "binary/octet-stream"
     owner = conn.assigns.principal.arn
 
@@ -83,6 +91,12 @@ defmodule Maxio.S3.Handlers.Multipart do
         conn
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
+
+      {:error, :invalid_key} ->
+        # B5-3 R4 backstop：入口守卫部署前遗留的在途会话（点段 key）打到后端路径层
+        # （FS object_path）结构化拒绝 → 400 XMinioInvalidObjectName，绝不塌缩 500（铁律 3）。
+        # 新会话已被 create_multipart_upload 入口守卫拦截，此分支仅兜历史在途上传。
+        raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       {:error, reason} ->
         raise Error.new(:internal_error, message: inspect(reason))
@@ -307,6 +321,19 @@ defmodule Maxio.S3.Handlers.Multipart do
     end
   end
 
+  # B5-3 R3/R4 —— 对象 key 入口守卫（与 Handlers.Object.validate_object_key!/2 同构）：
+  # 单一事实来源 = Maxio.Cluster.Paths.validate_key/1（与盘上路径构造同源），
+  # handler 仅做错误映射 400 XMinioInvalidObjectName（铁律 2）。
+  defp validate_object_key!(bucket, key) do
+    case Maxio.Cluster.Paths.validate_key(key) do
+      :ok ->
+        :ok
+
+      {:error, :invalid_key} ->
+        raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
+    end
+  end
+
   defp upload_or_raise(bucket, key, upload_id) do
     _ = ensure_bucket!(bucket)
 
@@ -342,6 +369,12 @@ defmodule Maxio.S3.Handlers.Multipart do
     do: Error.new(:entity_too_small, resource: "/#{b}/#{k}")
 
   defp complete_error(:no_parts, b, k), do: Error.new(:malformed_xml, resource: "/#{b}/#{k}")
+
+  # B5-3 R4 backstop：入口守卫部署前遗留在途会话的点段 key 在 assemble（FS object_path）被
+  # 结构化拒绝 → 400 XMinioInvalidObjectName（与 object.ex PUT 提交分支同映射），绝不塌缩
+  # 500 InternalError（铁律 3）。新会话已被 create_multipart_upload 入口守卫拦截。
+  defp complete_error(:invalid_key, b, k),
+    do: Error.new(:invalid_object_name, resource: "/#{b}/#{k}")
 
   # 写 quorum 不足 / 原子 rename 争用 = 瞬时写限流，对齐 MinIO 的 SlowDownWrite(503)，
   # SDK 据此退避重试自愈（与 object.ex PUT 一致）；绝不退化成 500 InternalError。

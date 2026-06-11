@@ -12,7 +12,9 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
     * R3/R4（端点级）：保留布局名段（meta.json/part.0/.versions/.uploads/.tmp 精确匹配）与
       `.`/`..` 点段 key → 400 `XMinioInvalidObjectName`（对齐 MinIO ErrInvalidObjectName），
       绝不 500；正常含点 key / part.1 等近似名不受影响；空段 key（"a//b"、"dir/"）在 :pg+FS
-      下维持既有合法行为（铁律 5，integration_test 锁死）。
+      下维持既有合法行为（铁律 5，integration_test 锁死）。review-fix：multipart 门同一守卫——
+      CreateMultipartUpload 即 400（零孤儿会话，杜绝「可建不可达」对象）；守卫前遗留在途会话的
+      UploadPart/Complete 经 :invalid_key backstop 同映射 400（绝不 500）。
     * R5（端点级 e2e）：Enabled + `:write=:sidecar` 的签名 DELETE——成功 204 +
       x-amz-delete-marker:true + `:read=:sidecar` GET 404；down 端点 quorum 失败 → 503
       `<Code>SlowDownWrite</Code>`。
@@ -180,6 +182,59 @@ defmodule Maxio.RouteBB5_3ResidualsTest do
 
       assert src.status == 400
       assert src.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+    end
+
+    test "CreateMultipartUpload 保留段/点段 key → 400 XMinioInvalidObjectName，零孤儿会话（multipart 门同一入口守卫）" do
+      for key <- ["a/meta.json/b", "a/../b"] do
+        init =
+          SigV4Request.signed_conn(:post, "/rb53key/#{key}", query: %{"uploads" => ""}) |> call()
+
+        assert init.status == 400, "CreateMultipartUpload for #{key} must be rejected"
+        assert init.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+        refute init.resp_body =~ "InternalError"
+      end
+
+      # 失败 pre-initiate：无孤儿会话（端点级 ListMultipartUploads + context 双取证）。
+      list = SigV4Request.signed_conn(:get, "/rb53key", query: %{"uploads" => ""}) |> call()
+      assert list.status == 200
+      refute list.resp_body =~ "meta.json"
+      assert Maxio.Multipart.list_uploads("rb53key", %{}).uploads == []
+    end
+
+    test "守卫前遗留在途会话（点段 key）→ UploadPart/Complete 400 绝不 500（backstop）" do
+      # 直接经 context 造会话，模拟入口守卫部署前已存在的在途上传（绕过 handler 门）。
+      {:ok, upload} = Maxio.Multipart.initiate("rb53key", "a/../b", %{owner: @owner})
+
+      up =
+        SigV4Request.signed_conn(:put, "/rb53key/a/../b",
+          query: %{"partNumber" => "1", "uploadId" => upload.upload_id},
+          body: "part bytes"
+        )
+        |> call()
+
+      assert up.status == 400
+      assert up.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+      refute up.resp_body =~ "InternalError"
+
+      # Complete 分支：PG part 行直接造（点段 key 的字节路径必然被后端拒绝，元数据行足以驱动
+      # Multipart.complete 走到 Storage.assemble 的 :invalid_key 分支）。
+      etag = :crypto.hash(:md5, "p1") |> Base.encode16(case: :lower)
+      {:ok, _} = Maxio.Multipart.put_part(upload, 1, %{etag: etag, size: 2})
+
+      xml =
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>" <>
+          "<ETag>\"#{etag}\"</ETag></Part></CompleteMultipartUpload>"
+
+      comp =
+        SigV4Request.signed_conn(:post, "/rb53key/a/../b",
+          query: %{"uploadId" => upload.upload_id},
+          body: xml
+        )
+        |> call()
+
+      assert comp.status == 400
+      assert comp.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+      refute comp.resp_body =~ "InternalError"
     end
 
     test "正常含点 key（a.b/c.d）与近似名（part.1、metadata.json）不受影响（仅精确保留名）" do

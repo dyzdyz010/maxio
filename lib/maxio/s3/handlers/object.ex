@@ -1207,7 +1207,8 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  # B5-3 R3/R4 —— 对象 key 入口守卫（PUT/GET/HEAD/DELETE/Copy 源与目标统一）：保留布局名段
+  # B5-3 R3/R4 —— 对象 key 入口守卫（PUT/GET/HEAD/DELETE/Copy 源与目标统一；multipart 门由
+  # Handlers.Multipart.create_multipart_upload 同构守卫，保证「可建即可达」）：保留布局名段
   # （meta.json/part.0/.versions/.uploads/.tmp 精确匹配）或 ./.. 点段 → 400 XMinioInvalidObjectName
   # （对齐 MinIO ErrInvalidObjectName，在任何查找/写入之前校验）。单一事实来源 =
   # Maxio.Cluster.Paths.validate_key/1（与盘上路径构造同源），handler 仅做错误映射（铁律 2）。
