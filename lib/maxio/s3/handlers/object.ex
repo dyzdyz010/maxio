@@ -145,6 +145,13 @@ defmodule Maxio.S3.Handlers.Object do
         # multipart 会话）结构化拒绝 → 同样映射 400 XMinioInvalidObjectName（绝不 500/静默折叠）。
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
+      {:ok, {:error, :key_too_long}} ->
+        # backstop：FS 后端把 OS 段长超限（:enametoolong，MinIO errFileNameTooLong 同因）
+        # 结构化为 :key_too_long → 400 KeyTooLongError（对齐 MinIO toObjectErr 的
+        # ObjectNameTooLong 映射，绝不 500 / 绝不泄露盘路径）。入口守卫
+        # （Paths.validate_key 段长闸）已先行拦截，此处仅兜底。
+        raise Error.new(:key_too_long, resource: "/#{bucket}/#{key}")
+
       # 写 quorum 不足 / 原子 rename 争用 = 瞬时写限流，对齐 MinIO 的 SlowDownWrite(503)
       # （cmd/api-errors.go: errErasureWriteQuorum -> ErrSlowDownWrite）。SDK 据此指数退避重试，
       # 集群降级/争用得以自愈；绝不能映射成 500 InternalError（被客户端当硬失败）。

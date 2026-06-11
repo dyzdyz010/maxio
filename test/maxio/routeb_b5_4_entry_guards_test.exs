@@ -52,20 +52,36 @@ defmodule Maxio.RouteBB5_4EntryGuardsTest do
   # ── 单元面：Paths.validate_key 长度闸（对原始 key 字节计量）──
 
   describe "Paths.validate_key — 1024 字节长度闸（单一来源）" do
-    test "恰 1024 字节 :ok；1025 字节 {:error, :key_too_long}（与 :invalid_key 分流）" do
-      assert :ok = Paths.validate_key(String.duplicate("a", 1024))
+    # 多段构造恰 N 字节 key（每段 ≤255 字节，不触段长闸——段长闸单测见下个 describe）。
+    defp multiseg_key_1024 do
+      key =
+        Enum.map_join(1..4, "/", fn _ -> String.duplicate("a", 204) end) <>
+          "/" <> String.duplicate("b", 204)
+
+      assert byte_size(key) == 1024
+      key
+    end
+
+    test "恰 1024 字节 :ok；超 1024 字节 {:error, :key_too_long}（与 :invalid_key 分流）" do
+      assert :ok = Paths.validate_key(multiseg_key_1024())
+      assert {:error, :key_too_long} = Paths.validate_key(multiseg_key_1024() <> "/x")
+
+      # 单段超长 key（1025×"a"）同样 :key_too_long（raw 长度闸先于段长闸命中）。
       assert {:error, :key_too_long} = Paths.validate_key(String.duplicate("a", 1025))
       # 点段 key 仍 :invalid_key（两类错误分流，handler 映射不同 Code）。
       assert {:error, :invalid_key} = Paths.validate_key("a/../b")
     end
 
-    test "对原始 key 的 UTF-8 字节计量（非字符数、非编码后长度）" do
-      # 341 个三字节汉字 = 1023 字节 → 合法；342 个 = 1026 字节 → 超限。
-      assert :ok = Paths.validate_key(String.duplicate("汉", 341))
+    test "对原始 key 的 UTF-8 字节计量（非字符数）" do
+      # 85 个三字节汉字 = 255 字节/段（恰 NAME_MAX）：4 段 + 分隔 = 1023 字节 → 合法。
+      assert :ok =
+               Paths.validate_key(Enum.map_join(1..4, "/", fn _ -> String.duplicate("汉", 85) end))
+
+      # 342 个汉字单段 = 1026 字节 → raw 超限。
       assert {:error, :key_too_long} = Paths.validate_key(String.duplicate("汉", 342))
 
-      # 段编码（__MXESC__ 追加）可能使盘上路径超 1024——长度闸只对原始 key 计量：
-      # 1020 字节原始 key 即使全段是保留名（编码后膨胀）也合法。
+      # 段编码（__MXESC__ 追加）可能使盘上路径总长超 1024——总长闸只对原始 key 计量：
+      # 1019 字节原始 key 即使全段是保留名（编码后膨胀）也合法（每段编码后 18B ≤ 255）。
       long_reserved = Enum.map_join(1..102, "/", fn _ -> "meta.json" end)
       assert byte_size(long_reserved) == 1019
       assert :ok = Paths.validate_key(long_reserved)
@@ -73,7 +89,29 @@ defmodule Maxio.RouteBB5_4EntryGuardsTest do
 
     test "encode_key 对超长 key 折叠为 {:error, :invalid_key}（后端 backstop 契约不变）" do
       assert {:error, :invalid_key} = Paths.encode_key(String.duplicate("a", 1025))
-      assert {:ok, _rel} = Paths.encode_key(String.duplicate("a", 1024))
+      assert {:ok, _rel} = Paths.encode_key(multiseg_key_1024())
+    end
+  end
+
+  # ── 单元面：盘段 255 字节硬限（MinIO checkPathLength：errFileNameTooLong → 400 KeyTooLongError）──
+
+  describe "Paths.validate_key — 编码后单段 255 字节硬限（对齐 MinIO checkPathLength）" do
+    test "单段 255 字节 :ok；256 字节 {:error, :key_too_long}（合法总长也拦）" do
+      assert :ok = Paths.validate_key(String.duplicate("a", 255))
+      assert {:error, :key_too_long} = Paths.validate_key(String.duplicate("a", 256))
+
+      # 总长 ≤1024 但含超长段：同样 :key_too_long（曾 500 InternalError 并泄露盘路径）。
+      assert {:error, :key_too_long} = Paths.validate_key("ok/" <> String.duplicate("a", 300))
+    end
+
+    test "段长对编码后字节计量（escape 膨胀 / __MXESC__ 追加后仍 ≤255 才放行）" do
+      # ":" escape 为 "%3A"（3 字节）：85 个 ":" = 编码后 255 → :ok；86 个 = 258 → 超限。
+      assert :ok = Paths.validate_key(String.duplicate(":", 85))
+      assert {:error, :key_too_long} = Paths.validate_key(String.duplicate(":", 86))
+
+      # 250×"a" + "__MXDIR__"（9B）段本身以标记结尾 → 编码追加 __MXESC__（9B）后 268 → 超限。
+      assert {:error, :key_too_long} =
+               Paths.validate_key(String.duplicate("a", 250) <> "__MXDIR__")
     end
   end
 
@@ -113,8 +151,9 @@ defmodule Maxio.RouteBB5_4EntryGuardsTest do
     end
 
     test "恰 1024 字节 key：PUT/GET/HEAD/DELETE 完整 round-trip" do
-      # 多段构造（每段 ≤ 255 字节）：NTFS/posix 对单个路径组件有 255 字节硬限——那是文件系统
-      # 层约束（MinIO errFileNameTooLong 同样存在），与本单元的 API 层 1024 字节 key 长度闸正交。
+      # 多段构造（每段 ≤ 255 字节）：NTFS/posix 对单个路径组件有 255 字节硬限——超限段由
+      # validate_key 的段长闸结构化拒绝为同 Code 400 KeyTooLongError（对齐 MinIO
+      # errFileNameTooLong，端点级取证见 routeb_fidelity_fs_key_mapping_test.exs）。
       key =
         Enum.map_join(1..5, "/", fn _ -> String.duplicate("a", 200) end) <>
           "/" <> "bbbbbbbbbbbbbbbbbbb"

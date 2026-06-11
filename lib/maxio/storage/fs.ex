@@ -356,7 +356,7 @@ defmodule Maxio.Storage.FS do
     )
 
     _ = File.rm_rf(tmp)
-    {:error, reason}
+    {:error, structured_reason(reason)}
   end
 
   # ── obj-dir 原子提交（do_put/do_assemble 共用）──
@@ -368,9 +368,17 @@ defmodule Maxio.Storage.FS do
     else
       {:error, reason} ->
         _ = File.rm_rf(tmp)
-        {:error, reason}
+        {:error, structured_reason(reason)}
     end
   end
+
+  # OS 报路径段超 NAME_MAX（:enametoolong）→ 结构化 :key_too_long（handler 映射 400
+  # KeyTooLongError），对齐 MinIO toObjectErr：errFileNameTooLong → ObjectNameTooLong →
+  # ErrKeyTooLongError（cmd/xl-storage.go checkPathLength / cmd/api-errors.go）。
+  # Paths.validate_key 的段长闸已在入口先行拦截；此处是后端 backstop（守卫部署前遗留的在途
+  # multipart 会话等），绝不让 posix 原因冒成 500 InternalError。
+  defp structured_reason(:enametoolong), do: :key_too_long
+  defp structured_reason(reason), do: reason
 
   # 旧单文件布局对象占据 final obj-dir 路径 → 先摘除（否则 commit 的 mkdir_p 撞文件）。
   # 文件→目录无原子转换：rm 与 commit 之间存在极窄 crash 窗口（S3 PUT/marker 替换语义下

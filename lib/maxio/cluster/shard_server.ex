@@ -53,14 +53,17 @@ defmodule Maxio.Cluster.ShardServer do
   @spec put_shard(String.t(), non_neg_integer(), binary(), pos_integer()) ::
           :ok | {:error, term()}
   def put_shard(drive_obj_dir, block_index, shard_bytes, shard_len) do
-    File.mkdir_p!(drive_obj_dir)
     path = Path.join(drive_obj_dir, @part_file)
-    {:ok, fd} = :file.open(String.to_charlist(path), [:read, :write, :binary, :raw])
 
-    try do
-      :file.pwrite(fd, block_index * shard_len, shard_bytes)
-    after
-      :file.close(fd)
+    # mkdir/open 失败（:enametoolong/:eacces/盘满等）→ 结构化 {:error, posix}，绝不 raise——
+    # File.mkdir_p! 的异常 message 内嵌服务器绝对盘路径，曾沿 500 InternalError 泄露给客户端。
+    with :ok <- File.mkdir_p(drive_obj_dir),
+         {:ok, fd} <- :file.open(String.to_charlist(path), [:read, :write, :binary, :raw]) do
+      try do
+        :file.pwrite(fd, block_index * shard_len, shard_bytes)
+      after
+        :file.close(fd)
+      end
     end
   end
 
@@ -88,8 +91,10 @@ defmodule Maxio.Cluster.ShardServer do
   @doc "写该 drive 上对象的 sidecar（每端点一份；read 侧从任一存活端点恢复）。"
   @spec put_sidecar(String.t(), map()) :: :ok | {:error, term()}
   def put_sidecar(drive_obj_dir, meta) do
-    File.mkdir_p!(drive_obj_dir)
-    File.write(Path.join(drive_obj_dir, @meta_file), Meta.encode(meta))
+    # 结构化错误而非 raise（同 put_shard：异常 message 内嵌盘路径，绝不泄露给客户端）。
+    with :ok <- File.mkdir_p(drive_obj_dir) do
+      File.write(Path.join(drive_obj_dir, @meta_file), Meta.encode(meta))
+    end
   end
 
   @doc "读该 drive 上对象的 sidecar。"
@@ -219,7 +224,6 @@ defmodule Maxio.Cluster.ShardServer do
     fsync? = fsync?(opts)
     rename_fun = rename_fun(opts)
     meta_only? = Keyword.get(opts, :meta_only, false)
-    File.mkdir_p!(drive_obj_dir)
 
     src_part = Path.join(tmp_dir, @part_file)
     src_meta = Path.join(tmp_dir, @meta_file)
@@ -229,7 +233,12 @@ defmodule Maxio.Cluster.ShardServer do
     # 使 write_quorum 对纯元数据版本同样不是耐久谎言。
     if fsync? and meta_only?, do: sync_path(src_meta)
 
-    with :ok <- commit_part(meta_only?, rename_fun, src_part, drive_obj_dir),
+    # mkdir 失败（:enametoolong 段超 NAME_MAX / :eacces / 盘满等）→ 结构化 {:error, posix}，
+    # 绝不 raise——File.mkdir_p! 的异常 message 内嵌服务器绝对盘路径，曾沿 500 InternalError
+    # 序列化给客户端（信息泄露 + 违反铁律 3 结构化错误）。调用方（FS/EC/Distributed）按
+    # 既有 {:error, reason} 分支回滚 temp。
+    with :ok <- File.mkdir_p(drive_obj_dir),
+         :ok <- commit_part(meta_only?, rename_fun, src_part, drive_obj_dir),
          :ok <- maybe_sync_dir(fsync?, drive_obj_dir),
          :ok <- rename_atomic(rename_fun, src_meta, Path.join(drive_obj_dir, @meta_file)),
          :ok <- maybe_sync_dir(fsync?, drive_obj_dir) do
@@ -253,10 +262,10 @@ defmodule Maxio.Cluster.ShardServer do
   def commit_file(src, dst, opts) do
     fsync? = fsync?(opts)
     rename_fun = rename_fun(opts)
-    File.mkdir_p!(Path.dirname(dst))
     if fsync? and File.exists?(src), do: sync_path(src)
 
-    with :ok <- rename_atomic(rename_fun, src, dst),
+    with :ok <- File.mkdir_p(Path.dirname(dst)),
+         :ok <- rename_atomic(rename_fun, src, dst),
          :ok <- maybe_sync_dir(fsync?, Path.dirname(dst)) do
       :ok
     end

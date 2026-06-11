@@ -17,8 +17,24 @@ defmodule Maxio.Cluster.Paths do
     * 尾斜杠 folder marker（`dir/`）→ 末段追加 `__MXDIR__`（同 MinIO `dir__XLDIR__`：与对象
       `dir` 是**兄弟**路径，FS 后端文件/目录不互斥）。
 
+  ## 字节级 escape（MinIO-fidelity 修复：Windows 禁用文件名字节绝不裸落盘）
+
+  Windows/NTFS 对 `\\ : * ? " < > |` 与控制字节（0x00–0x1F）有路径语义（`a:b` 的 `:` 被吞成
+  NTFS 流/盘符语义 → 两个不同 S3 key 静默别名同一盘路径 = 跨 key 字节覆写）。MinIO 在 Windows
+  上直接 400 拒绝这些字符（cmd/object-api-utils.go checkObjectNameForLengthAndSlash）；AWS
+  接受并忠实存储。maxio 取 AWS 上界：段内这些字节一律 `%XX`（大写十六进制）escape（`%` 自身
+  也 escape，保证单射——编码输出中每个 `%` 必来自 escape），**跨平台恒 escape**（相对路径
+  跨节点/跨 OS 字节一致，铁律 2），任何 UTF-8 key 在任何 OS 上都有唯一、可逆的盘路径。
+
   编码是单射（escape 规则同时覆盖「本身以标记结尾」的用户段），`decode_segment/1`/`decode_key/1`
   为精确逆变换——drive-walk（LIST/scanner/heal）据此把盘上目录名还原成原始 key。
+
+  ## 盘上段长硬限（对齐 MinIO checkPathLength）
+
+  编码后的单个盘段 >255 字节（POSIX NAME_MAX / NTFS 单组件硬限）→ `validate_key/1` 返回
+  `{:error, :key_too_long}`（handler 映射 400 KeyTooLongError）。对齐 MinIO
+  cmd/xl-storage.go checkPathLength：单段超 255 → errFileNameTooLong → ObjectNameTooLong →
+  400 KeyTooLongError——在触 OS 之前结构化拒绝，绝不让 mkdir 的 :enametoolong 冒成 500。
   """
 
   # 盘上布局保留名：与编码后的用户段必须不相交（ShardServer @meta_file/@part_file、
@@ -30,6 +46,14 @@ defmodule Maxio.Cluster.Paths do
   @empty_seg "__MXEMPTY__"
   @dir_suffix "__MXDIR__"
 
+  # 字节 escape 集：Windows 文件名禁用字节（MinIO checkObjectNameForLengthAndSlash 的
+  # `\:*?"|<>` 同集合；控制字节 0x00-0x1F 由 escape_byte/1 的范围守卫覆盖）+ escape 引导符 `%`。
+  @escape_bytes [?%, ?\\, ?:, ?*, ??, ?", ?<, ?>, ?|]
+
+  # 盘上单个路径段（编码后目录名）字节硬限：POSIX NAME_MAX / NTFS 单组件 255。对齐 MinIO
+  # cmd/xl-storage.go checkPathLength（>255 → errFileNameTooLong → 400 KeyTooLongError）。
+  @max_segment_bytes 255
+
   @doc """
   S3 API 层对象 key 守卫：仅拒绝 S3/MinIO 都拒绝的形态——
     * 空 key 与 `.`/`..` 点段（MinIO cmd/object-api-utils.go IsValidObjectPrefix 的
@@ -37,7 +61,11 @@ defmodule Maxio.Cluster.Paths do
       （handler 映射 400 `XMinioInvalidObjectName`）；
     * **原始 key**（编码前）超 1024 字节（AWS/MinIO 对象 key 长度硬上限，MinIO
       IsValidObjectName 的 len > 1024 检查）→ `{:error, :key_too_long}`
-      （handler 映射 400 `KeyTooLongError`，与 :invalid_key 分流，B5-4）。
+      （handler 映射 400 `KeyTooLongError`，与 :invalid_key 分流，B5-4）；
+    * **编码后**任一盘段超 255 字节（POSIX NAME_MAX / NTFS 单组件硬限）→ 同样
+      `{:error, :key_too_long}`（对齐 MinIO checkPathLength → errFileNameTooLong →
+      400 KeyTooLongError；在触 OS 之前拒绝，杜绝 mkdir :enametoolong 冒成 500 并
+      泄露服务器盘路径）。
 
   **不**拒绝布局保留名段（meta.json/part.0/...）——MinIO/AWS 均接受这类普通 key
   （盘上碰撞由 `encode_key/1` 段编码结构化消除）；**不**拒绝空段——尾/连续/前导斜杠 key
@@ -56,6 +84,9 @@ defmodule Maxio.Cluster.Paths do
       key |> String.split("/") |> Enum.any?(&(&1 in [".", ".."])) ->
         {:error, :invalid_key}
 
+      key |> encoded_segments() |> Enum.any?(&(byte_size(&1) > @max_segment_bytes)) ->
+        {:error, :key_too_long}
+
       true ->
         :ok
     end
@@ -70,23 +101,7 @@ defmodule Maxio.Cluster.Paths do
   def encode_key(key) do
     case validate_key(key) do
       :ok ->
-        segments = String.split(key, "/")
-
-        {segments, dir_marker?} =
-          if List.last(segments) == "" do
-            {Enum.drop(segments, -1), true}
-          else
-            {segments, false}
-          end
-
-        encoded = Enum.map(segments, &encode_segment/1)
-
-        encoded =
-          if dir_marker?,
-            do: List.update_at(encoded, -1, &(&1 <> @dir_suffix)),
-            else: encoded
-
-        {:ok, Enum.join(encoded, "/")}
+        {:ok, key |> encoded_segments() |> Enum.join("/")}
 
       {:error, _reason} ->
         # 长度闸（:key_too_long）是 API 入口语义——精确错误 Code（KeyTooLongError vs
@@ -152,12 +167,35 @@ defmodule Maxio.Cluster.Paths do
     Path.join([".uploads", bucket, upload_id]) |> to_unix()
   end
 
-  # 段编码（单射）：空段 → @empty_seg；布局保留名 / 恰为 @empty_seg / 以 @esc_suffix 或
-  # @dir_suffix 结尾的段 → 追加 @esc_suffix（保证三类输出——passthrough（不以任何标记结尾）、
-  # escaped（以 @esc_suffix 结尾）、empty（== @empty_seg）——互不相交且可逆）。
+  # key → 编码后盘段序列（validate_key 与 encode_key 共用的单一来源：长度闸与实际落盘
+  # 路径对同一字节序列计量——validate_key 接受的 key 后端必可写，可建即可达）。
+  defp encoded_segments(key) do
+    segments = String.split(key, "/")
+
+    {segments, dir_marker?} =
+      if List.last(segments) == "" do
+        {Enum.drop(segments, -1), true}
+      else
+        {segments, false}
+      end
+
+    encoded = Enum.map(segments, &encode_segment/1)
+
+    if dir_marker?,
+      do: List.update_at(encoded, -1, &(&1 <> @dir_suffix)),
+      else: encoded
+  end
+
+  # 段编码（单射）：空段 → @empty_seg；先字节级 escape（Windows 禁用字节/控制字节/`%` →
+  # `%XX`），再对布局保留名 / 恰为 @empty_seg / 以 @esc_suffix 或 @dir_suffix 结尾的段
+  # 追加 @esc_suffix（保证三类输出——passthrough（不以任何标记结尾）、escaped（以 @esc_suffix
+  # 结尾）、empty（== @empty_seg）——互不相交且可逆；escape 单射 + escape("meta.json") ==
+  # "meta.json" 等不动点性质使保留名判定在 escape 后做仍正确）。
   defp encode_segment(""), do: @empty_seg
 
-  defp encode_segment(seg) do
+  defp encode_segment(raw_seg) do
+    seg = escape_bytes(raw_seg)
+
     if seg in @layout_reserved or seg == @empty_seg or
          String.ends_with?(seg, @esc_suffix) or String.ends_with?(seg, @dir_suffix) do
       seg <> @esc_suffix
@@ -166,19 +204,59 @@ defmodule Maxio.Cluster.Paths do
     end
   end
 
-  # encode_segment 的逆（不含 @dir_suffix 层）：剥一层 @esc_suffix / 还原空段 / 原样。
+  # encode_segment 的逆（不含 @dir_suffix 层）：剥一层 @esc_suffix / 还原空段，再做字节级
+  # unescape（与 encode 的「先 escape 后追加后缀」恰好相反序）。
   defp decode_plain(name) do
     cond do
       String.ends_with?(name, @esc_suffix) ->
-        binary_part(name, 0, byte_size(name) - byte_size(@esc_suffix))
+        name
+        |> binary_part(0, byte_size(name) - byte_size(@esc_suffix))
+        |> unescape_bytes()
 
       name == @empty_seg ->
         ""
 
       true ->
-        name
+        unescape_bytes(name)
     end
   end
+
+  # 字节级 escape：@escape_bytes 与控制字节（0x00-0x1F）→ `%XX`（大写十六进制）。单射：
+  # 输出中每个 `%` 必来自 escape（原始 `%` 自身也被 escape）。UTF-8 多字节序列高位 ≥ 0x80，
+  # 永不命中 escape 集——逐字节处理对任意 UTF-8 key 安全。
+  defp escape_bytes(seg) do
+    if escape_needed?(seg) do
+      for <<b <- seg>>, into: "", do: escape_byte(b)
+    else
+      seg
+    end
+  end
+
+  defp escape_needed?(<<b, _rest::binary>>) when b <= 0x1F or b in @escape_bytes, do: true
+  defp escape_needed?(<<_b, rest::binary>>), do: escape_needed?(rest)
+  defp escape_needed?(<<>>), do: false
+
+  defp escape_byte(b) when b <= 0x1F or b in @escape_bytes,
+    do: <<?%>> <> Base.encode16(<<b>>, case: :upper)
+
+  defp escape_byte(b), do: <<b>>
+
+  # escape_bytes 的精确逆（在 encode 像集上）：`%` + 两位大写十六进制 → 原字节；其余原样。
+  # 非 encode 像集的盘名（pre-escape 遗留数据中的裸 `%`，P7 B7-1 backfill 迁移）宽容透传。
+  defp unescape_bytes(name) do
+    if String.contains?(name, "%"), do: do_unescape(name, <<>>), else: name
+  end
+
+  defp do_unescape(<<?%, h1, h2, rest::binary>>, acc)
+       when (h1 in ?0..?9 or h1 in ?A..?F) and (h2 in ?0..?9 or h2 in ?A..?F) do
+    do_unescape(rest, <<acc::binary, hex_val(h1) * 16 + hex_val(h2)>>)
+  end
+
+  defp do_unescape(<<b, rest::binary>>, acc), do: do_unescape(rest, <<acc::binary, b>>)
+  defp do_unescape(<<>>, acc), do: acc
+
+  defp hex_val(c) when c in ?0..?9, do: c - ?0
+  defp hex_val(c) when c in ?A..?F, do: c - ?A + 10
 
   # 路径分隔统一为 "/"（Windows 上 Path.join 产 "\\"；端点目录后续仍经 Path.join(drive, rel) 落地，
   # 但相对路径本身用 "/" 保证跨节点/跨平台一致，且单测断言稳定）。

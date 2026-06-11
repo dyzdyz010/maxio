@@ -32,8 +32,16 @@ defmodule Maxio.S3.Plugs.Dispatch do
         render_error(conn, err)
 
       other ->
-        Log.error("unhandled exception in dispatch", code: "InternalError", status: 500)
-        render_error(conn, Error.new(:internal_error, message: Exception.message(other)))
+        # 完整异常 message 只进服务端日志，绝不进客户端 XML——File.Error 等的 message 内嵌
+        # 服务器绝对盘路径（data_dir），曾沿 <Message> 序列化给客户端（信息泄露）。客户端只见
+        # 通用 InternalError 文案（与 MinIO 一致：内部错误细节永不出现在 S3 错误响应里）。
+        Log.error("unhandled exception in dispatch",
+          code: "InternalError",
+          status: 500,
+          reason: Exception.message(other)
+        )
+
+        render_error(conn, Error.new(:internal_error))
     end
   end
 
