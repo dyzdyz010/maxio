@@ -8,6 +8,7 @@ defmodule Maxio.Objects do
   alias Maxio.Repo
   alias Maxio.Buckets
   alias Maxio.Objects.Object
+  alias Maxio.S3.Log
   alias Maxio.Sidecar
   alias Maxio.Versioning.VersionId
 
@@ -403,6 +404,13 @@ defmodule Maxio.Objects do
   entry is_latest=true 时先 unset 该 key 其余 latest 行（与写路径同事务语义）；is_latest=false
   （历史版本 reconcile）不触碰其他行。
 
+  **ROUTE B B5-3 R1 —— `updated_at` 忠于对象写入时刻**：`updated_at` 是客户端可见 Last-Modified /
+  `<LastModified>` 的来源，S3 语义下它随对象写入固定、绝不随扫描漂移。故从 canonical entry 的
+  `modtime`（int64 纳秒，`Sidecar.entry_modtime_datetime/1`，与读路径同源）导出 `updated_at`；
+  modtime 缺失（异常 sidecar）→ 既有行保留其 updated_at（`:updated_at` 剔出 replace 集）、
+  新插行回落 timestamps now + divergent 日志（铁律 3 不静默）。`synced_at` 仍用 now——它就是
+  「同步确认时刻」。
+
   best-effort 契约（scanner 逐版本调用，单行失败绝不炸整轮）：成功 `:ok`；桶缺失
   `{:error, :no_such_bucket}`；changeset/DB 异常 → `{:error, term}`（绝不抛，铁律 3 由调用方记日志）。
   """
@@ -421,14 +429,35 @@ defmodule Maxio.Objects do
           index_generation: entry_generation(entry)
         })
 
+      {updated_at, replace_fields} =
+        case Sidecar.entry_modtime_datetime(entry) do
+          {:ok, dt} ->
+            {dt, @reconcile_replace}
+
+          :error ->
+            Log.warn(
+              "reconcile: sidecar entry missing modtime, preserving existing updated_at",
+              bucket: bucket_name,
+              key: key,
+              reason: "version_id=#{entry["version_id"]} modtime=#{inspect(entry["modtime"])}"
+            )
+
+            {nil, @reconcile_replace -- [:updated_at]}
+        end
+
       result =
         Repo.transaction(fn ->
           if base[:is_latest], do: unset_latest(bucket.id, key)
 
-          case %Object{}
-               |> Object.changeset(base)
-               |> Repo.insert(
-                 on_conflict: {:replace, @reconcile_replace},
+          changeset = Object.changeset(%Object{}, base)
+
+          changeset =
+            if updated_at,
+              do: Ecto.Changeset.put_change(changeset, :updated_at, updated_at),
+              else: changeset
+
+          case Repo.insert(changeset,
+                 on_conflict: {:replace, replace_fields},
                  conflict_target: [:bucket_id, :key, :version_id]
                ) do
             {:ok, _obj} -> :ok

@@ -110,6 +110,18 @@ defmodule Maxio.Storage.ScannerTest do
     etag
   end
 
+  # 从任一端点读盘上真实写出的 sidecar（绝不手搓；B5-3 R1 取证 entry modtime 用）。
+  defp read_disk_sidecar(eps, key, vid) do
+    {:ok, rel} = Maxio.Cluster.Paths.object_rel(@bucket, key, vid)
+
+    Enum.find_value(eps, fn {_n, d} ->
+      case File.read(Path.join([d, rel, "meta.json"])) do
+        {:ok, bin} -> Maxio.Sidecar.decode!(bin)
+        {:error, _} -> nil
+      end
+    end)
+  end
+
   describe "forward reconcile（盘 → PG）" do
     test "PG 缺行（盘上有，null 布局）→ upsert 建行（全字段 + synced 注入）", %{topo: topo} do
       etag = disk_put!(topo, "k-missing", "null", "hello scanner")
@@ -169,6 +181,52 @@ defmodule Maxio.Storage.ScannerTest do
 
       assert {:ok, %{upserted: 0, gc: 0, skipped: 0, scanned: 1}} =
                Scanner.run_once(scan_opts(topo))
+    end
+
+    test "B5-3 R1：reconcile 后 updated_at 忠于 sidecar modtime（Last-Modified 绝不漂移到扫描时刻）",
+         %{eps: eps, topo: topo} do
+      _ = disk_put!(topo, "k-lastmod", "null", "last-modified fidelity")
+
+      # 盘上真实写出的 entry modtime（int64 ns）= 对象写入时刻（Last-Modified 单一语义来源）。
+      meta = read_disk_sidecar(eps, "k-lastmod", "null")
+      [entry] = meta["versions"]
+      {:ok, expected} = DateTime.from_unix(entry["modtime"], :nanosecond)
+
+      Process.sleep(20)
+      scan_started = DateTime.utc_now()
+      assert {:ok, %{upserted: 1}} = Scanner.run_once(scan_opts(topo))
+
+      {:ok, row} = Objects.get_version(@bucket, "k-lastmod", "null")
+
+      # updated_at == 原 PUT 时刻（sidecar modtime），严格早于扫描时刻（旧缺陷：写成 now → 漂移）。
+      assert DateTime.compare(row.updated_at, expected) == :eq
+      assert DateTime.compare(row.updated_at, scan_started) == :lt
+      # synced_at 是同步确认时刻（≥ 扫描开始），与 updated_at 语义分离。
+      assert DateTime.compare(row.synced_at, scan_started) != :lt
+    end
+
+    test "B5-3 R1：stale 行 reconcile 后 updated_at 收敛回对象写入时刻（非行刷新时刻）", %{
+      eps: eps,
+      topo: topo
+    } do
+      _ = disk_put!(topo, "k-lm2", "null", "stale lastmod")
+      meta = read_disk_sidecar(eps, "k-lm2", "null")
+      [entry] = meta["versions"]
+      {:ok, expected} = DateTime.from_unix(entry["modtime"], :nanosecond)
+
+      # 漂移行：晚于对象写入时刻写入 PG（updated_at = 行刷新时刻 > modtime）。
+      Process.sleep(20)
+
+      {:ok, _} =
+        Objects.put_version_with_id(@bucket, "k-lm2", "null", %{size: 999, etag: "\"d\""})
+
+      {:ok, pre} = Objects.get_version(@bucket, "k-lm2", "null")
+      assert DateTime.compare(pre.updated_at, expected) == :gt
+
+      assert {:ok, %{upserted: 1}} = Scanner.run_once(scan_opts(topo))
+
+      {:ok, row} = Objects.get_version(@bucket, "k-lm2", "null")
+      assert DateTime.compare(row.updated_at, expected) == :eq
     end
 
     test "delete marker 版本（B5-0 落盘 sidecar）→ is_delete_marker 行 + 跨版本 latest 收敛", %{

@@ -247,14 +247,14 @@ defmodule Maxio.ObjectMeta do
   end
 
   # entry modtime（int64 纳秒）→ DateTime（响应头 last-modified 用）。缺失/非整数 → 当前时刻兜底。
-  defp entry_modtime_to_datetime(%{"modtime" => ns}) when is_integer(ns) do
-    case DateTime.from_unix(ns, :nanosecond) do
+  # B5-3 R1：语义源统一到 Sidecar.entry_modtime_datetime/1（与 Objects.reconcile_from_sidecar 的
+  # updated_at 同源，Last-Modified 单一事实来源）；读路径兜底 now 维持既有行为。
+  defp entry_modtime_to_datetime(entry) do
+    case Sidecar.entry_modtime_datetime(entry) do
       {:ok, dt} -> dt
-      {:error, _} -> DateTime.utc_now()
+      :error -> DateTime.utc_now()
     end
   end
-
-  defp entry_modtime_to_datetime(_), do: DateTime.utc_now()
 
   # sidecar 路径完全不可达（无拓扑 / object_rel 非法）→ 降级 PG 索引兜底（best-effort），记 Log.warn。
   defp sidecar_unreachable_fallback(bucket, key, version_id) do

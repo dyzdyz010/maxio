@@ -158,6 +158,22 @@ defmodule Maxio.Sidecar do
     :crypto.hash(:sha256, :erlang.term_to_binary(canon))
   end
 
+  @doc """
+  ROUTE B B5-3 R1 —— 版本 entry 的 modtime（int64 纳秒）→ DateTime（对象**真实写入时刻**；
+  客户端可见 Last-Modified 的单一语义来源）。缺失 / 非整数 / 越界 → `:error`，由调用方自决兜底
+  （读路径回落 now —— `Maxio.ObjectMeta`；reconcile 保留既有行 updated_at —— `Maxio.Objects`），
+  绝不在此静默猜一个时刻（铁律 3）。
+  """
+  @spec entry_modtime_datetime(version_entry()) :: {:ok, DateTime.t()} | :error
+  def entry_modtime_datetime(%{"modtime" => ns}) when is_integer(ns) do
+    case DateTime.from_unix(ns, :nanosecond) do
+      {:ok, dt} -> {:ok, dt}
+      {:error, _} -> :error
+    end
+  end
+
+  def entry_modtime_datetime(_entry), do: :error
+
   @doc "把 sidecar 某版本 entry 翻成 Maxio.Objects 索引行 attrs（PG 派生用；B2 接线）。"
   @spec to_object_attrs(String.t(), String.t(), version_entry()) :: map()
   def to_object_attrs(_bucket, _key, %{} = e) do

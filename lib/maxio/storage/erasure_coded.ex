@@ -289,6 +289,14 @@ defmodule Maxio.Storage.ErasureCoded do
       ok_drives = commit_drives(tmps, commit_pairs, Keyword.put(opts, :meta_only, true))
 
       if ok_drives >= cfg.write_quorum do
+        # B5-3 R2：marker 提交是对 final 的「替换」（Suspended null 路径 final 可能持有既有 null
+        # 版本，meta_only rename 覆盖其 sidecar）——quorum 成功后 best-effort GC 各盘 final 里被
+        # 替换 null 版本的孤儿 part.0（delete marker 无字节，marker 版本目录里任何 part.0 定义上
+        # 都是孤儿）。失败幂等忽略（残余孤儿归 heal/GC 渠道），与 Distributed 同语义（铁律 2）。
+        Enum.each(commit_pairs, fn {_drive_root, final_dir} ->
+          _ = File.rm(Path.join(final_dir, @part_file))
+        end)
+
         :ok
       else
         Logger.error("erasure put_delete_marker below write quorum",
@@ -297,7 +305,10 @@ defmodule Maxio.Storage.ErasureCoded do
           reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
         )
 
-        rollback_commit(tmps, commit_pairs)
+        # B5-3 R2：替换式提交的失败回滚**只清 temp，绝不删 final**（rollback_commit 会连 final 一并
+        # 删掉 = 摧毁被替换的旧 null 版本，制造裸 404 破坏窗口）。已 commit 的盘留部分 marker
+        # （< quorum 不构成读权威），由重试/heal 收敛，与 Distributed 同语义（铁律 2）。
+        Enum.each(tmps, &File.rm_rf/1)
         {:error, :write_quorum}
       end
     end

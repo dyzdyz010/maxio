@@ -26,6 +26,10 @@ defmodule Maxio.S3.Handlers.Object do
     key = conn.assigns.s3_key
     _ = ensure_bucket!(bucket)
 
+    # B5-3 R3/R4：对象 key 入口守卫（保留布局名段/点段 → 400 XMinioInvalidObjectName），
+    # 在读 body / 写任何字节之前失败 pre-commit（铁律 3，无孤儿）。
+    :ok = validate_object_key!(bucket, key)
+
     content_type = header(conn, "content-type") || "binary/octet-stream"
     payload_mode = conn.assigns.payload_mode
     chunks = BodyReader.stream(conn, payload_mode)
@@ -137,7 +141,9 @@ defmodule Maxio.S3.Handlers.Object do
         |> send_resp(200, "")
 
       {:ok, {:error, :invalid_key}} ->
-        raise Error.new(:invalid_argument, resource: "/#{bucket}/#{key}", message: "Invalid key")
+        # 入口守卫之外仍可达：空段 key（"a//b" 等，AWS 合法）在 sidecar 盘上布局无法无碰撞表达，
+        # 后端经 Paths.object_rel 结构化拒绝 → 同样映射 400 XMinioInvalidObjectName（绝不静默折叠）。
+        raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       # 写 quorum 不足 / 原子 rename 争用 = 瞬时写限流，对齐 MinIO 的 SlowDownWrite(503)
       # （cmd/api-errors.go: errErasureWriteQuorum -> ErrSlowDownWrite）。SDK 据此指数退避重试，
@@ -159,6 +165,9 @@ defmodule Maxio.S3.Handlers.Object do
     key = conn.assigns.s3_key
     conn = fetch_query_params(conn)
     _ = ensure_bucket!(bucket)
+
+    # B5-3 R3/R4：对象 key 入口守卫（与 PUT 同源，MinIO 在任何查找前校验对象名）。
+    :ok = validate_object_key!(bucket, key)
 
     version_id = Map.get(conn.query_params, "versionId")
     # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口）。
@@ -243,7 +252,9 @@ defmodule Maxio.S3.Handlers.Object do
 
     # ROUTE B：经 Maxio.ObjectMeta.get 取对象（读权威单一入口；:pg 默认含内部 shadow，行为不变）。
     # HEAD 无 body：缺失/read_quorum 不足都只回状态 + 头（read_quorum 不足 → 503，对齐 GET SlowDownRead）。
+    # B5-3 R3/R4：key 守卫与 GET 同源（Paths.validate_key），HEAD 无 body 故仅回 400 状态。
     with {:ok, _b} <- Buckets.lookup(bucket),
+         :ok <- Maxio.Cluster.Paths.validate_key(key),
          {:ok, object} <- fetch_for_head(bucket, key, version_id) do
       cond do
         object.is_delete_marker and version_id == nil ->
@@ -282,6 +293,18 @@ defmodule Maxio.S3.Handlers.Object do
         Log.info("head object miss", action: :head_object, bucket: bucket, key: key)
         send_resp(conn, 404, "")
 
+      {:error, :invalid_key} ->
+        # B5-3 R3/R4：保留布局名段/点段 key → 400（与 GET 的 XMinioInvalidObjectName 同因；
+        # HEAD 无 body 故仅状态码，结构化日志留痕，铁律 3 不静默）。
+        Log.info("head object invalid key",
+          action: :head_object,
+          bucket: bucket,
+          key: key,
+          reason: :invalid_key
+        )
+
+        send_resp(conn, 400, "")
+
       {:error, :read_quorum} ->
         # 仅 :read=:sidecar 时可达：sidecar reconcile 不足 read_quorum → 503（绝不猜，铁律 3）。
         # HEAD 无 body：只回 503 状态（与 GET 的 SlowDownRead 同源，SDK 据此退避重试；HEAD 响应无
@@ -311,6 +334,9 @@ defmodule Maxio.S3.Handlers.Object do
     key = conn.assigns.s3_key
     conn = fetch_query_params(conn)
     _ = ensure_bucket!(bucket)
+
+    # B5-3 R3/R4：key 守卫（保留布局名段/点段 → 400，修 delete-marker 路径此前的 500 InternalError）。
+    :ok = validate_object_key!(bucket, key)
 
     version_id = Map.get(conn.query_params, "versionId")
     versioning = bucket_versioning(bucket)
@@ -494,8 +520,13 @@ defmodule Maxio.S3.Handlers.Object do
     dest_key = conn.assigns.s3_key
     _ = ensure_bucket!(dest_bucket)
 
+    # B5-3 R3/R4：Copy 目标与源 key 都过同一入口守卫（保留布局名段/点段 → 400）。
+    :ok = validate_object_key!(dest_bucket, dest_key)
+
     {src_bucket, src_key, src_version_id} =
       parse_copy_source!(header(conn, "x-amz-copy-source"))
+
+    :ok = validate_object_key!(src_bucket, src_key)
 
     # 源对象按真实版本解析（默认 current/latest，?versionId= 选特定版本）。
     {src_obj, _total} = object_or_raise(src_bucket, src_key, src_version_id)
@@ -698,12 +729,13 @@ defmodule Maxio.S3.Handlers.Object do
   #
   # 对象锁内（B1-1：盘 + PG 同锁）按写权威分流，**铁律：权威提交成功之前绝不执行破坏性步骤**：
   #
-  #   * `authoritative_source(:write)==:sidecar` → 盘上 marker sidecar 即权威提交：Suspended 先删
-  #     既有 null 版本字节 + sidecar（marker sidecar 落同一 null 路径——「替换」语义要求删在写前，
-  #     后删会把刚写出的 marker 一并删掉），再写 marker sidecar（quorum 不足 →
-  #     {:error,:write_quorum} → 503 SlowDownWrite，绝不静默）；PG 索引降 best-effort
-  #     （insert_delete_marker_index 失败 Log.error 不致命，scanner 后续 reconcile）。
-  #     破坏性删除与权威提交同介质（盘）同锁，是该模式既定的提交 seam。
+  #   * `authoritative_source(:write)==:sidecar` → 盘上 marker sidecar 即权威提交：**先**
+  #     put_delete_marker（quorum 闸）。meta_only commit 本就原子 rename meta.json 覆盖旧 sidecar
+  #     ——Suspended 的 null「替换」语义由该 rename 天然完成（B5-3 R2：取消了旧序「写 marker 前先删
+  #     null 版本」的破坏性步骤——那会在 marker quorum 失败时留下裸 404 窗口；现在 quorum 失败 →
+  #     503 SlowDownWrite 时旧 null 版本完好可读，重试收敛）。被替换 null 版本的孤儿 part.0 由后端
+  #     在 quorum 成功后 best-effort GC（part.0 是盘上布局知识，属后端不属 handler）。PG 索引降
+  #     best-effort（insert_delete_marker_index 失败 Log.error 不致命，scanner 后续 reconcile）。
   #
   #   * `:pg`（默认）→ PG upsert 即权威提交：insert_delete_marker_with_id **先行且致命**
   #     （失败 MatchError 上抛 → 500，此时盘上分毫未动 = 与 B5-0 之前的纯 PG 路径同样无破坏性
@@ -719,7 +751,7 @@ defmodule Maxio.S3.Handlers.Object do
     result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
         case Maxio.ObjectMeta.authoritative_source(:write) do
-          :sidecar -> commit_delete_marker_sidecar(bucket, key, version_id, versioning)
+          :sidecar -> commit_delete_marker_sidecar(bucket, key, version_id)
           _pg -> commit_delete_marker_pg(bucket, key, version_id, versioning)
         end
       end)
@@ -727,6 +759,11 @@ defmodule Maxio.S3.Handlers.Object do
     case result do
       {:ok, :ok} ->
         version_id
+
+      {:ok, {:error, :invalid_key}} ->
+        # B5-3 R4：路径守卫拒绝的 key（保留布局名段/点段）→ 400 结构化错误，绝不再塌缩成 500
+        # InternalError（入口守卫已拦截大多数；此分支兜底空段 key 等 sidecar 布局不可表达的 key）。
+        raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       {:ok, {:error, reason}} when reason in [:write_quorum, :rename_busy] ->
         raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
@@ -856,12 +893,13 @@ defmodule Maxio.S3.Handlers.Object do
     _, _ -> false
   end
 
-  # :sidecar 写权威：盘上 marker sidecar 即权威提交。Suspended 的 null 替换必须删在写前
-  # （同一 null 路径，删在写后会连新 marker 一起删掉）；marker quorum 失败 {:error,reason}
-  # 原样上抛（→ 503 SlowDownWrite）；PG 索引 best-effort（盘上 marker 已权威耐久）。
-  defp commit_delete_marker_sidecar(bucket, key, version_id, versioning) do
-    if versioning == "Suspended", do: _ = Storage.delete(bucket, key, "null")
-
+  # :sidecar 写权威：盘上 marker sidecar 即权威提交（B5-3 R2 重排）。**先** put_delete_marker
+  # （quorum 闸）——meta_only commit 原子 rename meta.json 覆盖旧 sidecar，Suspended 的 null
+  # 「替换」语义天然由该 rename 完成，绝不在权威提交前执行破坏性删除（旧序在 marker quorum 失败时
+  # 留下「旧 null 版本已毁 + marker 未落」的裸 404 窗口）。被替换 null 版本的孤儿 part.0 由后端在
+  # quorum 成功后 best-effort GC。marker quorum 失败 {:error,reason} 原样上抛（→ 503 SlowDownWrite，
+  # 旧对象完好可读，重试收敛）；PG 索引 best-effort（盘上 marker 已权威耐久）。
+  defp commit_delete_marker_sidecar(bucket, key, version_id) do
     with :ok <- Storage.put_delete_marker(bucket, key, version_id) do
       case Objects.insert_delete_marker_index(bucket, key, version_id) do
         :ok ->
@@ -1166,6 +1204,20 @@ defmodule Maxio.S3.Handlers.Object do
     case Buckets.lookup(bucket) do
       {:ok, b} -> b
       {:error, :not_found} -> raise Error.new(:no_such_bucket, resource: "/" <> bucket)
+    end
+  end
+
+  # B5-3 R3/R4 —— 对象 key 入口守卫（PUT/GET/HEAD/DELETE/Copy 源与目标统一）：保留布局名段
+  # （meta.json/part.0/.versions/.uploads/.tmp 精确匹配）或 ./.. 点段 → 400 XMinioInvalidObjectName
+  # （对齐 MinIO ErrInvalidObjectName，在任何查找/写入之前校验）。单一事实来源 =
+  # Maxio.Cluster.Paths.validate_key/1（与盘上路径构造同源），handler 仅做错误映射（铁律 2）。
+  defp validate_object_key!(bucket, key) do
+    case Maxio.Cluster.Paths.validate_key(key) do
+      :ok ->
+        :ok
+
+      {:error, :invalid_key} ->
+        raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
     end
   end
 

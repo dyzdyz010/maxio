@@ -47,6 +47,11 @@ defmodule Maxio.S3.Error do
       {"InvalidTag", 400,
        "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation."},
     invalid_bucket_name: {"InvalidBucketName", 400, "The specified bucket is not valid."},
+    # ROUTE B B5-3 R3/R4：key 含盘上布局保留名段（meta.json/part.0/.versions/.uploads/.tmp）或
+    # ./.. 点段 → 对齐 MinIO ErrInvalidObjectName（Code "XMinioInvalidObjectName"，HTTP 400，
+    # cmd/api-errors.go，描述逐字对齐）。结构化 400 拒绝，绝不 500（铁律 3）。
+    invalid_object_name:
+      {"XMinioInvalidObjectName", 400, "Object name contains unsupported characters."},
     # AWS/MinIO 用户元数据（x-amz-meta-*）总量 2 KB 硬上限超限 → MetadataTooLarge(400)。
     # 权威：AWS UsingMetadata.html（user-defined metadata 限 2 KB / 每 key+value UTF-8 字节和）+
     # minio/minio cmd/generic-handlers.go isHTTPHeaderSizeTooLarge（maxUserDataSize=2*1024，key 含前缀）。
