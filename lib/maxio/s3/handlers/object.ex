@@ -967,8 +967,8 @@ defmodule Maxio.S3.Handlers.Object do
 
   # :pg（默认）写权威：PG upsert 先行且致命（失败时盘上分毫未动，无撕裂；{:ok,_} 匹配失败上抛
   # → dispatch 兜底 500）。权威提交成功后才做 Suspended null 字节清理 + 盘上 marker 镜像，
-  # 均 best-effort：FS 后端 put_delete_marker 返回 :not_supported / 纠删后端写失败都不影响
-  # 已权威提交的删除（盘上残留对 PG 读/列权威不可见），绝不让 :pg 路径因盘失败而失败。
+  # 均 best-effort：后端 marker 写失败（FS 单盘 IO 错 / 纠删 quorum 不足，B6-1 起 FS 也实落
+  # marker sidecar）不影响已权威提交的删除（盘上残留对 PG 读/列权威不可见），绝不让 :pg 路径因盘失败而失败。
   defp commit_delete_marker_pg(bucket, key, version_id, versioning) do
     {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id)
 

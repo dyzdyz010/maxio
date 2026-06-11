@@ -107,8 +107,8 @@ defmodule Maxio.Storage.Backend do
   `entry_opts`（keyword，可选）：`:modtime`（覆盖单次纳秒，默认实现自算）等版本头覆盖；缺省全默认。
   写到 write_quorum 个端点（temp→rename 原子，复用 PUT 同级原语）。
 
-  **FS 后端**：返回 `{:error, :not_supported}`（FS 无多端点拓扑、仅在 `:pg` 权威下使用，故无正确性影响；
-  FS sidecar/delete-marker 接线见 B6-1，铁律 3 显式文档化绝不静默 no-op）。
+  **FS 后端**（ROUTE B B6-1 接线）：单盘 quorum=1——唯一副本的 meta_only 原子提交成功即 `:ok`，
+  失败 `{:error, term}`（绝不静默 no-op，铁律 3）。
   """
   @callback put_delete_marker(
               bucket(),

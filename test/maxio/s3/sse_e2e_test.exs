@@ -41,8 +41,9 @@ defmodule Maxio.S3.SseE2ETest do
     assert get.resp_body == plain
     assert get_resp_header(get, "x-amz-server-side-encryption") == ["AES256"]
 
-    # 磁盘上是密文（不含明文片段）。SSE 对象落 null 版本路径 <data_dir>/sseb/secret.txt。
-    on_disk = File.read!(Path.join([@data_dir, "sseb", "secret.txt"]))
+    # 磁盘上是密文（不含明文片段）。B6-1 obj-dir 布局：null 版本字节落
+    # <data_dir>/sseb/secret.txt/part.0（sidecar 在同目录 meta.json）。
+    on_disk = File.read!(Path.join([@data_dir, "sseb", "secret.txt", "part.0"]))
     refute on_disk =~ "encrypt me"
   end
 

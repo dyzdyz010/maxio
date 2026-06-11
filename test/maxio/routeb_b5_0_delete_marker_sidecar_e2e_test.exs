@@ -231,10 +231,23 @@ defmodule Maxio.RouteBB5_0DeleteMarkerSidecarE2ETest do
     end
   end
 
-  describe "FS 后端 put_delete_marker 显式 :not_supported（铁律 3 不静默 no-op）" do
-    test "FS.put_delete_marker 返回 {:error, :not_supported}" do
-      assert {:error, :not_supported} =
-               Maxio.Storage.FS.put_delete_marker("anybucket", "anykey", "null", [], [])
+  # ROUTE B B6-1：FS put_delete_marker 已实装（marker sidecar 落盘，quorum=1）——B5-0 时期的
+  # {:error, :not_supported} 哨兵断言随之退役；FS marker e2e 见 test/maxio/storage/fs_sidecar_test.exs。
+  describe "FS 后端 put_delete_marker 实装（B6-1，不再 :not_supported）" do
+    test "FS.put_delete_marker 单盘提交成功返回 :ok" do
+      dir =
+        Path.join(System.tmp_dir!(), "maxio_b50_fs_marker_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert :ok =
+               Maxio.Storage.FS.put_delete_marker("anybucket", "anykey", "null", [],
+                 data_dir: dir
+               )
+
+      meta_path = Path.join([dir, "anybucket", "anykey", "meta.json"])
+      assert File.regular?(meta_path)
     end
   end
 end

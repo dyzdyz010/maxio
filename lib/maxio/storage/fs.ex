@@ -1,24 +1,47 @@
 defmodule Maxio.Storage.FS do
   @moduledoc """
-  单机文件系统存储后端（MVP）。对象落在 `<data_dir>/<bucket>/<encoded-key>`，key 中的 `/`
-  自然映射为子目录；key → 盘段编码经 `Maxio.Cluster.Paths.encode_key/1`（空段/尾斜杠/布局
-  保留名段无碰撞落盘，单一事实来源）。put 流式写入并边写边算 MD5（绝不全缓冲，铁律 4）；
-  get 支持 Range，按区间用 :file.pread 分块发出；防 `..` 路径穿越。
+  单机文件系统存储后端。ROUTE B B6-1 起对象落 **obj-dir 布局**（与 ErasureCoded/Distributed
+  同构，铁律 2 单一布局语义）：
 
-  写路径（put/assemble）经 **temp-then-rename + fsync**（ROUTE B B1-2）：先流式写
-  `<data_dir>/.tmp/<uuid>/data`，fsync，再原子 rename 覆盖到 final 对象路径（同卷保证原子；crash
-  在 rename 前 -> final 保旧值/不存在，绝不撕裂；temp 可 GC）。rename busy（Windows reader 持文件打开）
+    * null 版本：`<data_dir>/<bucket>/<encoded-key>/{part.0, meta.json}`
+    * 版本化：`<data_dir>/.versions/<bucket>/<encoded-key>/<version_id>/{part.0, meta.json}`
+
+  `part.0` 为对象完整字节（FS 单盘无纠删，无填充——文件长度即对象 size）；`meta.json` 为
+  maxio/2 sidecar（v1 core `size/etag/sha256` 经 `Maxio.Sidecar.migrate_v1/2` 携 versions 数组，
+  富元数据从 `opts[:object_meta]` 取——FS 从此不再忽略 object_meta），与 EC/Distributed 的
+  sidecar 同构，使 ObjectMeta/Listing/Scanner 经合成单端点 topology 逐字复用（B6-2）。
+
+  key → 盘段编码经 `Maxio.Cluster.Paths.encode_key/1`（空段/尾斜杠/布局保留名段无碰撞落盘，
+  单一事实来源）。put 流式写入并边写边算 MD5/SHA256（绝不全缓冲，铁律 4）；get 支持 Range，
+  按区间用 :file.pread 分块发出；防 `..` 路径穿越。
+
+  写路径（put/assemble/put_delete_marker）经 **temp obj-dir + 原子 rename + fsync**
+  （`ShardServer.begin_tmp/1` + `ShardServer.commit/3`，B1-2 原语：数据先于元数据 rename，
+  crash 在两 rename 之间绝不 meta 指向不存在数据）。rename busy（Windows reader 持文件打开）
   -> 有界重试后 {:error, :rename_busy}（铁律 3）。fsync 开关由 `config :maxio, :durability, fsync:` 控制。
+
+  ## 旧单文件布局读回退（B6-1 兼容；P7 B7-1 backfill 收尾迁移）
+
+  B6-1 之前 FS 对象 = 裸单文件（路径与 obj-dir 同名互斥）。get/stat（含 copy 源读，经同一
+  do_get）先探 obj-dir 的 part.0，miss 则回退旧单文件路径——命中**必记**结构化日志
+  `action: :legacy_layout_read`（绝不静默）；delete 双布局清理；put/assemble/put_delete_marker
+  覆盖旧布局对象时先摘除旧文件（`action: :legacy_layout_replace` 日志；文件→目录无原子转换，
+  rm 与 commit 之间存在极窄 crash 窗口，S3 PUT 替换语义下旧字节本就被替换，诚实文档化）。
 
   每个回调额外接受可选末参 `opts`（`:data_dir` 覆盖根目录，便于测试隔离），
   缺省时从 `config :maxio, :s3, :data_dir` 读取。
   """
   @behaviour Maxio.Storage.Backend
 
+  require Logger
+
   alias Maxio.Cluster.{Paths, ShardServer}
+  alias Maxio.Sidecar
+  alias Maxio.Storage.DeleteMarker
 
   @chunk_size 1_048_576
-  @tmp_root ".tmp"
+  @part_file "part.0"
+  @meta_file "meta.json"
 
   @impl true
   def put(bucket, key, version_id \\ "null", chunks, opts \\ [])
@@ -45,8 +68,8 @@ defmodule Maxio.Storage.FS do
   def delete_bucket(bucket, opts \\ []), do: do_delete_bucket(bucket, opts)
 
   # ── 分段上传 parts 回调（M2-4）。part 字节落在
-  # <data_dir>/.uploads/<bucket>/<upload_id>/<part_number>.part；
-  # assemble 按 part 升序拼到对象路径；abort 删整个 upload 临时目录。──
+  # <data_dir>/.uploads/<bucket>/<upload_id>/<part_number>.part（平铺布局不变，B6-1 非目标）；
+  # assemble 按 part 升序拼到对象 obj-dir；abort 删整个 upload 临时目录。──
 
   @impl true
   def put_part(bucket, key, upload_id, part_number, chunks, opts \\ []),
@@ -64,14 +87,12 @@ defmodule Maxio.Storage.FS do
   def abort_upload(bucket, key, upload_id, opts \\ []),
     do: do_abort_upload(bucket, key, upload_id, opts)
 
-  # ROUTE B B5-0：delete marker 落盘。FS 单机后端无多端点拓扑、无 maxio/2 sidecar（对象即裸字节文件），
-  # 且仅在 `authoritative_source=:pg`（默认）权威下使用——`:sidecar` 读/列权威永不命中 FS（那是
-  # 纠删/分布式后端的事），故 FS 不落 delete-marker sidecar 无正确性影响。**显式返回 :not_supported**
-  # （铁律 3：绝不静默 no-op :ok 假装写成功）；handler 在 `:pg` 权威下不调用本回调（PG insert_delete_marker
-  # 即权威），故此返回不触达。FS 的 sidecar/delete-marker 接线推迟到 B6-1（文档化非目标）。
+  # ROUTE B B6-1：delete marker 落盘（替换 B5-0 的 {:error, :not_supported}）。FS 单盘 quorum=1：
+  # 唯一副本的 meta_only 原子提交成功即 :ok。与 ErasureCoded/Distributed 同源
+  # （Maxio.Storage.DeleteMarker.sidecar/2 单一形态来源 + ShardServer.commit :meta_only）。
   @impl true
-  def put_delete_marker(_bucket, _key, _version_id, _entry_opts, _opts),
-    do: {:error, :not_supported}
+  def put_delete_marker(bucket, key, version_id, entry_opts \\ [], opts \\ []),
+    do: do_put_delete_marker(bucket, key, version_id, entry_opts, opts)
 
   # ROUTE B fidelity —— DELETE ?versionId 的权威删除（Backend.delete_version/4 契约）。FS 单副本
   # 本地盘：唯一副本的删除即权威提交（无 quorum 语义）——rm 成功 / 本就不存在 → :ok（幂等）；
@@ -80,11 +101,14 @@ defmodule Maxio.Storage.FS do
   def delete_version(bucket, key, version_id \\ "null", opts \\ []),
     do: do_delete(bucket, key, version_id, opts)
 
+  # ── PUT：流式写 temp obj-dir（part.0 + meta.json sidecar），原子提交到 final ──
+
   defp do_put(bucket, key, version_id, chunks, opts) do
-    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
-      # B1-2 原子提交：先流式写同卷 temp 文件，fsync，再原子 rename 覆盖 final（crash 前 final 保旧值/缺失）。
-      {tmp_dir, tmp_path} = begin_tmp_file!(opts)
-      {:ok, fd} = File.open(tmp_path, [:write, :binary, :raw])
+    with {:ok, final_dir} <- object_path(bucket, key, version_id, opts) do
+      # B1-2 原子提交：同卷 .tmp temp obj-dir 内流式写 part.0，流尾写 maxio/2 sidecar（meta.json），
+      # 数据先于元数据原子 rename 到 final（crash 前 final 保旧值/缺失）。
+      {:ok, tmp} = ShardServer.begin_tmp(data_dir(opts))
+      {:ok, fd} = File.open(Path.join(tmp, @part_file), [:write, :binary, :raw])
 
       {etag, sha256, size} =
         try do
@@ -106,43 +130,84 @@ defmodule Maxio.Storage.FS do
           File.close(fd)
         end
 
-      case ShardServer.commit_file(tmp_path, path, Keyword.take(opts, [:fsync])) do
+      meta = build_meta(version_id, opts, size, etag, sha256)
+
+      case ShardServer.put_sidecar(tmp, meta) do
         :ok ->
-          _ = File.rm_rf(tmp_dir)
-          {:ok, %{size: size, etag: etag, sha256: sha256}}
+          commit_obj_dir(tmp, final_dir, bucket, key, version_id, opts, %{
+            size: size,
+            etag: etag,
+            sha256: sha256
+          })
 
         {:error, reason} ->
-          _ = File.rm_rf(tmp_dir)
+          _ = File.rm_rf(tmp)
           {:error, reason}
       end
     end
   end
 
+  # ── GET / STAT：先 obj-dir（part.0），miss 回退旧单文件布局（命中必记日志，绝不静默）──
+
   defp do_get(bucket, key, version_id, range, opts) do
-    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
-      case File.stat(path) do
-        {:ok, %File.Stat{size: total}} -> {:ok, stream_file(path, range, total)}
-        {:error, :enoent} -> {:error, :enoent}
+    with {:ok, dir} <- object_path(bucket, key, version_id, opts) do
+      part = Path.join(dir, @part_file)
+
+      case File.stat(part) do
+        {:ok, %File.Stat{size: total}} ->
+          {:ok, stream_file(part, range, total)}
+
+        {:error, _} ->
+          with {:ok, total} <- legacy_stat(dir, bucket, key, version_id) do
+            {:ok, stream_file(dir, range, total)}
+          end
       end
     end
   end
 
   defp do_stat(bucket, key, version_id, opts) do
-    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
-      case File.stat(path) do
-        {:ok, %File.Stat{size: size}} -> {:ok, %{size: size}}
-        {:error, :enoent} -> {:error, :enoent}
+    with {:ok, dir} <- object_path(bucket, key, version_id, opts) do
+      case File.stat(Path.join(dir, @part_file)) do
+        {:ok, %File.Stat{size: size}} ->
+          {:ok, %{size: size}}
+
+        {:error, _} ->
+          with {:ok, size} <- legacy_stat(dir, bucket, key, version_id) do
+            {:ok, %{size: size}}
+          end
       end
     end
   end
 
+  # ── DELETE：双布局清理。obj-dir 只摘对象布局文件 part.0/meta.json（绝不 rm_rf 整目录——
+  # FS 单树上对象 "a" 的 obj-dir 同时是更深 key "a/b" 的命名空间父目录，rm_rf 会踩踏兄弟对象
+  # 字节）；空目录 best-effort rmdir 收尾。旧单文件布局直接 rm。幂等（本就不存在 → :ok）。──
+
   defp do_delete(bucket, key, version_id, opts) do
-    with {:ok, path} <- object_path(bucket, key, version_id, opts) do
-      case File.rm(path) do
-        :ok -> :ok
-        {:error, :enoent} -> :ok
-        {:error, reason} -> {:error, reason}
+    with {:ok, dir} <- object_path(bucket, key, version_id, opts) do
+      if File.dir?(dir) do
+        delete_obj_dir(dir)
+      else
+        # 旧单文件布局（或不存在，幂等 :ok）。
+        rm_ok(dir)
       end
+    end
+  end
+
+  defp delete_obj_dir(dir) do
+    with :ok <- rm_ok(Path.join(dir, @part_file)),
+         :ok <- rm_ok(Path.join(dir, @meta_file)) do
+      # 仅当目录已空（无更深 key 的子目录）才删得掉；非空失败即忽略（目录此后只是命名空间前缀）。
+      _ = File.rmdir(dir)
+      :ok
+    end
+  end
+
+  defp rm_ok(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -194,35 +259,45 @@ defmodule Maxio.Storage.FS do
     end
   end
 
+  # ── ASSEMBLE：逐 part 流式拼进 temp obj-dir 的 part.0（边拷边算 etag/sha256），流尾写
+  # maxio/2 sidecar，原子提交到 null 布局 final（与 EC do_assemble 同语义：assemble 透传
+  # opts[:object_meta]，sidecar 自描述真实 content_type/user_metadata，B4-6 D1）。──
+
   defp do_assemble(bucket, key, upload_id, part_numbers, opts) do
-    with {:ok, obj_path} <- object_path(bucket, key, "null", opts) do
-      # B1-2 原子提交：拼到同卷 temp 文件，fsync，再原子 rename 覆盖 final（绝不就地写半截对象）。
-      {tmp_dir, tmp_path} = begin_tmp_file!(opts)
-      {:ok, out} = File.open(tmp_path, [:write, :binary, :raw])
+    with {:ok, final_dir} <- object_path(bucket, key, "null", opts) do
+      {:ok, tmp} = ShardServer.begin_tmp(data_dir(opts))
+      {:ok, out} = File.open(Path.join(tmp, @part_file), [:write, :binary, :raw])
 
-      size =
+      {etag, sha256, size} =
         try do
-          Enum.reduce(part_numbers, 0, fn pn, acc ->
-            path = part_path(bucket, upload_id, pn, opts)
-            {:ok, in_fd} = :file.open(String.to_charlist(path), [:read, :binary, :raw])
+          acc0 = {:crypto.hash_init(:md5), :crypto.hash_init(:sha256), 0}
 
-            try do
-              acc + copy_fd(in_fd, out, 0)
-            after
-              :file.close(in_fd)
-            end
-          end)
+          {md5_ctx, sha_ctx, size} =
+            Enum.reduce(part_numbers, acc0, fn pn, acc ->
+              path = part_path(bucket, upload_id, pn, opts)
+              {:ok, in_fd} = :file.open(String.to_charlist(path), [:read, :binary, :raw])
+
+              try do
+                copy_fd(in_fd, out, acc)
+              after
+                :file.close(in_fd)
+              end
+            end)
+
+          {md5_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower),
+           sha_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower), size}
         after
           File.close(out)
         end
 
-      case ShardServer.commit_file(tmp_path, obj_path, Keyword.take(opts, [:fsync])) do
+      meta = build_meta("null", opts, size, etag, sha256)
+
+      case ShardServer.put_sidecar(tmp, meta) do
         :ok ->
-          _ = File.rm_rf(tmp_dir)
-          {:ok, %{size: size}}
+          commit_obj_dir(tmp, final_dir, bucket, key, "null", opts, %{size: size})
 
         {:error, reason} ->
-          _ = File.rm_rf(tmp_dir)
+          _ = File.rm_rf(tmp)
           {:error, reason}
       end
     end
@@ -234,12 +309,153 @@ defmodule Maxio.Storage.FS do
     :ok
   end
 
-  # 1MB 分块把 in_fd 全量拷到 out，返回拷贝字节数。
-  defp copy_fd(in_fd, out, acc) do
+  # ── delete marker 落盘（ROUTE B B6-1）：temp obj-dir 只写 marker sidecar（无 part.0，合法），
+  # ShardServer.commit :meta_only 原子 rename meta.json 覆盖 final（Suspended 的 null「替换」语义
+  # 天然由该 rename 完成，与 Distributed/EC 对齐）。quorum=1：单盘提交成功即 :ok。
+  # B5-3 R2 不变式：pre-commit 绝不破坏 final（失败只清 temp）；quorum 成功后 best-effort GC
+  # final 里被替换 null 版本的孤儿 part.0（delete marker 无字节，其版本目录里任何 part.0 定义上
+  # 都是孤儿）。──
+
+  defp do_put_delete_marker(bucket, key, version_id, entry_opts, opts) do
+    with {:ok, final_dir} <- object_path(bucket, key, version_id, opts),
+         {:ok, tmp} <- ShardServer.begin_tmp(data_dir(opts)) do
+      meta = DeleteMarker.sidecar(version_id, entry_opts)
+
+      case ShardServer.put_sidecar(tmp, meta) do
+        :ok -> commit_marker(tmp, final_dir, bucket, key, version_id, opts)
+        {:error, reason} -> marker_failed(tmp, bucket, key, reason)
+      end
+    end
+  end
+
+  defp commit_marker(tmp, final_dir, bucket, key, version_id, opts) do
+    # 旧单文件布局的 null 对象与 obj-dir 同路径互斥：marker 落点被旧文件占据时先摘除
+    # （文件→目录无原子转换；Suspended marker 本就替换 null 版本，rm 语义正确，日志留痕）。
+    with :ok <- clear_legacy_file(final_dir, bucket, key, version_id),
+         :ok <-
+           ShardServer.commit(
+             tmp,
+             final_dir,
+             Keyword.take(opts, [:fsync]) ++ [meta_only: true]
+           ) do
+      _ = File.rm(Path.join(final_dir, @part_file))
+      :ok
+    else
+      {:error, reason} -> marker_failed(tmp, bucket, key, reason)
+    end
+  end
+
+  # marker 提交失败：只清 temp，绝不触碰 final（B5-3 R2——替换式提交失败回滚删 final 会摧毁
+  # 被替换的旧 null 版本，制造裸 404 窗口）。Logger.error 留痕（铁律 3 不静默）。
+  defp marker_failed(tmp, bucket, key, reason) do
+    Logger.error("fs put_delete_marker failed",
+      action: :put_delete_marker,
+      bucket: bucket,
+      key: key,
+      reason: inspect(reason)
+    )
+
+    _ = File.rm_rf(tmp)
+    {:error, reason}
+  end
+
+  # ── obj-dir 原子提交（do_put/do_assemble 共用）──
+
+  defp commit_obj_dir(tmp, final_dir, bucket, key, version_id, opts, result) do
+    with :ok <- clear_legacy_file(final_dir, bucket, key, version_id),
+         :ok <- ShardServer.commit(tmp, final_dir, Keyword.take(opts, [:fsync])) do
+      {:ok, result}
+    else
+      {:error, reason} ->
+        _ = File.rm_rf(tmp)
+        {:error, reason}
+    end
+  end
+
+  # 旧单文件布局对象占据 final obj-dir 路径 → 先摘除（否则 commit 的 mkdir_p 撞文件）。
+  # 文件→目录无原子转换：rm 与 commit 之间存在极窄 crash 窗口（S3 PUT/marker 替换语义下
+  # 旧字节本就被替换）；命中必记结构化日志（绝不静默），P7 backfill 迁移后此路径消亡。
+  defp clear_legacy_file(final_dir, bucket, key, version_id) do
+    if File.regular?(final_dir) do
+      Logger.warning("fs legacy single-file layout object replaced by obj-dir commit",
+        action: :legacy_layout_replace,
+        bucket: bucket,
+        key: key,
+        version_id: version_id,
+        path: final_dir
+      )
+
+      rm_ok(final_dir)
+    else
+      :ok
+    end
+  end
+
+  # 旧单文件布局读回退：obj-dir 的 part.0 miss 后，对象路径本身若是常规文件即 B6-1 之前落的
+  # 裸单文件对象——命中必记结构化日志 action: :legacy_layout_read（绝不静默）；目录（纯命名空间
+  # 前缀 / 无 part.0 的 marker obj-dir）或不存在 → :enoent。
+  defp legacy_stat(path, bucket, key, version_id) do
+    case File.stat(path) do
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        Logger.warning("fs legacy single-file layout read (pre-B6-1 data; P7 backfill migrates)",
+          action: :legacy_layout_read,
+          bucket: bucket,
+          key: key,
+          version_id: version_id,
+          path: path
+        )
+
+        {:ok, size}
+
+      {:ok, _stat} ->
+        {:error, :enoent}
+
+      {:error, _} ->
+        {:error, :enoent}
+    end
+  end
+
+  # ── sidecar 构造（ROUTE B B6-1）：v1 core 仅 size/etag/sha256（FS 单盘无 ec/shards——合法，
+  # 读侧 Sidecar.latest/find_version/to_view 只依赖 versions 数组），经 Sidecar.migrate_v1/2
+  # 升级为完整 maxio/2（富元数据来自 opts[:object_meta]，FS 从此不再忽略 object_meta）。──
+
+  defp build_meta(version_id, opts, size, etag, sha256) do
+    core = %{"size" => size, "etag" => etag, "sha256" => sha256}
+    Sidecar.migrate_v1(core, version_opts(version_id, opts))
+  end
+
+  # 从 opts[:object_meta] 取 maxio/2 版本头字段，产出 Sidecar.migrate_v1/2 的 keyword。
+  # 与 ErasureCoded/Distributed 的同名私有函数逐字一致（铁律 2 单一语义）；modtime 一次计算；
+  # data_dir = version_id（方案 B 每版本独立目录）。缺字段由 migrate_v1 兜底默认。
+  defp version_opts(version_id, opts) do
+    om = Keyword.get(opts, :object_meta, %{})
+    modtime = System.os_time(:nanosecond)
+
+    [
+      version_id: version_id,
+      data_dir: version_id,
+      modtime: modtime,
+      content_type: Map.get(om, :content_type, "binary/octet-stream"),
+      tags: Map.get(om, :tags, %{}),
+      sse: Map.get(om, :sse),
+      acl_canned: Map.get(om, :acl_canned, "private"),
+      storage_class: Map.get(om, :storage_class, "STANDARD"),
+      user_metadata: Map.get(om, :user_metadata, %{})
+    ]
+  end
+
+  # 1MB 分块把 in_fd 全量拷到 out，边拷边算 MD5/SHA256（assemble 的 sidecar 需 etag/sha256，
+  # 与 EC do_assemble 同语义；铁律 4 绝不全缓冲）。acc = {md5_ctx, sha_ctx, size}。
+  defp copy_fd(in_fd, out, {md5, sha, size} = acc) do
     case :file.read(in_fd, @chunk_size) do
       {:ok, data} ->
         :ok = IO.binwrite(out, data)
-        copy_fd(in_fd, out, acc + byte_size(data))
+
+        copy_fd(
+          in_fd,
+          out,
+          {:crypto.hash_update(md5, data), :crypto.hash_update(sha, data), size + byte_size(data)}
+        )
 
       :eof ->
         acc
@@ -248,15 +464,6 @@ defmodule Maxio.Storage.FS do
         acc
     end
   end
-
-  # 在 data_dir 下建同卷 temp 目录 + 返回其中的 data 文件路径（与 final 同卷 -> rename 原子）。
-  defp begin_tmp_file!(opts) do
-    tmp_dir = Path.join([data_dir(opts), @tmp_root, tmp_uuid()])
-    File.mkdir_p!(tmp_dir)
-    {tmp_dir, Path.join(tmp_dir, "data")}
-  end
-
-  defp tmp_uuid, do: :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
 
   defp upload_dir(bucket, upload_id, opts) do
     Path.join([data_dir(opts), ".uploads", bucket, upload_id])
@@ -301,8 +508,8 @@ defmodule Maxio.Storage.FS do
 
   defp bucket_path(bucket, opts), do: Path.join(data_dir(opts), bucket)
 
-  # version_id == "null"（无版本）→ 落原路径 <data_dir>/<bucket>/<encoded-key>。
-  # 否则落版本化路径 <data_dir>/.versions/<bucket>/<encoded-key>/<version_id>（与对象路径物理隔离）。
+  # version_id == "null"（无版本）→ obj-dir 落 <data_dir>/<bucket>/<encoded-key>/。
+  # 否则落版本化 obj-dir <data_dir>/.versions/<bucket>/<encoded-key>/<version_id>/（物理隔离）。
   #
   # key → 盘段编码经 Maxio.Cluster.Paths.encode_key（单一事实来源，铁律 2）：空段（"a//b"）、
   # 尾斜杠 folder marker（"dir/"）、布局保留名段（meta.json 等）全部无碰撞落盘——绝不再
