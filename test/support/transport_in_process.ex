@@ -35,6 +35,13 @@ defmodule Maxio.Cluster.Transport.InProcess do
   @doc "Restore one drive root on a node."
   def set_drive_up(node, drive), do: :ets.delete(@table, {:drive, node, normalize_path(drive)})
 
+  @doc "Set an injected node-local pressure snapshot for a simulated node."
+  def set_pressure_snapshot(node, snapshot),
+    do: :ets.insert(@table, {{:pressure, node}, normalize_pressure_snapshot(snapshot)})
+
+  @doc "Clear an injected node-local pressure snapshot for a simulated node."
+  def clear_pressure_snapshot(node), do: :ets.delete(@table, {:pressure, node})
+
   @doc "Fail heal_shard for one drive while keeping probes online."
   def set_heal_shard_down(node, drive), do: set_op_down(:heal_shard, node, drive)
 
@@ -86,6 +93,31 @@ defmodule Maxio.Cluster.Transport.InProcess do
   end
 
   defp normalize_path(path), do: path |> Path.expand() |> Path.split() |> Path.join()
+
+  defp normalize_pressure_snapshot(snapshot) when is_map(snapshot) do
+    s3 =
+      non_negative_int(Map.get(snapshot, :s3_in_flight) || Map.get(snapshot, "s3_in_flight"), 0)
+
+    storage =
+      non_negative_int(Map.get(snapshot, :storage_ops) || Map.get(snapshot, "storage_ops"), 0)
+
+    combined =
+      non_negative_int(
+        Map.get(snapshot, :combined) || Map.get(snapshot, "combined"),
+        s3 + storage
+      )
+
+    %{
+      s3_in_flight: s3,
+      storage_ops: storage,
+      combined: combined
+    }
+  end
+
+  defp normalize_pressure_snapshot(_snapshot), do: %{s3_in_flight: 0, storage_ops: 0, combined: 0}
+
+  defp non_negative_int(n, _default) when is_integer(n) and n >= 0, do: n
+  defp non_negative_int(_n, default), do: default
 
   @impl true
   def put_shard(node, dir, j, shard, shard_len) do
@@ -166,5 +198,22 @@ defmodule Maxio.Cluster.Transport.InProcess do
     if down?(node, drive_root),
       do: {:error, :unavailable},
       else: ShardServer.probe_drive(drive_root)
+  end
+
+  @impl true
+  def pressure_snapshot(node, _opts \\ []) do
+    cond do
+      down?(node, nil) ->
+        {:error, :unavailable}
+
+      :ets.whereis(@table) == :undefined ->
+        {:ok, Maxio.Cluster.IOPressure.local_snapshot()}
+
+      true ->
+        case :ets.lookup(@table, {:pressure, node}) do
+          [{{:pressure, ^node}, snapshot}] -> {:ok, snapshot}
+          _ -> {:ok, Maxio.Cluster.IOPressure.local_snapshot()}
+        end
+    end
   end
 end

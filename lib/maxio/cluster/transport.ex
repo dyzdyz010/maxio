@@ -33,6 +33,7 @@ defmodule Maxio.Cluster.Transport do
   @callback list_dir(node(), String.t(), keyword()) ::
               {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
   @callback probe_drive(node(), String.t()) :: :ok | {:error, term()}
+  @callback pressure_snapshot(node(), keyword()) :: {:ok, map()} | {:error, term()}
 
   @doc "当前配置的传输实现（test 经 opts[:transport] 覆盖；缺省 config :maxio, :shard_transport）。"
   @spec impl(keyword()) :: module()
@@ -54,6 +55,7 @@ defmodule Maxio.Cluster.Transport.Erpc do
   alias Maxio.Cluster.ShardServer
 
   @timeout 5_000
+  @pressure_timeout 50
 
   @impl true
   def put_shard(node, dir, j, shard, shard_len) do
@@ -118,6 +120,23 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def probe_drive(node, drive_root) do
     call(node, :probe_drive, [drive_root], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def pressure_snapshot(node, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout_ms, @pressure_timeout)
+
+    if node == Node.self() do
+      {:ok, Maxio.Cluster.IOPressure.local_snapshot()}
+    else
+      try do
+        {:ok, :erpc.call(node, Maxio.Cluster.IOPressure, :local_snapshot, [], timeout)}
+      catch
+        :error, _reason -> {:error, :unavailable}
+        :exit, _reason -> {:error, :unavailable}
+        :throw, _reason -> {:error, :unavailable}
+      end
+    end
   end
 
   # 本地直接调；远端 :erpc。任何宕机/超时/异常 -> on_fail 兜底（铁律 3：结构化降级，绝不上抛）。

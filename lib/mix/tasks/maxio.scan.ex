@@ -24,6 +24,9 @@ defmodule Mix.Tasks.Maxio.Scan do
   """
   use Mix.Task
 
+  @io_load_sources ~w(s3-in-flight storage-ops combined cluster-s3-in-flight cluster-storage-ops cluster-combined)
+  @io_load_source_usage Enum.join(@io_load_sources, "|")
+
   @impl true
   def run(args) do
     {opts, rest, invalid} =
@@ -58,7 +61,7 @@ defmodule Mix.Tasks.Maxio.Scan do
         "usage: mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] " <>
           "[--max-objects-per-sec <n>] [--object-burst <n>] " <>
           "[--sleep-between-batches-ms <ms>] [--no-adaptive-io] " <>
-          "[--io-load-source s3-in-flight|storage-ops|combined] " <>
+          "[--io-load-source #{@io_load_source_usage}] " <>
           "[--max-live-requests <n>] [--io-pause-ms <ms>] [--io-max-pause-ms <ms>] " <>
           "[--drive-offline-after-ms <ms>] " <>
           "[--reconcile-index] [--force-reconcile-index] [--cleanup-orphan-shards] " <>
@@ -121,12 +124,12 @@ defmodule Mix.Tasks.Maxio.Scan do
       nil ->
         nil
 
-      source when source in ["s3-in-flight", "storage-ops", "combined"] ->
+      source when source in @io_load_sources ->
         Maxio.Cluster.IOPressure.normalize_source(source)
 
       source ->
         Mix.raise(
-          "invalid --io-load-source #{inspect(source)}; expected s3-in-flight, storage-ops, or combined"
+          "invalid --io-load-source #{inspect(source)}; expected one of #{Enum.join(@io_load_sources, ", ")}"
         )
     end
   end

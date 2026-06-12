@@ -21,6 +21,9 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
 
   alias Maxio.Cluster.FreshDriveHeal
 
+  @io_load_sources ~w(s3-in-flight storage-ops combined cluster-s3-in-flight cluster-storage-ops cluster-combined)
+  @io_load_source_usage Enum.join(@io_load_sources, "|")
+
   @impl true
   def run(args) do
     {opts, rest, invalid} =
@@ -52,7 +55,7 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
           "[--max-objects <n>] [--current-only] [--page-size <n>] " <>
           "[--no-throttle] [--max-objects-per-sec <n>] [--object-burst <n>] " <>
           "[--sleep-between-batches-ms <ms>] [--no-adaptive-io] " <>
-          "[--io-load-source s3-in-flight|storage-ops|combined] " <>
+          "[--io-load-source #{@io_load_source_usage}] " <>
           "[--max-live-requests <n>] [--io-pause-ms <ms>] [--io-max-pause-ms <ms>] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
@@ -100,12 +103,12 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
       nil ->
         nil
 
-      source when source in ["s3-in-flight", "storage-ops", "combined"] ->
+      source when source in @io_load_sources ->
         Maxio.Cluster.IOPressure.normalize_source(source)
 
       source ->
         Mix.raise(
-          "invalid --io-load-source #{inspect(source)}; expected s3-in-flight, storage-ops, or combined"
+          "invalid --io-load-source #{inspect(source)}; expected one of #{Enum.join(@io_load_sources, ", ")}"
         )
     end
   end

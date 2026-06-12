@@ -390,7 +390,7 @@ M8-3a/b/c/d/e 已提供：
 - `Maxio.Cluster.Scrubber`：默认随监督树启动但不调度；`config :maxio, :scrubber, enabled: true`
   后按 `interval_ms` 周期运行。周期轮按 `sample_inverse` 做确定性 1/N 深度 heal 检查，
   `mix maxio.scan` / `run_once` 默认仍为全量取证。
-- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--no-adaptive-io] [--io-load-source s3-in-flight|storage-ops|combined] [--max-live-requests N] [--io-pause-ms MS] [--io-max-pause-ms MS] [--drive-offline-after-ms MS] [--reconcile-index]`：
+- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--no-adaptive-io] [--io-load-source s3-in-flight|storage-ops|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-combined] [--max-live-requests N] [--io-pause-ms MS] [--io-max-pause-ms MS] [--drive-offline-after-ms MS] [--reconcile-index]`：
   一次性扫描入口，输出
   buckets/scanned/damaged/healed/unrecoverable/missing/skipped/sampled_out/index_status/index_scanned/index_upserted/index_gc/index_skipped/index_divergent/index_orphan_shards/index_orphan_bytes/index_orphan_cleaned/index_orphan_cleaned_bytes/drive_sets/drive_endpoints/drive_online/drive_suspect/drive_offline/drive_heal_required/objects/bytes。
   `--reconcile-index` 会先调用既有 `Maxio.Storage.Scanner` 做 disk/peer sidecar → PG 派生索引收敛，
@@ -401,8 +401,11 @@ M8-3a/b/c/d/e 已提供：
   不拒绝前台请求，只给后台维护任务提供 live traffic 压力信号。
 - `Maxio.Cluster.DriveIO`：监督树内长期进程持有本节点 ETS 计数器，`ShardServer` 的 shard/sidecar/list/probe/stat/delete/commit/heal
   路径会记录 active storage ops、读写/metadata/delete 次数与 best-effort bytes；计数 fail-open，不影响存储结果。
+- `Maxio.Cluster.PressureAggregator`：监督树内缓存 peer node 的 `IOPressure.local_snapshot/0`，
+  后台按 `config :maxio, :io_pressure` 刷新；scrubber/fresh-drive gate 只读本地计数 + 新鲜缓存，
+  peer timeout/stale/down 均 fail-open，不在对象间同步 RPC。
 - `Maxio.Cluster.Scrubber.Throttle`：token-bucket object pacing 后追加 adaptive IO gate；
-  当 `adaptive_io: true` 且所选 `io_load_source`（默认 combined）超过 `max_live_requests` 时，scrubber 在对象之间按
+  当 `adaptive_io: true` 且所选 `io_load_source`（默认 `cluster-combined`）超过 `max_live_requests` 时，scrubber 在对象之间按
   `io_pause_ms` 分段等待，单对象最多等待 `io_max_pause_ms`。`--no-throttle` 会同时关闭 token/fixed/adaptive sleeps。
 - `Maxio.Cluster.DriveHealth`：监督树内 node-local registry，按 `{node, drive}` 记录结构化
   reachability probe；scrubber topology 轮使用 root-drive probe，scanner 在既有 `list_dir/3`
@@ -443,9 +446,9 @@ M8-4 已提供：
 
 M8 剩余：
 
-- 完整 MinIO data-scanner parity：OS/设备级 drive queue/吞吐反馈、跨节点负载聚合、物理 drive identity 与完整 replacement/rebalance workflow。
+- 完整 MinIO data-scanner parity：OS/设备级 drive queue/吞吐反馈、物理 drive identity 与完整 replacement/rebalance workflow。
   当前已有保守 token-bucket object pacing（`max_objects_per_sec` + `object_burst`，允许 burst 后限制下一次对象扫描开始），
-  本节点 S3 handler in-flight + ShardServer storage-op 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|combined`）、
+  本节点/缓存 peer 的 S3 handler in-flight + ShardServer storage-op 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-combined`）、
   node-local drive-offline 长窗口观测，
   手动 `mix maxio.heal.fresh_drives` marker 消费，以及默认关闭的 fresh-drive heal scheduler；
-  尚未接入 OS/设备级磁盘队列/吞吐反馈，也不做跨节点聚合或物理 replacement identity 跟踪。
+  尚未接入 OS/设备级磁盘队列/吞吐反馈，也不做物理 replacement identity 跟踪。

@@ -17,6 +17,7 @@ defmodule Maxio.Application do
           # M8 live-IO 自适应限流：本节点 S3 handler in-flight 计数器，由长期进程持有 ETS。
           Maxio.S3.InFlight,
           Maxio.Cluster.DriveIO,
+          Maxio.Cluster.PressureAggregator,
           Maxio.Cluster.CacheInvalidator,
           Maxio.Cluster.DriveHealth,
           Maxio.Cluster.FreshDriveHeal.Scheduler,

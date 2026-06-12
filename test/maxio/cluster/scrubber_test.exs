@@ -1,8 +1,9 @@
 defmodule Maxio.Cluster.ScrubberTest do
   use Maxio.DataCase, async: false
 
-  alias Maxio.Cluster.{DriveIO, Lock, Scrubber}
+  alias Maxio.Cluster.{DriveIO, Lock, PressureAggregator, Scrubber}
   alias Maxio.Cluster.Scrubber.Usage
+  alias Maxio.Cluster.Transport.InProcess
   alias Maxio.{Buckets, Objects}
   alias Maxio.Storage.{ErasureCoded, FS}
 
@@ -388,6 +389,43 @@ defmodule Maxio.Cluster.ScrubberTest do
     assert Task.await(task) == :ok
   after
     DriveIO.reset()
+  end
+
+  test "scrubber adaptive IO gate can use cached cluster pressure" do
+    InProcess.setup!()
+    PressureAggregator.reset()
+
+    bucket = bucket_name("scrub-cluster-io")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    put_index!(bucket, "remote-busy.txt", 10, "etag-remote-busy")
+
+    InProcess.set_pressure_snapshot(:maxio@n1, %{combined: 1})
+
+    assert {:ok, %{:maxio@n1 => %{combined: 1}}} =
+             PressureAggregator.refresh_once(nodes: [:maxio@n1], transport: InProcess)
+
+    parent = self()
+
+    assert {:ok, summary} =
+             Scrubber.run_once(
+               bucket: bucket,
+               backend: FS,
+               adaptive_io: true,
+               io_load_source: :cluster_combined,
+               max_live_requests: 0,
+               io_pause_ms: 10,
+               io_max_pause_ms: 20,
+               throttle_now_fun: fn -> 0 end,
+               throttle_sleep_fun: fn ms -> send(parent, {:cluster_io_sleep, ms}) end
+             )
+
+    assert summary.scanned == 1
+    assert summary.object_count == 1
+    assert_receive {:cluster_io_sleep, 10}
+    assert_receive {:cluster_io_sleep, 10}
+  after
+    PressureAggregator.reset()
+    InProcess.setup!()
   end
 
   test "scrubber threads configured token bucket across buckets when caller passes nil overrides" do

@@ -69,6 +69,10 @@ defmodule Maxio.Cluster.DriveIOTest do
     assert IOPressure.normalize_source("s3-in-flight") == :s3_in_flight
     assert IOPressure.normalize_source("storage-ops") == :storage_ops
     assert IOPressure.normalize_source("combined") == :combined
+    assert IOPressure.normalize_source("cluster-s3-in-flight") == :cluster_s3_in_flight
+    assert IOPressure.normalize_source("cluster-storage-ops") == :cluster_storage_ops
+    assert IOPressure.normalize_source("cluster-combined") == :cluster_combined
+    assert IOPressure.normalize_local_source(:cluster_combined) == :combined
     assert IOPressure.normalize_source("unknown") == :combined
   end
 end

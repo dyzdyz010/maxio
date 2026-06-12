@@ -17,7 +17,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
             max_live_requests: 0,
             io_pause_ms: 100,
             io_max_pause_ms: 0,
-            io_load_fun: &Maxio.Cluster.IOPressure.combined_count/0,
+            io_load_fun: &Maxio.Cluster.IOPressure.cluster_combined_count/0,
             sleep_fun: &Process.sleep/1
 
   @type t :: %__MODULE__{
@@ -193,7 +193,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
   defp io_load_fun(opts) do
     case Keyword.get(opts, :io_load_fun) do
       fun when is_function(fun, 0) -> fun
-      _ -> io_load_source_fun(Keyword.get(opts, :io_load_source, :combined))
+      _ -> io_load_source_fun(Keyword.get(opts, :io_load_source, :cluster_combined))
     end
   end
 

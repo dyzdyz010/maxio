@@ -57,4 +57,17 @@ defmodule Maxio.Cluster.TransportInProcessTest do
     InProcess.set_drive_up(node, drive0)
     assert InProcess.get_shard(node, dir0, 0, 128) == shard
   end
+
+  test "pressure snapshot injection follows node down state" do
+    node = :maxio@n4
+
+    InProcess.set_pressure_snapshot(node, %{s3_in_flight: 1, storage_ops: 2})
+
+    assert {:ok, %{s3_in_flight: 1, storage_ops: 2, combined: 3}} =
+             InProcess.pressure_snapshot(node)
+
+    InProcess.set_down(node)
+
+    assert {:error, :unavailable} = InProcess.pressure_snapshot(node)
+  end
 end

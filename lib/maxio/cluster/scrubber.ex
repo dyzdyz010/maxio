@@ -568,7 +568,7 @@ defmodule Maxio.Cluster.Scrubber do
       io_load_fun: Keyword.get(opts, :io_load_fun),
       io_load_source:
         Maxio.Cluster.IOPressure.normalize_source(
-          config_value(opts, cfg, :io_load_source, :combined)
+          config_value(opts, cfg, :io_load_source, :cluster_combined)
         ),
       throttle_sleep_fun: Keyword.get(opts, :throttle_sleep_fun),
       throttle_now_fun: Keyword.get(opts, :throttle_now_fun),
