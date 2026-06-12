@@ -42,5 +42,11 @@ defmodule Maxio.Cluster.ShardServerIOTest do
     assert snapshot.delete_ops >= 2
     assert snapshot.bytes_written > 0
     assert snapshot.bytes_read >= byte_size(shard)
+
+    assert snapshot.completed_ops >=
+             snapshot.read_ops + snapshot.write_ops + snapshot.metadata_ops + snapshot.delete_ops
+
+    assert snapshot.max_latency_us >= 0
+    assert snapshot.avg_latency_us >= 0
   end
 end

@@ -358,7 +358,8 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 **M8-3a/b/c/d/e PG metadata-driven scrubber/auto-heal + optional index reconcile pre-pass + orphan shard evidence/cleanup**
 与 **M8-4 integration evidence + peer lock harness**，并补入 **node-local S3 + storage-op adaptive scrubber pacing**、
 **node-local drive health long-window offline registry**、**software drive identity replacement detection**、
-**operator-triggered fresh-drive heal workflow** 和 **config-gated fresh-drive heal scheduler**。
+**drive IO latency/throughput telemetry CLI**、**operator-triggered fresh-drive heal workflow** 和
+**config-gated fresh-drive heal scheduler**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -401,7 +402,10 @@ M8-3a/b/c/d/e 已提供：
   在 handler 生命周期内计数并在正常返回/结构化 S3 错误/异常后释放。计数是 node-local、best-effort，
   不拒绝前台请求，只给后台维护任务提供 live traffic 压力信号。
 - `Maxio.Cluster.DriveIO`：监督树内长期进程持有本节点 ETS 计数器，`ShardServer` 的 shard/sidecar/list/probe/stat/delete/commit/heal
-  路径会记录 active storage ops、读写/metadata/delete 次数与 best-effort bytes；计数 fail-open，不影响存储结果。
+  路径会记录 active storage ops、读写/metadata/delete 次数、completed attempts、best-effort bytes、
+  应用层 latency（`max_latency_us` 为并发完成下的 best-effort 高水位）与自上次 reset 起的吞吐估算；
+  `mix maxio.drive.io [--reset]` 可打印/清零本节点累计 telemetry，reset 保留 active gauges 以免干扰 adaptive pacing。
+  计数 fail-open，不影响存储结果。
 - `Maxio.Cluster.PressureAggregator`：监督树内缓存 peer node 的 `IOPressure.local_snapshot/0`，
   后台按 `config :maxio, :io_pressure` 刷新；scrubber/fresh-drive gate 只读本地计数 + 新鲜缓存，
   peer timeout/stale/down 均 fail-open，不在对象间同步 RPC。
@@ -458,6 +462,6 @@ M8 剩余：
 - 完整 MinIO data-scanner parity：OS/设备级 drive queue/吞吐反馈、硬件/物理 drive identity 与完整 replacement/rebalance/decommission workflow。
   当前已有保守 token-bucket object pacing（`max_objects_per_sec` + `object_burst`，允许 burst 后限制下一次对象扫描开始），
   本节点/缓存 peer 的 S3 handler in-flight + ShardServer storage-op 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-combined`）、
-  node-local drive-offline 长窗口观测、software UUID same-path replacement detection，
+  node-local ShardServer IO latency/throughput telemetry、node-local drive-offline 长窗口观测、software UUID same-path replacement detection，
   手动 `mix maxio.heal.fresh_drives` marker 消费，以及默认关闭的 fresh-drive heal scheduler；
-  尚未接入 OS/设备级磁盘队列/吞吐反馈、硬件/物理 replacement identity、decommission 或 rebalance 数据迁移。
+  尚未接入 OS/设备级磁盘队列/硬件吞吐反馈、硬件/物理 replacement identity、decommission 或 rebalance 数据迁移。
