@@ -138,6 +138,7 @@ config :maxio, :scanner,
 # heal 引擎。reconcile_index:true 时先复用 Storage.Scanner 做 disk/peer sidecar→PG 派生索引收敛。
 # 周期轮按 sample_inverse 做确定性 1/N 深度 heal 检查（每 cycle 轮换分区），但
 # 手动触发/取证 `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle]` 默认全量扫描。
+# max_objects_per_sec + object_burst 使用 token-bucket 限速；object_burst 默认 1，保持保守稳态。
 config :maxio, :scrubber,
   enabled: false,
   interval_ms: 86_400_000,
@@ -147,6 +148,7 @@ config :maxio, :scrubber,
   sample_inverse: 1024,
   reconcile_index: false,
   max_objects_per_sec: 200,
+  object_burst: 1,
   sleep_between_batches_ms: 50,
   lock_ttl_ms: 60_000,
   lock_timeout_ms: 3_000

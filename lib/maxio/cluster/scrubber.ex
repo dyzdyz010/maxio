@@ -110,15 +110,23 @@ defmodule Maxio.Cluster.Scrubber do
     cfg = config(opts)
     backend = backend(cfg)
     cfg = Keyword.put(cfg, :resolved_backend, backend)
+    cfg = Keyword.put(cfg, :throttle, Throttle.new(cfg))
     buckets = bucket_names(cfg[:bucket])
     index_report = maybe_reconcile_index(cfg)
 
-    summary =
+    {summary, _throttle} =
       buckets
-      |> Enum.reduce(zero_summary(backend) |> merge_index_report(index_report), fn bucket, acc ->
-        merge_summary(acc, scan_bucket(bucket, backend, cfg))
-      end)
-      |> Map.put(:buckets, length(buckets))
+      |> Enum.reduce(
+        {zero_summary(backend) |> merge_index_report(index_report), cfg[:throttle]},
+        fn bucket, {acc, throttle} ->
+          {bucket_summary, throttle} =
+            scan_bucket(bucket, backend, Keyword.put(cfg, :throttle, throttle))
+
+          {merge_summary(acc, bucket_summary), throttle}
+        end
+      )
+
+    summary = Map.put(summary, :buckets, length(buckets))
 
     Log.info(
       "scrubber round complete",
@@ -210,22 +218,31 @@ defmodule Maxio.Cluster.Scrubber do
   defp schedule(ms), do: Process.send_after(self(), :scrub, max(ms, 0))
 
   defp scan_bucket(bucket, backend, cfg) do
-    {usage_counts, scan_counts} =
+    {usage_counts, scan_counts, throttle} =
       if cfg[:scan_versions] do
-        {
-          current_usage(bucket, cfg),
+        {scan_counts, throttle} =
           reduce_version_pages(
             bucket,
             cfg,
-            zero_counts(),
+            {zero_counts(), cfg[:throttle]},
             &scan_object(bucket, backend, cfg, &1, &2)
           )
+
+        {
+          current_usage(bucket, cfg),
+          scan_counts,
+          throttle
         }
       else
-        reduce_current_pages(bucket, cfg, {zero_usage(), zero_counts()}, fn object,
-                                                                            {usage, counts} ->
-          {add_usage(usage, object), scan_object(bucket, backend, cfg, object, counts)}
-        end)
+        reduce_current_pages(
+          bucket,
+          cfg,
+          {zero_usage(), zero_counts(), cfg[:throttle]},
+          fn object, {usage, counts, throttle} ->
+            {counts, throttle} = scan_object(bucket, backend, cfg, object, {counts, throttle})
+            {add_usage(usage, object), counts, throttle}
+          end
+        )
       end
 
     Usage.put(bucket, %{
@@ -234,9 +251,12 @@ defmodule Maxio.Cluster.Scrubber do
       scanned_at: DateTime.utc_now()
     })
 
-    zero_summary(backend)
-    |> merge_counts(scan_counts)
-    |> merge_usage(usage_counts)
+    summary =
+      zero_summary(backend)
+      |> merge_counts(scan_counts)
+      |> merge_usage(usage_counts)
+
+    {summary, throttle}
   rescue
     e ->
       Log.error("scrubber bucket scan failed",
@@ -245,7 +265,7 @@ defmodule Maxio.Cluster.Scrubber do
         reason: Exception.message(e)
       )
 
-      zero_summary(backend)
+      {zero_summary(backend), Keyword.get(cfg, :throttle, Throttle.new(no_throttle: true))}
   catch
     kind, reason ->
       Log.error("scrubber bucket scan caught",
@@ -254,42 +274,44 @@ defmodule Maxio.Cluster.Scrubber do
         reason: inspect({kind, reason})
       )
 
-      zero_summary(backend)
+      {zero_summary(backend), Keyword.get(cfg, :throttle, Throttle.new(no_throttle: true))}
   end
 
-  defp scan_object(bucket, backend, cfg, object, counts) do
-    case healer_for(backend) do
-      :none ->
-        bump(counts, :scanned)
+  defp scan_object(bucket, backend, cfg, object, {counts, throttle}) do
+    counts =
+      case healer_for(backend) do
+        :none ->
+          bump(counts, :scanned)
 
-      {healer, backend_kind} ->
-        if sampled?(bucket, object, cfg) do
-          set_id = scrub_set(backend_kind, bucket, object.key, cfg)
-          resource = {:scrubber_set, set_id}
+        {healer, backend_kind} ->
+          if sampled?(bucket, object, cfg) do
+            set_id = scrub_set(backend_kind, bucket, object.key, cfg)
+            resource = {:scrubber_set, set_id}
 
-          case Lock.quorum_with_lock(
-                 resource,
-                 fn -> heal_object(healer, bucket, object, cfg, counts) end,
-                 lock_opts(backend_kind, set_id, cfg)
-               ) do
-            {:ok, counts} ->
-              counts
+            case Lock.quorum_with_lock(
+                   resource,
+                   fn -> heal_object(healer, bucket, object, cfg, counts) end,
+                   lock_opts(backend_kind, set_id, cfg)
+                 ) do
+              {:ok, counts} ->
+                counts
 
-            {:error, :no_quorum} ->
-              Log.warn("scrubber skipped object because set lock is held",
-                bucket: bucket,
-                key: object.key,
-                action: :scrubber,
-                reason: "version_id=#{object.version_id}"
-              )
+              {:error, :no_quorum} ->
+                Log.warn("scrubber skipped object because set lock is held",
+                  bucket: bucket,
+                  key: object.key,
+                  action: :scrubber,
+                  reason: "version_id=#{object.version_id}"
+                )
 
-              bump(counts, :skipped)
+                bump(counts, :skipped)
+            end
+          else
+            bump(counts, :sampled_out)
           end
-        else
-          bump(counts, :sampled_out)
-        end
-    end
-    |> tap(fn _ -> Throttle.maybe_wait(cfg) end)
+      end
+
+    {counts, Throttle.maybe_wait(throttle)}
   end
 
   defp heal_object(healer, bucket, object, cfg, counts) do
@@ -490,12 +512,15 @@ defmodule Maxio.Cluster.Scrubber do
         Keyword.get(opts, :lock_heartbeat_ms, Keyword.get(cfg, :lock_heartbeat_ms)),
       max_objects_per_sec:
         Keyword.get(opts, :max_objects_per_sec, Keyword.get(cfg, :max_objects_per_sec, 200)),
+      object_burst:
+        positive_int(Keyword.get(opts, :object_burst, Keyword.get(cfg, :object_burst, 1)), 1),
       sleep_between_batches_ms:
         Keyword.get(
           opts,
           :sleep_between_batches_ms,
           Keyword.get(cfg, :sleep_between_batches_ms, 50)
         ),
+      throttle_sleep_fun: Keyword.get(opts, :throttle_sleep_fun),
       no_throttle: Keyword.get(opts, :no_throttle, false),
       reconcile_index:
         Keyword.get(opts, :reconcile_index, Keyword.get(cfg, :reconcile_index, false)),
@@ -532,8 +557,10 @@ defmodule Maxio.Cluster.Scrubber do
       :lock_timeout_ms,
       :lock_heartbeat_ms,
       :max_objects_per_sec,
+      :object_burst,
       :sleep_between_batches_ms,
       :sleep_between_objects_ms,
+      :throttle_sleep_fun,
       :reconcile_index,
       :force_reconcile_index,
       :reconcile_index_dry_run,

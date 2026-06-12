@@ -9,6 +9,7 @@ defmodule Mix.Tasks.Maxio.Scan do
       mix maxio.scan --no-throttle
       mix maxio.scan --reconcile-index
       mix maxio.scan --reconcile-index --cleanup-orphan-shards
+      mix maxio.scan --max-objects-per-sec 100 --object-burst 10
 
   FS backends refresh scan-derived usage only. Erasure-coded backends also invoke
   the existing local or distributed heal engine for each enumerated object.
@@ -28,6 +29,9 @@ defmodule Mix.Tasks.Maxio.Scan do
           bucket: :string,
           versions: :boolean,
           no_throttle: :boolean,
+          max_objects_per_sec: :integer,
+          object_burst: :integer,
+          sleep_between_batches_ms: :integer,
           reconcile_index: :boolean,
           force_reconcile_index: :boolean,
           cleanup_orphan_shards: :boolean,
@@ -43,6 +47,8 @@ defmodule Mix.Tasks.Maxio.Scan do
 
       Mix.raise(
         "usage: mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] " <>
+          "[--max-objects-per-sec <n>] [--object-burst <n>] " <>
+          "[--sleep-between-batches-ms <ms>] " <>
           "[--reconcile-index] [--force-reconcile-index] [--cleanup-orphan-shards] " <>
           "[--orphan-cleanup-dry-run] [--orphan-cleanup-min-age-ms <ms>] " <>
           "[--orphan-cleanup-max-deletes <n>] " <>
@@ -57,6 +63,9 @@ defmodule Mix.Tasks.Maxio.Scan do
         bucket: opts[:bucket],
         scan_versions: Keyword.get(opts, :versions, false),
         no_throttle: Keyword.get(opts, :no_throttle, false),
+        max_objects_per_sec: Keyword.get(opts, :max_objects_per_sec),
+        object_burst: Keyword.get(opts, :object_burst),
+        sleep_between_batches_ms: Keyword.get(opts, :sleep_between_batches_ms),
         reconcile_index: Keyword.get(opts, :reconcile_index, false),
         force_reconcile_index: Keyword.get(opts, :force_reconcile_index, false),
         cleanup_orphan_shards: Keyword.get(opts, :cleanup_orphan_shards, false),
