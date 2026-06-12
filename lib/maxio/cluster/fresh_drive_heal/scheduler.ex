@@ -33,6 +33,7 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
     :max_live_requests,
     :io_pause_ms,
     :io_max_pause_ms,
+    :io_load_source,
     :io_load_fun,
     :throttle_sleep_fun,
     :throttle_now_fun,

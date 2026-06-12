@@ -105,6 +105,8 @@ defmodule Mix.Tasks.Maxio.ScanTest do
           "--sleep-between-batches-ms",
           "0",
           "--no-adaptive-io",
+          "--io-load-source",
+          "storage-ops",
           "--max-live-requests",
           "2",
           "--io-pause-ms",

@@ -179,6 +179,8 @@ defmodule Maxio.Cluster.FreshDriveHeal do
       io_pause_ms: positive_int(config_value(opts, :io_pause_ms, 100), 100),
       io_max_pause_ms: non_negative_int(config_value(opts, :io_max_pause_ms, 5_000), 5_000),
       io_load_fun: Keyword.get(opts, :io_load_fun),
+      io_load_source:
+        Maxio.Cluster.IOPressure.normalize_source(config_value(opts, :io_load_source, :combined)),
       throttle_sleep_fun: Keyword.get(opts, :throttle_sleep_fun),
       throttle_now_fun: Keyword.get(opts, :throttle_now_fun),
       no_throttle: Keyword.get(opts, :no_throttle, false),

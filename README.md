@@ -334,9 +334,9 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
    （`part.0` 无 sidecar、delete-marker 目录残留 `part.0`），默认只计数/日志；显式
    `--cleanup-orphan-shards` 时才在 sidecar 写权威、全端点可达、对象锁、二次探针、年龄门和每轮删除上限
    同时满足后删除 `part.0`。M8 续作已补保守 token-bucket object pacing、本节点
-   S3 handler in-flight 自适应对象间暂停、node-local drive health 长窗口离线观测，
+   S3 handler in-flight + ShardServer storage-op 自适应对象间暂停、node-local drive health 长窗口离线观测，
    operator-triggered fresh-drive heal pass，以及默认关闭的 marker-based 自动 fresh-drive heal scheduler；
-   仍 defer：真实 drive IO 采样/跨节点聚合、物理 drive identity 与完整 replacement/rebalance workflow。
+   仍 defer：OS/设备级 drive queue/吞吐采样、跨节点聚合、物理 drive identity 与完整 replacement/rebalance workflow。
 5. **多 parity / storage class**：单一 (K,M)；`x-amz-storage-class` → 不同 EC = defer（沿用 M6）。
 6. **parity upgrade on degraded write**：写未达 write_quorum 即 `{:error, :write_quorum}`（绝不静默）；
    MinIO 的「写时临时提高 effective parity」= defer。
@@ -355,7 +355,7 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 
 当前已完成 **M8-1 quorum lock core**、**M8-2 cache invalidation spine**、
 **M8-3a/b/c/d/e PG metadata-driven scrubber/auto-heal + optional index reconcile pre-pass + orphan shard evidence/cleanup**
-与 **M8-4 integration evidence + peer lock harness**，并补入 **live S3 in-flight adaptive scrubber pacing**、
+与 **M8-4 integration evidence + peer lock harness**，并补入 **node-local S3 + storage-op adaptive scrubber pacing**、
 **node-local drive health long-window offline registry**、**operator-triggered fresh-drive heal workflow**
 和 **config-gated fresh-drive heal scheduler**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
@@ -390,7 +390,7 @@ M8-3a/b/c/d/e 已提供：
 - `Maxio.Cluster.Scrubber`：默认随监督树启动但不调度；`config :maxio, :scrubber, enabled: true`
   后按 `interval_ms` 周期运行。周期轮按 `sample_inverse` 做确定性 1/N 深度 heal 检查，
   `mix maxio.scan` / `run_once` 默认仍为全量取证。
-- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--no-adaptive-io] [--max-live-requests N] [--io-pause-ms MS] [--io-max-pause-ms MS] [--drive-offline-after-ms MS] [--reconcile-index]`：
+- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--no-adaptive-io] [--io-load-source s3-in-flight|storage-ops|combined] [--max-live-requests N] [--io-pause-ms MS] [--io-max-pause-ms MS] [--drive-offline-after-ms MS] [--reconcile-index]`：
   一次性扫描入口，输出
   buckets/scanned/damaged/healed/unrecoverable/missing/skipped/sampled_out/index_status/index_scanned/index_upserted/index_gc/index_skipped/index_divergent/index_orphan_shards/index_orphan_bytes/index_orphan_cleaned/index_orphan_cleaned_bytes/drive_sets/drive_endpoints/drive_online/drive_suspect/drive_offline/drive_heal_required/objects/bytes。
   `--reconcile-index` 会先调用既有 `Maxio.Storage.Scanner` 做 disk/peer sidecar → PG 派生索引收敛，
@@ -399,8 +399,10 @@ M8-3a/b/c/d/e 已提供：
 - `Maxio.S3.InFlight`：监督树内长期进程持有本节点 ETS 计数器，`S3.Plugs.Dispatch`
   在 handler 生命周期内计数并在正常返回/结构化 S3 错误/异常后释放。计数是 node-local、best-effort，
   不拒绝前台请求，只给后台维护任务提供 live traffic 压力信号。
+- `Maxio.Cluster.DriveIO`：监督树内长期进程持有本节点 ETS 计数器，`ShardServer` 的 shard/sidecar/list/probe/stat/delete/commit/heal
+  路径会记录 active storage ops、读写/metadata/delete 次数与 best-effort bytes；计数 fail-open，不影响存储结果。
 - `Maxio.Cluster.Scrubber.Throttle`：token-bucket object pacing 后追加 adaptive IO gate；
-  当 `adaptive_io: true` 且本节点 in-flight 请求数超过 `max_live_requests` 时，scrubber 在对象之间按
+  当 `adaptive_io: true` 且所选 `io_load_source`（默认 combined）超过 `max_live_requests` 时，scrubber 在对象之间按
   `io_pause_ms` 分段等待，单对象最多等待 `io_max_pause_ms`。`--no-throttle` 会同时关闭 token/fixed/adaptive sleeps。
 - `Maxio.Cluster.DriveHealth`：监督树内 node-local registry，按 `{node, drive}` 记录结构化
   reachability probe；scrubber topology 轮使用 root-drive probe，scanner 在既有 `list_dir/3`
@@ -441,8 +443,9 @@ M8-4 已提供：
 
 M8 剩余：
 
-- 完整 MinIO data-scanner parity：真实 drive IO 反馈、跨节点负载聚合、物理 drive identity 与完整 replacement/rebalance workflow。
+- 完整 MinIO data-scanner parity：OS/设备级 drive queue/吞吐反馈、跨节点负载聚合、物理 drive identity 与完整 replacement/rebalance workflow。
   当前已有保守 token-bucket object pacing（`max_objects_per_sec` + `object_burst`，允许 burst 后限制下一次对象扫描开始），
-  本节点 S3 handler in-flight 自适应对象间暂停、node-local drive-offline 长窗口观测，
+  本节点 S3 handler in-flight + ShardServer storage-op 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|combined`）、
+  node-local drive-offline 长窗口观测，
   手动 `mix maxio.heal.fresh_drives` marker 消费，以及默认关闭的 fresh-drive heal scheduler；
-  尚未接入真实磁盘队列/吞吐反馈，也不做跨节点聚合或物理 replacement identity 跟踪。
+  尚未接入 OS/设备级磁盘队列/吞吐反馈，也不做跨节点聚合或物理 replacement identity 跟踪。

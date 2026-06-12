@@ -66,6 +66,8 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrivesTest do
           "--sleep-between-batches-ms",
           "0",
           "--no-adaptive-io",
+          "--io-load-source",
+          "storage-ops",
           "--max-live-requests",
           "1",
           "--io-pause-ms",

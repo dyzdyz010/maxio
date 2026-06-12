@@ -9,6 +9,7 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
       mix maxio.heal.fresh_drives --max-objects 1000
       mix maxio.heal.fresh_drives --current-only
       mix maxio.heal.fresh_drives --max-objects-per-sec 100 --object-burst 10
+      mix maxio.heal.fresh_drives --io-load-source storage-ops
 
   The task scans PG object inventory for distributed erasure sets containing
   recovered drives marked `DriveHealth.heal_required?`. It clears those markers
@@ -35,6 +36,7 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
           object_burst: :integer,
           sleep_between_batches_ms: :integer,
           no_adaptive_io: :boolean,
+          io_load_source: :string,
           max_live_requests: :integer,
           io_pause_ms: :integer,
           io_max_pause_ms: :integer
@@ -50,6 +52,7 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
           "[--max-objects <n>] [--current-only] [--page-size <n>] " <>
           "[--no-throttle] [--max-objects-per-sec <n>] [--object-burst <n>] " <>
           "[--sleep-between-batches-ms <ms>] [--no-adaptive-io] " <>
+          "[--io-load-source s3-in-flight|storage-ops|combined] " <>
           "[--max-live-requests <n>] [--io-pause-ms <ms>] [--io-max-pause-ms <ms>] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
@@ -69,6 +72,7 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
         object_burst: Keyword.get(opts, :object_burst),
         sleep_between_batches_ms: Keyword.get(opts, :sleep_between_batches_ms),
         adaptive_io: adaptive_io_opt(opts),
+        io_load_source: io_load_source_opt(opts),
         max_live_requests: Keyword.get(opts, :max_live_requests),
         io_pause_ms: Keyword.get(opts, :io_pause_ms),
         io_max_pause_ms: Keyword.get(opts, :io_max_pause_ms)
@@ -89,5 +93,20 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
 
   defp adaptive_io_opt(opts) do
     if Keyword.get(opts, :no_adaptive_io, false), do: false, else: nil
+  end
+
+  defp io_load_source_opt(opts) do
+    case Keyword.get(opts, :io_load_source) do
+      nil ->
+        nil
+
+      source when source in ["s3-in-flight", "storage-ops", "combined"] ->
+        Maxio.Cluster.IOPressure.normalize_source(source)
+
+      source ->
+        Mix.raise(
+          "invalid --io-load-source #{inspect(source)}; expected s3-in-flight, storage-ops, or combined"
+        )
+    end
   end
 end

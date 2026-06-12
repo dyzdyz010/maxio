@@ -17,7 +17,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
             max_live_requests: 0,
             io_pause_ms: 100,
             io_max_pause_ms: 0,
-            io_load_fun: &Maxio.S3.InFlight.count/0,
+            io_load_fun: &Maxio.Cluster.IOPressure.combined_count/0,
             sleep_fun: &Process.sleep/1
 
   @type t :: %__MODULE__{
@@ -67,7 +67,12 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
         |> put_io_opts(opts)
 
       true ->
-        %__MODULE__{mode: :disabled, last_ms: now_ms, now_fun: now_fun(opts)}
+        %__MODULE__{
+          mode: :disabled,
+          last_ms: now_ms,
+          now_fun: now_fun(opts),
+          sleep_fun: sleep_fun(opts)
+        }
         |> put_io_opts(opts)
     end
   end
@@ -188,8 +193,13 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
   defp io_load_fun(opts) do
     case Keyword.get(opts, :io_load_fun) do
       fun when is_function(fun, 0) -> fun
-      _ -> &Maxio.S3.InFlight.count/0
+      _ -> io_load_source_fun(Keyword.get(opts, :io_load_source, :combined))
     end
+  end
+
+  defp io_load_source_fun(source) do
+    source = Maxio.Cluster.IOPressure.normalize_source(source)
+    fn -> Maxio.Cluster.IOPressure.count(source) end
   end
 
   defp non_negative_int(n, _default) when is_integer(n) and n >= 0, do: n

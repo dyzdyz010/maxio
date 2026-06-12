@@ -31,6 +31,7 @@ defmodule Maxio.Cluster.ShardServer do
   """
   use GenServer
 
+  alias Maxio.Cluster.DriveIO
   alias Maxio.Storage.Erasure.Meta
 
   @part_file "part.0"
@@ -54,57 +55,82 @@ defmodule Maxio.Cluster.ShardServer do
   @spec put_shard(String.t(), non_neg_integer(), binary(), pos_integer()) ::
           :ok | {:error, term()}
   def put_shard(drive_obj_dir, block_index, shard_bytes, shard_len) do
-    path = Path.join(drive_obj_dir, @part_file)
+    DriveIO.track(
+      :write,
+      fn ->
+        path = Path.join(drive_obj_dir, @part_file)
 
-    # mkdir/open 失败（:enametoolong/:eacces/盘满等）→ 结构化 {:error, posix}，绝不 raise——
-    # File.mkdir_p! 的异常 message 内嵌服务器绝对盘路径，曾沿 500 InternalError 泄露给客户端。
-    with :ok <- File.mkdir_p(drive_obj_dir),
-         {:ok, fd} <- :file.open(String.to_charlist(path), [:read, :write, :binary, :raw]) do
-      try do
-        :file.pwrite(fd, block_index * shard_len, shard_bytes)
-      after
-        :file.close(fd)
-      end
-    end
+        # mkdir/open 失败（:enametoolong/:eacces/盘满等）→ 结构化 {:error, posix}，绝不 raise——
+        # File.mkdir_p! 的异常 message 内嵌服务器绝对盘路径，曾沿 500 InternalError 泄露给客户端。
+        with :ok <- File.mkdir_p(drive_obj_dir),
+             {:ok, fd} <- :file.open(String.to_charlist(path), [:read, :write, :binary, :raw]) do
+          try do
+            :file.pwrite(fd, block_index * shard_len, shard_bytes)
+          after
+            :file.close(fd)
+          end
+        end
+      end,
+      bytes: byte_size(shard_bytes)
+    )
   end
 
   @doc "读对象在 drive_obj_dir 下、block_index 的分片字节；缺文件/缺块/短读 -> nil（交 EC 重建）。"
   @spec get_shard(String.t(), non_neg_integer(), pos_integer()) :: binary() | nil
   def get_shard(drive_obj_dir, block_index, shard_len) do
-    path = Path.join(drive_obj_dir, @part_file)
+    DriveIO.track(
+      :read,
+      fn ->
+        path = Path.join(drive_obj_dir, @part_file)
 
-    case :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
-      {:ok, fd} ->
-        try do
-          case :file.pread(fd, block_index * shard_len, shard_len) do
-            {:ok, data} when byte_size(data) == shard_len -> data
-            _ -> nil
-          end
-        after
-          :file.close(fd)
+        case :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
+          {:ok, fd} ->
+            try do
+              case :file.pread(fd, block_index * shard_len, shard_len) do
+                {:ok, data} when byte_size(data) == shard_len -> data
+                _ -> nil
+              end
+            after
+              :file.close(fd)
+            end
+
+          {:error, _} ->
+            nil
         end
-
-      {:error, _} ->
-        nil
-    end
+      end,
+      bytes: fn
+        data when is_binary(data) -> byte_size(data)
+        _ -> 0
+      end
+    )
   end
 
   @doc "写该 drive 上对象的 sidecar（每端点一份；read 侧从任一存活端点恢复）。"
   @spec put_sidecar(String.t(), map()) :: :ok | {:error, term()}
   def put_sidecar(drive_obj_dir, meta) do
-    # 结构化错误而非 raise（同 put_shard：异常 message 内嵌盘路径，绝不泄露给客户端）。
-    with :ok <- File.mkdir_p(drive_obj_dir) do
-      File.write(Path.join(drive_obj_dir, @meta_file), Meta.encode(meta))
-    end
+    meta_bin = Meta.encode(meta)
+
+    DriveIO.track(
+      :write,
+      fn ->
+        # 结构化错误而非 raise（同 put_shard：异常 message 内嵌盘路径，绝不泄露给客户端）。
+        with :ok <- File.mkdir_p(drive_obj_dir) do
+          File.write(Path.join(drive_obj_dir, @meta_file), meta_bin)
+        end
+      end,
+      bytes: byte_size(meta_bin)
+    )
   end
 
   @doc "读该 drive 上对象的 sidecar。"
   @spec get_sidecar(String.t()) :: {:ok, map()} | {:error, :enoent}
   def get_sidecar(drive_obj_dir) do
-    case File.read(Path.join(drive_obj_dir, @meta_file)) do
-      {:ok, bin} -> {:ok, Meta.decode!(bin)}
-      {:error, _} -> {:error, :enoent}
-    end
+    DriveIO.track(:read, fn ->
+      case File.read(Path.join(drive_obj_dir, @meta_file)) do
+        {:ok, bin} -> {:ok, Meta.decode!(bin)}
+        {:error, _} -> {:error, :enoent}
+      end
+    end)
   end
 
   # 走盘 LIST 须跳过的内部前缀（ROUTE B P3）：.versions（版本树）/.uploads（multipart parts）/.tmp（原子提交临时区）。
@@ -122,93 +148,105 @@ defmodule Maxio.Cluster.ShardServer do
   @spec list_dir(String.t(), keyword()) ::
           {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
   def list_dir(drive_dir, opts \\ []) do
-    case File.ls(drive_dir) do
-      {:ok, names} ->
-        include_layout_files? = Keyword.get(opts, :include_layout_files, false)
+    DriveIO.track(:list, fn ->
+      case File.ls(drive_dir) do
+        {:ok, names} ->
+          include_layout_files? = Keyword.get(opts, :include_layout_files, false)
 
-        entries =
-          names
-          |> Enum.reject(&(&1 in @internal_prefixes))
-          |> Enum.flat_map(fn n ->
-            path = Path.join(drive_dir, n)
+          entries =
+            names
+            |> Enum.reject(&(&1 in @internal_prefixes))
+            |> Enum.flat_map(fn n ->
+              path = Path.join(drive_dir, n)
 
-            cond do
-              File.dir?(path) ->
-                [
-                  %{
-                    name: n,
-                    object?: File.regular?(Path.join([drive_dir, n, @meta_file])),
-                    type: :dir
-                  }
-                ]
+              cond do
+                File.dir?(path) ->
+                  [
+                    %{
+                      name: n,
+                      object?: File.regular?(Path.join([drive_dir, n, @meta_file])),
+                      type: :dir
+                    }
+                  ]
 
-              include_layout_files? and n in [@meta_file, @part_file] and File.regular?(path) ->
-                [%{name: n, object?: false, type: :file}]
+                include_layout_files? and n in [@meta_file, @part_file] and File.regular?(path) ->
+                  [%{name: n, object?: false, type: :file}]
 
-              true ->
-                []
-            end
-          end)
-          |> Enum.sort_by(& &1.name)
+                true ->
+                  []
+              end
+            end)
+            |> Enum.sort_by(& &1.name)
 
-        {:ok, entries}
+          {:ok, entries}
 
-      {:error, :enoent} ->
-        {:ok, []}
+        {:error, :enoent} ->
+          {:ok, []}
 
-      {:error, reason} ->
-        {:error, reason}
-    end
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end)
   end
 
   @doc "Probe a configured drive root; unlike list_dir/2, a missing root is unavailable."
   @spec probe_drive(String.t()) :: :ok | {:error, term()}
   def probe_drive(drive_root) do
-    case File.stat(drive_root) do
-      {:ok, %File.Stat{type: :directory}} -> :ok
-      {:ok, _stat} -> {:error, :enotdir}
-      {:error, :enoent} -> {:error, :unavailable}
-      {:error, reason} -> {:error, reason}
-    end
+    DriveIO.track(:probe, fn ->
+      case File.stat(drive_root) do
+        {:ok, %File.Stat{type: :directory}} -> :ok
+        {:ok, _stat} -> {:error, :enotdir}
+        {:error, :enoent} -> {:error, :unavailable}
+        {:error, reason} -> {:error, reason}
+      end
+    end)
   end
 
   @doc "stat：该 drive 上 part.0 字节数（heal 用其判文件完整）。"
   @spec stat_shard(String.t()) :: {:ok, non_neg_integer()} | {:error, :enoent}
   def stat_shard(drive_obj_dir) do
-    case File.stat(Path.join(drive_obj_dir, @part_file)) do
-      {:ok, %File.Stat{size: s}} -> {:ok, s}
-      {:error, _} -> {:error, :enoent}
-    end
+    DriveIO.track(:metadata, fn ->
+      case File.stat(Path.join(drive_obj_dir, @part_file)) do
+        {:ok, %File.Stat{size: s}} -> {:ok, s}
+        {:error, _} -> {:error, :enoent}
+      end
+    end)
   end
 
   @doc "stat：该 drive 上 part.0 字节数与 mtime（scanner orphan cleanup 安全年龄门使用）。"
   @spec stat_shard_info(String.t()) ::
           {:ok, %{size: non_neg_integer(), mtime_ms: integer()}} | {:error, :enoent}
   def stat_shard_info(drive_obj_dir) do
-    case File.stat(Path.join(drive_obj_dir, @part_file), time: :posix) do
-      {:ok, %File.Stat{size: size, mtime: mtime}} ->
-        {:ok, %{size: size, mtime_ms: mtime_ms(mtime)}}
+    DriveIO.track(:metadata, fn ->
+      case File.stat(Path.join(drive_obj_dir, @part_file), time: :posix) do
+        {:ok, %File.Stat{size: size, mtime: mtime}} ->
+          {:ok, %{size: size, mtime_ms: mtime_ms(mtime)}}
 
-      {:error, _} ->
-        {:error, :enoent}
-    end
+        {:error, _} ->
+          {:error, :enoent}
+      end
+    end)
   end
 
   @doc "删该 drive 上对象的整个目录（part.0 + meta.json）。幂等。"
   @spec delete_shard(String.t()) :: :ok
   def delete_shard(drive_obj_dir) do
-    _ = File.rm_rf(drive_obj_dir)
-    :ok
+    DriveIO.track(:delete, fn ->
+      _ = File.rm_rf(drive_obj_dir)
+      :ok
+    end)
   end
 
   @doc "只删除该 drive 上对象目录里的 part.0，保留 meta.json 与子目录。幂等。"
   @spec delete_part_file(String.t()) :: :ok | {:error, term()}
   def delete_part_file(drive_obj_dir) do
-    case File.rm(Path.join(drive_obj_dir, @part_file)) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+    DriveIO.track(:delete, fn ->
+      case File.rm(Path.join(drive_obj_dir, @part_file)) do
+        :ok -> :ok
+        {:error, :enoent} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end)
   end
 
   # ── 原子提交原语（ROUTE B B1-2）──
@@ -220,12 +258,7 @@ defmodule Maxio.Cluster.ShardServer do
   """
   @spec begin_tmp(String.t()) :: {:ok, String.t()} | {:error, term()}
   def begin_tmp(drive_root) do
-    tmp = Path.join([drive_root, @tmp_root, uuid()])
-
-    case File.mkdir_p(tmp) do
-      :ok -> {:ok, tmp}
-      {:error, reason} -> {:error, reason}
-    end
+    DriveIO.track(:write, fn -> do_begin_tmp(drive_root) end)
   end
 
   @doc """
@@ -243,23 +276,36 @@ defmodule Maxio.Cluster.ShardServer do
         ) ::
           {:ok, String.t()} | {:error, term()}
   def prepare_commit(_drive_obj_dir, block_map, shard_len, meta, opts) do
-    drive_root = Keyword.fetch!(opts, :drive_root)
-    fsync? = fsync?(opts)
-    {:ok, tmp} = begin_tmp(drive_root)
+    meta_bin = Meta.encode(meta)
 
-    path = Path.join(tmp, @part_file)
-    {:ok, fd} = :file.open(String.to_charlist(path), [:read, :write, :binary, :raw])
+    bytes =
+      Enum.reduce(block_map, byte_size(meta_bin), fn {_j, shard}, acc ->
+        acc + byte_size(shard)
+      end)
 
-    try do
-      Enum.each(block_map, fn {j, shard} -> :ok = :file.pwrite(fd, j * shard_len, shard) end)
-      if fsync?, do: sync_fd(fd)
-    after
-      :file.close(fd)
-    end
+    DriveIO.track(
+      :write,
+      fn ->
+        drive_root = Keyword.fetch!(opts, :drive_root)
+        fsync? = fsync?(opts)
+        {:ok, tmp} = do_begin_tmp(drive_root)
 
-    File.write!(Path.join(tmp, @meta_file), Meta.encode(meta))
-    if fsync?, do: sync_path(Path.join(tmp, @meta_file))
-    {:ok, tmp}
+        path = Path.join(tmp, @part_file)
+        {:ok, fd} = :file.open(String.to_charlist(path), [:read, :write, :binary, :raw])
+
+        try do
+          Enum.each(block_map, fn {j, shard} -> :ok = :file.pwrite(fd, j * shard_len, shard) end)
+          if fsync?, do: sync_fd(fd)
+        after
+          :file.close(fd)
+        end
+
+        File.write!(Path.join(tmp, @meta_file), meta_bin)
+        if fsync?, do: sync_path(Path.join(tmp, @meta_file))
+        {:ok, tmp}
+      end,
+      bytes: bytes
+    )
   end
 
   @doc """
@@ -277,31 +323,33 @@ defmodule Maxio.Cluster.ShardServer do
   """
   @spec commit(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def commit(tmp_dir, drive_obj_dir, opts) do
-    fsync? = fsync?(opts)
-    rename_fun = rename_fun(opts)
-    meta_only? = Keyword.get(opts, :meta_only, false)
+    DriveIO.track(:write, fn ->
+      fsync? = fsync?(opts)
+      rename_fun = rename_fun(opts)
+      meta_only? = Keyword.get(opts, :meta_only, false)
 
-    src_part = Path.join(tmp_dir, @part_file)
-    src_meta = Path.join(tmp_dir, @meta_file)
-    if fsync? and File.exists?(src_part), do: sync_path(src_part)
+      src_part = Path.join(tmp_dir, @part_file)
+      src_meta = Path.join(tmp_dir, @meta_file)
+      if fsync? and File.exists?(src_part), do: sync_path(src_part)
 
-    # meta.json 是对象可见性的真值源：正常对象提交也必须在暴露元数据 rename 前 fsync，
-    # 否则 write_quorum 成功后掉电可能只耐久 part.0，读侧看不见对象或看见旧 sidecar。
-    # meta_only（delete marker）同理，meta.json 即数据本体。
-    if fsync?, do: sync_path(src_meta)
+      # meta.json 是对象可见性的真值源：正常对象提交也必须在暴露元数据 rename 前 fsync，
+      # 否则 write_quorum 成功后掉电可能只耐久 part.0，读侧看不见对象或看见旧 sidecar。
+      # meta_only（delete marker）同理，meta.json 即数据本体。
+      if fsync?, do: sync_path(src_meta)
 
-    # mkdir 失败（:enametoolong 段超 NAME_MAX / :eacces / 盘满等）→ 结构化 {:error, posix}，
-    # 绝不 raise——File.mkdir_p! 的异常 message 内嵌服务器绝对盘路径，曾沿 500 InternalError
-    # 序列化给客户端（信息泄露 + 违反铁律 3 结构化错误）。调用方（FS/EC/Distributed）按
-    # 既有 {:error, reason} 分支回滚 temp。
-    with :ok <- File.mkdir_p(drive_obj_dir),
-         :ok <- commit_part(meta_only?, rename_fun, src_part, drive_obj_dir),
-         :ok <- maybe_sync_dir(fsync?, drive_obj_dir),
-         :ok <- rename_atomic(rename_fun, src_meta, Path.join(drive_obj_dir, @meta_file)),
-         :ok <- maybe_sync_dir(fsync?, drive_obj_dir) do
-      _ = File.rm_rf(tmp_dir)
-      :ok
-    end
+      # mkdir 失败（:enametoolong 段超 NAME_MAX / :eacces / 盘满等）→ 结构化 {:error, posix}，
+      # 绝不 raise——File.mkdir_p! 的异常 message 内嵌服务器绝对盘路径，曾沿 500 InternalError
+      # 序列化给客户端（信息泄露 + 违反铁律 3 结构化错误）。调用方（FS/EC/Distributed）按
+      # 既有 {:error, reason} 分支回滚 temp。
+      with :ok <- File.mkdir_p(drive_obj_dir),
+           :ok <- commit_part(meta_only?, rename_fun, src_part, drive_obj_dir),
+           :ok <- maybe_sync_dir(fsync?, drive_obj_dir),
+           :ok <- rename_atomic(rename_fun, src_meta, Path.join(drive_obj_dir, @meta_file)),
+           :ok <- maybe_sync_dir(fsync?, drive_obj_dir) do
+        _ = File.rm_rf(tmp_dir)
+        :ok
+      end
+    end)
   end
 
   # part.0 提交步：meta_only（纯元数据版本，B5-0 delete marker）显式跳过——temp 无 part.0 合法；
@@ -317,14 +365,35 @@ defmodule Maxio.Cluster.ShardServer do
   """
   @spec commit_file(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def commit_file(src, dst, opts) do
-    fsync? = fsync?(opts)
-    rename_fun = rename_fun(opts)
-    if fsync? and File.exists?(src), do: sync_path(src)
+    bytes =
+      case File.stat(src) do
+        {:ok, %File.Stat{size: size}} -> size
+        {:error, _} -> 0
+      end
 
-    with :ok <- File.mkdir_p(Path.dirname(dst)),
-         :ok <- rename_atomic(rename_fun, src, dst),
-         :ok <- maybe_sync_dir(fsync?, Path.dirname(dst)) do
-      :ok
+    DriveIO.track(
+      :write,
+      fn ->
+        fsync? = fsync?(opts)
+        rename_fun = rename_fun(opts)
+        if fsync? and File.exists?(src), do: sync_path(src)
+
+        with :ok <- File.mkdir_p(Path.dirname(dst)),
+             :ok <- rename_atomic(rename_fun, src, dst),
+             :ok <- maybe_sync_dir(fsync?, Path.dirname(dst)) do
+          :ok
+        end
+      end,
+      bytes: bytes
+    )
+  end
+
+  defp do_begin_tmp(drive_root) do
+    tmp = Path.join([drive_root, @tmp_root, uuid()])
+
+    case File.mkdir_p(tmp) do
+      :ok -> {:ok, tmp}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -429,19 +498,32 @@ defmodule Maxio.Cluster.ShardServer do
   @spec heal_shard(String.t(), %{non_neg_integer() => binary()}, pos_integer(), map()) ::
           {:ok, non_neg_integer()}
   def heal_shard(drive_obj_dir, block_map, shard_len, meta) do
-    File.mkdir_p!(drive_obj_dir)
-    path = Path.join(drive_obj_dir, @part_file)
-    ensure_part_file!(path, meta, drive_obj_dir, shard_len)
-    {:ok, fd} = :file.open(String.to_charlist(path), [:read, :write, :binary, :raw])
+    meta_bin = Meta.encode(meta)
 
-    try do
-      Enum.each(block_map, fn {j, shard} -> :ok = :file.pwrite(fd, j * shard_len, shard) end)
-    after
-      :file.close(fd)
-    end
+    bytes =
+      Enum.reduce(block_map, byte_size(meta_bin), fn {_j, shard}, acc ->
+        acc + byte_size(shard)
+      end)
 
-    File.write!(Path.join(drive_obj_dir, @meta_file), Meta.encode(meta))
-    {:ok, map_size(block_map)}
+    DriveIO.track(
+      :write,
+      fn ->
+        File.mkdir_p!(drive_obj_dir)
+        path = Path.join(drive_obj_dir, @part_file)
+        ensure_part_file!(path, meta, drive_obj_dir, shard_len)
+        {:ok, fd} = :file.open(String.to_charlist(path), [:read, :write, :binary, :raw])
+
+        try do
+          Enum.each(block_map, fn {j, shard} -> :ok = :file.pwrite(fd, j * shard_len, shard) end)
+        after
+          :file.close(fd)
+        end
+
+        File.write!(Path.join(drive_obj_dir, @meta_file), meta_bin)
+        {:ok, map_size(block_map)}
+      end,
+      bytes: bytes
+    )
   end
 
   # 整列缺失时先确保 part.0 存在；:raw 文件 pwrite 到偏移会自动以 0 填充空洞（POSIX/Windows 均如此），

@@ -1,7 +1,7 @@
 defmodule Maxio.Cluster.ScrubberTest do
   use Maxio.DataCase, async: false
 
-  alias Maxio.Cluster.{Lock, Scrubber}
+  alias Maxio.Cluster.{DriveIO, Lock, Scrubber}
   alias Maxio.Cluster.Scrubber.Usage
   alias Maxio.{Buckets, Objects}
   alias Maxio.Storage.{ErasureCoded, FS}
@@ -346,6 +346,48 @@ defmodule Maxio.Cluster.ScrubberTest do
 
     _ = Scrubber.Throttle.maybe_wait(no_throttle)
     refute_receive {:adaptive_io_sleep, _}, 10
+  end
+
+  test "adaptive IO gate can use storage operation pressure" do
+    DriveIO.reset()
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        DriveIO.track(:read, fn ->
+          send(parent, {:storage_operation_active, self()})
+
+          receive do
+            :release_storage_operation -> :ok
+          end
+        end)
+      end)
+
+    assert_receive {:storage_operation_active, worker}
+    assert DriveIO.active_count() == 1
+
+    throttle =
+      Scrubber.Throttle.new(
+        [
+          adaptive_io: true,
+          io_load_source: :storage_ops,
+          max_live_requests: 0,
+          io_pause_ms: 10,
+          io_max_pause_ms: 20,
+          throttle_now_fun: fn -> 0 end,
+          throttle_sleep_fun: fn ms -> send(parent, {:storage_io_sleep, ms}) end
+        ],
+        0
+      )
+
+    _ = Scrubber.Throttle.maybe_wait(throttle)
+    assert_receive {:storage_io_sleep, 10}
+    assert_receive {:storage_io_sleep, 10}
+
+    send(worker, :release_storage_operation)
+    assert Task.await(task) == :ok
+  after
+    DriveIO.reset()
   end
 
   test "scrubber threads configured token bucket across buckets when caller passes nil overrides" do
