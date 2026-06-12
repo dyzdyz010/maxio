@@ -11,6 +11,7 @@ defmodule Maxio.Cluster.FreshDriveHeal do
 
   alias Maxio.{Buckets, Objects}
   alias Maxio.Cluster.{DriveHealth, Heal, Lock, Router, Topology, Transport}
+  alias Maxio.Cluster.Scrubber.Throttle
   alias Maxio.S3.Log
   alias Maxio.Storage.Distributed
   alias Maxio.Storage.Erasure.{Codec, Config}
@@ -80,7 +81,9 @@ defmodule Maxio.Cluster.FreshDriveHeal do
 
         true ->
           cfg = config(opts, selected)
-          scan_buckets(buckets, cfg, report)
+          cfg = Keyword.put(cfg, :throttle, Throttle.new(cfg))
+          {report, _throttle} = scan_buckets(buckets, cfg, report)
+          report
       end
 
     report =
@@ -168,6 +171,17 @@ defmodule Maxio.Cluster.FreshDriveHeal do
       lock_ttl_ms: Keyword.get(opts, :lock_ttl_ms, 60_000),
       lock_timeout_ms: Keyword.get(opts, :lock_timeout_ms, 3_000),
       lock_heartbeat_ms: Keyword.get(opts, :lock_heartbeat_ms),
+      max_objects_per_sec: config_value(opts, :max_objects_per_sec, 200),
+      object_burst: positive_int(config_value(opts, :object_burst, 1), 1),
+      sleep_between_batches_ms: config_value(opts, :sleep_between_batches_ms, 50),
+      adaptive_io: config_value(opts, :adaptive_io, true),
+      max_live_requests: non_negative_int(config_value(opts, :max_live_requests, 0), 0),
+      io_pause_ms: positive_int(config_value(opts, :io_pause_ms, 100), 100),
+      io_max_pause_ms: non_negative_int(config_value(opts, :io_max_pause_ms, 5_000), 5_000),
+      io_load_fun: Keyword.get(opts, :io_load_fun),
+      throttle_sleep_fun: Keyword.get(opts, :throttle_sleep_fun),
+      throttle_now_fun: Keyword.get(opts, :throttle_now_fun),
+      no_throttle: Keyword.get(opts, :no_throttle, false),
       ec_config: erasure_config(Keyword.get(opts, :topology)),
       healer_opts:
         [
@@ -179,9 +193,9 @@ defmodule Maxio.Cluster.FreshDriveHeal do
   end
 
   defp scan_buckets(buckets, cfg, report) do
-    Enum.reduce_while(buckets, report, fn bucket, acc ->
-      acc = scan_bucket(bucket, cfg, acc)
-      if acc.truncated, do: {:halt, acc}, else: {:cont, acc}
+    Enum.reduce_while(buckets, {report, cfg[:throttle]}, fn bucket, {acc, throttle} ->
+      {acc, throttle} = scan_bucket(bucket, Keyword.put(cfg, :throttle, throttle), acc)
+      if acc.truncated, do: {:halt, {acc, throttle}}, else: {:cont, {acc, throttle}}
     end)
   end
 
@@ -199,7 +213,7 @@ defmodule Maxio.Cluster.FreshDriveHeal do
         reason: Exception.message(e)
       )
 
-      bump(report, :errors)
+      {bump(report, :errors), cfg[:throttle]}
   catch
     kind, reason ->
       Log.error("fresh-drive heal bucket scan caught",
@@ -208,7 +222,7 @@ defmodule Maxio.Cluster.FreshDriveHeal do
         reason: inspect({kind, reason})
       )
 
-      bump(report, :errors)
+      {bump(report, :errors), cfg[:throttle]}
   end
 
   defp reduce_current_pages(bucket, cfg, report, cursor) do
@@ -218,20 +232,22 @@ defmodule Maxio.Cluster.FreshDriveHeal do
         continuation_token: cursor
       })
 
-    report = reduce_objects(bucket, cfg, report, page.objects)
+    {report, throttle} = reduce_objects(bucket, cfg, report, page.objects)
+    cfg = Keyword.put(cfg, :throttle, throttle)
 
     cond do
       report.truncated ->
-        report
+        {report, throttle}
 
       page.is_truncated and cap_reached?(report, cfg) ->
-        %{report | truncated: true}
+        {%{report | truncated: true}, throttle}
 
       page.is_truncated ->
+        Throttle.maybe_wait_between_batches(cfg)
         reduce_current_pages(bucket, cfg, report, page.next_continuation_token)
 
       true ->
-        report
+        {report, throttle}
     end
   end
 
@@ -243,16 +259,19 @@ defmodule Maxio.Cluster.FreshDriveHeal do
         version_id_marker: version_marker
       })
 
-    report = reduce_objects(bucket, cfg, report, page.versions)
+    {report, throttle} = reduce_objects(bucket, cfg, report, page.versions)
+    cfg = Keyword.put(cfg, :throttle, throttle)
 
     cond do
       report.truncated ->
-        report
+        {report, throttle}
 
       page.is_truncated and cap_reached?(report, cfg) ->
-        %{report | truncated: true}
+        {%{report | truncated: true}, throttle}
 
       page.is_truncated ->
+        Throttle.maybe_wait_between_batches(cfg)
+
         reduce_version_pages(
           bucket,
           cfg,
@@ -262,14 +281,16 @@ defmodule Maxio.Cluster.FreshDriveHeal do
         )
 
       true ->
-        report
+        {report, throttle}
     end
   end
 
   defp reduce_objects(bucket, cfg, report, objects) do
-    Enum.reduce_while(objects, report, fn object, acc ->
-      acc = maybe_scan_object(bucket, cfg, acc, object)
-      if acc.truncated, do: {:halt, acc}, else: {:cont, acc}
+    Enum.reduce_while(objects, {report, cfg[:throttle]}, fn object, {acc, throttle} ->
+      {acc, throttle} =
+        maybe_scan_object(bucket, Keyword.put(cfg, :throttle, throttle), acc, object)
+
+      if acc.truncated, do: {:halt, {acc, throttle}}, else: {:cont, {acc, throttle}}
     end)
   end
 
@@ -278,13 +299,14 @@ defmodule Maxio.Cluster.FreshDriveHeal do
 
     cond do
       not MapSet.member?(cfg[:target_sets], set_id) ->
-        report
+        {report, cfg[:throttle]}
 
       cap_reached?(report, cfg) ->
-        %{report | truncated: true}
+        {%{report | truncated: true}, cfg[:throttle]}
 
       true ->
-        scan_object(bucket, cfg, report, object, set_id)
+        report = scan_object(bucket, cfg, report, object, set_id)
+        {report, Throttle.maybe_wait(cfg[:throttle])}
     end
   end
 
@@ -655,6 +677,17 @@ defmodule Maxio.Cluster.FreshDriveHeal do
   defp positive_int(n, _default) when is_integer(n) and n > 0, do: n
   defp positive_int(_n, default), do: default
 
+  defp non_negative_int(n, _default) when is_integer(n) and n >= 0, do: n
+  defp non_negative_int(_n, default), do: default
+
   defp positive_int_or_nil(n) when is_integer(n) and n > 0, do: n
   defp positive_int_or_nil(_n), do: nil
+
+  defp config_value(opts, key, default) do
+    case Keyword.fetch(opts, key) do
+      {:ok, nil} -> default
+      {:ok, value} -> value
+      :error -> default
+    end
+  end
 end

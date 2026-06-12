@@ -144,6 +144,48 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
     assert DriveHealth.heal_required?({node, drive})
   end
 
+  test "fresh-drive heal paces target objects with token bucket", ctx do
+    parent = self()
+    {node, drive} = seed_missing_objects!(ctx, "fresh-paced", ["a.bin", "b.bin"])
+
+    assert {:ok, report} =
+             FreshDriveHeal.run_once(
+               topology: ctx.topology,
+               transport: InProcess,
+               max_objects_per_sec: 1,
+               object_burst: 1,
+               adaptive_io: false,
+               throttle_now_fun: fn -> 0 end,
+               throttle_sleep_fun: fn ms -> send(parent, {:fresh_drive_sleep, ms}) end
+             )
+
+    assert report.status == :ok
+    assert report.scanned == 2
+    assert report.drives_cleared == 1
+    assert_receive {:fresh_drive_sleep, 1000}
+    refute DriveHealth.heal_required?({node, drive})
+  end
+
+  test "no_throttle disables fresh-drive heal pacing", ctx do
+    parent = self()
+    {_node, _drive} = seed_missing_objects!(ctx, "fresh-no-throttle", ["a.bin", "b.bin"])
+
+    assert {:ok, report} =
+             FreshDriveHeal.run_once(
+               topology: ctx.topology,
+               transport: InProcess,
+               no_throttle: true,
+               max_objects_per_sec: 1,
+               object_burst: 1,
+               throttle_now_fun: fn -> 0 end,
+               throttle_sleep_fun: fn ms -> send(parent, {:fresh_drive_sleep, ms}) end
+             )
+
+    assert report.status == :ok
+    assert report.scanned == 2
+    refute_receive {:fresh_drive_sleep, _}, 20
+  end
+
   test "target shard write failure is verified before marker clear", ctx do
     bucket = bucket_name("fresh-shard-fail")
     key = "object.bin"
@@ -297,6 +339,28 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
     assert %{offline: 1, heal_required: 0} = probe(ctx, 0)
     InProcess.set_drive_up(node, drive)
     assert %{online: 6, heal_required: 1} = probe(ctx, 1)
+    {node, drive}
+  end
+
+  defp seed_missing_objects!(ctx, prefix, keys) do
+    bucket = bucket_name(prefix)
+    opts = dist_opts(ctx)
+    {node, drive} = hd(ctx.endpoints)
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    :ok = Distributed.put_bucket(bucket, opts)
+
+    InProcess.set_drive_down(node, drive)
+    assert %{offline: 1, heal_required: 0} = probe(ctx, 0)
+
+    Enum.each(keys, fn key ->
+      body = :crypto.strong_rand_bytes(1536)
+      {:ok, %{size: size, etag: etag}} = Distributed.put(bucket, key, "null", [body], opts)
+      put_index!(bucket, key, "null", size, etag)
+    end)
+
+    InProcess.set_drive_up(node, drive)
+    assert %{heal_required: 1} = probe(ctx, 1)
     {node, drive}
   end
 

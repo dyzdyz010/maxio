@@ -139,6 +139,18 @@ config :maxio, :drive_health,
   enabled: true,
   offline_after_ms: 172_800_000
 
+# M8 fresh-drive heal scheduler. Disabled by default; when enabled it automates
+# only the existing DriveHealth.heal_required? marker workflow. It does not track
+# physical drive identity or perform rebalance/decommission.
+config :maxio, :fresh_drive_heal_scheduler,
+  enabled: false,
+  interval_ms: 86_400_000,
+  initial_delay_ms: 60_000,
+  probe_drive_health: true,
+  run_opts: [],
+  lock_ttl_ms: 60_000,
+  lock_timeout_ms: 3_000
+
 # M8-3 auto-heal scrubber（默认关——启动进程但不调度，避免 dev/test 意外扫盘）：
 # 与 ROUTE B Storage.Scanner 分离。本 scrubber 从 PG 对象元数据分页枚举对象，刷新 usage
 # 快照；FS 后端只统计 usage，ErasureCoded/Distributed 后端按 erasure set 短租约锁调度既有

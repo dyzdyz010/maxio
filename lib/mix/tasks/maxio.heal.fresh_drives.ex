@@ -8,6 +8,7 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
       mix maxio.heal.fresh_drives --bucket my-bucket
       mix maxio.heal.fresh_drives --max-objects 1000
       mix maxio.heal.fresh_drives --current-only
+      mix maxio.heal.fresh_drives --max-objects-per-sec 100 --object-burst 10
 
   The task scans PG object inventory for distributed erasure sets containing
   recovered drives marked `DriveHealth.heal_required?`. It clears those markers
@@ -28,7 +29,15 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
           dry_run: :boolean,
           max_objects: :integer,
           current_only: :boolean,
-          page_size: :integer
+          page_size: :integer,
+          no_throttle: :boolean,
+          max_objects_per_sec: :integer,
+          object_burst: :integer,
+          sleep_between_batches_ms: :integer,
+          no_adaptive_io: :boolean,
+          max_live_requests: :integer,
+          io_pause_ms: :integer,
+          io_max_pause_ms: :integer
         ],
         aliases: [b: :bucket]
       )
@@ -39,6 +48,9 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
       Mix.raise(
         "usage: mix maxio.heal.fresh_drives [--bucket <name>] [--dry-run] " <>
           "[--max-objects <n>] [--current-only] [--page-size <n>] " <>
+          "[--no-throttle] [--max-objects-per-sec <n>] [--object-burst <n>] " <>
+          "[--sleep-between-batches-ms <ms>] [--no-adaptive-io] " <>
+          "[--max-live-requests <n>] [--io-pause-ms <ms>] [--io-max-pause-ms <ms>] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
     end
@@ -51,7 +63,15 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
         dry_run: Keyword.get(opts, :dry_run, false),
         max_objects: Keyword.get(opts, :max_objects),
         scan_versions: not Keyword.get(opts, :current_only, false),
-        page_size: Keyword.get(opts, :page_size)
+        page_size: Keyword.get(opts, :page_size),
+        no_throttle: Keyword.get(opts, :no_throttle, false),
+        max_objects_per_sec: Keyword.get(opts, :max_objects_per_sec),
+        object_burst: Keyword.get(opts, :object_burst),
+        sleep_between_batches_ms: Keyword.get(opts, :sleep_between_batches_ms),
+        adaptive_io: adaptive_io_opt(opts),
+        max_live_requests: Keyword.get(opts, :max_live_requests),
+        io_pause_ms: Keyword.get(opts, :io_pause_ms),
+        io_max_pause_ms: Keyword.get(opts, :io_max_pause_ms)
       )
 
     IO.puts(
@@ -65,5 +85,9 @@ defmodule Mix.Tasks.Maxio.Heal.FreshDrives do
         "missing=#{report.missing} skipped=#{report.skipped} errors=#{report.errors} " <>
         "truncated=#{report.truncated} dry_run=#{report.dry_run}"
     )
+  end
+
+  defp adaptive_io_opt(opts) do
+    if Keyword.get(opts, :no_adaptive_io, false), do: false, else: nil
   end
 end
