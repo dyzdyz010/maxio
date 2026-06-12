@@ -30,6 +30,21 @@ defmodule Maxio.Cluster.ShardServerIOTest do
     assert :ok = ShardServer.probe_drive(dir)
     assert {:ok, %{drive_uuid: drive_uuid}} = ShardServer.probe_drive_identity(dir)
     assert drive_uuid =~ ~r/\A[0-9a-f]{32}\z/
+
+    assert {:ok, %{capacity_bytes: 1_000, free_bytes: 400}} =
+             ShardServer.drive_stats(dir,
+               provider: fn ^dir ->
+                 {:ok,
+                  %{
+                    mount_root: "test-mount",
+                    capacity_bytes: 1_000,
+                    free_bytes: 400,
+                    source: :test,
+                    precision: :exact
+                  }}
+               end
+             )
+
     assert :ok = ShardServer.delete_part_file(obj)
     assert :ok = ShardServer.delete_shard(obj)
 
@@ -38,7 +53,7 @@ defmodule Maxio.Cluster.ShardServerIOTest do
     assert snapshot.active_ops == 0
     assert snapshot.write_ops >= 2
     assert snapshot.read_ops >= 2
-    assert snapshot.metadata_ops >= 3
+    assert snapshot.metadata_ops >= 4
     assert snapshot.delete_ops >= 2
     assert snapshot.bytes_written > 0
     assert snapshot.bytes_read >= byte_size(shard)

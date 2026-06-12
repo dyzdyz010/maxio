@@ -208,6 +208,13 @@ defmodule Maxio.Cluster.Transport.InProcess do
   end
 
   @impl true
+  def drive_stats(node, drive_root, opts \\ []) do
+    if down?(node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.drive_stats(drive_root, opts)
+  end
+
+  @impl true
   def pressure_snapshot(node, _opts \\ []) do
     cond do
       down?(node, nil) ->

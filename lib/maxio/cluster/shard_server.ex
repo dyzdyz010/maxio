@@ -31,7 +31,7 @@ defmodule Maxio.Cluster.ShardServer do
   """
   use GenServer
 
-  alias Maxio.Cluster.{DriveIO, DriveIdentity}
+  alias Maxio.Cluster.{DriveIO, DriveIdentity, DriveStats}
   alias Maxio.Storage.Erasure.Meta
 
   @part_file "part.0"
@@ -206,6 +206,12 @@ defmodule Maxio.Cluster.ShardServer do
   @spec probe_drive_identity(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def probe_drive_identity(drive_root, opts \\ []) do
     DriveIO.track(:probe, fn -> DriveIdentity.probe_drive_root(drive_root, opts) end)
+  end
+
+  @doc "Return OS-backed filesystem capacity stats for a configured drive root."
+  @spec drive_stats(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def drive_stats(drive_root, opts \\ []) do
+    DriveIO.track(:metadata, fn -> DriveStats.local(drive_root, opts) end)
   end
 
   @doc "stat：该 drive 上 part.0 字节数（heal 用其判文件完整）。"

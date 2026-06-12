@@ -34,6 +34,7 @@ defmodule Maxio.Cluster.Transport do
               {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
   @callback probe_drive(node(), String.t()) :: :ok | {:error, term()}
   @callback probe_drive_identity(node(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  @callback drive_stats(node(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   @callback pressure_snapshot(node(), keyword()) :: {:ok, map()} | {:error, term()}
 
   @doc "当前配置的传输实现（test 经 opts[:transport] 覆盖；缺省 config :maxio, :shard_transport）。"
@@ -126,6 +127,11 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def probe_drive_identity(node, drive_root, opts \\ []) do
     call(node, :probe_drive_identity, [drive_root, opts], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def drive_stats(node, drive_root, opts \\ []) do
+    call(node, :drive_stats, [drive_root, opts], fn -> {:error, :unavailable} end)
   end
 
   @impl true

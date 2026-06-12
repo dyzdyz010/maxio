@@ -83,4 +83,27 @@ defmodule Maxio.Cluster.TransportInProcessTest do
     InProcess.set_drive_down(node, drive)
     assert {:error, :unavailable} = InProcess.probe_drive_identity(node, drive)
   end
+
+  test "drive stats follow drive down state", %{base: base} do
+    node = :maxio@n6
+    drive = Path.join(base, "n6_d0")
+    File.mkdir_p!(drive)
+
+    provider = fn ^drive ->
+      {:ok,
+       %{
+         mount_root: "test-mount",
+         capacity_bytes: 1_000,
+         free_bytes: 300,
+         source: :test,
+         precision: :exact
+       }}
+    end
+
+    assert {:ok, %{capacity_bytes: 1_000, free_bytes: 300}} =
+             InProcess.drive_stats(node, drive, provider: provider)
+
+    InProcess.set_drive_down(node, drive)
+    assert {:error, :unavailable} = InProcess.drive_stats(node, drive, provider: provider)
+  end
 end

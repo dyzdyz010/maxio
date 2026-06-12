@@ -146,6 +146,10 @@ config :maxio, :drive_identity,
   marker_file: ".maxio-drive-identity.json",
   create_missing: true
 
+# M8 drive filesystem stats telemetry. The default provider uses OTP os_mon
+# disksup and remains read-only. Tests may inject `provider: fun/1`.
+config :maxio, :drive_stats, provider: nil
+
 # M8 fresh-drive heal scheduler. Disabled by default; when enabled it automates
 # only the existing DriveHealth.heal_required? marker workflow. It does not track
 # physical drive identity or perform rebalance/decommission.
