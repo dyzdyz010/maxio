@@ -12,6 +12,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
             tokens: 0.0,
             last_ms: 0,
             fixed_ms: 0,
+            now_fun: &__MODULE__.monotonic_ms/0,
             sleep_fun: &Process.sleep/1
 
   @type t :: %__MODULE__{
@@ -21,6 +22,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
           tokens: float(),
           last_ms: integer(),
           fixed_ms: non_neg_integer(),
+          now_fun: (-> integer()),
           sleep_fun: (non_neg_integer() -> any())
         }
 
@@ -28,13 +30,14 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
   def new(opts, now_ms \\ monotonic_ms()) do
     cond do
       Keyword.get(opts, :no_throttle, false) ->
-        %__MODULE__{mode: :disabled, last_ms: now_ms}
+        %__MODULE__{mode: :disabled, last_ms: now_ms, now_fun: now_fun(opts)}
 
       fixed = Keyword.get(opts, :sleep_between_objects_ms) ->
         %__MODULE__{
           mode: :fixed,
           fixed_ms: max(fixed, 0),
           last_ms: now_ms,
+          now_fun: now_fun(opts),
           sleep_fun: sleep_fun(opts)
         }
 
@@ -47,11 +50,12 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
           burst: burst,
           tokens: burst * 1.0,
           last_ms: now_ms,
+          now_fun: now_fun(opts),
           sleep_fun: sleep_fun(opts)
         }
 
       true ->
-        %__MODULE__{mode: :disabled, last_ms: now_ms}
+        %__MODULE__{mode: :disabled, last_ms: now_ms, now_fun: now_fun(opts)}
     end
   end
 
@@ -95,7 +99,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
 
   @spec maybe_wait(t()) :: t()
   def maybe_wait(%__MODULE__{} = state) do
-    {ms, state} = take(state)
+    {ms, state} = take(state, state.now_fun.())
     if ms > 0, do: state.sleep_fun.(ms)
     state
   end
@@ -120,7 +124,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
     end
   end
 
-  defp monotonic_ms, do: System.monotonic_time(:millisecond)
+  def monotonic_ms, do: System.monotonic_time(:millisecond)
 
   defp positive_int(n) when is_integer(n) and n > 0, do: n
   defp positive_int(_n), do: nil
@@ -129,6 +133,13 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
     case Keyword.get(opts, :throttle_sleep_fun) do
       fun when is_function(fun, 1) -> fun
       _ -> &Process.sleep/1
+    end
+  end
+
+  defp now_fun(opts) do
+    case Keyword.get(opts, :throttle_now_fun) do
+      fun when is_function(fun, 0) -> fun
+      _ -> &__MODULE__.monotonic_ms/0
     end
   end
 end

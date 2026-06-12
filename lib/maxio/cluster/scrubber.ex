@@ -510,17 +510,11 @@ defmodule Maxio.Cluster.Scrubber do
         Keyword.get(opts, :lock_timeout_ms, Keyword.get(cfg, :lock_timeout_ms, 3_000)),
       lock_heartbeat_ms:
         Keyword.get(opts, :lock_heartbeat_ms, Keyword.get(cfg, :lock_heartbeat_ms)),
-      max_objects_per_sec:
-        Keyword.get(opts, :max_objects_per_sec, Keyword.get(cfg, :max_objects_per_sec, 200)),
-      object_burst:
-        positive_int(Keyword.get(opts, :object_burst, Keyword.get(cfg, :object_burst, 1)), 1),
-      sleep_between_batches_ms:
-        Keyword.get(
-          opts,
-          :sleep_between_batches_ms,
-          Keyword.get(cfg, :sleep_between_batches_ms, 50)
-        ),
+      max_objects_per_sec: config_value(opts, cfg, :max_objects_per_sec, 200),
+      object_burst: positive_int(config_value(opts, cfg, :object_burst, 1), 1),
+      sleep_between_batches_ms: config_value(opts, cfg, :sleep_between_batches_ms, 50),
       throttle_sleep_fun: Keyword.get(opts, :throttle_sleep_fun),
+      throttle_now_fun: Keyword.get(opts, :throttle_now_fun),
       no_throttle: Keyword.get(opts, :no_throttle, false),
       reconcile_index:
         Keyword.get(opts, :reconcile_index, Keyword.get(cfg, :reconcile_index, false)),
@@ -561,6 +555,7 @@ defmodule Maxio.Cluster.Scrubber do
       :sleep_between_batches_ms,
       :sleep_between_objects_ms,
       :throttle_sleep_fun,
+      :throttle_now_fun,
       :reconcile_index,
       :force_reconcile_index,
       :reconcile_index_dry_run,
@@ -578,6 +573,14 @@ defmodule Maxio.Cluster.Scrubber do
 
   defp non_negative_int(n, _default) when is_integer(n) and n >= 0, do: n
   defp non_negative_int(_n, default), do: default
+
+  defp config_value(opts, cfg, key, default) do
+    case Keyword.fetch(opts, key) do
+      {:ok, nil} -> Keyword.get(cfg, key, default)
+      {:ok, value} -> value
+      :error -> Keyword.get(cfg, key, default)
+    end
+  end
 
   defp cycle(cfg), do: Keyword.get(cfg, :sample_cycle, 0)
 

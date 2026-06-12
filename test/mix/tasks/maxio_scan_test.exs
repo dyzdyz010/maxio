@@ -77,6 +77,40 @@ defmodule Mix.Tasks.Maxio.ScanTest do
     assert output =~ "objects=1"
   end
 
+  test "accepts token-bucket throttle flags" do
+    bucket = bucket_name()
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, "rate.txt", "null", %{
+        size: 5,
+        etag: "etag-rate",
+        content_type: "text/plain"
+      })
+
+    Mix.Task.reenable("maxio.scan")
+
+    output =
+      capture_io(fn ->
+        Scan.run([
+          "--bucket",
+          bucket,
+          "--max-objects-per-sec",
+          "10",
+          "--object-burst",
+          "3",
+          "--sleep-between-batches-ms",
+          "0"
+        ])
+      end)
+
+    assert output =~ "[maxio scan] status=ok"
+    assert output =~ "buckets=1"
+    assert output =~ "scanned=1"
+    assert output =~ "objects=1"
+    assert output =~ "bytes=5"
+  end
+
   test "prints orphan shard evidence from reconcile pre-pass" do
     bucket = bucket_name()
     dir = Path.join(System.tmp_dir!(), "maxio_scan_orphan_#{System.unique_integer([:positive])}")

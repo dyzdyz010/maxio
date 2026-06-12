@@ -289,6 +289,69 @@ defmodule Maxio.Cluster.ScrubberTest do
     assert Scrubber.Throttle.sleep_ms(max_objects_per_sec: 3, no_throttle: true) == 0
   end
 
+  test "token-bucket throttle consumes burst and refills deterministically" do
+    throttle = Scrubber.Throttle.new([max_objects_per_sec: 2, object_burst: 2], 0)
+
+    assert throttle.mode == :token_bucket
+    assert throttle.tokens == 2.0
+
+    {0, throttle} = Scrubber.Throttle.take(throttle, 0)
+    assert throttle.tokens == 1.0
+
+    {0, throttle} = Scrubber.Throttle.take(throttle, 0)
+    assert throttle.tokens == 0.0
+
+    {sleep_ms, throttle} = Scrubber.Throttle.take(throttle, 0)
+    assert sleep_ms == 500
+    assert throttle.last_ms == 500
+
+    {0, throttle} = Scrubber.Throttle.take(throttle, 1000)
+    assert throttle.tokens == 0.0
+    assert throttle.last_ms == 1000
+  end
+
+  test "scrubber threads configured token bucket across buckets when caller passes nil overrides" do
+    prev_scrubber = Application.get_env(:maxio, :scrubber, [])
+    parent = self()
+
+    try do
+      Application.put_env(
+        :maxio,
+        :scrubber,
+        Keyword.merge(prev_scrubber,
+          max_objects_per_sec: 1,
+          object_burst: 1,
+          sleep_between_batches_ms: 0
+        )
+      )
+
+      bucket_a = bucket_name("scrub-rate-a")
+      bucket_b = bucket_name("scrub-rate-b")
+      {:ok, _bucket} = Buckets.create(bucket_a, @owner)
+      {:ok, _bucket} = Buckets.create(bucket_b, @owner)
+      put_index!(bucket_a, "a.txt", 10, "etag-a")
+      put_index!(bucket_b, "b.txt", 20, "etag-b")
+
+      assert {:ok, summary} =
+               Scrubber.run_once(
+                 backend: FS,
+                 max_objects_per_sec: nil,
+                 object_burst: nil,
+                 sleep_between_batches_ms: nil,
+                 throttle_now_fun: fn -> 0 end,
+                 throttle_sleep_fun: fn ms -> send(parent, {:throttle_sleep, ms}) end
+               )
+
+      assert summary.buckets == 2
+      assert summary.scanned == 2
+      assert summary.object_count == 2
+      assert summary.total_size == 30
+      assert_receive {:throttle_sleep, 1000}
+    after
+      Application.put_env(:maxio, :scrubber, prev_scrubber)
+    end
+  end
+
   defp ec_opts(drives), do: [drives: drives, data_shards: 4, parity_shards: 2, block_size: 1024]
 
   defp put_index!(bucket, key, size, etag) do
