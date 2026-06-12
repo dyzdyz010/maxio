@@ -28,6 +28,8 @@ defmodule Maxio.Cluster.ShardServerIOTest do
     assert {:ok, 128} = ShardServer.stat_shard(obj)
     assert {:ok, [%{name: "bucket", object?: false}]} = ShardServer.list_dir(dir)
     assert :ok = ShardServer.probe_drive(dir)
+    assert {:ok, %{drive_uuid: drive_uuid}} = ShardServer.probe_drive_identity(dir)
+    assert drive_uuid =~ ~r/\A[0-9a-f]{32}\z/
     assert :ok = ShardServer.delete_part_file(obj)
     assert :ok = ShardServer.delete_shard(obj)
 

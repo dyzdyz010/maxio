@@ -1,7 +1,7 @@
 defmodule Maxio.Cluster.DriveHealthTest do
-  use ExUnit.Case, async: false
+  use Maxio.DataCase, async: false
 
-  alias Maxio.Cluster.{DriveHealth, Topology, Transport.InProcess}
+  alias Maxio.Cluster.{DriveHealth, DriveIdentity, Topology, Transport.InProcess}
 
   setup do
     :ok = DriveHealth.reset()
@@ -193,5 +193,101 @@ defmodule Maxio.Cluster.DriveHealthTest do
                offline_after_ms: 0,
                now_ms: 0
              )
+  end
+
+  test "topology probe marks same-path identity replacement for fresh-drive heal", %{
+    base: base
+  } do
+    endpoints = for i <- 0..5, do: {Node.self(), Path.join(base, "replace-d#{i}")}
+    Enum.each(endpoints, fn {_node, drive} -> File.mkdir_p!(drive) end)
+
+    topology =
+      Topology.parse_and_validate!(
+        data_shards: 4,
+        parity_shards: 2,
+        block_size: 1_024,
+        allow_colocated_endpoints: true,
+        pools: [%{id: 0, sets: [%{id: 0, endpoints: endpoints}]}]
+      )
+
+    assert %{
+             online: 6,
+             heal_required: 0,
+             identity_replacements: 0,
+             identity_heal_required: 0,
+             identity_errors: 0
+           } =
+             DriveHealth.probe_topology(
+               topology: topology,
+               transport: InProcess,
+               offline_after_ms: 60_000,
+               now_ms: 0
+             )
+
+    {node, replaced_drive} = hd(endpoints)
+    first_status = DriveHealth.status({node, replaced_drive})
+    first_uuid = first_status.drive_uuid
+    assert is_binary(first_uuid)
+
+    File.rm!(DriveIdentity.marker_path(replaced_drive))
+
+    assert %{
+             online: 6,
+             heal_required: 1,
+             identity_replacements: 1,
+             identity_heal_required: 1,
+             identity_errors: 0
+           } =
+             DriveHealth.probe_topology(
+               topology: topology,
+               transport: InProcess,
+               offline_after_ms: 60_000,
+               now_ms: 1
+             )
+
+    replacement_status = DriveHealth.status({node, replaced_drive})
+    assert replacement_status.previous_drive_uuid == first_uuid
+    assert replacement_status.identity_generation == 2
+    assert replacement_status.identity_heal_required?
+    assert replacement_status.identity_replacement_detected?
+    assert replacement_status.heal_required?
+
+    assert %{
+             heal_required: 1,
+             identity_replacements: 0,
+             identity_heal_required: 1,
+             identity_errors: 0
+           } =
+             DriveHealth.probe_topology(
+               topology: topology,
+               transport: InProcess,
+               offline_after_ms: 60_000,
+               now_ms: 2
+             )
+  end
+
+  test "identity probe errors are visible separately from reachability failures", %{base: base} do
+    drive = Path.join(base, "identity-error")
+    endpoint = {Node.self(), drive}
+
+    status =
+      DriveHealth.record_probe(endpoint, {:error, :missing_identity},
+        now_ms: 0,
+        offline_after_ms: 1_000
+      )
+
+    assert status.status == :suspect
+    assert status.identity_error?
+
+    reachability_status =
+      DriveHealth.record_probe(
+        {Node.self(), Path.join(base, "reachability-error")},
+        {:error, {:exception, "plain probe failed"}},
+        now_ms: 0,
+        offline_after_ms: 1_000,
+        drive_identity_enabled: false
+      )
+
+    refute reachability_status.identity_error?
   end
 end

@@ -49,6 +49,9 @@ defmodule Mix.Tasks.Maxio.ScanTest do
     assert output =~ "drive_sets=0"
     assert output =~ "drive_offline=0"
     assert output =~ "drive_heal_required=0"
+    assert output =~ "drive_identity_replacements=0"
+    assert output =~ "drive_identity_heal_required=0"
+    assert output =~ "drive_identity_errors=0"
     assert output =~ "objects=1"
     assert output =~ "bytes=7"
   end

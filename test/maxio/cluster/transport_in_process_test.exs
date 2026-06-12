@@ -70,4 +70,17 @@ defmodule Maxio.Cluster.TransportInProcessTest do
 
     assert {:error, :unavailable} = InProcess.pressure_snapshot(node)
   end
+
+  test "drive identity probe creates a stable marker and follows drive down state", %{base: base} do
+    node = :maxio@n5
+    drive = Path.join(base, "n5_d0")
+    File.mkdir_p!(drive)
+
+    assert {:ok, %{drive_uuid: drive_uuid}} = InProcess.probe_drive_identity(node, drive)
+    assert drive_uuid =~ ~r/\A[0-9a-f]{32}\z/
+    assert {:ok, %{drive_uuid: ^drive_uuid}} = InProcess.probe_drive_identity(node, drive)
+
+    InProcess.set_drive_down(node, drive)
+    assert {:error, :unavailable} = InProcess.probe_drive_identity(node, drive)
+  end
 end

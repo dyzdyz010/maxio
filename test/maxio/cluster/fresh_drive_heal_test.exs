@@ -2,7 +2,16 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
   use Maxio.DataCase, async: false
 
   alias Maxio.{Buckets, Objects}
-  alias Maxio.Cluster.{DriveHealth, FreshDriveHeal, Paths, Topology, Transport.InProcess}
+
+  alias Maxio.Cluster.{
+    DriveHealth,
+    DriveIdentity,
+    FreshDriveHeal,
+    Paths,
+    Topology,
+    Transport.InProcess
+  }
+
   alias Maxio.Storage.Distributed
 
   @owner "arn:aws:iam:::root"
@@ -55,6 +64,13 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
     InProcess.set_drive_up(node, drive)
     assert %{online: 6, heal_required: 1} = probe(ctx, 1)
     assert DriveHealth.heal_required?({node, drive})
+    assert {:ok, first_identity} = DriveIdentity.status({node, drive})
+
+    File.rm!(DriveIdentity.marker_path(drive))
+    assert %{heal_required: 1, identity_heal_required: 1} = probe(ctx, 2)
+    assert {:ok, replacement_identity} = DriveIdentity.status({node, drive})
+    assert replacement_identity.previous_drive_uuid == first_identity.drive_uuid
+    assert replacement_identity.identity_heal_required?
 
     assert {:ok, report} =
              FreshDriveHeal.run_once(
@@ -72,6 +88,10 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
     assert report.healed_shards > 0
     assert File.exists?(missing_part)
     refute DriveHealth.heal_required?({node, drive})
+    refute DriveHealth.status({node, drive}).identity_heal_required?
+    refute DriveHealth.status({node, drive}).identity_replacement_detected?
+    assert {:ok, cleared_identity} = DriveIdentity.status({node, drive})
+    refute cleared_identity.identity_heal_required?
 
     {:ok, stream} = Distributed.get(bucket, key, "null", nil, opts)
     assert IO.iodata_to_binary(Enum.to_list(stream)) == body

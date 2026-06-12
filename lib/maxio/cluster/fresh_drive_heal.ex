@@ -10,7 +10,7 @@ defmodule Maxio.Cluster.FreshDriveHeal do
   """
 
   alias Maxio.{Buckets, Objects}
-  alias Maxio.Cluster.{DriveHealth, Heal, Lock, Router, Topology, Transport}
+  alias Maxio.Cluster.{DriveHealth, DriveIdentity, Heal, Lock, Router, Topology, Transport}
   alias Maxio.Cluster.Scrubber.Throttle
   alias Maxio.S3.Log
   alias Maxio.Storage.Distributed
@@ -86,10 +86,8 @@ defmodule Maxio.Cluster.FreshDriveHeal do
           report
       end
 
-    report =
-      report
-      |> maybe_clear_selected(selected)
-      |> Map.put(:status, status_for(report))
+    report = maybe_clear_selected(report, selected)
+    report = Map.put(report, :status, status_for(report))
 
     Log.info("fresh-drive heal pass complete",
       action: :fresh_drive_heal,
@@ -423,11 +421,43 @@ defmodule Maxio.Cluster.FreshDriveHeal do
 
   defp maybe_clear_selected(report, selected) do
     if status_for(report) == :ok do
-      Enum.each(selected, &DriveHealth.clear_heal_required(&1.endpoint))
-      %{report | drives_cleared: length(selected)}
+      Enum.reduce(selected, report, fn target, acc ->
+        case clear_heal_required(target.endpoint) do
+          :ok ->
+            %{acc | drives_cleared: acc.drives_cleared + 1}
+
+          {:error, reason} ->
+            log_identity_clear_error(target.endpoint, reason)
+            bump(acc, :errors)
+        end
+      end)
     else
       report
     end
+  end
+
+  defp clear_heal_required(endpoint) do
+    case DriveIdentity.clear_heal_required(endpoint) do
+      {:ok, _status} ->
+        _ = DriveHealth.clear_heal_required(endpoint)
+        :ok
+
+      {:error, :not_found} ->
+        _ = DriveHealth.clear_heal_required(endpoint)
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp log_identity_clear_error({node, drive}, reason) do
+    Log.error("fresh-drive heal identity marker clear failed",
+      action: :fresh_drive_heal,
+      reason: "node=#{inspect(node)} drive=#{drive} reason=#{inspect(reason)}"
+    )
+
+    :ok
   end
 
   defp status_for(report) do

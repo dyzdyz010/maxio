@@ -111,6 +111,9 @@ defmodule Mix.Tasks.Maxio.Scan do
         "drive_online=#{summary.drive_online} drive_suspect=#{summary.drive_suspect} " <>
         "drive_offline=#{summary.drive_offline} " <>
         "drive_heal_required=#{summary.drive_heal_required} " <>
+        "drive_identity_replacements=#{summary.drive_identity_replacements} " <>
+        "drive_identity_heal_required=#{summary.drive_identity_heal_required} " <>
+        "drive_identity_errors=#{summary.drive_identity_errors} " <>
         "objects=#{summary.object_count} bytes=#{summary.total_size}"
     )
   end

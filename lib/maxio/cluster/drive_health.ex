@@ -8,7 +8,7 @@ defmodule Maxio.Cluster.DriveHealth do
   """
   use GenServer
 
-  alias Maxio.Cluster.{Topology, Transport}
+  alias Maxio.Cluster.{DriveIdentity, Topology, Transport}
   alias Maxio.S3.Log
   alias Maxio.Storage.Erasure.Config
 
@@ -29,6 +29,12 @@ defmodule Maxio.Cluster.DriveHealth do
           set_write_available_seen?: boolean(),
           set_unavailable_seen?: boolean(),
           heal_required?: boolean(),
+          drive_uuid: String.t() | nil,
+          previous_drive_uuid: String.t() | nil,
+          identity_generation: pos_integer() | nil,
+          identity_heal_required?: boolean(),
+          identity_replacement_detected?: boolean(),
+          identity_error?: boolean(),
           last_offline_duration_ms: integer() | nil,
           last_transition: atom() | nil
         }
@@ -38,7 +44,10 @@ defmodule Maxio.Cluster.DriveHealth do
           online: non_neg_integer(),
           suspect: non_neg_integer(),
           offline: non_neg_integer(),
-          heal_required: non_neg_integer()
+          heal_required: non_neg_integer(),
+          identity_replacements: non_neg_integer(),
+          identity_heal_required: non_neg_integer(),
+          identity_errors: non_neg_integer()
         }
 
   @doc false
@@ -100,7 +109,18 @@ defmodule Maxio.Cluster.DriveHealth do
         statuses =
           Enum.flat_map(set_ids, fn set_id ->
             endpoints = endpoints(view, set_id)
-            results = Enum.map(endpoints, &probe_drive(transport, &1))
+
+            results =
+              endpoints
+              |> Enum.with_index()
+              |> Enum.map(fn {endpoint, endpoint_index} ->
+                probe_drive(
+                  transport,
+                  endpoint,
+                  Keyword.merge(opts, set_id: set_id, endpoint_index: endpoint_index)
+                )
+              end)
+
             online_count = Enum.count(results, fn {_endpoint, result} -> ok_result?(result) end)
             set_write_available? = online_count >= write_quorum
 
@@ -157,13 +177,15 @@ defmodule Maxio.Cluster.DriveHealth do
       state.endpoints
       |> Map.get(endpoint, default_status(endpoint))
       |> Map.put(:heal_required?, false)
+      |> Map.put(:identity_heal_required?, false)
+      |> Map.put(:identity_replacement_detected?, false)
 
     {:reply, next, put_in(state.endpoints[endpoint], next)}
   end
 
   defp apply_probe(current, result, opts) do
     case normalize_result(result) do
-      {:ok, _value} -> apply_success(current, opts)
+      {:ok, value} -> apply_success(current, value, opts)
       {:error, reason} -> apply_failure(current, reason, opts)
     end
   end
@@ -184,17 +206,20 @@ defmodule Maxio.Cluster.DriveHealth do
       last_failure_ms: now,
       last_reason: reason,
       set_id: Keyword.get(opts, :set_id, current.set_id),
+      identity_error?: identity_error?(reason, opts),
       last_transition: transition(current.status, status)
     })
   end
 
-  defp apply_success(current, opts) do
+  defp apply_success(current, probe_value, opts) do
     now = now_ms(opts)
     duration = failure_duration(current, now)
     long_outage? = duration != nil and duration >= offline_after_ms(opts)
+    identity = identity_status(probe_value)
 
     needs_heal? =
       Map.fetch!(current, :heal_required?) or
+        Map.get(identity, :identity_heal_required?, false) or
         (long_outage? and Map.fetch!(current, :set_write_available_seen?) and
            not Map.fetch!(current, :set_unavailable_seen?))
 
@@ -210,6 +235,12 @@ defmodule Maxio.Cluster.DriveHealth do
       set_write_available_seen?: false,
       set_unavailable_seen?: false,
       heal_required?: needs_heal?,
+      drive_uuid: Map.get(identity, :drive_uuid, current.drive_uuid),
+      previous_drive_uuid: Map.get(identity, :previous_drive_uuid, current.previous_drive_uuid),
+      identity_generation: Map.get(identity, :generation, current.identity_generation),
+      identity_heal_required?: Map.get(identity, :identity_heal_required?, false),
+      identity_replacement_detected?: Map.get(identity, :replacement_detected?, false),
+      identity_error?: false,
       last_offline_duration_ms: duration || current.last_offline_duration_ms,
       last_transition: transition(current.status, :online)
     })
@@ -256,10 +287,14 @@ defmodule Maxio.Cluster.DriveHealth do
     apply(Log, level, [message, fields])
   end
 
-  defp probe_drive(transport, {node, drive} = endpoint) do
+  defp probe_drive(transport, {node, drive} = endpoint, opts) do
     result =
       try do
-        transport.probe_drive(node, drive)
+        if drive_identity_enabled?(opts) do
+          DriveIdentity.probe_endpoint(endpoint, Keyword.put(opts, :transport, transport))
+        else
+          transport.probe_drive(node, drive)
+        end
       rescue
         e -> {:error, {:exception, Exception.message(e)}}
       catch
@@ -293,6 +328,12 @@ defmodule Maxio.Cluster.DriveHealth do
       set_write_available_seen?: false,
       set_unavailable_seen?: false,
       heal_required?: false,
+      drive_uuid: nil,
+      previous_drive_uuid: nil,
+      identity_generation: nil,
+      identity_heal_required?: false,
+      identity_replacement_detected?: false,
+      identity_error?: false,
       last_offline_duration_ms: nil,
       last_transition: nil
     }
@@ -330,7 +371,11 @@ defmodule Maxio.Cluster.DriveHealth do
       online: Map.get(counts, :online, 0),
       suspect: Map.get(counts, :suspect, 0),
       offline: Map.get(counts, :offline, 0),
-      heal_required: Enum.count(statuses, &Map.fetch!(&1, :heal_required?))
+      heal_required: Enum.count(statuses, &Map.fetch!(&1, :heal_required?)),
+      identity_replacements:
+        Enum.count(statuses, &Map.fetch!(&1, :identity_replacement_detected?)),
+      identity_heal_required: Enum.count(statuses, &Map.fetch!(&1, :identity_heal_required?)),
+      identity_errors: Enum.count(statuses, &Map.fetch!(&1, :identity_error?))
     }
   end
 
@@ -341,8 +386,41 @@ defmodule Maxio.Cluster.DriveHealth do
       online: 0,
       suspect: 0,
       offline: 0,
-      heal_required: 0
+      heal_required: 0,
+      identity_replacements: 0,
+      identity_heal_required: 0,
+      identity_errors: 0
     }
+  end
+
+  defp identity_status(%{} = value), do: value
+  defp identity_status(_value), do: %{}
+
+  defp identity_error?({:exception, _message}, opts), do: drive_identity_enabled?(opts)
+  defp identity_error?(reason, _opts), do: identity_error?(reason)
+
+  defp identity_error?({:invalid_identity_marker, _reason}), do: true
+  defp identity_error?(%Ecto.Changeset{}), do: true
+  defp identity_error?(:missing_identity), do: true
+  defp identity_error?(:bad_drive_uuid), do: true
+  defp identity_error?(:missing_drive_uuid), do: true
+  defp identity_error?(:unsupported_version), do: true
+  defp identity_error?(:enotdir), do: true
+  defp identity_error?(:eacces), do: true
+  defp identity_error?(:eperm), do: true
+  defp identity_error?(:erofs), do: true
+  defp identity_error?(_reason), do: false
+
+  defp drive_identity_enabled?(opts) do
+    case Keyword.get(
+           opts,
+           :drive_identity_enabled,
+           Application.get_env(:maxio, :drive_identity, [])
+         ) do
+      cfg when is_list(cfg) -> Keyword.get(cfg, :enabled, true)
+      enabled when is_boolean(enabled) -> enabled
+      _other -> true
+    end
   end
 
   defp offline_after_ms(opts) do

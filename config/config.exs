@@ -139,6 +139,13 @@ config :maxio, :drive_health,
   enabled: true,
   offline_after_ms: 172_800_000
 
+# M8 drive software identity marker. The marker lives inside each configured
+# drive root and lets drive-health detect same-path replacement before healing.
+config :maxio, :drive_identity,
+  enabled: true,
+  marker_file: ".maxio-drive-identity.json",
+  create_missing: true
+
 # M8 fresh-drive heal scheduler. Disabled by default; when enabled it automates
 # only the existing DriveHealth.heal_required? marker workflow. It does not track
 # physical drive identity or perform rebalance/decommission.

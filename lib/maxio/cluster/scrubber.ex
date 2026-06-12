@@ -47,6 +47,9 @@ defmodule Maxio.Cluster.Scrubber do
           drive_suspect: non_neg_integer(),
           drive_offline: non_neg_integer(),
           drive_heal_required: non_neg_integer(),
+          drive_identity_replacements: non_neg_integer(),
+          drive_identity_heal_required: non_neg_integer(),
+          drive_identity_errors: non_neg_integer(),
           object_count: non_neg_integer(),
           total_size: non_neg_integer()
         }
@@ -155,6 +158,9 @@ defmodule Maxio.Cluster.Scrubber do
           "drive_online=#{summary.drive_online} drive_suspect=#{summary.drive_suspect} " <>
           "drive_offline=#{summary.drive_offline} " <>
           "drive_heal_required=#{summary.drive_heal_required} " <>
+          "drive_identity_replacements=#{summary.drive_identity_replacements} " <>
+          "drive_identity_heal_required=#{summary.drive_identity_heal_required} " <>
+          "drive_identity_errors=#{summary.drive_identity_errors} " <>
           "objects=#{summary.object_count} bytes=#{summary.total_size}"
     )
 
@@ -195,7 +201,8 @@ defmodule Maxio.Cluster.Scrubber do
         topology: cfg[:topology],
         transport: cfg[:transport],
         offline_after_ms: cfg[:drive_offline_after_ms],
-        now_fun: cfg[:drive_health_now_fun]
+        now_fun: cfg[:drive_health_now_fun],
+        drive_identity_enabled: cfg[:drive_identity_enabled]
       ]
       |> Keyword.reject(fn {_key, value} -> is_nil(value) end)
       |> DriveHealth.probe_topology()
@@ -531,6 +538,7 @@ defmodule Maxio.Cluster.Scrubber do
   defp config(opts) do
     cfg = Application.get_env(:maxio, :scrubber, [])
     drive_cfg = Application.get_env(:maxio, :drive_health, [])
+    identity_cfg = Application.get_env(:maxio, :drive_identity, [])
 
     page_size =
       positive_int(Keyword.get(opts, :page_size, Keyword.get(cfg, :page_size, 500)), 500)
@@ -592,6 +600,12 @@ defmodule Maxio.Cluster.Scrubber do
           DriveHealth.default_offline_after_ms()
         ),
       drive_health_now_fun: Keyword.get(opts, :drive_health_now_fun),
+      drive_identity_enabled:
+        Keyword.get(
+          opts,
+          :drive_identity_enabled,
+          Keyword.get(cfg, :drive_identity_enabled, Keyword.get(identity_cfg, :enabled, true))
+        ),
       no_throttle: Keyword.get(opts, :no_throttle, false),
       reconcile_index:
         Keyword.get(opts, :reconcile_index, Keyword.get(cfg, :reconcile_index, false)),
@@ -639,6 +653,7 @@ defmodule Maxio.Cluster.Scrubber do
       :drive_health_enabled,
       :drive_offline_after_ms,
       :drive_health_now_fun,
+      :drive_identity_enabled,
       :sleep_between_objects_ms,
       :throttle_sleep_fun,
       :throttle_now_fun,
@@ -698,6 +713,9 @@ defmodule Maxio.Cluster.Scrubber do
       drive_suspect: 0,
       drive_offline: 0,
       drive_heal_required: 0,
+      drive_identity_replacements: 0,
+      drive_identity_heal_required: 0,
+      drive_identity_errors: 0,
       object_count: 0,
       total_size: 0
     }
@@ -756,7 +774,10 @@ defmodule Maxio.Cluster.Scrubber do
         drive_online: Map.fetch!(report, :online),
         drive_suspect: Map.fetch!(report, :suspect),
         drive_offline: Map.fetch!(report, :offline),
-        drive_heal_required: Map.fetch!(report, :heal_required)
+        drive_heal_required: Map.fetch!(report, :heal_required),
+        drive_identity_replacements: Map.fetch!(report, :identity_replacements),
+        drive_identity_heal_required: Map.fetch!(report, :identity_heal_required),
+        drive_identity_errors: Map.fetch!(report, :identity_errors)
     }
   end
 
@@ -782,7 +803,10 @@ defmodule Maxio.Cluster.Scrubber do
       online: 0,
       suspect: 0,
       offline: 0,
-      heal_required: 0
+      heal_required: 0,
+      identity_replacements: 0,
+      identity_heal_required: 0,
+      identity_errors: 0
     }
   end
 end
