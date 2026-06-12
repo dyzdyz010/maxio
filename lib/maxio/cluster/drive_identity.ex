@@ -34,7 +34,11 @@ defmodule Maxio.Cluster.DriveIdentity do
           identity_heal_required?: boolean(),
           replacement_detected?: boolean(),
           set_id: integer() | nil,
-          endpoint_index: integer() | nil
+          endpoint_index: integer() | nil,
+          first_seen_at: DateTime.t(),
+          last_seen_at: DateTime.t(),
+          replacement_detected_at: DateTime.t() | nil,
+          healed_at: DateTime.t() | nil
         }
 
   @doc "Return the configured marker file name."
@@ -43,7 +47,7 @@ defmodule Maxio.Cluster.DriveIdentity do
     opts
     |> Keyword.get(:marker_file, config(:marker_file, @marker_file))
     |> case do
-      name when is_binary(name) and name != "" -> name
+      name when is_binary(name) -> safe_marker_file_name(name)
       _ -> @marker_file
     end
   end
@@ -304,7 +308,11 @@ defmodule Maxio.Cluster.DriveIdentity do
       identity_heal_required?: record.identity_heal_required,
       replacement_detected?: replacement_detected?,
       set_id: record.set_id,
-      endpoint_index: record.endpoint_index
+      endpoint_index: record.endpoint_index,
+      first_seen_at: record.first_seen_at,
+      last_seen_at: record.last_seen_at,
+      replacement_detected_at: record.replacement_detected_at,
+      healed_at: record.healed_at
     }
   end
 
@@ -318,6 +326,14 @@ defmodule Maxio.Cluster.DriveIdentity do
 
   defp normalize_endpoint({node, drive}) when is_atom(node) and is_binary(drive),
     do: {node, Path.expand(drive)}
+
+  defp safe_marker_file_name(name) do
+    if valid_marker_file_name?(name), do: name, else: @marker_file
+  end
+
+  defp valid_marker_file_name?(name) do
+    name != "" and name not in [".", ".."] and not String.contains?(name, ["/", "\\"])
+  end
 
   defp create_missing?(opts),
     do: Keyword.get(opts, :create_missing, config(:create_missing, true))

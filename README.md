@@ -417,6 +417,10 @@ M8-3a/b/c/d/e 已提供：
   并用 `cluster_drive_identities` 按 `{node_name, drive_path}` 持久化最近观察到的 UUID。同一路径看到新 UUID
   会记录 `previous_drive_uuid`、递增 generation、置 `identity_heal_required`，并折入 `DriveHealth.heal_required?`；
   这是 same-path replacement detection，不是硬件序列号或自动 rebalance。
+- `mix maxio.drive.identities [--heal-required] [--summary-only]`：读取持久化 drive identity inventory；
+  `--probe` 会按当前 topology 主动探测并持久化观察结果，默认会为可达的本机或远端 endpoint 创建缺失的
+  `.maxio-drive-identity.json`；`--probe --no-create-missing` 用于只取证缺失 marker，`--marker-file <name>`
+  可临时指定 marker 文件名。
 - `Maxio.Cluster.FreshDriveHeal` / `mix maxio.heal.fresh_drives`：显式运维入口，枚举 PG inventory
   中落到 affected erasure set 的对象/版本（默认含 delete marker），复用 `Maxio.Cluster.Heal` 修复缺失 shard
   或 marker sidecar；仅在完整、非 bucket 限定、非 current-only、非 dry-run 且无 missing/skipped/unrecoverable/error 的 pass

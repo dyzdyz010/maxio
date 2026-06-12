@@ -148,10 +148,15 @@ defmodule Maxio.Cluster.LockTest do
       spawn(fn ->
         {:ok, _lease} = Lock.acquire(resource, nodes: [Node.self()], refresh: false)
         send(parent, :locked)
+
+        receive do
+          :release_owner -> :ok
+        end
       end)
 
     ref = Process.monitor(pid)
     assert_receive :locked
+    send(pid, :release_owner)
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
     assert {:ok, lease} = eventually_acquire(resource, 20)
     assert :ok = Lock.release(lease)

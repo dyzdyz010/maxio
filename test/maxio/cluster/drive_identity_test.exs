@@ -14,6 +14,19 @@ defmodule Maxio.Cluster.DriveIdentityTest do
     {:ok, base: base}
   end
 
+  test "marker file names are constrained to a file name", %{base: base} do
+    drive = Path.join(base, "name-check")
+
+    assert DriveIdentity.marker_file_name(marker_file: ".custom-drive-id.json") ==
+             ".custom-drive-id.json"
+
+    assert DriveIdentity.marker_file_name(marker_file: "../outside.json") ==
+             DriveIdentity.marker_file_name()
+
+    assert DriveIdentity.marker_path(drive, marker_file: "..\\outside.json") ==
+             DriveIdentity.marker_path(drive)
+  end
+
   test "first probe creates a local marker and persisted endpoint identity", %{base: base} do
     drive = Path.join(base, "d0")
     endpoint = {Node.self(), drive}
