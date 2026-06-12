@@ -10,7 +10,7 @@ defmodule Maxio.Cluster.Scrubber do
   use GenServer
 
   alias Maxio.{Buckets, Objects}
-  alias Maxio.Cluster.{Lock, Router, Topology}
+  alias Maxio.Cluster.{DriveHealth, Lock, Router, Topology}
   alias Maxio.Cluster.Scrubber.{Throttle, Usage}
   alias Maxio.S3.Log
   alias Maxio.Storage.{Distributed, ErasureCoded, Scanner}
@@ -41,6 +41,12 @@ defmodule Maxio.Cluster.Scrubber do
           index_orphan_bytes: non_neg_integer(),
           index_orphan_cleaned: non_neg_integer(),
           index_orphan_cleaned_bytes: non_neg_integer(),
+          drive_sets: non_neg_integer(),
+          drive_endpoints: non_neg_integer(),
+          drive_online: non_neg_integer(),
+          drive_suspect: non_neg_integer(),
+          drive_offline: non_neg_integer(),
+          drive_heal_required: non_neg_integer(),
           object_count: non_neg_integer(),
           total_size: non_neg_integer()
         }
@@ -113,11 +119,14 @@ defmodule Maxio.Cluster.Scrubber do
     cfg = Keyword.put(cfg, :throttle, Throttle.new(cfg))
     buckets = bucket_names(cfg[:bucket])
     index_report = maybe_reconcile_index(cfg)
+    drive_report = maybe_probe_drive_health(backend, cfg)
 
     {summary, _throttle} =
       buckets
       |> Enum.reduce(
-        {zero_summary(backend) |> merge_index_report(index_report), cfg[:throttle]},
+        {zero_summary(backend)
+         |> merge_index_report(index_report)
+         |> merge_drive_report(drive_report), cfg[:throttle]},
         fn bucket, {acc, throttle} ->
           {bucket_summary, throttle} =
             scan_bucket(bucket, backend, Keyword.put(cfg, :throttle, throttle))
@@ -142,6 +151,10 @@ defmodule Maxio.Cluster.Scrubber do
           "index_orphan_bytes=#{summary.index_orphan_bytes} " <>
           "index_orphan_cleaned=#{summary.index_orphan_cleaned} " <>
           "index_orphan_cleaned_bytes=#{summary.index_orphan_cleaned_bytes} " <>
+          "drive_sets=#{summary.drive_sets} drive_endpoints=#{summary.drive_endpoints} " <>
+          "drive_online=#{summary.drive_online} drive_suspect=#{summary.drive_suspect} " <>
+          "drive_offline=#{summary.drive_offline} " <>
+          "drive_heal_required=#{summary.drive_heal_required} " <>
           "objects=#{summary.object_count} bytes=#{summary.total_size}"
     )
 
@@ -176,6 +189,39 @@ defmodule Maxio.Cluster.Scrubber do
       zero_index_report(:error)
   end
 
+  defp maybe_probe_drive_health(Distributed, cfg) do
+    if cfg[:drive_health_enabled] do
+      [
+        topology: cfg[:topology],
+        transport: cfg[:transport],
+        offline_after_ms: cfg[:drive_offline_after_ms],
+        now_fun: cfg[:drive_health_now_fun]
+      ]
+      |> Keyword.reject(fn {_key, value} -> is_nil(value) end)
+      |> DriveHealth.probe_topology()
+    else
+      zero_drive_report()
+    end
+  rescue
+    e ->
+      Log.error("scrubber drive health probe crashed",
+        action: :drive_health,
+        reason: Exception.message(e)
+      )
+
+      zero_drive_report()
+  catch
+    kind, reason ->
+      Log.error("scrubber drive health probe caught",
+        action: :drive_health,
+        reason: inspect({kind, reason})
+      )
+
+      zero_drive_report()
+  end
+
+  defp maybe_probe_drive_health(_backend, _cfg), do: zero_drive_report()
+
   defp scanner_opts(cfg) do
     [
       bucket: cfg[:bucket],
@@ -186,6 +232,7 @@ defmodule Maxio.Cluster.Scrubber do
       orphan_cleanup_dry_run: cfg[:orphan_cleanup_dry_run],
       orphan_cleanup_min_age_ms: cfg[:orphan_cleanup_min_age_ms],
       orphan_cleanup_max_deletes: cfg[:orphan_cleanup_max_deletes],
+      drive_offline_after_ms: cfg[:drive_offline_after_ms],
       transport: cfg[:transport],
       authoritative_source: cfg[:authoritative_source]
     ]
@@ -483,6 +530,7 @@ defmodule Maxio.Cluster.Scrubber do
 
   defp config(opts) do
     cfg = Application.get_env(:maxio, :scrubber, [])
+    drive_cfg = Application.get_env(:maxio, :drive_health, [])
 
     page_size =
       positive_int(Keyword.get(opts, :page_size, Keyword.get(cfg, :page_size, 500)), 500)
@@ -520,6 +568,26 @@ defmodule Maxio.Cluster.Scrubber do
       io_load_fun: Keyword.get(opts, :io_load_fun),
       throttle_sleep_fun: Keyword.get(opts, :throttle_sleep_fun),
       throttle_now_fun: Keyword.get(opts, :throttle_now_fun),
+      drive_health_enabled:
+        Keyword.get(
+          opts,
+          :drive_health_enabled,
+          Keyword.get(cfg, :drive_health_enabled, Keyword.get(drive_cfg, :enabled, true))
+        ),
+      drive_offline_after_ms:
+        non_negative_int(
+          Keyword.get(
+            opts,
+            :drive_offline_after_ms,
+            Keyword.get(
+              cfg,
+              :drive_offline_after_ms,
+              Keyword.get(drive_cfg, :offline_after_ms, DriveHealth.default_offline_after_ms())
+            )
+          ),
+          DriveHealth.default_offline_after_ms()
+        ),
+      drive_health_now_fun: Keyword.get(opts, :drive_health_now_fun),
       no_throttle: Keyword.get(opts, :no_throttle, false),
       reconcile_index:
         Keyword.get(opts, :reconcile_index, Keyword.get(cfg, :reconcile_index, false)),
@@ -563,6 +631,9 @@ defmodule Maxio.Cluster.Scrubber do
       :io_pause_ms,
       :io_max_pause_ms,
       :io_load_fun,
+      :drive_health_enabled,
+      :drive_offline_after_ms,
+      :drive_health_now_fun,
       :sleep_between_objects_ms,
       :throttle_sleep_fun,
       :throttle_now_fun,
@@ -616,6 +687,12 @@ defmodule Maxio.Cluster.Scrubber do
       index_orphan_bytes: 0,
       index_orphan_cleaned: 0,
       index_orphan_cleaned_bytes: 0,
+      drive_sets: 0,
+      drive_endpoints: 0,
+      drive_online: 0,
+      drive_suspect: 0,
+      drive_offline: 0,
+      drive_heal_required: 0,
       object_count: 0,
       total_size: 0
     }
@@ -666,6 +743,18 @@ defmodule Maxio.Cluster.Scrubber do
     }
   end
 
+  defp merge_drive_report(summary, report) do
+    %{
+      summary
+      | drive_sets: Map.fetch!(report, :sets),
+        drive_endpoints: Map.fetch!(report, :endpoints),
+        drive_online: Map.fetch!(report, :online),
+        drive_suspect: Map.fetch!(report, :suspect),
+        drive_offline: Map.fetch!(report, :offline),
+        drive_heal_required: Map.fetch!(report, :heal_required)
+    }
+  end
+
   defp zero_index_report(status) do
     %{
       status: status,
@@ -678,6 +767,17 @@ defmodule Maxio.Cluster.Scrubber do
       orphan_bytes: 0,
       orphan_cleaned: 0,
       orphan_cleaned_bytes: 0
+    }
+  end
+
+  defp zero_drive_report do
+    %{
+      sets: 0,
+      endpoints: 0,
+      online: 0,
+      suspect: 0,
+      offline: 0,
+      heal_required: 0
     }
   end
 end

@@ -46,6 +46,9 @@ defmodule Mix.Tasks.Maxio.ScanTest do
     assert output =~ "index_orphan_bytes=0"
     assert output =~ "index_orphan_cleaned=0"
     assert output =~ "index_orphan_cleaned_bytes=0"
+    assert output =~ "drive_sets=0"
+    assert output =~ "drive_offline=0"
+    assert output =~ "drive_heal_required=0"
     assert output =~ "objects=1"
     assert output =~ "bytes=7"
   end
@@ -107,13 +110,16 @@ defmodule Mix.Tasks.Maxio.ScanTest do
           "--io-pause-ms",
           "10",
           "--io-max-pause-ms",
-          "25"
+          "25",
+          "--drive-offline-after-ms",
+          "0"
         ])
       end)
 
     assert output =~ "[maxio scan] status=ok"
     assert output =~ "buckets=1"
     assert output =~ "scanned=1"
+    assert output =~ "drive_offline=0"
     assert output =~ "objects=1"
     assert output =~ "bytes=5"
   end

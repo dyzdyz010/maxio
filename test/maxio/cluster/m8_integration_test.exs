@@ -1,7 +1,7 @@
 defmodule Maxio.Cluster.M8IntegrationTest do
   use Maxio.DataCase, async: false
 
-  alias Maxio.Cluster.{Lock, Notify, Paths, Scrubber, Topology, Transport.InProcess}
+  alias Maxio.Cluster.{DriveHealth, Lock, Notify, Paths, Scrubber, Topology, Transport.InProcess}
   alias Maxio.Cluster.Scrubber.Usage
   alias Maxio.{Buckets, Objects}
   alias Maxio.Storage.Distributed
@@ -10,12 +10,14 @@ defmodule Maxio.Cluster.M8IntegrationTest do
 
   setup do
     InProcess.setup!()
+    DriveHealth.reset()
     Usage.clear()
 
     base =
       Path.join(System.tmp_dir!(), "maxio_m8_integration_#{System.unique_integer([:positive])}")
 
     endpoints = for i <- 0..5, do: {Node.self(), Path.join(base, "d#{i}")}
+    Enum.each(endpoints, fn {_node, drive} -> File.mkdir_p!(drive) end)
 
     topology =
       Topology.parse_and_validate!(
@@ -27,6 +29,7 @@ defmodule Maxio.Cluster.M8IntegrationTest do
       )
 
     on_exit(fn ->
+      DriveHealth.reset()
       Usage.clear()
       File.rm_rf(base)
     end)
@@ -121,6 +124,43 @@ defmodule Maxio.Cluster.M8IntegrationTest do
     assert healed.scanned == 1
     assert healed.healed == 1
     assert File.exists?(missing_part)
+  end
+
+  test "distributed scrubber reports drive health and fresh-drive heal markers", ctx do
+    {node, failed_drive} = hd(ctx.endpoints)
+    InProcess.set_drive_down(node, failed_drive)
+
+    assert {:ok, offline} =
+             Scrubber.run_once(
+               backend: Distributed,
+               topology: ctx.topology,
+               transport: InProcess,
+               no_throttle: true,
+               drive_offline_after_ms: 0
+             )
+
+    assert offline.drive_sets == 1
+    assert offline.drive_endpoints == 6
+    assert offline.drive_online == 5
+    assert offline.drive_suspect == 0
+    assert offline.drive_offline == 1
+    assert offline.drive_heal_required == 0
+
+    InProcess.set_drive_up(node, failed_drive)
+
+    assert {:ok, recovered} =
+             Scrubber.run_once(
+               backend: Distributed,
+               topology: ctx.topology,
+               transport: InProcess,
+               no_throttle: true,
+               drive_offline_after_ms: 0
+             )
+
+    assert recovered.drive_online == 6
+    assert recovered.drive_suspect == 0
+    assert recovered.drive_offline == 0
+    assert recovered.drive_heal_required == 1
   end
 
   defp dist_opts(ctx), do: [topology: ctx.topology, transport: InProcess]

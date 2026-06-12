@@ -32,6 +32,7 @@ defmodule Maxio.Cluster.Transport do
   # 节点宕机/超时/远端异常 -> {:error, :unavailable}（铁律 3：结构化降级，绝不上抛炸列举路径）。
   @callback list_dir(node(), String.t(), keyword()) ::
               {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
+  @callback probe_drive(node(), String.t()) :: :ok | {:error, term()}
 
   @doc "当前配置的传输实现（test 经 opts[:transport] 覆盖；缺省 config :maxio, :shard_transport）。"
   @spec impl(keyword()) :: module()
@@ -112,6 +113,11 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def list_dir(node, drive_dir, opts) do
     call(node, :list_dir, [drive_dir, opts], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def probe_drive(node, drive_root) do
+    call(node, :probe_drive, [drive_root], fn -> {:error, :unavailable} end)
   end
 
   # 本地直接调；远端 :erpc。任何宕机/超时/异常 -> on_fail 兜底（铁律 3：结构化降级，绝不上抛）。

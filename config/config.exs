@@ -132,6 +132,13 @@ config :maxio, :scanner,
   orphan_cleanup_min_age_ms: 172_800_000,
   orphan_cleanup_max_deletes: 100
 
+# M8 drive health registry: node-local, observational drive status based on
+# structured list_dir probes. The 48h window matches the fresh-drive-heal policy
+# for drives that were offline while their erasure set remained writable.
+config :maxio, :drive_health,
+  enabled: true,
+  offline_after_ms: 172_800_000
+
 # M8-3 auto-heal scrubber（默认关——启动进程但不调度，避免 dev/test 意外扫盘）：
 # 与 ROUTE B Storage.Scanner 分离。本 scrubber 从 PG 对象元数据分页枚举对象，刷新 usage
 # 快照；FS 后端只统计 usage，ErasureCoded/Distributed 后端按 erasure set 短租约锁调度既有

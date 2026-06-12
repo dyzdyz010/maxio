@@ -11,6 +11,7 @@ defmodule Mix.Tasks.Maxio.Scan do
       mix maxio.scan --reconcile-index --cleanup-orphan-shards
       mix maxio.scan --max-objects-per-sec 100 --object-burst 10
       mix maxio.scan --no-adaptive-io
+      mix maxio.scan --drive-offline-after-ms 172800000
 
   FS backends refresh scan-derived usage only. Erasure-coded backends also invoke
   the existing local or distributed heal engine for each enumerated object.
@@ -37,6 +38,7 @@ defmodule Mix.Tasks.Maxio.Scan do
           max_live_requests: :integer,
           io_pause_ms: :integer,
           io_max_pause_ms: :integer,
+          drive_offline_after_ms: :integer,
           reconcile_index: :boolean,
           force_reconcile_index: :boolean,
           cleanup_orphan_shards: :boolean,
@@ -55,6 +57,7 @@ defmodule Mix.Tasks.Maxio.Scan do
           "[--max-objects-per-sec <n>] [--object-burst <n>] " <>
           "[--sleep-between-batches-ms <ms>] [--no-adaptive-io] " <>
           "[--max-live-requests <n>] [--io-pause-ms <ms>] [--io-max-pause-ms <ms>] " <>
+          "[--drive-offline-after-ms <ms>] " <>
           "[--reconcile-index] [--force-reconcile-index] [--cleanup-orphan-shards] " <>
           "[--orphan-cleanup-dry-run] [--orphan-cleanup-min-age-ms <ms>] " <>
           "[--orphan-cleanup-max-deletes <n>] " <>
@@ -76,6 +79,7 @@ defmodule Mix.Tasks.Maxio.Scan do
         max_live_requests: Keyword.get(opts, :max_live_requests),
         io_pause_ms: Keyword.get(opts, :io_pause_ms),
         io_max_pause_ms: Keyword.get(opts, :io_max_pause_ms),
+        drive_offline_after_ms: Keyword.get(opts, :drive_offline_after_ms),
         reconcile_index: Keyword.get(opts, :reconcile_index, false),
         force_reconcile_index: Keyword.get(opts, :force_reconcile_index, false),
         cleanup_orphan_shards: Keyword.get(opts, :cleanup_orphan_shards, false),
@@ -96,6 +100,10 @@ defmodule Mix.Tasks.Maxio.Scan do
         "index_orphan_bytes=#{summary.index_orphan_bytes} " <>
         "index_orphan_cleaned=#{summary.index_orphan_cleaned} " <>
         "index_orphan_cleaned_bytes=#{summary.index_orphan_cleaned_bytes} " <>
+        "drive_sets=#{summary.drive_sets} drive_endpoints=#{summary.drive_endpoints} " <>
+        "drive_online=#{summary.drive_online} drive_suspect=#{summary.drive_suspect} " <>
+        "drive_offline=#{summary.drive_offline} " <>
+        "drive_heal_required=#{summary.drive_heal_required} " <>
         "objects=#{summary.object_count} bytes=#{summary.total_size}"
     )
   end

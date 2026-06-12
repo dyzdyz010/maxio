@@ -60,7 +60,7 @@ defmodule Maxio.Storage.Scanner do
   import Ecto.Query
 
   alias Maxio.{Buckets, Listing, Lock, MetaReconcile, ObjectMeta, Objects, Repo}
-  alias Maxio.Cluster.{Paths, Router, Topology, Transport}
+  alias Maxio.Cluster.{DriveHealth, Paths, Router, Topology, Transport}
   alias Maxio.Objects.Object
   alias Maxio.S3.Log
   alias Maxio.Storage.Erasure.Config
@@ -281,27 +281,34 @@ defmodule Maxio.Storage.Scanner do
 
     endpoints
     |> Enum.reduce(zero_counts(), fn {node, drive}, counts ->
-      walk_orphan_endpoint(counts, transport, node, drive, bucket, cleanup)
+      walk_orphan_endpoint(counts, transport, node, drive, bucket, cleanup, opts)
     end)
   end
 
-  defp walk_orphan_endpoint(counts, transport, node, drive, bucket, cleanup) do
+  defp walk_orphan_endpoint(counts, transport, node, drive, bucket, cleanup, opts) do
     bucket_root = Path.join(drive, bucket)
 
     # Full endpoint outage would otherwise be counted once per root. Probe the bucket root first so
     # one unavailable endpoint contributes one skipped evidence lane, then avoid the version root.
-    case transport.list_dir(node, bucket_root, include_layout_files: true) do
+    case observe_drive_probe(
+           node,
+           drive,
+           transport.list_dir(node, bucket_root, include_layout_files: true),
+           opts
+         ) do
       {:ok, _entries} ->
         counts
-        |> walk_orphan_tree(transport, node, bucket_root, [], :null, bucket, cleanup)
+        |> walk_orphan_tree(transport, node, drive, bucket_root, [], :null, bucket, cleanup, opts)
         |> walk_orphan_tree(
           transport,
           node,
+          drive,
           Path.join([drive, ".versions", bucket]),
           [],
           :versions,
           bucket,
-          cleanup
+          cleanup,
+          opts
         )
 
       {:error, _reason} ->
@@ -309,8 +316,24 @@ defmodule Maxio.Storage.Scanner do
     end
   end
 
-  defp walk_orphan_tree(counts, transport, node, dir, rel_segments, layout, bucket, cleanup) do
-    case transport.list_dir(node, dir, include_layout_files: true) do
+  defp walk_orphan_tree(
+         counts,
+         transport,
+         node,
+         drive,
+         dir,
+         rel_segments,
+         layout,
+         bucket,
+         cleanup,
+         opts
+       ) do
+    case observe_drive_probe(
+           node,
+           drive,
+           transport.list_dir(node, dir, include_layout_files: true),
+           opts
+         ) do
       {:ok, entries} ->
         files = entries |> Enum.filter(&(entry_type(&1) == :file)) |> MapSet.new(& &1.name)
         dirs = Enum.filter(entries, &(entry_type(&1) == :dir))
@@ -334,11 +357,13 @@ defmodule Maxio.Storage.Scanner do
             acc,
             transport,
             node,
+            drive,
             Path.join(dir, entry.name),
             rel_segments ++ [entry.name],
             layout,
             bucket,
-            cleanup
+            cleanup,
+            opts
           )
         end)
 
@@ -469,7 +494,7 @@ defmodule Maxio.Storage.Scanner do
     require_all? = Keyword.get(opts, :orphan_cleanup_require_all_endpoints, true)
 
     endpoints_reachable? =
-      not require_all? or orphan_cleanup_endpoints_reachable?(transport, endpoints, bucket)
+      not require_all? or orphan_cleanup_endpoints_reachable?(transport, endpoints, bucket, opts)
 
     mode =
       cond do
@@ -521,11 +546,16 @@ defmodule Maxio.Storage.Scanner do
     if mode in [:report_only, :dry_run, :delete], do: mode, else: :report_only
   end
 
-  defp orphan_cleanup_endpoints_reachable?(transport, endpoints, bucket) do
+  defp orphan_cleanup_endpoints_reachable?(transport, endpoints, bucket, opts) do
     Enum.all?(endpoints, fn {node, drive} ->
       match?(
         {:ok, _},
-        transport.list_dir(node, Path.join(drive, bucket), include_layout_files: true)
+        observe_drive_probe(
+          node,
+          drive,
+          transport.list_dir(node, Path.join(drive, bucket), include_layout_files: true),
+          opts
+        )
       )
     end)
   end
@@ -1055,7 +1085,7 @@ defmodule Maxio.Storage.Scanner do
 
         results =
           for {node, drive} <- endpoints_for(bucket, key, opts) do
-            probe_endpoint(transport, node, drive, rel)
+            probe_endpoint(transport, node, drive, rel, opts)
           end
 
         cond do
@@ -1069,18 +1099,33 @@ defmodule Maxio.Storage.Scanner do
 
   # 单端点探针：列版本目录的父目录，存在 = 有名为版本末段且含 meta.json（object?=true）的子目录。
   # 目录不存在 → {:ok, []}（可达、显式 missing）；端点宕机/异常 → {:error, _}（unreachable）。
-  defp probe_endpoint(transport, node, drive, rel) do
+  defp probe_endpoint(transport, node, drive, rel, opts) do
     dir = Path.join(drive, rel)
     parent = Path.dirname(dir)
     base = Path.basename(dir)
 
-    case transport.list_dir(node, parent, []) do
+    case observe_drive_probe(node, drive, transport.list_dir(node, parent, []), opts) do
       {:ok, entries} ->
         if Enum.any?(entries, &(&1.name == base and &1.object?)), do: :present, else: :missing
 
       {:error, _} ->
         :unreachable
     end
+  end
+
+  defp observe_drive_probe(node, drive, result, opts) do
+    _ =
+      DriveHealth.record_probe(
+        {node, drive},
+        result,
+        offline_after_ms: Keyword.get(opts, :drive_offline_after_ms)
+      )
+
+    result
+  rescue
+    _ -> result
+  catch
+    _, _ -> result
   end
 
   # ── 端点/quorum 辅助（与 Maxio.ObjectMeta 的同名私有函数同语义，铁律 5 同源 quorum）──

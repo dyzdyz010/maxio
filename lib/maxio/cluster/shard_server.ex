@@ -161,6 +161,17 @@ defmodule Maxio.Cluster.ShardServer do
     end
   end
 
+  @doc "Probe a configured drive root; unlike list_dir/2, a missing root is unavailable."
+  @spec probe_drive(String.t()) :: :ok | {:error, term()}
+  def probe_drive(drive_root) do
+    case File.stat(drive_root) do
+      {:ok, %File.Stat{type: :directory}} -> :ok
+      {:ok, _stat} -> {:error, :enotdir}
+      {:error, :enoent} -> {:error, :unavailable}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @doc "stat：该 drive 上 part.0 字节数（heal 用其判文件完整）。"
   @spec stat_shard(String.t()) :: {:ok, non_neg_integer()} | {:error, :enoent}
   def stat_shard(drive_obj_dir) do
