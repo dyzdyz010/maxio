@@ -3,7 +3,7 @@ defmodule Maxio.Cluster.HealTest do
   import Bitwise
 
   alias Maxio.Storage.Distributed
-  alias Maxio.Cluster.{Heal, Topology, Transport.InProcess}
+  alias Maxio.Cluster.{Heal, Paths, Topology, Transport.InProcess}
 
   setup do
     InProcess.setup!()
@@ -75,5 +75,21 @@ defmodule Maxio.Cluster.HealTest do
   test "无任何 sidecar -> {:error, :enoent}", ctx do
     o = opts(ctx)
     assert {:error, :enoent} = Heal.heal_object("b", "missing", "null", o)
+  end
+
+  test "heal restores delete-marker sidecars without fabricating part.0", ctx do
+    o = opts(ctx)
+    version_id = "dm-001"
+    assert :ok = Distributed.put_delete_marker("b", "marker", version_id, [], o)
+
+    {_, d0} = Enum.at(ctx.endpoints, 0)
+    {:ok, rel} = Paths.object_rel("b", "marker", version_id)
+    object_dir = Path.join(d0, rel)
+    File.rm_rf!(object_dir)
+
+    assert {:ok, %{healed: healed}} = Heal.heal_object("b", "marker", version_id, o)
+    assert healed >= 1
+    assert File.exists?(Path.join(object_dir, "meta.json"))
+    refute File.exists?(Path.join(object_dir, "part.0"))
   end
 end

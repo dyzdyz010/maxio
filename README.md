@@ -334,8 +334,9 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
    （`part.0` 无 sidecar、delete-marker 目录残留 `part.0`），默认只计数/日志；显式
    `--cleanup-orphan-shards` 时才在 sidecar 写权威、全端点可达、对象锁、二次探针、年龄门和每轮删除上限
    同时满足后删除 `part.0`。M8 续作已补保守 token-bucket object pacing、本节点
-   S3 handler in-flight 自适应对象间暂停，以及 node-local drive health 长窗口离线观测；
-   仍 defer：真实 drive IO 采样/跨节点聚合与实际 fresh-drive heal/replacement 工作流。
+   S3 handler in-flight 自适应对象间暂停、node-local drive health 长窗口离线观测，
+   以及 operator-triggered fresh-drive heal pass；仍 defer：真实 drive IO 采样/跨节点聚合、
+   自动 replacement 调度与物理 drive identity/rebalance workflow。
 5. **多 parity / storage class**：单一 (K,M)；`x-amz-storage-class` → 不同 EC = defer（沿用 M6）。
 6. **parity upgrade on degraded write**：写未达 write_quorum 即 `{:error, :write_quorum}`（绝不静默）；
    MinIO 的「写时临时提高 effective parity」= defer。
@@ -354,8 +355,8 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 
 当前已完成 **M8-1 quorum lock core**、**M8-2 cache invalidation spine**、
 **M8-3a/b/c/d/e PG metadata-driven scrubber/auto-heal + optional index reconcile pre-pass + orphan shard evidence/cleanup**
-与 **M8-4 integration evidence + peer lock harness**，并补入 **live S3 in-flight adaptive scrubber pacing**
-和 **node-local drive health long-window offline registry**。
+与 **M8-4 integration evidence + peer lock harness**，并补入 **live S3 in-flight adaptive scrubber pacing**、
+**node-local drive health long-window offline registry** 和 **operator-triggered fresh-drive heal workflow**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -403,8 +404,12 @@ M8-3a/b/c/d/e 已提供：
 - `Maxio.Cluster.DriveHealth`：监督树内 node-local registry，按 `{node, drive}` 记录结构化
   reachability probe；scrubber topology 轮使用 root-drive probe，scanner 在既有 `list_dir/3`
   reachability 探针处同步观察。单次失败只进入 `suspect`，超过 `offline_after_ms` 才进入 `offline`。如果离线期间
-  erasure set 仍达到 write quorum，恢复后保留 `heal_required?` 标记，供后续 fresh-drive heal workflow 消费。
+  erasure set 仍达到 write quorum，恢复后保留 `heal_required?` 标记，供 `FreshDriveHeal` workflow 消费。
   该状态当前是运行时观测信号，不改变 S3 请求路由或 quorum 语义。
+- `Maxio.Cluster.FreshDriveHeal` / `mix maxio.heal.fresh_drives`：显式运维入口，枚举 PG inventory
+  中落到 affected erasure set 的对象/版本（默认含 delete marker），复用 `Maxio.Cluster.Heal` 修复缺失 shard
+  或 marker sidecar；仅在完整、非 bucket 限定、非 current-only、非 dry-run 且无 missing/skipped/unrecoverable/error 的 pass
+  后清除 `DriveHealth.heal_required?`。`--dry-run`、`--bucket`、`--max-objects`、`--current-only` 都不会清 marker。
 - 对象来源为 `Maxio.Objects` 的有界分页；FS 后端只刷新 `Maxio.Cluster.Scrubber.Usage` 快照，
   `ErasureCoded`/`Distributed` 后端按 erasure set 通过 `Maxio.Cluster.Lock.quorum_with_lock/3`
   获取 heartbeat-backed 短租约后调用 `Maxio.Storage.Erasure.Heal` 或 `Maxio.Cluster.Heal`。
@@ -431,6 +436,7 @@ M8-4 已提供：
 
 M8 剩余：
 
-- 完整 MinIO data-scanner parity：真实 drive IO 反馈、跨节点负载聚合、实际 fresh-drive heal/replacement 工作流。
+- 完整 MinIO data-scanner parity：真实 drive IO 反馈、跨节点负载聚合、自动 fresh-drive replacement 调度与物理 drive identity/rebalance workflow。
   当前已有保守 token-bucket object pacing（`max_objects_per_sec` + `object_burst`，允许 burst 后限制下一次对象扫描开始），
-  本节点 S3 handler in-flight 自适应对象间暂停，以及 node-local drive-offline 长窗口观测；尚未接入真实磁盘队列/吞吐反馈，也不做跨节点聚合。
+  本节点 S3 handler in-flight 自适应对象间暂停、node-local drive-offline 长窗口观测，
+  以及手动 `mix maxio.heal.fresh_drives` marker 消费；尚未接入真实磁盘队列/吞吐反馈，也不做跨节点聚合。

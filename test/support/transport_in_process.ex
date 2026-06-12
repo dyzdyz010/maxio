@@ -35,6 +35,18 @@ defmodule Maxio.Cluster.Transport.InProcess do
   @doc "Restore one drive root on a node."
   def set_drive_up(node, drive), do: :ets.delete(@table, {:drive, node, normalize_path(drive)})
 
+  @doc "Fail heal_shard for one drive while keeping probes online."
+  def set_heal_shard_down(node, drive), do: set_op_down(:heal_shard, node, drive)
+
+  @doc "Fail put_sidecar for one drive while keeping probes online."
+  def set_put_sidecar_down(node, drive), do: set_op_down(:put_sidecar, node, drive)
+
+  @doc "Fail delete_part_file for one drive while keeping probes online."
+  def set_delete_part_file_down(node, drive), do: set_op_down(:delete_part_file, node, drive)
+
+  defp set_op_down(op, node, drive),
+    do: :ets.insert(@table, {{:op, op, node, normalize_path(drive)}, true})
+
   defp down?(node, path) do
     case :ets.whereis(@table) do
       :undefined ->
@@ -54,6 +66,17 @@ defmodule Maxio.Cluster.Transport.InProcess do
     |> :ets.tab2list()
     |> Enum.any?(fn
       {{:drive, ^node, drive}, true} -> under_drive?(normalized_path, drive)
+      _ -> false
+    end)
+  end
+
+  defp op_down?(op, node, path) do
+    normalized_path = normalize_path(path)
+
+    @table
+    |> :ets.tab2list()
+    |> Enum.any?(fn
+      {{:op, ^op, ^node, drive}, true} -> under_drive?(normalized_path, drive)
       _ -> false
     end)
   end
@@ -78,7 +101,9 @@ defmodule Maxio.Cluster.Transport.InProcess do
 
   @impl true
   def put_sidecar(node, dir, meta) do
-    if down?(node, dir), do: {:error, :unavailable}, else: ShardServer.put_sidecar(dir, meta)
+    if down?(node, dir) or op_down?(:put_sidecar, node, dir),
+      do: {:error, :unavailable},
+      else: ShardServer.put_sidecar(dir, meta)
   end
 
   @impl true
@@ -103,12 +128,14 @@ defmodule Maxio.Cluster.Transport.InProcess do
 
   @impl true
   def delete_part_file(node, dir) do
-    if down?(node, dir), do: {:error, :unavailable}, else: ShardServer.delete_part_file(dir)
+    if down?(node, dir) or op_down?(:delete_part_file, node, dir),
+      do: {:error, :unavailable},
+      else: ShardServer.delete_part_file(dir)
   end
 
   @impl true
   def heal_shard(node, dir, block_map, shard_len, meta) do
-    if down?(node, dir),
+    if down?(node, dir) or op_down?(:heal_shard, node, dir),
       do: {:ok, 0},
       else: ShardServer.heal_shard(dir, block_map, shard_len, meta)
   end

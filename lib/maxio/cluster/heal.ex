@@ -12,6 +12,7 @@ defmodule Maxio.Cluster.Heal do
 
   alias Maxio.Storage.Erasure.{Codec, Config}
   alias Maxio.Cluster.{Paths, Router, Topology, Transport}
+  alias Maxio.Sidecar
 
   @doc """
   heal 单个对象版本：从存活端点重建各端点缺/损分片。返回 {:ok, %{healed: n}}（n=回写分片数）或
@@ -39,6 +40,15 @@ defmodule Maxio.Cluster.Heal do
   end
 
   defp do_heal(cfg, bucket, key, version_id, tx, dirs, meta) do
+    if delete_marker_meta?(meta, version_id) do
+      healed = heal_delete_marker(bucket, key, version_id, tx, dirs, meta)
+      {:ok, %{healed: healed}}
+    else
+      heal_erasure_object(cfg, bucket, key, version_id, tx, dirs, meta)
+    end
+  end
+
+  defp heal_erasure_object(cfg, bucket, key, version_id, tx, dirs, meta) do
     n = Config.total(cfg)
     size = meta["size"]
     block_size = get_in(meta, ["ec", "block_size"]) || cfg.block_size
@@ -181,6 +191,45 @@ defmodule Maxio.Cluster.Heal do
       {:ok, written} = tx.heal_shard(node, dir, block_map, shard_len, meta)
       count + written
     end)
+  end
+
+  defp heal_delete_marker(bucket, key, version_id, tx, dirs, meta) do
+    Enum.reduce(dirs, 0, fn {node, dir}, healed ->
+      if same_delete_marker?(tx, node, dir, meta, version_id) do
+        _ = tx.delete_part_file(node, dir)
+        healed
+      else
+        case tx.put_sidecar(node, dir, meta) do
+          :ok ->
+            _ = tx.delete_part_file(node, dir)
+            healed + 1
+
+          {:error, reason} ->
+            Logger.warning("cluster heal delete-marker sidecar skipped",
+              bucket: bucket,
+              key: key,
+              reason:
+                "version_id=#{version_id} endpoint=#{inspect({node, dir})} reason=#{inspect(reason)}"
+            )
+
+            healed
+        end
+      end
+    end)
+  end
+
+  defp same_delete_marker?(tx, node, dir, meta, version_id) do
+    case tx.get_sidecar(node, dir) do
+      {:ok, existing} -> existing == meta and delete_marker_meta?(existing, version_id)
+      {:error, _} -> false
+    end
+  end
+
+  defp delete_marker_meta?(%{"is_delete_marker" => true}, _version_id), do: true
+
+  defp delete_marker_meta?(%{} = meta, version_id) do
+    entry = Sidecar.find_version(meta, version_id) || Sidecar.latest(meta) || %{}
+    entry["type"] == "delete_marker"
   end
 
   @doc """
