@@ -10,6 +10,7 @@ defmodule Mix.Tasks.Maxio.Scan do
       mix maxio.scan --reconcile-index
       mix maxio.scan --reconcile-index --cleanup-orphan-shards
       mix maxio.scan --max-objects-per-sec 100 --object-burst 10
+      mix maxio.scan --no-adaptive-io
 
   FS backends refresh scan-derived usage only. Erasure-coded backends also invoke
   the existing local or distributed heal engine for each enumerated object.
@@ -32,6 +33,10 @@ defmodule Mix.Tasks.Maxio.Scan do
           max_objects_per_sec: :integer,
           object_burst: :integer,
           sleep_between_batches_ms: :integer,
+          no_adaptive_io: :boolean,
+          max_live_requests: :integer,
+          io_pause_ms: :integer,
+          io_max_pause_ms: :integer,
           reconcile_index: :boolean,
           force_reconcile_index: :boolean,
           cleanup_orphan_shards: :boolean,
@@ -48,7 +53,8 @@ defmodule Mix.Tasks.Maxio.Scan do
       Mix.raise(
         "usage: mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] " <>
           "[--max-objects-per-sec <n>] [--object-burst <n>] " <>
-          "[--sleep-between-batches-ms <ms>] " <>
+          "[--sleep-between-batches-ms <ms>] [--no-adaptive-io] " <>
+          "[--max-live-requests <n>] [--io-pause-ms <ms>] [--io-max-pause-ms <ms>] " <>
           "[--reconcile-index] [--force-reconcile-index] [--cleanup-orphan-shards] " <>
           "[--orphan-cleanup-dry-run] [--orphan-cleanup-min-age-ms <ms>] " <>
           "[--orphan-cleanup-max-deletes <n>] " <>
@@ -66,6 +72,10 @@ defmodule Mix.Tasks.Maxio.Scan do
         max_objects_per_sec: Keyword.get(opts, :max_objects_per_sec),
         object_burst: Keyword.get(opts, :object_burst),
         sleep_between_batches_ms: Keyword.get(opts, :sleep_between_batches_ms),
+        adaptive_io: adaptive_io_opt(opts),
+        max_live_requests: Keyword.get(opts, :max_live_requests),
+        io_pause_ms: Keyword.get(opts, :io_pause_ms),
+        io_max_pause_ms: Keyword.get(opts, :io_max_pause_ms),
         reconcile_index: Keyword.get(opts, :reconcile_index, false),
         force_reconcile_index: Keyword.get(opts, :force_reconcile_index, false),
         cleanup_orphan_shards: Keyword.get(opts, :cleanup_orphan_shards, false),
@@ -88,5 +98,9 @@ defmodule Mix.Tasks.Maxio.Scan do
         "index_orphan_cleaned_bytes=#{summary.index_orphan_cleaned_bytes} " <>
         "objects=#{summary.object_count} bytes=#{summary.total_size}"
     )
+  end
+
+  defp adaptive_io_opt(opts) do
+    if Keyword.get(opts, :no_adaptive_io, false), do: false, else: nil
   end
 end

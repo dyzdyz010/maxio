@@ -13,6 +13,11 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
             last_ms: 0,
             fixed_ms: 0,
             now_fun: &__MODULE__.monotonic_ms/0,
+            adaptive_io: false,
+            max_live_requests: 0,
+            io_pause_ms: 100,
+            io_max_pause_ms: 0,
+            io_load_fun: &Maxio.S3.InFlight.count/0,
             sleep_fun: &Process.sleep/1
 
   @type t :: %__MODULE__{
@@ -23,6 +28,11 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
           last_ms: integer(),
           fixed_ms: non_neg_integer(),
           now_fun: (-> integer()),
+          adaptive_io: boolean(),
+          max_live_requests: non_neg_integer(),
+          io_pause_ms: pos_integer(),
+          io_max_pause_ms: non_neg_integer(),
+          io_load_fun: (-> non_neg_integer()),
           sleep_fun: (non_neg_integer() -> any())
         }
 
@@ -40,6 +50,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
           now_fun: now_fun(opts),
           sleep_fun: sleep_fun(opts)
         }
+        |> put_io_opts(opts)
 
       rate = positive_int(Keyword.get(opts, :max_objects_per_sec)) ->
         burst = positive_int(Keyword.get(opts, :object_burst)) || 1
@@ -53,9 +64,11 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
           now_fun: now_fun(opts),
           sleep_fun: sleep_fun(opts)
         }
+        |> put_io_opts(opts)
 
       true ->
         %__MODULE__{mode: :disabled, last_ms: now_ms, now_fun: now_fun(opts)}
+        |> put_io_opts(opts)
     end
   end
 
@@ -101,7 +114,7 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
   def maybe_wait(%__MODULE__{} = state) do
     {ms, state} = take(state, state.now_fun.())
     if ms > 0, do: state.sleep_fun.(ms)
-    state
+    maybe_wait_for_low_io(state, 0)
   end
 
   @spec maybe_wait(keyword()) :: :ok
@@ -142,4 +155,43 @@ defmodule Maxio.Cluster.Scrubber.Throttle do
       _ -> &__MODULE__.monotonic_ms/0
     end
   end
+
+  defp put_io_opts(state, opts) do
+    %{
+      state
+      | adaptive_io: Keyword.get(opts, :adaptive_io, false),
+        max_live_requests: non_negative_int(Keyword.get(opts, :max_live_requests), 0),
+        io_pause_ms: positive_int(Keyword.get(opts, :io_pause_ms)) || 100,
+        io_max_pause_ms: non_negative_int(Keyword.get(opts, :io_max_pause_ms), 0),
+        io_load_fun: io_load_fun(opts)
+    }
+  end
+
+  defp maybe_wait_for_low_io(%__MODULE__{adaptive_io: false} = state, _waited_ms), do: state
+  defp maybe_wait_for_low_io(%__MODULE__{io_max_pause_ms: 0} = state, _waited_ms), do: state
+
+  defp maybe_wait_for_low_io(%__MODULE__{} = state, waited_ms) do
+    cond do
+      waited_ms >= state.io_max_pause_ms ->
+        state
+
+      state.io_load_fun.() <= state.max_live_requests ->
+        state
+
+      true ->
+        pause_ms = min(state.io_pause_ms, state.io_max_pause_ms - waited_ms)
+        state.sleep_fun.(pause_ms)
+        maybe_wait_for_low_io(state, waited_ms + pause_ms)
+    end
+  end
+
+  defp io_load_fun(opts) do
+    case Keyword.get(opts, :io_load_fun) do
+      fun when is_function(fun, 0) -> fun
+      _ -> &Maxio.S3.InFlight.count/0
+    end
+  end
+
+  defp non_negative_int(n, _default) when is_integer(n) and n >= 0, do: n
+  defp non_negative_int(_n, default), do: default
 end

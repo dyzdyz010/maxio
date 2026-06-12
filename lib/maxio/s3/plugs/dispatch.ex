@@ -14,6 +14,10 @@ defmodule Maxio.S3.Plugs.Dispatch do
 
   @impl true
   def call(conn, _opts) do
+    Maxio.S3.InFlight.track(fn -> do_call(conn) end)
+  end
+
+  defp do_call(conn) do
     conn = fetch_query_params(conn)
     query_keys = conn.query_params |> Map.keys() |> Enum.map(&String.downcase/1) |> MapSet.new()
 

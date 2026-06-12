@@ -310,6 +310,44 @@ defmodule Maxio.Cluster.ScrubberTest do
     assert throttle.last_ms == 1000
   end
 
+  test "adaptive IO gate does not sleep below threshold and is disabled by no_throttle" do
+    parent = self()
+
+    below_threshold =
+      Scrubber.Throttle.new(
+        [
+          max_objects_per_sec: 1,
+          object_burst: 1,
+          adaptive_io: true,
+          max_live_requests: 1,
+          io_load_fun: fn -> 1 end,
+          throttle_now_fun: fn -> 0 end,
+          throttle_sleep_fun: fn ms -> send(parent, {:adaptive_io_sleep, ms}) end
+        ],
+        0
+      )
+
+    _ = Scrubber.Throttle.maybe_wait(below_threshold)
+    refute_receive {:adaptive_io_sleep, _}, 10
+
+    no_throttle =
+      Scrubber.Throttle.new(
+        [
+          no_throttle: true,
+          adaptive_io: true,
+          max_live_requests: 0,
+          io_pause_ms: 10,
+          io_max_pause_ms: 30,
+          io_load_fun: fn -> 1 end,
+          throttle_sleep_fun: fn ms -> send(parent, {:adaptive_io_sleep, ms}) end
+        ],
+        0
+      )
+
+    _ = Scrubber.Throttle.maybe_wait(no_throttle)
+    refute_receive {:adaptive_io_sleep, _}, 10
+  end
+
   test "scrubber threads configured token bucket across buckets when caller passes nil overrides" do
     prev_scrubber = Application.get_env(:maxio, :scrubber, [])
     parent = self()
@@ -350,6 +388,32 @@ defmodule Maxio.Cluster.ScrubberTest do
     after
       Application.put_env(:maxio, :scrubber, prev_scrubber)
     end
+  end
+
+  test "scrubber pauses between objects while live S3 IO is above threshold" do
+    bucket = bucket_name("scrub-live-io")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    put_index!(bucket, "busy.txt", 10, "etag-busy")
+    parent = self()
+
+    assert {:ok, summary} =
+             Scrubber.run_once(
+               bucket: bucket,
+               backend: FS,
+               adaptive_io: true,
+               max_live_requests: 0,
+               io_pause_ms: 10,
+               io_max_pause_ms: 25,
+               io_load_fun: fn -> 1 end,
+               throttle_now_fun: fn -> 0 end,
+               throttle_sleep_fun: fn ms -> send(parent, {:adaptive_io_sleep, ms}) end
+             )
+
+    assert summary.scanned == 1
+    assert summary.object_count == 1
+    assert_receive {:adaptive_io_sleep, 10}
+    assert_receive {:adaptive_io_sleep, 10}
+    assert_receive {:adaptive_io_sleep, 5}
   end
 
   defp ec_opts(drives), do: [drives: drives, data_shards: 4, parity_shards: 2, block_size: 1024]

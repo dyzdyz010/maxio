@@ -333,8 +333,9 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
    仍是单对象跨节点重建核心。`Maxio.Storage.Scanner` 现在会检测盘上孤儿 shard
    （`part.0` 无 sidecar、delete-marker 目录残留 `part.0`），默认只计数/日志；显式
    `--cleanup-orphan-shards` 时才在 sidecar 写权威、全端点可达、对象锁、二次探针、年龄门和每轮删除上限
-   同时满足后删除 `part.0`。M8 续作已补保守 token-bucket object pacing；
-   仍 defer：live IO 自适应暂停与长期离线盘策略。
+   同时满足后删除 `part.0`。M8 续作已补保守 token-bucket object pacing 与本节点
+   S3 handler in-flight 自适应对象间暂停；
+   仍 defer：真实 drive IO 采样/跨节点聚合与长期离线盘策略。
 5. **多 parity / storage class**：单一 (K,M)；`x-amz-storage-class` → 不同 EC = defer（沿用 M6）。
 6. **parity upgrade on degraded write**：写未达 write_quorum 即 `{:error, :write_quorum}`（绝不静默）；
    MinIO 的「写时临时提高 effective parity」= defer。
@@ -353,7 +354,7 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 
 当前已完成 **M8-1 quorum lock core**、**M8-2 cache invalidation spine**、
 **M8-3a/b/c/d/e PG metadata-driven scrubber/auto-heal + optional index reconcile pre-pass + orphan shard evidence/cleanup**
-与 **M8-4 integration evidence + peer lock harness**。
+与 **M8-4 integration evidence + peer lock harness**，并补入 **live S3 in-flight adaptive scrubber pacing**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -386,12 +387,18 @@ M8-3a/b/c/d/e 已提供：
 - `Maxio.Cluster.Scrubber`：默认随监督树启动但不调度；`config :maxio, :scrubber, enabled: true`
   后按 `interval_ms` 周期运行。周期轮按 `sample_inverse` 做确定性 1/N 深度 heal 检查，
   `mix maxio.scan` / `run_once` 默认仍为全量取证。
-- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--reconcile-index]`：
+- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--no-adaptive-io] [--max-live-requests N] [--io-pause-ms MS] [--io-max-pause-ms MS] [--reconcile-index]`：
   一次性扫描入口，输出
   buckets/scanned/damaged/healed/unrecoverable/missing/skipped/sampled_out/index_status/index_scanned/index_upserted/index_gc/index_skipped/index_divergent/index_orphan_shards/index_orphan_bytes/index_orphan_cleaned/index_orphan_cleaned_bytes/objects/bytes。
   `--reconcile-index` 会先调用既有 `Maxio.Storage.Scanner` 做 disk/peer sidecar → PG 派生索引收敛，
   再用刷新后的 PG inventory 做 usage/heal；默认不越过 write-authority 安全闸，需要明确接受盘权威时才加
   `--force-reconcile-index`。
+- `Maxio.S3.InFlight`：监督树内长期进程持有本节点 ETS 计数器，`S3.Plugs.Dispatch`
+  在 handler 生命周期内计数并在正常返回/结构化 S3 错误/异常后释放。计数是 node-local、best-effort，
+  不拒绝前台请求，只给后台维护任务提供 live traffic 压力信号。
+- `Maxio.Cluster.Scrubber.Throttle`：token-bucket object pacing 后追加 adaptive IO gate；
+  当 `adaptive_io: true` 且本节点 in-flight 请求数超过 `max_live_requests` 时，scrubber 在对象之间按
+  `io_pause_ms` 分段等待，单对象最多等待 `io_max_pause_ms`。`--no-throttle` 会同时关闭 token/fixed/adaptive sleeps。
 - 对象来源为 `Maxio.Objects` 的有界分页；FS 后端只刷新 `Maxio.Cluster.Scrubber.Usage` 快照，
   `ErasureCoded`/`Distributed` 后端按 erasure set 通过 `Maxio.Cluster.Lock.quorum_with_lock/3`
   获取 heartbeat-backed 短租约后调用 `Maxio.Storage.Erasure.Heal` 或 `Maxio.Cluster.Heal`。
@@ -418,6 +425,6 @@ M8-4 已提供：
 
 M8 剩余：
 
-- 完整 MinIO data-scanner parity：live IO 自适应限流、drive-offline 长窗口策略。
+- 完整 MinIO data-scanner parity：真实 drive IO 反馈、跨节点负载聚合、drive-offline 长窗口策略。
   当前已有保守 token-bucket object pacing（`max_objects_per_sec` + `object_burst`，允许 burst 后限制下一次对象扫描开始），
-  但尚未接入 live request/drive IO 负载反馈。
+  以及本节点 S3 handler in-flight 自适应对象间暂停；尚未接入真实磁盘队列/吞吐反馈，也不做跨节点聚合。

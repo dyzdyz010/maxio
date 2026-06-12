@@ -139,6 +139,8 @@ config :maxio, :scanner,
 # 周期轮按 sample_inverse 做确定性 1/N 深度 heal 检查（每 cycle 轮换分区），但
 # 手动触发/取证 `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle]` 默认全量扫描。
 # max_objects_per_sec + object_burst 使用 token-bucket 限速；object_burst 默认 1，保持保守稳态。
+# adaptive_io 会读取本节点 S3 handler in-flight 计数，live 请求数超过 max_live_requests 时在对象间
+# 短暂停顿，最多 io_max_pause_ms，避免后台 scrubber 与前台请求抢 IO；这不是请求限流/拒绝机制。
 config :maxio, :scrubber,
   enabled: false,
   interval_ms: 86_400_000,
@@ -150,6 +152,10 @@ config :maxio, :scrubber,
   max_objects_per_sec: 200,
   object_burst: 1,
   sleep_between_batches_ms: 50,
+  adaptive_io: true,
+  max_live_requests: 0,
+  io_pause_ms: 100,
+  io_max_pause_ms: 5_000,
   lock_ttl_ms: 60_000,
   lock_timeout_ms: 3_000
 
