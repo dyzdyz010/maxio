@@ -29,6 +29,21 @@ defmodule Maxio.Crypto.SSETest do
     assert out == plain
   end
 
+  test "unwrap_stream 支持密文帧跨输入 chunk 切分" do
+    plain = :crypto.strong_rand_bytes(80_000)
+    {cipher_stream, envelope} = SSE.wrap_stream([plain])
+    cipher = Enum.to_list(cipher_stream) |> IO.iodata_to_binary()
+
+    split_cipher =
+      cipher
+      |> :binary.bin_to_list()
+      |> Enum.chunk_every(7)
+      |> Enum.map(&:erlang.list_to_binary/1)
+
+    out = SSE.unwrap_stream(split_cipher, envelope) |> Enum.to_list() |> IO.iodata_to_binary()
+    assert out == plain
+  end
+
   test "篡改密文 → 解密 raise（GCM 认证失败，绝不静默）" do
     {cipher_stream, envelope} = SSE.wrap_stream(["data"])
     cipher = Enum.to_list(cipher_stream) |> IO.iodata_to_binary()

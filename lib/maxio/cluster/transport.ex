@@ -15,7 +15,10 @@ defmodule Maxio.Cluster.Transport do
   @callback put_sidecar(node(), String.t(), map()) :: :ok | {:error, term()}
   @callback get_sidecar(node(), String.t()) :: {:ok, map()} | {:error, :enoent}
   @callback stat_shard(node(), String.t()) :: {:ok, non_neg_integer()} | {:error, :enoent}
+  @callback stat_shard_info(node(), String.t()) ::
+              {:ok, %{size: non_neg_integer(), mtime_ms: integer()}} | {:error, :enoent}
   @callback delete_shard(node(), String.t()) :: :ok
+  @callback delete_part_file(node(), String.t()) :: :ok | {:error, term()}
   @callback heal_shard(node(), String.t(), %{non_neg_integer() => binary()}, pos_integer(), map()) ::
               {:ok, non_neg_integer()}
 
@@ -25,6 +28,7 @@ defmodule Maxio.Cluster.Transport do
   @callback commit_object(node(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
 
   # 走盘 LIST 单层目录原语（ROUTE B P3）：读单端点 drive_dir 下一层条目并标记每个子目录是否为对象。
+  # opts[:include_layout_files] 为 scanner orphan-shard 取证专用；默认 false 时保持只返回目录。
   # 节点宕机/超时/远端异常 -> {:error, :unavailable}（铁律 3：结构化降级，绝不上抛炸列举路径）。
   @callback list_dir(node(), String.t(), keyword()) ::
               {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
@@ -76,8 +80,18 @@ defmodule Maxio.Cluster.Transport.Erpc do
   end
 
   @impl true
+  def stat_shard_info(node, dir) do
+    call(node, :stat_shard_info, [dir], fn -> {:error, :enoent} end)
+  end
+
+  @impl true
   def delete_shard(node, dir) do
     call(node, :delete_shard, [dir], fn -> :ok end)
+  end
+
+  @impl true
+  def delete_part_file(node, dir) do
+    call(node, :delete_part_file, [dir], fn -> {:error, :unavailable} end)
   end
 
   @impl true

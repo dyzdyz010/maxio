@@ -54,6 +54,8 @@ defmodule Maxio.ListingTest do
   # 生成一个 ULID（用于不关心相对顺序的单版本场景）。
   defp ulid, do: Maxio.Versioning.VersionId.generate()
 
+  defp pad(i), do: String.pad_leading(Integer.to_string(i), 4, "0")
+
   # 确定性「更晚」版本 ID：26 字符 Crockford base32，字典序严格递增（高位时间戳大者为 newest，
   # 与真实 ULID 时间序一致）。避免依赖同毫秒两次 generate/0 的随机后缀排序（current_version 取
   # max ULID，本辅助保证 v(2) > v(1) > v(0) 字典序确定）。
@@ -125,6 +127,17 @@ defmodule Maxio.ListingTest do
 
     assert Enum.map(r3.objects, & &1.key) == ["e"]
     assert r3.is_truncated == false
+  end
+
+  test "max_keys 超过 S3 单页上限时夹到 1000", %{topo: topo, eps: eps} do
+    for i <- 1..1002, do: put(eps, "b", "clamp/" <> pad(i))
+
+    r = Listing.list_objects_v2("b", %{prefix: "clamp/", max_keys: 5_000}, opts(topo))
+
+    assert length(r.objects) == 1000
+    assert r.key_count == 1000
+    assert r.is_truncated == true
+    assert r.next_continuation_token == "clamp/1000"
   end
 
   test "start-after", %{topo: topo, eps: eps} do

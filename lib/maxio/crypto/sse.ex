@@ -13,6 +13,15 @@ defmodule Maxio.Crypto.SSE do
   """
   @chunk 65_536
   @aad "maxio-sse-s3"
+  @frame_header_size 4 + 12 + 16
+
+  @doc "SSE-S3 plaintext block size used for frame mapping."
+  @spec plaintext_block_size() :: pos_integer()
+  def plaintext_block_size, do: @chunk
+
+  @doc "SSE-S3 per-frame header size: ct_len + iv + tag."
+  @spec frame_header_size() :: pos_integer()
+  def frame_header_size, do: @frame_header_size
 
   @doc "把明文 chunks 流加密为密文帧流，并返回随元数据存的信封头 map。"
   @spec wrap_stream(Enumerable.t()) ::
@@ -41,8 +50,19 @@ defmodule Maxio.Crypto.SSE do
   @spec unwrap_stream(Enumerable.t(), map()) :: Enumerable.t()
   def unwrap_stream(cipher_chunks, envelope) do
     dek = unwrap_dek(envelope)
-    full = cipher_chunks |> Enum.to_list() |> IO.iodata_to_binary()
-    decrypt_frames(full, dek, [])
+
+    cipher_chunks
+    |> Stream.transform(
+      fn -> <<>> end,
+      fn data, buf ->
+        decrypt_available_frames(buf <> data, dek, [])
+      end,
+      fn
+        <<>> -> {[], <<>>}
+        _garbage -> raise("SSE-S3 decryption failed: malformed ciphertext frame")
+      end,
+      fn _ -> :ok end
+    )
   end
 
   # ── 块加解密 ──
@@ -52,25 +72,27 @@ defmodule Maxio.Crypto.SSE do
     <<byte_size(ct)::32, iv::binary-size(12), tag::binary-size(16), ct::binary>>
   end
 
-  # 逐帧解密（密文已全读进内存——对象 GET 在 handler 流式发出前解密块；为简化此处整读密文，
-  # 大对象的逐帧流式解密留后续优化，本 MVP 正确性优先且密文与明文同量级，文档化）。
-  defp decrypt_frames(<<>>, _dek, acc), do: Enum.reverse(acc)
+  # 逐帧懒解密：只缓存不足一帧的尾部，避免 SSE GET/CopyObject 把完整对象读入内存。
+  defp decrypt_available_frames(buf, _dek, acc) when byte_size(buf) < 4,
+    do: {Enum.reverse(acc), buf}
 
-  defp decrypt_frames(
-         <<ct_len::32, iv::binary-size(12), tag::binary-size(16), rest::binary>>,
-         dek,
-         acc
-       ) do
-    <<ct::binary-size(^ct_len), tail::binary>> = rest
-
-    case :crypto.crypto_one_time_aead(:aes_256_gcm, dek, iv, ct, @aad, tag, false) do
-      :error -> raise "SSE-S3 decryption failed: GCM authentication tag mismatch"
-      plain -> decrypt_frames(tail, dek, [plain | acc])
-    end
+  defp decrypt_available_frames(<<ct_len::32, _rest::binary>>, _dek, _acc)
+       when ct_len > @chunk do
+    raise "SSE-S3 decryption failed: malformed ciphertext frame"
   end
 
-  defp decrypt_frames(_garbage, _dek, _acc),
-    do: raise("SSE-S3 decryption failed: malformed ciphertext frame")
+  defp decrypt_available_frames(<<ct_len::32, rest::binary>> = buf, dek, acc) do
+    if byte_size(rest) < @frame_header_size - 4 + ct_len do
+      {Enum.reverse(acc), buf}
+    else
+      <<iv::binary-size(12), tag::binary-size(16), ct::binary-size(^ct_len), tail::binary>> = rest
+
+      case :crypto.crypto_one_time_aead(:aes_256_gcm, dek, iv, ct, @aad, tag, false) do
+        :error -> raise "SSE-S3 decryption failed: GCM authentication tag mismatch"
+        plain -> decrypt_available_frames(tail, dek, [plain | acc])
+      end
+    end
+  end
 
   # ── DEK 包裹/解裹（主密钥 AES-256-GCM）──
   defp wrap_dek(dek) do

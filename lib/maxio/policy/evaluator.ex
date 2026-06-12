@@ -10,7 +10,7 @@ defmodule Maxio.Policy.Evaluator do
     Step 3: 否则 → {:deny, :implicit_deny}
   applicable ⇔ principal ∧ action ∧ resource ∧ conditions 全部命中（effect 不参与 applicable）。
   """
-  alias Maxio.Policy.{Arn, Condition, RequestContext, Statement}
+  alias Maxio.Policy.{Condition, RequestContext, Statement}
 
   @spec evaluate(RequestContext.t(), [Statement.t()]) ::
           :allow | {:deny, :explicit_deny | :implicit_deny}
@@ -27,29 +27,26 @@ defmodule Maxio.Policy.Evaluator do
   end
 
   defp statement_applies?(%Statement{} = s, %RequestContext{} = ctx) do
-    principal_match?(s.principals, ctx) and
-      action_match?(s.actions, ctx.action) and
-      resource_match?(s.resources, ctx.resource) and
-      Condition.hold?(s.conditions, ctx.conditions)
+    principal_match?(s, ctx) and
+      Statement.action_match?(s, ctx.action) and
+      Statement.resource_match?(s, ctx) and
+      Condition.hold?(s.conditions, ctx.conditions, variables_enabled?: s.variables_enabled?)
   end
 
   # :any 匹配匿名与任意认证；{:aws,list} 只匹配认证 principal 且 arn 命中（匿名永不命中）。
-  defp principal_match?(:any, _ctx), do: true
+  defp principal_match?(%Statement{principals: principals, not_principal?: not_principal?}, ctx) do
+    matched? = principal_selector_match?(principals, ctx)
+    if not_principal?, do: not matched?, else: matched?
+  end
 
-  defp principal_match?({:aws, _list}, %RequestContext{principal: :anonymous}), do: false
+  defp principal_selector_match?(:any, _ctx), do: true
 
-  defp principal_match?({:aws, list}, %RequestContext{principal: %{arn: arn}}) do
+  defp principal_selector_match?({:aws, _list}, %RequestContext{principal: :anonymous}), do: false
+
+  defp principal_selector_match?({:aws, list}, %RequestContext{principal: %{arn: arn}}) do
     # AWS Principal 精确匹配（区分大小写）；不做 glob（policy variable 未实现）。Statement 已把纯 "*" 归一化为 :any。
     Enum.any?(list, fn pat -> pat == arn end)
   end
 
-  defp principal_match?(_principals, _ctx), do: false
-
-  defp action_match?(actions, action) do
-    Enum.any?(actions, &Arn.glob_match?(&1, action, case_insensitive: true))
-  end
-
-  defp resource_match?(resources, resource) do
-    Enum.any?(resources, &Arn.glob_match?(&1, resource))
-  end
+  defp principal_selector_match?(_principals, _ctx), do: false
 end

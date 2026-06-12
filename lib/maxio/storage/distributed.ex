@@ -381,14 +381,27 @@ defmodule Maxio.Storage.Distributed do
       version_id: version_id,
       data_dir: version_id,
       modtime: modtime,
+      size: object_meta_value(om, :size),
       etag: Map.get(om, :etag),
       content_type: Map.get(om, :content_type, "binary/octet-stream"),
+      content_encoding: Map.get(om, :content_encoding),
+      content_disposition: Map.get(om, :content_disposition),
+      cache_control: Map.get(om, :cache_control),
+      expires: Map.get(om, :expires),
       tags: Map.get(om, :tags, %{}),
       sse: Map.get(om, :sse),
       acl_canned: Map.get(om, :acl_canned, "private"),
+      acl_grants: Map.get(om, :acl_grants, %{"grants" => []}),
       storage_class: Map.get(om, :storage_class, "STANDARD"),
       user_metadata: Map.get(om, :user_metadata, %{})
     ]
+  end
+
+  defp object_meta_value(om, key) do
+    case Map.get(om, key) do
+      fun when is_function(fun, 0) -> fun.()
+      value -> value
+    end
   end
 
   # sidecar 写各端点（并行），返回成功端点数。dirs 可能含 nil（begin_tmp 失败端点）-> 跳过。
@@ -730,17 +743,19 @@ defmodule Maxio.Storage.Distributed do
   end
 
   defp do_assemble(bucket, key, upload_id, part_numbers, opts) do
-    case Paths.object_rel(bucket, key, "null") do
+    version_id = Keyword.get(opts, :version_id, "null")
+
+    case Paths.object_rel(bucket, key, version_id) do
       {:error, :invalid_key} ->
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
         # 不自持对象锁（B1-1：锁由 handler 层 Maxio.Lock 横跨 assemble 字节 + put_metadata 元数据单点持有）。
-        assemble_locked(bucket, key, upload_id, obj_rel, part_numbers, opts)
+        assemble_locked(bucket, key, upload_id, version_id, obj_rel, part_numbers, opts)
     end
   end
 
-  defp assemble_locked(bucket, key, upload_id, obj_rel, part_numbers, opts) do
+  defp assemble_locked(bucket, key, upload_id, version_id, obj_rel, part_numbers, opts) do
     c = cfg(opts)
     endpoints = endpoints_for(bucket, key, opts)
     tx = transport(opts)
@@ -775,14 +790,14 @@ defmodule Maxio.Storage.Distributed do
     sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
     shard_len = acc.shard_len || 0
 
-    # 多段 assemble 的最终对象落 null 布局（Paths.object_rel(..., "null")）；同样产 maxio/2 sidecar
+    # 多段 assemble 的最终对象落 opts[:version_id] 指定布局（缺省 null）；同样产 maxio/2 sidecar
     # 使其 sidecar-可读/可列。ROUTE B B4-6 D1：透传 assemble 的 opts（携 opts[:object_meta]，由
     # Multipart.complete 从 upload 会话取 content_type/user_metadata 构造），version_opts 据此自描述
     # 真实 content_type/user_metadata（替换原硬编码 []，消除多段 :sidecar 读 content-type 错误）。
     meta =
       build_meta(
         c,
-        "null",
+        version_id,
         opts,
         acc.size,
         etag,

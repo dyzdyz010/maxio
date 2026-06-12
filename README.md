@@ -46,11 +46,50 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **实际请求带 `Origin`**：注册 `before_send` 注入 CORS 响应头（流式安全，不缓冲）。无 `Origin` 的请求完全不受影响。
 - **仅作用于 S3 Endpoint**（dev:9900 / prod:9000）；Console Endpoint（:4000）不受 CORS 影响。
 
-### Lifecycle（仅配置，执行 DEFER）
+### Lifecycle（配置 + CLI / 后台调度）
 
-- **`PutBucketLifecycleConfiguration`/`Get`/`Delete`**（`?lifecycle`）：**仅存储 / 校验 / 出站配置**（字节级往返：Filter/And/legacy Prefix、Expiration、NoncurrentVersionExpiration、AbortIncompleteMultipartUpload、Transition）；无配置 → `NoSuchLifecycleConfiguration 404`。
-- **后台过期执行未实现（defer）**：maxio **不会**自动过期对象或中止未完成的分段上传。诚实暴露于三处：(a) 应用启动时 `Logger.info` 列出 M4 defer 清单；(b) `mix maxio.lifecycle.run` 仅打印「expiration execution NOT implemented in M4」；(c) 本 README。
-- `Transition`/`NoncurrentVersionTransition` 在单层 maxio 无意义——接受持久化但 **no-op**。`Date`（绝对时间）仅存储/校验。
+- **`PutBucketLifecycleConfiguration`/`Get`/`Delete`**（`?lifecycle`）：存储 / 校验 / 出站配置（Filter/And/legacy Prefix、Tag/size filter、Expiration、NoncurrentVersionExpiration、AbortIncompleteMultipartUpload、Transition）；无配置 → `NoSuchLifecycleConfiguration 404`。非法/非正数值、缺 Key/Value 的 Tag filter 会 fail-closed 拒绝，避免删除选择器被静默放宽。
+- **执行器**：`mix maxio.lifecycle.run [--bucket name] [--dry-run]` 执行当前版本 `Expiration`（Days/Date）、`NoncurrentVersionExpiration`（按成为非当前的时间 + `NewerNoncurrentVersions` 保留数永久删除）、`ExpiredObjectDeleteMarker` 清理、`AbortIncompleteMultipartUpload`。未知 CLI 参数或对象级 partial error 会失败退出。
+- **后台调度器**：`Maxio.Lifecycle.Scheduler` 默认启动但不调度；配置 `config :maxio, :lifecycle_scheduler, enabled: true` 后按 `interval_ms` 周期调用同一个 `Maxio.Lifecycle.run/1`。`Transition` / `NoncurrentVersionTransition` 仍仅持久化与回放，runner 计为 unsupported no-op。
+
+### IAM identity policies（续作已支持）
+
+- **Principal 内联策略**：`principal_policies/1` 不再恒空；`principal_policies` 表按 `principal_arn + policy_name` 存储 identity-based policy，并与 bucket policy / ACL 一起交给同一个 Evaluator。显式 Deny 仍优先于任意 Allow。
+- **Principal 语义**：identity policy 绑定在 principal 上，JSON 内不允许 `Principal`；绑定关系隐式提供当前 principal。bucket policy 仍要求显式 `Principal`。
+- **CLI**：`mix maxio.iam.put_policy --principal ARN --name NAME --file policy.json`、`mix maxio.iam.list_policies --principal ARN`、`mix maxio.iam.delete_policy --principal ARN --name NAME`。
+
+### IAM condition operators（续作已支持）
+
+- **基础算子与集合限定符真实求值**：`String*` / `Arn*` / `Date*` / `Numeric*` 正反向比较、`Bool`、IPv4/IPv6 `IpAddress`/`NotIpAddress`、`Null`、`*IfExists`、`ForAnyValue:` / `ForAllValues:` 已在 bucket policy 与 identity policy 的 Condition 求值器中实现；真实 S3 请求上下文已抽取 `aws:SecureTransport`、`aws:SourceIp`、`aws:CurrentTime`、`aws:PrincipalArn`、`s3:prefix`、`s3:delimiter`、`s3:max-keys`、常用 `s3:x-amz-*` header，以及 `aws:PrincipalTag/*` / `s3:BucketTag/*` / `aws:ResourceTag/*` / `s3:ExistingObjectTag/*` / `s3:RequestObjectTag*` / `aws:RequestTag/*` / `aws:TagKeys` 等 tag 条件键。`PutObjectTagging` 的 XML body request tags 会在 handler bounded read + XML/tag 校验后、写入前做二阶段授权。
+- **缺失键语义**：正向算子缺键为 false；否定算子缺键为 true；`*IfExists` 缺键为 true；`ForAnyValue:` 缺键/空请求值为 false，`ForAllValues:` 缺键/空请求值按 AWS 语义为 true；`Null` 做存在性/null dataset 判断，可用于阻断空字符串等空值。无法解析的值 fail-closed，不命中 statement。
+- **ListBucket 数值条件**：授权上下文会传入 `s3:max-keys`，可用 `NumericLessThanEquals` 等条件限制单次列举数量。
+- **仍 defer**：跨账户与更广泛 AWS 全局上下文键。
+
+### IAM policy variables（续作已支持）
+
+- **变量展开范围**：`Version: "2012-10-17"` 的 policy 会在 `Resource` / `NotResource` 以及 String/Arn 系 Condition policy value 中展开 `${context-key}`；缺省或 legacy `Version` 下 `${...}` 按字面量处理。支持默认值语法 `${key, 'default'}` 与字面量转义 `${*}` / `${?}` / `${$}`。
+- **principal 上下文**：真实授权上下文已补齐 `aws:PrincipalType`、`aws:userid`、IAM user 的 `aws:username`。当前单租户实现中 `aws:userid` 使用 maxio access-key，`aws:username` 从本项目 IAM user ARN 尾段派生；可用于 identity policy 中按 access-key principal 隔离对象前缀，例如 `arn:aws:s3:::bucket/home/${aws:username}/*`。
+- **fail-closed 边界**：变量只接受单值标量上下文；缺失、空值或多值变量若无默认值则不匹配。`NotResource` 中任何未解析变量都会使该 resource selector 不命中，避免反向匹配被变量缺失放大。
+
+### IAM negated selectors（续作已支持）
+
+- **`NotAction` / `NotResource`**：policy statement 支持 `Action`/`NotAction`、`Resource`/`NotResource` 二选一 selector；评估时按 AWS IAM 语义匹配“除列出项之外”的 action 或 resource，显式 Deny 仍优先。
+- **`NotPrincipal`**：bucket policy 支持 resource-based `Deny` statement 中的 `NotPrincipal`；identity policy 继续拒绝 `Principal` / `NotPrincipal`，因为绑定关系隐式提供 principal。
+- **边界**：`NotResource` 在 bucket policy 写入时仍按目标 bucket 做 ARN 作用域校验，防止 bucket policy 静默声明其它 bucket 的资源；跨账户 principal、Service/CanonicalUser 细粒度语义仍属后续扩展。
+
+### ACL explicit grants（续作已支持）
+
+- **显式 grant 持久化与授权**：`x-amz-grant-read/write/read-acp/write-acp/full-control` 以及 PutBucketAcl/PutObjectAcl 的 ACL XML 会写入 `acl_grants` jsonb 文档，并与 `acl_canned` 一起经 `Maxio.Policy.ACL` 折叠成同一个 Evaluator statement 列表。
+- **支持 grantee**：Group URI 支持 AllUsers / AuthenticatedUsers / LogDelivery（LogDelivery 当前不产生可匹配 principal）；CanonicalUser 以 maxio principal ARN 精确匹配；email grantee 继续 `InvalidArgument 400`。
+- **sidecar 保真**：对象显式 grants 会随 maxio/2 sidecar 写入并参与 scanner reconcile / shadow 比对；CopyObject 默认仍按 AWS 语义重置为 private，显式 `x-amz-acl` 或 `x-amz-grant-*` 才应用到目标。
+
+### PublicAccessBlock（续作已支持）
+
+- **API**：`Put/Get/DeletePublicAccessBlock`（`?publicAccessBlock`）支持 bucket-level `BlockPublicAcls` / `IgnorePublicAcls` / `BlockPublicPolicy` / `RestrictPublicBuckets` 四布尔项；无配置的 GET 返回 `NoSuchPublicAccessBlockConfiguration 404`。
+- **ACL 防护**：`BlockPublicAcls=true` 时，PutBucketAcl、PutObjectAcl、PutObject、CopyObject、CreateMultipartUpload 携带公共 canned ACL 或 AllUsers / AuthenticatedUsers grant 会在写入前 `AccessDenied 403`，不落对象、ACL 或 MPU 会话副作用。
+- **有效权限**：`IgnorePublicAcls=true` 不删除既有 ACL，但授权时忽略公共 ACL 派生 statement；GetBucketAcl/GetObjectAcl 返回有效权限视图，不回显被忽略的公共 grant。
+- **Policy 防护**：`BlockPublicPolicy=true` 在 PutBucketPolicy 写入前拒绝公共 bucket policy 并保留既有 policy；`RestrictPublicBuckets=true` 对已存在公共 bucket policy 在授权聚合阶段抑制公共 Allow。
+- **边界**：当前仅实现 bucket-level 设置；AWS account / organization / access point 级叠加、跨账户精细限制、Service principal 例外仍随多租户/IAM 扩展后续实现。
 
 ### SSE-S3（服务端加密）
 
@@ -62,15 +101,15 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 
 ### M4 显式 defer 清单（汇总；文档化，绝不静默）
 
-1. **Lifecycle 后台过期 / 中止 MPU 执行**：仅存储/校验/出站；不跑 sweeper（启动日志 + mix stub + 本 README 暴露）。`Transition`/`NoncurrentVersionTransition` 接受持久化但 no-op。
+1. **Lifecycle Transition / NoncurrentVersionTransition 执行**：当前版本过期、非当前版本过期、仅存 delete marker 清理、旧 MPU 中止可由 `mix maxio.lifecycle.run` 或 `config :maxio, :lifecycle_scheduler, enabled: true` 后台周期执行；Transition / NoncurrentVersionTransition 仍 no-op 并显式暴露。
 2. **MFA Delete**：`MfaDelete` 状态解析/存储/回显（仅曾配置时回 `<MfaDelete>`），但不强制 MFA 校验（无设备），`x-amz-mfa` 头不验证。
 3. **SSE-C / SSE-KMS / DSSE-KMS**：仅 SSE-S3（AES256）；其余 → `501 NotImplemented`。`BucketKeyEnabled` no-op。
 4. **SSE 密钥管理简化**：单一静态主密钥，无轮转/HSM/KMS。
 5. **SSE 对象 + Range / 大对象逐帧流式解密**：Range 降级为完整对象；整对象解密后返回。
-6. **Multipart 完成对象在版本化桶的逐版本字节路径**：multipart 字节走 null 路径、元数据当当前 null 版本；单段 PutObject 版本化完整。
+6. **Multipart 完成对象版本化（2026-06-12 已收敛）**：CompleteMultipartUpload 在 Enabled 桶生成独立 ULID `version_id`，字节、sidecar、PG/索引与 `x-amz-version-id` 响应头使用同一版本；Suspended/Unversioned 仍写 `null` 版本。
 7. **对象级逐版本独立 tag set**：tag 挂在版本行（`?tagging&versionId` 已支持指定版本）；`s3:*VersionTagging` 按同名非 version 权限评估（单租户）。
-8. **lifecycle `Date`（绝对时间）与 `Transition` 执行**：仅存储/校验。
-9. **沿用 M3 全部 defer**：跨账户/多租户、完整条件算子、IAM identity policy（`principal_policies/1` 恒 `[]`，接口已就绪传真实 principal）、STS/session token、email grantee、`x-amz-grant-*` 细粒度、Block Public Access、checksum trailer 重算、DeleteObjects 逐 key 授权。
+8. **lifecycle `Transition` / `NoncurrentVersionTransition` 执行**：仅存储/校验/回放；runner 计 unsupported，不做静默转储。
+9. **沿用 M3 剩余 defer**：跨账户/多租户、更广泛 AWS 全局上下文键、STS/session token、email grantee、checksum trailer 重算、secret at-rest 加密。
 
 ## Console（M5，LiveView 管理控制台）
 
@@ -92,20 +131,20 @@ LiveView mount 时凭 access_key 重查 principal。鉴权经 `live_session` 的
 - **Buckets**：列表（streams）/ 创建（S3 名校验）/ 删除（非空守卫；所有错误显式 flash）。
 - **Object Browser**：prefix/folder 面包屑导航（`list_objects_v2` delimiter）/ 上传（`allow_upload` 流式 `File.stream!` 喂 `Storage.put`，≤5 GiB 单 PUT 路径，绝不全缓冲）/ 下载（plain controller `send_chunked` 流式）/ 新建文件夹（零字节 `prefix/` 对象）/ 删除（版本化感知：Enabled 插 delete marker，否则永久删）。
 - **Object Detail**：元数据（size/etag/content-type/storage-class/version_id/修改时间）/ 标签编辑（`Tags.validate`，`:invalid_tag` 显式 flash）/ 版本历史（`list_object_versions`，含 delete marker badge，per-version 流式下载/永久删除）。
-- **Bucket Settings**（7 tab，`?tab=` 切换）：版本化（`put_versioning`）/ 桶策略 JSON（`Statement.parse_policy` 校验）/ canned ACL（`put_acl`）/ 桶标签（`Tags.validate`）/ CORS（`BucketConfigs` :cors）/ 生命周期（`BucketConfigs` :lifecycle，明确标注后台执行 defer）/ 默认加密（SSE-S3 AES256；SSE-KMS 绝不静默当 AES256）。
+- **Bucket Settings**（8 tab，`?tab=` 切换）：版本化（`put_versioning`）/ 桶策略 JSON（`Statement.parse_policy` 校验）/ canned ACL（`put_acl`）/ 桶标签（`Tags.validate`）/ CORS（复用 S3 `PutBucketCors` 语义校验）/ 生命周期（复用 S3 `PutBucketLifecycle` 语义校验，提示可用 CLI 或 lifecycle scheduler 执行支持动作）/ 默认加密（SSE-S3 AES256；SSE-KMS 绝不静默当 AES256）/ PublicAccessBlock（四布尔项 bucket-level 设置）。
 - **Access Keys**：列表（绝不回 secret）/ 创建（secret 仅在创建响应里显示一次，不入 stream/session）/ 删除（保护最后一个 root：`:cannot_delete_last_root` 显式 flash）。
 
 前端可调试钩子：app.js 暴露 `window.__maxio = {liveSocket, log, version: "M5"}`，所有 Console 日志带标签 `[maxio][Console]`。
 
 ### 显式未实现（defer，绝不假装实现 / 不画死按钮）
 
-- **Identity → Users / Groups / IAM identity policy / STS / IdP**：maxio 单租户，无独立 user/group 实体（`principal_policies/1` 恒 `[]`）。Console 用 **access key** 作 identity primitive；Users/Groups 在侧边栏**不出现**（不画灰条目假装有）。
-- **Bucket → Quota / Events-Notifications / Replication / Object-Lock-Retention-Legal-Hold**：后端未实现，Settings 页不画这些 tab。
+- **Identity → Users / Groups / STS / IdP**：maxio 单租户，无独立 user/group 实体；IAM identity policy 已支持 CLI 绑定到 access-key principal，但 Console 暂未提供 UI。Console 用 **access key** 作 identity primitive；Users/Groups 在侧边栏**不出现**（不画灰条目假装有）。
+- **Bucket → Quota / Events-Notifications / Replication / Object-Lock-Retention-Legal-Hold**：后端未实现，Settings 页不画这些 tab。PublicAccessBlock 后端与 Settings tab 已接入；account / organization / access point 级叠加仍随多租户/IAM 扩展 defer。
 - **Object → 内联预览 / Legal hold / Retention**：后端未实现 / SSE 对象 GET 全缓冲（M4 defer）使大加密对象预览有风险——仅提供下载。
 - **Monitoring → Logs/Trace/Audit 流 / Drives/Heal / 流量·API速率·延迟 时序图**：需 Prometheus/纠删码（M6）。Dashboard 只做廉价计数，不画时序图。
 - **Configuration / Settings 运行时编辑 / Tiers / Site Replication / Batch Jobs / License**：后端无运行时配置存储；不做。
 - **Console 大文件多段上传**：MVP 走单 PUT（≤5 GiB，服务端临时文件中转）；接 `Maxio.Multipart` 逐 part 上传标为后续优化。
-- **生命周期后台执行**：Console 可编辑规则，但后台过期/转储执行未实现（沿用 M4 defer）。
+- **Lifecycle Transition / NoncurrentVersionTransition**：Console 可编辑规则，支持 `mix maxio.lifecycle.run` 或后台 scheduler 执行已支持动作；Transition、NoncurrentVersionTransition 仍 defer。
 - **预签名分享 URL**：可经 `Maxio.Auth.SigV4.Signer` 生成指向 S3 端的预签名 GET（唯一引用 S3 HTTP 之处），MVP 未做 UI（不画死按钮）。
 
 ## Erasure Coding（M6，单机多盘 Reed-Solomon 纠删码）
@@ -249,8 +288,9 @@ iex --sname maxio_c --cookie maxio -S mix
   绝不一次传整对象/整文件）；成功端点数 `>= write_quorum` 才 `{:ok}`，否则 `{:error, :write_quorum}` + 结构化日志。
 - **GET**：逐块跨节点并行读 K-of-N 分片（宕机/超时端点经 transport 兜底 → nil），按 sidecar BLAKE3 校验 +
   RS 重建（存活 `< K` → raise `InsufficientShardsError`，**绝不静默返回错数据**）+ Range 裁剪 + 流式发出。
-- **并发守护**：PUT/assemble/delete 经 `Maxio.Cluster.Lock.with_lock`（`:global.trans` 全 mesh 互斥），
-  获锁失败 → `{:error, :locked}`（**绝不静默并发写同对象**）。
+- **并发守护**：PUT/assemble/delete 经 `Maxio.Cluster.Lock.with_lock`（每节点 `LockServer` + quorum lease；
+  单节点退化 quorum=1，公共 API 保持不变），获锁失败 → `{:error, :locked}`，
+  S3 API 层回 503 `RequestTimeout`（**绝不静默并发写同对象**）。
 - **节点宕机/超时/远端异常**：`Transport.Erpc` 统一兜底为 nil 分片（与 M6 缺失本地文件语义完全相同），
   交 RS 重建，绝不把异常上抛炸后端。
 
@@ -281,14 +321,19 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
 1. **Rebalance / Decommission / online pool 扩容**：添加/退役 pool、跨 pool 迁移、free-space 加权放置
    （MinIO `mc admin rebalance`/`decommission`）。M7 单 pool（多 pool 两级路由 + 加权新写 + 迁移 = defer）；
    set 数 per pool 不可变。
-2. **完整 dsync 锁语义**：M7 用 `:global.trans`（全 mesh 互斥）+ `quorum_with_lock` 骨架。
-   lock lease/refresh keepalive、owner-crash refresh-expiry、`ForceUnlock`、read/write 锁区分、
-   split-brain 处理 = defer。
+2. **完整 dsync 锁语义**：M8-1 已把 `:global.trans` MVP 升级为 `LockServer` + quorum lease，
+   支持 acquire/release/refresh/force_unlock、read/write 锁区分、owner-death 与 TTL sweep。
+   仍 defer：Raft 线性化锁、fencing token、split-brain 下陈旧写硬拒绝。
 3. **跨节点 IAM / bucket-metadata 复制**：maxio 的 IAM/bucket-meta 走 **Postgres**（多节点共享 DB 天然一致，
-   故无需 `.maxio.sys` 对象化复制——架构差异，非缺口）；节点本地 ETS 缓存的跨节点失效通知（PubSub 广播）= defer。
-4. **scanner 全自动跨节点 walk + 1/1024 采样 + 限流**：`heal_object/4`（单对象跨节点重建）完整；
-   `scrub_bucket` 的对象列举当前经 `opts[:objects]` 显式列表（CLI 从 `Maxio.Objects` 取）。
-   自动跨节点目录 walk（需 transport `list_dir` callback + peer 列举）+ hash 采样 + token-bucket 限流 = defer。
+   故无需 `.maxio.sys` 对象化复制——架构差异，非缺口）；M8-2 已接入 PubSub metadata invalidation spine，
+   让节点本地 ETS credential cache 与后续 read-through cache 有统一失效路径。它不是 `.minio.sys` shared-nothing
+   元数据复制，也不替代后续 sidecar 权威化的完整收敛。
+4. **scanner 成熟度**：M8-3a/b/c/d + orphan cleanup 续作已新增 `Maxio.Cluster.Scrubber`，可从 PG 对象元数据分页自动枚举、
+   刷新 usage 快照，并按 `sample_inverse` 做确定性 1/N 深度 heal 采样；`Maxio.Cluster.Heal.heal_object/4`
+   仍是单对象跨节点重建核心。`Maxio.Storage.Scanner` 现在会检测盘上孤儿 shard
+   （`part.0` 无 sidecar、delete-marker 目录残留 `part.0`），默认只计数/日志；显式
+   `--cleanup-orphan-shards` 时才在 sidecar 写权威、全端点可达、对象锁、二次探针、年龄门和每轮删除上限
+   同时满足后删除 `part.0`。仍 defer：token-bucket/IO 自适应限流与长期离线盘策略。
 5. **多 parity / storage class**：单一 (K,M)；`x-amz-storage-class` → 不同 EC = defer（沿用 M6）。
 6. **parity upgrade on degraded write**：写未达 write_quorum 即 `{:error, :write_quorum}`（绝不静默）；
    MinIO 的「写时临时提高 effective parity」= defer。
@@ -296,9 +341,79 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
    大规模 / 跨数据中心 / mTLS 专用传输 = defer（`Transport` behaviour 已抽象，换实现不动后端）。
 8. **failure-domain 感知的自动 set 形成**：M7 拓扑由 config **手工**指定每 set 的 N 个 `{node, drive}`。
    MinIO 的 ellipsis 展开 + node-interleaving + GCD set sizing 自动形成 = defer（手工 config 即可达同等放置）。
-9. **沿用 M0–M6 全部既有 defer**（lifecycle 后台执行、SSE 大对象逐帧流式 GET、identity policy、
-   MFA Delete 强制、跨账户多租户、完整条件算子、inline 小对象等）。
+9. **沿用 M0–M6 全部既有 defer**（lifecycle Transition/NoncurrentVersionTransition、SSE 大对象逐帧流式 GET、
+   IAM managed-policy/group/role/session 扩展、MFA Delete 强制、跨账户多租户、条件高级扩展、inline 小对象等）。
 
 **设计保证**：M7 在 M6 同一 RS 核心**之外**加 routing/locking/topology/transport 层，**不重写
 encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分片 → EC 重建或结构化 raise，
 **绝不静默返回错数据**（铁律 3）。deferral 逐条显式列出，无静默缺口。
+
+## 分布式运维成熟度（M8，进行中）
+
+当前已完成 **M8-1 quorum lock core**、**M8-2 cache invalidation spine**、
+**M8-3a/b/c/d/e PG metadata-driven scrubber/auto-heal + optional index reconcile pre-pass + orphan shard evidence/cleanup**
+与 **M8-4 integration evidence + peer lock harness**。
+`Maxio.Cluster.LockServer` 作为每节点本地 lease table，
+`Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
+`with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
+
+支持能力：
+
+- write lock 独占、read lock 共享；
+- owner 进程退出自动释放本地 token；
+- monotonic TTL sweep 清理过期 lease；
+- `acquire/2`、`release/1`、`refresh/1`、`force_unlock/2` 可用于后续 scanner/运维任务；
+- heartbeat 丢失 quorum 会中止受保护 worker，避免 lease 失效后继续写入；
+- unknown-token release 会短期取消该 token，防止远端超时 acquire 后到造成未跟踪锁；
+- 锁竞争继续在 S3 层映射为 `503 RequestTimeout`，不同于 write quorum 的 `SlowDownWrite`。
+
+边界：这是 dsync/Redlock 类 best-effort 锁，不是 Raft 线性化锁；节点重启会遗忘本地 lease。
+后续若要把锁作为强写 epoch，需要 fencing token 写入 sidecar/元数据来拒绝陈旧 writer。
+
+M8-2 已提供：
+
+- `Maxio.Cluster.Notify`：统一通过 `Phoenix.PubSub` topic `maxio:metadata` 广播 metadata invalidation event；
+- `Maxio.Cluster.CacheInvalidator`：监督树内订阅 topic，当前对 credential MemoryStore 执行真实 ETS 失效；
+- `CredentialStore.invalidate/1` 可选 callback，EctoStore 当前 no-op（生产路径每请求读 Postgres，无本地 credential cache）；
+- IAM access key、bucket config、bucket metadata、bucket/identity policy、object ACL/tag mutation 成功后在 context/facade 层广播事件，S3 API、Console、Mix 任务共享同一失效路径。
+
+边界：当前多数 metadata 仍由共享 Postgres 或 sidecar 权威入口读取，失效订阅者多数事件是为未来缓存预留的 no-op；
+这不是 `.minio.sys` shared-nothing 元数据复制，也不提供 Raft/epoch 强一致。
+
+M8-3a/b/c/d/e 已提供：
+
+- `Maxio.Cluster.Scrubber`：默认随监督树启动但不调度；`config :maxio, :scrubber, enabled: true`
+  后按 `interval_ms` 周期运行。周期轮按 `sample_inverse` 做确定性 1/N 深度 heal 检查，
+  `mix maxio.scan` / `run_once` 默认仍为全量取证。
+- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--reconcile-index]`：一次性扫描入口，输出
+  buckets/scanned/damaged/healed/unrecoverable/missing/skipped/sampled_out/index_status/index_scanned/index_upserted/index_gc/index_skipped/index_divergent/index_orphan_shards/index_orphan_bytes/index_orphan_cleaned/index_orphan_cleaned_bytes/objects/bytes。
+  `--reconcile-index` 会先调用既有 `Maxio.Storage.Scanner` 做 disk/peer sidecar → PG 派生索引收敛，
+  再用刷新后的 PG inventory 做 usage/heal；默认不越过 write-authority 安全闸，需要明确接受盘权威时才加
+  `--force-reconcile-index`。
+- 对象来源为 `Maxio.Objects` 的有界分页；FS 后端只刷新 `Maxio.Cluster.Scrubber.Usage` 快照，
+  `ErasureCoded`/`Distributed` 后端按 erasure set 通过 `Maxio.Cluster.Lock.quorum_with_lock/3`
+  获取 heartbeat-backed 短租约后调用 `Maxio.Storage.Erasure.Heal` 或 `Maxio.Cluster.Heal`。
+  Distributed 的默认锁节点来自对象所在 erasure set 端点节点，避免多节点本地-only 重复扫描。
+- `Maxio.Storage.Scanner` 会在 reconcile 轮附带 orphan shard evidence：检测 `part.0`
+  无 `meta.json`、delete-marker sidecar 旁残留 `part.0`，默认输出 `orphan_shards/orphan_bytes`，
+  并透传到 `mix maxio.scan` 的 `index_orphan_*` 字段。显式
+  `--cleanup-orphan-shards` / `--orphan-cleanup-dry-run` 可执行或演练 guarded cleanup；
+  清理只删除 `part.0`，绝不删除目录或 `meta.json`，并输出 `orphan_cleaned/orphan_cleaned_bytes`。
+- 不可恢复对象只计数并结构化 error 日志，绝不伪造数据；拿不到 set 锁的对象计为 skipped。
+
+M8-4 已提供：
+
+- `test/maxio/cluster/m8_integration_test.exs`：默认回归中证明监督树内 `Scrubber.scan_now/1`
+  能对 `Distributed` + `InProcess` 拓扑执行 PG-inventory driven heal；同一流程验证
+  bucket/object metadata mutation 仍经 `Notify` topic 可观测。
+- 同一集成测试证明 `Distributed` scrubber 使用 set-resource 锁；local-node topology 下 set lock 被持有时对象计为
+  `skipped` 且不越权 heal，释放后下一轮才修复 shard。多节点 quorum 语义由 peer harness 收集。
+- `test/maxio/cluster/peer_lock_test.exs`：`@tag :distributed` 默认排除，单独
+  `MAXIO_RUN_PEER_LOCK=1 mix test test/maxio/cluster/peer_lock_test.exs --include distributed`
+  时才尝试起真实 `:peer` BEAM 节点，收集 `Lock.acquire/2` 经 `:erpc` 到 peer `LockServer`
+  后跨节点排他、三节点丢一 peer 仍保留多数 quorum、以及 peer-backed scrubber 默认 set-node
+  lock 选择的证据。未设置环境变量时该文件报告 skipped，避免把不可用 peer 环境伪装成通过。
+
+M8 剩余：
+
+- 完整 MinIO data-scanner parity：token-bucket + live IO 自适应限流、drive-offline 长窗口策略。

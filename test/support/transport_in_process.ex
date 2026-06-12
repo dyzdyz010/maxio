@@ -65,8 +65,18 @@ defmodule Maxio.Cluster.Transport.InProcess do
   end
 
   @impl true
+  def stat_shard_info(node, dir) do
+    if down?(node), do: {:error, :enoent}, else: ShardServer.stat_shard_info(dir)
+  end
+
+  @impl true
   def delete_shard(node, dir) do
     if down?(node), do: :ok, else: ShardServer.delete_shard(dir)
+  end
+
+  @impl true
+  def delete_part_file(node, dir) do
+    if down?(node), do: {:error, :unavailable}, else: ShardServer.delete_part_file(dir)
   end
 
   @impl true

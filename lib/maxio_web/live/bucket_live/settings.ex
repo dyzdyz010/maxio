@@ -1,8 +1,9 @@
 defmodule MaxioWeb.BucketLive.Settings do
   @moduledoc """
   Bucket Settings tabbed 编辑器（M5-7）：单个 LiveView 经 `?tab=` query + `push_patch`
-  在 7 个 tab 间切换——versioning / policy(JSON) / acl(canned) / tags / cors(JSON) /
-  lifecycle(JSON，后台执行标 defer) / encryption(SSE-S3，KMS 拒绝)。全部复用 M2–M4
+  在 8 个 tab 间切换——versioning / policy(JSON) / acl(canned) / tags / cors(JSON) /
+  lifecycle(JSON，CLI/后台 scheduler 执行支持动作，Transition 仍 defer) /
+  encryption(SSE-S3，KMS 拒绝) / public_access_block。全部复用 M2–M4
   context（`Maxio.Buckets` / `Maxio.BucketConfigs` / `Maxio.Tags` / `Maxio.Policy.{Store,Statement}`）
   + 其内置校验；所有 context 错误显式 flash 呈现，绝不静默吞掉（铁律 3）。
   """
@@ -10,8 +11,11 @@ defmodule MaxioWeb.BucketLive.Settings do
 
   alias Maxio.{Buckets, BucketConfigs, Tags}
   alias Maxio.Policy.{Store, Statement}
+  alias Maxio.S3.Error, as: S3Error
+  alias Maxio.S3.Handlers.{Cors, Lifecycle}
+  alias Maxio.S3.PublicAccessBlock
 
-  @tabs ~w(versioning policy acl tags cors lifecycle encryption)
+  @tabs ~w(versioning policy acl tags cors lifecycle encryption public_access_block)
   @canned ~w(private public-read public-read-write authenticated-read)
 
   @impl true
@@ -56,6 +60,7 @@ defmodule MaxioWeb.BucketLive.Settings do
         <.tab bucket={@bucket} tab={@tab} key="cors" label="CORS" />
         <.tab bucket={@bucket} tab={@tab} key="lifecycle" label="生命周期" />
         <.tab bucket={@bucket} tab={@tab} key="encryption" label="加密" />
+        <.tab bucket={@bucket} tab={@tab} key="public_access_block" label="公共访问" />
       </div>
 
       <div class="rounded-box bg-base-100 border border-base-300 p-5">
@@ -138,7 +143,7 @@ defmodule MaxioWeb.BucketLive.Settings do
             <div class="space-y-3">
               <div id="lifecycle-defer-alert" class="alert alert-warning text-sm">
                 <.icon name="hero-exclamation-triangle" class="size-4" />
-                生命周期规则仅存储/校验；后台过期/转储执行尚未实现（M4 defer）。
+                生命周期规则可由 mix maxio.lifecycle.run 执行一轮，或通过 config :maxio, :lifecycle_scheduler 开启后台调度；Transition 与 NoncurrentVersionTransition 仍未执行。
               </div>
               <.form
                 for={@lifecycle_form}
@@ -175,6 +180,54 @@ defmodule MaxioWeb.BucketLive.Settings do
               <p class="text-xs text-base-content/50">SSE-KMS 尚未实现（选择将被拒绝）。</p>
               <.button variant="primary" id="encryption-submit" type="submit">保存加密</.button>
             </.form>
+          <% "public_access_block" -> %>
+            <div class="space-y-4">
+              <div id="public-access-block-context" class="alert alert-info text-sm">
+                <.icon name="hero-shield-check" class="size-4" />
+                当前只编辑 bucket-level PublicAccessBlock；account / organization / access point 叠加仍由后续 IAM/多租户扩展接入。
+              </div>
+              <.form
+                for={@public_access_block_form}
+                id="public-access-block-form"
+                phx-submit="save_public_access_block"
+                class="space-y-3"
+              >
+                <div class="grid gap-2 md:grid-cols-2">
+                  <.input
+                    field={@public_access_block_form[:block_public_acls]}
+                    type="checkbox"
+                    label="BlockPublicAcls：拒绝新的公共 ACL 写入"
+                  />
+                  <.input
+                    field={@public_access_block_form[:ignore_public_acls]}
+                    type="checkbox"
+                    label="IgnorePublicAcls：授权时忽略公共 ACL"
+                  />
+                  <.input
+                    field={@public_access_block_form[:block_public_policy]}
+                    type="checkbox"
+                    label="BlockPublicPolicy：拒绝公共 bucket policy"
+                  />
+                  <.input
+                    field={@public_access_block_form[:restrict_public_buckets]}
+                    type="checkbox"
+                    label="RestrictPublicBuckets：公共 policy 仅保留 Deny"
+                  />
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <.button variant="primary" id="public-access-block-submit" type="submit">
+                    保存 PublicAccessBlock
+                  </.button>
+                  <.button
+                    id="public-access-block-delete"
+                    type="button"
+                    phx-click="delete_public_access_block"
+                  >
+                    删除配置
+                  </.button>
+                </div>
+              </.form>
+            </div>
         <% end %>
       </div>
     </Layouts.app>
@@ -211,6 +264,7 @@ defmodule MaxioWeb.BucketLive.Settings do
     cors_json = config_json(bucket, :cors)
     lifecycle_json = config_json(bucket, :lifecycle)
     encryption_algo = encryption_algo(bucket)
+    public_access_block_config = public_access_block_config(bucket)
     {:ok, bucket_tags} = Buckets.get_tags(bucket)
 
     socket
@@ -221,6 +275,7 @@ defmodule MaxioWeb.BucketLive.Settings do
     |> assign(:cors_form, to_form(%{"json" => cors_json}, as: :cors))
     |> assign(:lifecycle_form, to_form(%{"json" => lifecycle_json}, as: :lifecycle))
     |> assign(:encryption_form, to_form(%{"algorithm" => encryption_algo}, as: :encryption))
+    |> assign(:public_access_block_form, public_access_block_form(public_access_block_config))
   end
 
   defp config_json(bucket, kind) do
@@ -236,6 +291,25 @@ defmodule MaxioWeb.BucketLive.Settings do
       {:ok, _} -> "none"
       :none -> "none"
     end
+  end
+
+  defp public_access_block_config(bucket) do
+    case PublicAccessBlock.get_config(bucket) do
+      {:ok, config} -> config
+      :none -> PublicAccessBlock.defaults()
+    end
+  end
+
+  defp public_access_block_form(config) do
+    to_form(
+      %{
+        "block_public_acls" => Map.get(config, "BlockPublicAcls", false),
+        "ignore_public_acls" => Map.get(config, "IgnorePublicAcls", false),
+        "block_public_policy" => Map.get(config, "BlockPublicPolicy", false),
+        "restrict_public_buckets" => Map.get(config, "RestrictPublicBuckets", false)
+      },
+      as: :public_access_block
+    )
   end
 
   defp tags_raw(tag_list),
@@ -326,6 +400,36 @@ defmodule MaxioWeb.BucketLive.Settings do
     end
   end
 
+  def handle_event(
+        "save_public_access_block",
+        %{"public_access_block" => params},
+        socket
+      ) do
+    bucket = socket.assigns.bucket
+    config = public_access_block_params(params)
+
+    case BucketConfigs.put(bucket, :public_access_block, config) do
+      :ok ->
+        {:noreply,
+         socket
+         |> assign(:public_access_block_form, public_access_block_form(config))
+         |> put_flash(:info, "PublicAccessBlock 已保存")}
+
+      {:error, _changeset} ->
+        {:noreply, put_flash(socket, :error, "PublicAccessBlock 保存失败")}
+    end
+  end
+
+  def handle_event("delete_public_access_block", _params, socket) do
+    bucket = socket.assigns.bucket
+    :ok = BucketConfigs.delete(bucket, :public_access_block)
+
+    {:noreply,
+     socket
+     |> assign(:public_access_block_form, public_access_block_form(PublicAccessBlock.defaults()))
+     |> put_flash(:info, "PublicAccessBlock 已删除")}
+  end
+
   # 通用 JSON 配置保存（cors/lifecycle）：空 = 删除；非法 JSON = 错误 flash。
   defp save_config_json(socket, bucket, kind, json, label) do
     trimmed = String.trim(json)
@@ -338,15 +442,34 @@ defmodule MaxioWeb.BucketLive.Settings do
       true ->
         case Jason.decode(trimmed) do
           {:ok, value} ->
-            case BucketConfigs.put(bucket, kind, value) do
-              :ok -> {:noreply, put_flash(socket, :info, "#{label} 已保存")}
-              {:error, _} -> {:noreply, put_flash(socket, :error, "#{label} 保存失败")}
+            case validate_config(kind, value) do
+              :ok ->
+                case BucketConfigs.put(bucket, kind, value) do
+                  :ok -> {:noreply, put_flash(socket, :info, "#{label} 已保存")}
+                  {:error, _} -> {:noreply, put_flash(socket, :error, "#{label} 保存失败")}
+                end
+
+              {:error, %S3Error{} = error} ->
+                {:noreply, put_flash(socket, :error, "#{label} 规则非法（#{error.code}）")}
             end
 
           {:error, _} ->
             {:noreply, put_flash(socket, :error, "#{label} JSON 非法")}
         end
     end
+  end
+
+  defp validate_config(:cors, value), do: validate_s3_config(fn -> Cors.validate!(value) end)
+
+  defp validate_config(:lifecycle, value),
+    do: validate_s3_config(fn -> Lifecycle.validate!(value) end)
+
+  defp validate_config(_kind, _value), do: :ok
+
+  defp validate_s3_config(fun) do
+    fun.()
+  rescue
+    error in S3Error -> {:error, error}
   end
 
   defp parse_raw_tags(raw) do
@@ -361,4 +484,16 @@ defmodule MaxioWeb.BucketLive.Settings do
       end
     end)
   end
+
+  defp public_access_block_params(params) do
+    %{
+      "BlockPublicAcls" => checkbox_value(params["block_public_acls"]),
+      "IgnorePublicAcls" => checkbox_value(params["ignore_public_acls"]),
+      "BlockPublicPolicy" => checkbox_value(params["block_public_policy"]),
+      "RestrictPublicBuckets" => checkbox_value(params["restrict_public_buckets"])
+    }
+  end
+
+  defp checkbox_value(value) when value in [true, "true", "on", "1"], do: true
+  defp checkbox_value(_value), do: false
 end

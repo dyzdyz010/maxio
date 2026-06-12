@@ -28,7 +28,10 @@ defmodule Maxio.Storage.Scanner do
        不存在 `{:ok, entries}`」）——`get_sidecar` 把宕机塌缩成 `:enoent`，对 GC 判定不可用。
 
   每轮汇总日志：scanned（forward 检视的盘上版本数）/ upserted / gc / skipped（端点不可达跳过 +
-  写失败留待下轮）/ divergent（quorum 仲裁失败）。`--dry-run` 只报告（would-计数）**绝不写**。
+  写失败留待下轮）/ divergent（quorum 仲裁失败）/ orphan_shards / orphan_bytes / orphan_cleaned /
+  orphan_cleaned_bytes。orphan shard 默认只做取证：盘上 `part.0` 缺 sidecar，或 delete-marker
+  版本目录残留 `part.0`，均计数并日志；显式开启清理时仍须满足 age/quorum/authority/lock 安全门，
+  且只删除 `part.0`，绝不删除目录或 `meta.json`。`--dry-run` 只报告（would-计数）**绝不写**。
 
   与在线写路径的竞态（无锁，文档化）：写路径盘先 PG 后——scanner 在两步之间看到「盘有 PG 缺」会
   提前 upsert（与随后的写路径 upsert 同 (bucket,key,version_id) 冲突替换，幂等收敛）；反向探针在
@@ -47,20 +50,32 @@ defmodule Maxio.Storage.Scanner do
 
   默认 `config :maxio, :scanner, enabled: false`：GenServer 启动但不调度（显式日志声明），
   行为零变更；interval_ms 默认 86_400_000（每日一轮），batch_size 默认 500（铁律 4 有界批量）。
-  无分布式拓扑（单机 FS / dev）时 `run_once` 安全 no-op（status: :no_topology + 日志，绝不
-  raise——盘上枚举需要拓扑端点，FS sidecar 接线 = B6-1 defer）。
+  无分布式拓扑且非 FS 后端时 `run_once` 安全 no-op（status: :no_topology + 日志，绝不
+  raise——盘上枚举需要拓扑端点）。ROUTE B B6-2：FS 后端无全局拓扑时 `run_once` 入口经
+  `Maxio.ObjectMeta.put_effective_topology/1` 注入**合成单端点 topology**
+  （`{Node.self(), data_dir}`，quorum=1）——FS 单机的派生索引 reconcile 全机器逐字复用。
   """
   use GenServer
 
   import Ecto.Query
 
-  alias Maxio.{Buckets, Listing, MetaReconcile, ObjectMeta, Objects, Repo}
+  alias Maxio.{Buckets, Listing, Lock, MetaReconcile, ObjectMeta, Objects, Repo}
   alias Maxio.Cluster.{Paths, Router, Topology, Transport}
   alias Maxio.Objects.Object
   alias Maxio.S3.Log
   alias Maxio.Storage.Erasure.Config
 
-  @count_keys [:scanned, :upserted, :gc, :skipped, :divergent]
+  @count_keys [
+    :scanned,
+    :upserted,
+    :gc,
+    :skipped,
+    :divergent,
+    :orphan_shards,
+    :orphan_bytes,
+    :orphan_cleaned,
+    :orphan_cleaned_bytes
+  ]
 
   @type report :: %{
           status: :ok | :no_topology | :authority_mismatch,
@@ -70,7 +85,11 @@ defmodule Maxio.Storage.Scanner do
           upserted: non_neg_integer(),
           gc: non_neg_integer(),
           skipped: non_neg_integer(),
-          divergent: non_neg_integer()
+          divergent: non_neg_integer(),
+          orphan_shards: non_neg_integer(),
+          orphan_bytes: non_neg_integer(),
+          orphan_cleaned: non_neg_integer(),
+          orphan_cleaned_bytes: non_neg_integer()
         }
 
   # ── GenServer（周期调度；enabled: false 时启动但不调度，显式日志声明状态）──
@@ -137,6 +156,9 @@ defmodule Maxio.Storage.Scanner do
     * `:force`（默认 false）——`authoritative_source(:write) != :sidecar` 时本函数一律拒绝
       （status: :authority_mismatch 零计数，**含 dry-run**）；force: true 显式越闸，仅当你明确
       接受「以盘为权威重写 PG 索引」的后果（PG-only delete marker 会被复活 + 被 reverse-GC）；
+    * `:cleanup_orphan_shards`（默认 false）——显式清理 orphan evidence 中满足安全门的 `part.0`；
+      仅删除 `part.0` 文件，绝不删除目录或 `meta.json`。`dry_run: true` 时只计 would-clean；
+    * `:orphan_cleanup_min_age_ms`——orphan `part.0` 最小年龄，默认来自 scanner config；
     * `:transport` / `:topology` / `:authoritative_source`——test 注入（与读/列路径同款依赖注入）。
 
   返回 `{:ok, report}`（见 `t:report/0`）。写权威非 :sidecar 且未 force → status:
@@ -144,6 +166,11 @@ defmodule Maxio.Storage.Scanner do
   """
   @spec run_once(keyword()) :: {:ok, report()}
   def run_once(opts \\ []) do
+    # ROUTE B B6-2：入口处一次性解析有效 topology（与读/列权威同一 helper）——FS 后端无全局
+    # 拓扑时注入合成单端点 {Node.self(), data_dir}（quorum=1，单盘确认即权威），下游
+    # 枚举（Listing.scan_keys/version_ids）、endpoints_for、read_quorum、reverse-GC 探针
+    # 全经既有 opts[:topology] 优先逻辑消费。真集群拓扑 / 显式注入 → 行为不变。
+    opts = ObjectMeta.put_effective_topology(opts)
     dry_run = Keyword.get(opts, :dry_run, false)
     batch_size = Keyword.get(opts, :batch_size, config()[:batch_size])
 
@@ -175,14 +202,17 @@ defmodule Maxio.Storage.Scanner do
         report =
           buckets
           |> Enum.reduce(zero_report(dry_run, :ok), fn bucket, acc ->
-            merge_counts(acc, scan_bucket(bucket, batch_size, dry_run, opts))
+            bucket_opts = Keyword.put(opts, :orphan_cleanup_used, acc.orphan_cleaned)
+            merge_counts(acc, scan_bucket(bucket, batch_size, dry_run, bucket_opts))
           end)
           |> Map.put(:buckets, length(buckets))
 
         Log.info(
           "scanner round complete: buckets=#{report.buckets} scanned=#{report.scanned} " <>
             "upserted=#{report.upserted} gc=#{report.gc} skipped=#{report.skipped} " <>
-            "divergent=#{report.divergent} dry_run=#{report.dry_run}",
+            "divergent=#{report.divergent} orphan_shards=#{report.orphan_shards} " <>
+            "orphan_bytes=#{report.orphan_bytes} orphan_cleaned=#{report.orphan_cleaned} " <>
+            "orphan_cleaned_bytes=#{report.orphan_cleaned_bytes} dry_run=#{report.dry_run}",
           action: :reconcile_index
         )
 
@@ -201,7 +231,9 @@ defmodule Maxio.Storage.Scanner do
       ObjectMeta.authoritative_source(:write, opts) == :sidecar
   end
 
-  # opts[:topology]（test 注入）优先；否则须有真集群拓扑（与 ObjectMeta.shadow_enabled? 同语义）。
+  # opts[:topology]（test 注入 / B6-2 run_once 入口注入的 FS 合成单端点）优先；
+  # 否则须有真集群拓扑。FS 后端经入口的 put_effective_topology 已注入合成拓扑，
+  # 故 no_topology 仅余「非 FS 后端且无集群拓扑」一种形态。
   defp topology_available?(opts) do
     Keyword.get(opts, :topology) != nil or Topology.configured?()
   end
@@ -215,7 +247,11 @@ defmodule Maxio.Storage.Scanner do
   defp scan_bucket(bucket, batch_size, dry_run, opts) do
     {forward_counts, seen} = forward_pass(bucket, batch_size, dry_run, opts)
     reverse_counts = reverse_pass(bucket, batch_size, dry_run, seen, opts)
-    merge_counts(forward_counts, reverse_counts)
+    orphan_counts = orphan_shard_pass(bucket, dry_run, opts)
+
+    forward_counts
+    |> merge_counts(reverse_counts)
+    |> merge_counts(orphan_counts)
   rescue
     e ->
       Log.error("scanner bucket scan failed",
@@ -234,6 +270,550 @@ defmodule Maxio.Storage.Scanner do
       )
 
       zero_counts()
+  end
+
+  # ── orphan shard 只读取证：盘上有 part.0 但缺可见 sidecar，或 delete-marker 版本残留 part.0 ──
+
+  defp orphan_shard_pass(bucket, dry_run, opts) do
+    transport = Transport.impl(opts)
+    endpoints = all_endpoints(opts)
+    cleanup = orphan_cleanup_config(bucket, dry_run, opts, transport, endpoints)
+
+    endpoints
+    |> Enum.reduce(zero_counts(), fn {node, drive}, counts ->
+      walk_orphan_endpoint(counts, transport, node, drive, bucket, cleanup)
+    end)
+  end
+
+  defp walk_orphan_endpoint(counts, transport, node, drive, bucket, cleanup) do
+    bucket_root = Path.join(drive, bucket)
+
+    # Full endpoint outage would otherwise be counted once per root. Probe the bucket root first so
+    # one unavailable endpoint contributes one skipped evidence lane, then avoid the version root.
+    case transport.list_dir(node, bucket_root, include_layout_files: true) do
+      {:ok, _entries} ->
+        counts
+        |> walk_orphan_tree(transport, node, bucket_root, [], :null, bucket, cleanup)
+        |> walk_orphan_tree(
+          transport,
+          node,
+          Path.join([drive, ".versions", bucket]),
+          [],
+          :versions,
+          bucket,
+          cleanup
+        )
+
+      {:error, _reason} ->
+        bump(counts, :skipped)
+    end
+  end
+
+  defp walk_orphan_tree(counts, transport, node, dir, rel_segments, layout, bucket, cleanup) do
+    case transport.list_dir(node, dir, include_layout_files: true) do
+      {:ok, entries} ->
+        files = entries |> Enum.filter(&(entry_type(&1) == :file)) |> MapSet.new(& &1.name)
+        dirs = Enum.filter(entries, &(entry_type(&1) == :dir))
+
+        counts =
+          maybe_count_orphan_shard(
+            counts,
+            transport,
+            node,
+            dir,
+            bucket,
+            layout,
+            rel_segments,
+            MapSet.member?(files, "part.0"),
+            MapSet.member?(files, "meta.json"),
+            cleanup
+          )
+
+        Enum.reduce(dirs, counts, fn entry, acc ->
+          walk_orphan_tree(
+            acc,
+            transport,
+            node,
+            Path.join(dir, entry.name),
+            rel_segments ++ [entry.name],
+            layout,
+            bucket,
+            cleanup
+          )
+        end)
+
+      {:error, _reason} ->
+        bump(counts, :skipped)
+    end
+  end
+
+  defp maybe_count_orphan_shard(
+         counts,
+         _transport,
+         _node,
+         _dir,
+         _bucket,
+         _layout,
+         _rel,
+         false,
+         _meta?,
+         _cleanup
+       ),
+       do: counts
+
+  defp maybe_count_orphan_shard(
+         counts,
+         transport,
+         node,
+         dir,
+         bucket,
+         layout,
+         rel,
+         true,
+         false,
+         cleanup
+       ) do
+    record_orphan_shard(
+      counts,
+      transport,
+      node,
+      dir,
+      bucket,
+      layout,
+      rel,
+      :part_without_meta,
+      cleanup
+    )
+  end
+
+  defp maybe_count_orphan_shard(
+         counts,
+         transport,
+         node,
+         dir,
+         bucket,
+         layout,
+         rel,
+         true,
+         true,
+         cleanup
+       ) do
+    case safe_get_sidecar(transport, node, dir) do
+      {:ok, meta} ->
+        if delete_marker_meta?(meta) do
+          record_orphan_shard(
+            counts,
+            transport,
+            node,
+            dir,
+            bucket,
+            layout,
+            rel,
+            :delete_marker_part,
+            cleanup
+          )
+        else
+          counts
+        end
+
+      {:error, _} ->
+        bump(counts, :skipped)
+    end
+  end
+
+  defp record_orphan_shard(counts, transport, node, dir, bucket, layout, rel, reason, cleanup) do
+    {key, version_id} = orphan_ref(layout, rel)
+    info = shard_info(transport, node, dir)
+    bytes = info.size
+
+    Log.warn("scanner: orphan shard bytes detected",
+      bucket: bucket,
+      key: key,
+      action: :orphan_shard,
+      reason:
+        "reason=#{reason} version_id=#{version_id} node=#{node} bytes=#{bytes} path_layout=#{layout}"
+    )
+
+    counts
+    |> bump(:orphan_shards)
+    |> Map.update!(:orphan_bytes, &(&1 + bytes))
+    |> maybe_cleanup_orphan_shard(
+      transport,
+      node,
+      dir,
+      bucket,
+      key,
+      version_id,
+      reason,
+      info,
+      cleanup
+    )
+  end
+
+  defp orphan_cleanup_config(bucket, dry_run, opts, transport, endpoints) do
+    mode = orphan_cleanup_mode(opts, dry_run)
+
+    min_age_ms =
+      non_negative_int(
+        Keyword.get(opts, :orphan_cleanup_min_age_ms, config()[:orphan_cleanup_min_age_ms]),
+        172_800_000
+      )
+
+    max_deletes =
+      positive_int(
+        Keyword.get(opts, :orphan_cleanup_max_deletes, config()[:orphan_cleanup_max_deletes]),
+        100
+      )
+
+    write_authority? = ObjectMeta.authoritative_source(:write, opts) == :sidecar
+    require_all? = Keyword.get(opts, :orphan_cleanup_require_all_endpoints, true)
+
+    endpoints_reachable? =
+      not require_all? or orphan_cleanup_endpoints_reachable?(transport, endpoints, bucket)
+
+    mode =
+      cond do
+        mode == :report_only ->
+          :report_only
+
+        not write_authority? ->
+          Log.warn(
+            "scanner: orphan shard cleanup disabled because write authority is not sidecar",
+            bucket: bucket,
+            action: :orphan_shard,
+            reason: "force_does_not_enable_byte_cleanup"
+          )
+
+          :report_only
+
+        not endpoints_reachable? ->
+          Log.warn(
+            "scanner: orphan shard cleanup disabled because at least one endpoint is unreachable",
+            bucket: bucket,
+            action: :orphan_shard,
+            reason: "require_all_endpoints=true"
+          )
+
+          :report_only
+
+        true ->
+          mode
+      end
+
+    %{
+      mode: mode,
+      min_age_ms: min_age_ms,
+      max_deletes: max_deletes,
+      used: non_negative_int(Keyword.get(opts, :orphan_cleanup_used, 0), 0),
+      opts: opts
+    }
+  end
+
+  defp orphan_cleanup_mode(opts, dry_run) do
+    mode =
+      cond do
+        Keyword.get(opts, :orphan_cleanup_dry_run, false) -> :dry_run
+        Keyword.get(opts, :cleanup_orphan_shards, false) -> :delete
+        true -> Keyword.get(opts, :orphan_cleanup, :report_only)
+      end
+
+    mode = if dry_run and mode == :delete, do: :dry_run, else: mode
+    if mode in [:report_only, :dry_run, :delete], do: mode, else: :report_only
+  end
+
+  defp orphan_cleanup_endpoints_reachable?(transport, endpoints, bucket) do
+    Enum.all?(endpoints, fn {node, drive} ->
+      match?(
+        {:ok, _},
+        transport.list_dir(node, Path.join(drive, bucket), include_layout_files: true)
+      )
+    end)
+  end
+
+  defp maybe_cleanup_orphan_shard(
+         counts,
+         _transport,
+         _node,
+         _dir,
+         _bucket,
+         _key,
+         _version_id,
+         _reason,
+         _info,
+         %{mode: :report_only}
+       ),
+       do: counts
+
+  defp maybe_cleanup_orphan_shard(
+         counts,
+         transport,
+         node,
+         dir,
+         bucket,
+         key,
+         version_id,
+         reason,
+         info,
+         cleanup
+       ) do
+    cond do
+      cleanup.used + counts.orphan_cleaned >= cleanup.max_deletes ->
+        counts
+
+      not info.exists? ->
+        bump(counts, :skipped)
+
+      not shard_old_enough?(info, cleanup.min_age_ms) ->
+        Log.info("scanner: orphan shard cleanup deferred because part.0 is too new",
+          bucket: bucket,
+          key: key,
+          action: :orphan_shard,
+          reason: "reason=#{reason} version_id=#{version_id} min_age_ms=#{cleanup.min_age_ms}"
+        )
+
+        counts
+
+      true ->
+        cleanup_orphan_under_lock(
+          counts,
+          transport,
+          node,
+          dir,
+          bucket,
+          key,
+          version_id,
+          reason,
+          info,
+          cleanup
+        )
+    end
+  end
+
+  defp cleanup_orphan_under_lock(
+         counts,
+         transport,
+         node,
+         dir,
+         bucket,
+         key,
+         version_id,
+         reason,
+         info,
+         cleanup
+       ) do
+    case Lock.with_object_lock({bucket, key}, fn ->
+           cleanup_orphan_candidate(
+             transport,
+             node,
+             dir,
+             bucket,
+             key,
+             version_id,
+             reason,
+             info,
+             cleanup
+           )
+         end) do
+      {:ok, {:cleaned, bytes}} ->
+        counts
+        |> bump(:orphan_cleaned)
+        |> Map.update!(:orphan_cleaned_bytes, &(&1 + bytes))
+
+      {:ok, :skipped} ->
+        counts
+
+      {:error, :locked} ->
+        Log.warn("scanner: orphan shard cleanup skipped because object lock is held",
+          bucket: bucket,
+          key: key,
+          action: :orphan_shard,
+          reason: "version_id=#{version_id}"
+        )
+
+        bump(counts, :skipped)
+    end
+  end
+
+  defp cleanup_orphan_candidate(
+         transport,
+         node,
+         dir,
+         bucket,
+         key,
+         version_id,
+         reason,
+         info,
+         cleanup
+       ) do
+    with true <-
+           orphan_candidate_still_valid?(
+             reason,
+             transport,
+             node,
+             dir,
+             bucket,
+             key,
+             version_id,
+             cleanup.opts
+           ),
+         %{exists?: true} = fresh <- shard_info(transport, node, dir),
+         true <- fresh.size == info.size and fresh.mtime_ms == info.mtime_ms do
+      case cleanup.mode do
+        :dry_run ->
+          Log.info("scanner dry-run: would clean orphan shard part.0",
+            bucket: bucket,
+            key: key,
+            action: :orphan_shard,
+            reason: "reason=#{reason} version_id=#{version_id} bytes=#{info.size}"
+          )
+
+          {:cleaned, info.size}
+
+        :delete ->
+          case transport.delete_part_file(node, dir) do
+            :ok ->
+              Log.info("scanner: cleaned orphan shard part.0",
+                bucket: bucket,
+                key: key,
+                action: :orphan_shard,
+                reason: "reason=#{reason} version_id=#{version_id} bytes=#{info.size}"
+              )
+
+              {:cleaned, info.size}
+
+            {:error, delete_reason} ->
+              Log.warn("scanner: orphan shard cleanup failed",
+                bucket: bucket,
+                key: key,
+                action: :orphan_shard,
+                reason: "version_id=#{version_id} error=#{inspect(delete_reason)}"
+              )
+
+              :skipped
+          end
+      end
+    else
+      _ -> :skipped
+    end
+  end
+
+  defp orphan_candidate_still_valid?(
+         :delete_marker_part,
+         transport,
+         node,
+         dir,
+         bucket,
+         key,
+         version_id,
+         opts
+       ) do
+    with {:ok, meta} <- safe_get_sidecar(transport, node, dir),
+         true <- delete_marker_meta?(meta),
+         {:ok, entry, _divergent} <-
+           MetaReconcile.reconcile(
+             read_endpoint_sidecars(bucket, key, version_id, opts),
+             read_quorum(opts),
+             {:version, version_id}
+           ) do
+      delete_marker_entry?(entry)
+    else
+      _ -> false
+    end
+  end
+
+  defp orphan_candidate_still_valid?(
+         :part_without_meta,
+         transport,
+         node,
+         dir,
+         bucket,
+         key,
+         version_id,
+         opts
+       ) do
+    match?({:error, _}, safe_get_sidecar(transport, node, dir)) and
+      probe_version(bucket, key, version_id, opts) == :all_missing and
+      match?({:error, :not_found}, Objects.get_version(bucket, key, version_id))
+  end
+
+  defp orphan_candidate_still_valid?(
+         _reason,
+         _transport,
+         _node,
+         _dir,
+         _bucket,
+         _key,
+         _version_id,
+         _opts
+       ),
+       do: false
+
+  defp delete_marker_entry?(entry) do
+    Map.get(entry, "is_delete_marker", false) == true or Map.get(entry, "type") == "delete_marker"
+  end
+
+  defp shard_old_enough?(_info, min_age_ms) when min_age_ms <= 0, do: true
+  defp shard_old_enough?(%{mtime_ms: nil}, _min_age_ms), do: false
+
+  defp shard_old_enough?(%{mtime_ms: mtime_ms}, min_age_ms) do
+    System.system_time(:millisecond) - mtime_ms >= min_age_ms
+  end
+
+  defp all_endpoints(opts) do
+    case Keyword.get(opts, :topology) do
+      nil ->
+        Topology.all_set_ids()
+        |> Enum.flat_map(&Topology.endpoints/1)
+        |> Enum.uniq()
+
+      topology ->
+        topology
+        |> Topology.all_set_ids_from()
+        |> Enum.flat_map(&Topology.endpoints_from(topology, &1))
+        |> Enum.uniq()
+    end
+  end
+
+  defp entry_type(%{type: type}), do: type
+  defp entry_type(_entry), do: :dir
+
+  defp safe_get_sidecar(transport, node, dir) do
+    transport.get_sidecar(node, dir)
+  rescue
+    _ -> {:error, :unreadable}
+  catch
+    _, _ -> {:error, :unreadable}
+  end
+
+  defp delete_marker_meta?(meta) do
+    Map.get(meta, "is_delete_marker", false) == true or
+      match?(%{"type" => "delete_marker"}, Maxio.Sidecar.latest(meta))
+  end
+
+  defp shard_info(transport, node, dir) do
+    case transport.stat_shard_info(node, dir) do
+      {:ok, %{size: size, mtime_ms: mtime_ms}} ->
+        %{exists?: true, size: size, mtime_ms: mtime_ms}
+
+      {:error, _} ->
+        %{exists?: false, size: 0, mtime_ms: nil}
+    end
+  end
+
+  defp orphan_ref(:null, []), do: {"<invalid-null-root>", "null"}
+  defp orphan_ref(:null, rel), do: {Maxio.Cluster.Paths.decode_key(rel), "null"}
+
+  defp orphan_ref(:versions, rel) do
+    case Enum.split(rel, max(length(rel) - 1, 0)) do
+      {[], _} ->
+        {"<invalid-version-root>", "<unknown>"}
+
+      {key_segs, [version_id]} ->
+        {Maxio.Cluster.Paths.decode_key(key_segs), version_id}
+
+      _ ->
+        {"<invalid-version-root>", "<unknown>"}
+    end
   end
 
   # ── forward reconcile：盘上枚举 → 逐版本 quorum 仲裁 → PG 缺行/stale 收敛 ──
@@ -559,9 +1139,17 @@ defmodule Maxio.Storage.Scanner do
     [
       enabled: Keyword.get(cfg, :enabled, false),
       interval_ms: Keyword.get(cfg, :interval_ms, 86_400_000),
-      batch_size: Keyword.get(cfg, :batch_size, 500)
+      batch_size: Keyword.get(cfg, :batch_size, 500),
+      orphan_cleanup_min_age_ms: Keyword.get(cfg, :orphan_cleanup_min_age_ms, 172_800_000),
+      orphan_cleanup_max_deletes: Keyword.get(cfg, :orphan_cleanup_max_deletes, 100)
     ]
   end
+
+  defp positive_int(n, _default) when is_integer(n) and n > 0, do: n
+  defp positive_int(_n, default), do: default
+
+  defp non_negative_int(n, _default) when is_integer(n) and n >= 0, do: n
+  defp non_negative_int(_n, default), do: default
 
   defp zero_counts, do: Map.new(@count_keys, &{&1, 0})
 

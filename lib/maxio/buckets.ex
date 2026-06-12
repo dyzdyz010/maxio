@@ -6,6 +6,7 @@ defmodule Maxio.Buckets do
   import Ecto.Query
   alias Maxio.Repo
   alias Maxio.Buckets.Bucket
+  alias Maxio.Cluster.Notify
   alias Maxio.Objects.Object
 
   @reserved_prefixes ~w(xn-- sthree- amzn-s3-demo-)
@@ -55,12 +56,20 @@ defmodule Maxio.Buckets do
   def create(name, owner, opts \\ []) do
     region = Keyword.get(opts, :region, default_region())
     acl = Keyword.get(opts, :acl_canned, "private")
+    acl_grants = Keyword.get(opts, :acl_grants, %{"grants" => []})
 
     with :ok <- validate_name(name) do
-      attrs = %{name: name, owner: owner, region: region, acl_canned: acl}
+      attrs = %{
+        name: name,
+        owner: owner,
+        region: region,
+        acl_canned: acl,
+        acl_grants: acl_grants
+      }
 
       case %Bucket{} |> Bucket.changeset(attrs) |> Repo.insert() do
         {:ok, bucket} ->
+          Notify.broadcast({:bucket_metadata_changed, bucket.name})
           {:ok, bucket}
 
         {:error, %Ecto.Changeset{errors: errors} = changeset} ->
@@ -82,12 +91,16 @@ defmodule Maxio.Buckets do
     end
   end
 
-  @doc "更新桶的 canned ACL（PutBucketAcl）。桶不存在 → :not_found。"
-  @spec put_acl(String.t(), String.t()) :: :ok | {:error, :not_found}
-  def put_acl(name, canned) do
+  @doc "更新桶 ACL（PutBucketAcl）。桶不存在 → :not_found。"
+  @spec put_acl(String.t(), String.t(), map()) :: :ok | {:error, :not_found}
+  def put_acl(name, canned, grants_doc \\ %{"grants" => []}) do
     case lookup(name) do
       {:ok, bucket} ->
-        bucket |> Bucket.changeset(%{acl_canned: canned}) |> Repo.update!()
+        bucket
+        |> Bucket.changeset(%{acl_canned: canned, acl_grants: grants_doc})
+        |> Repo.update!()
+
+        Notify.broadcast({:bucket_metadata_changed, name})
         :ok
 
       {:error, :not_found} ->
@@ -110,6 +123,7 @@ defmodule Maxio.Buckets do
     case lookup(name) do
       {:ok, b} ->
         b |> Bucket.changeset(%{tags: Maxio.Tags.list_to_map(tags)}) |> Repo.update!()
+        Notify.broadcast({:bucket_metadata_changed, name})
         :ok
 
       {:error, :not_found} ->
@@ -135,6 +149,7 @@ defmodule Maxio.Buckets do
           :ok
         else
           bucket |> Bucket.changeset(changes) |> Repo.update!()
+          Notify.broadcast({:bucket_metadata_changed, name})
           :ok
         end
 
@@ -157,6 +172,7 @@ defmodule Maxio.Buckets do
         {:error, :not_empty}
       else
         Repo.delete!(bucket)
+        Notify.broadcast({:bucket_metadata_changed, name})
         :ok
       end
     end

@@ -20,7 +20,8 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
         principal = %{
           type: String.to_existing_atom(row.type),
           access_key: row.access_key_id,
-          arn: row.principal_arn
+          arn: row.principal_arn,
+          tags: row.tags || %{}
         }
 
         {:ok, %{secret_key: row.secret_key, principal: principal}}
@@ -29,22 +30,30 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
 
   @impl true
   def put_access_key(%{access_key: ak, secret_key: sk} = attrs) do
-    type = Map.get(attrs, :type, "iam_user")
+    principal = Map.get(attrs, :principal, %{})
+    type = principal |> Map.get(:type, Map.get(attrs, :type, "iam_user")) |> to_string()
 
     arn =
-      Map.get(attrs, :arn) ||
+      Map.get(principal, :arn) ||
+        Map.get(attrs, :arn) ||
         if type == "root", do: "arn:aws:iam:::root", else: "arn:aws:iam:::user/#{ak}"
+
+    tags =
+      attrs
+      |> Map.get(:tags, Map.get(principal, :tags, %{}))
+      |> normalize_tags()
 
     %AccessKey{}
     |> AccessKey.changeset(%{
       access_key_id: ak,
       secret_key: sk,
       principal_arn: arn,
-      type: to_string(type),
-      status: "active"
+      type: type,
+      status: "active",
+      tags: tags
     })
     |> Repo.insert(
-      on_conflict: {:replace, [:secret_key, :principal_arn, :type, :status, :updated_at]},
+      on_conflict: {:replace, [:secret_key, :principal_arn, :type, :status, :tags, :updated_at]},
       conflict_target: :access_key_id
     )
     |> case do
@@ -64,9 +73,22 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
         principal: %{
           type: String.to_existing_atom(a.type),
           access_key: a.access_key_id,
-          arn: a.principal_arn
+          arn: a.principal_arn,
+          tags: a.tags || %{}
         }
       }
     end)
   end
+
+  @impl true
+  def invalidate(_scope), do: :ok
+
+  defp normalize_tags(tags) when is_map(tags) do
+    Map.new(tags, fn {key, value} -> {to_string(key), tag_value(value)} end)
+  end
+
+  defp normalize_tags(_tags), do: %{}
+
+  defp tag_value(nil), do: ""
+  defp tag_value(value), do: to_string(value)
 end

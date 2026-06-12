@@ -7,7 +7,7 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
   import Plug.Conn
   alias Maxio.Buckets
   alias Maxio.Policy.{Statement, Store}
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{Error, Log, PublicAccessBlock}
 
   @policy_limit 1_048_576
 
@@ -20,7 +20,9 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
     # 语义校验：JSON 合法 + 策略结构合法（Version/Effect/Action/Resource/Principal）
     # + 每个 Resource ARN 引用目标桶（跨桶 → MalformedPolicy，铁律 5 对齐 minio Resource.ValidateBucket）。
     case Statement.parse_policy(json, bucket) do
-      {:ok, _stmts} ->
+      {:ok, stmts} ->
+        :ok = PublicAccessBlock.reject_public_policy_write!(bucket, stmts)
+
         case Store.put_bucket_policy(bucket, json) do
           :ok ->
             Log.info("put bucket policy", action: :put_bucket_policy, bucket: bucket)

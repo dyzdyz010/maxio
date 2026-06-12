@@ -56,7 +56,8 @@ defmodule Maxio.S3.Handlers.Cors do
   end
 
   # ── 校验 ──
-  defp validate!(rules) do
+  @spec validate!(term()) :: :ok
+  def validate!(rules) when is_list(rules) do
     cond do
       length(rules) > 100 ->
         raise Error.new(:malformed_xml, message: "Too many CORS rules (max 100)")
@@ -69,16 +70,37 @@ defmodule Maxio.S3.Handlers.Cors do
     end
   end
 
-  defp valid_rule?(r) do
+  def validate!(_rules),
+    do: raise(Error.new(:malformed_xml, message: "Invalid CORS configuration"))
+
+  defp valid_rule?(r) when is_map(r) do
     methods = Map.get(r, "allowed_methods", [])
     origins = Map.get(r, "allowed_origins", [])
     headers = Map.get(r, "allowed_headers", [])
+    expose_headers = Map.get(r, "expose_headers", [])
+    max_age = Map.get(r, "max_age_seconds")
+    id = Map.get(r, "id")
 
     methods != [] and origins != [] and
+      list_of_strings?(methods) and list_of_strings?(origins) and
+      list_of_strings?(headers) and list_of_strings?(expose_headers) and
       Enum.all?(methods, &(&1 in @valid_methods)) and
       Enum.all?(origins, &at_most_one_star?/1) and
-      Enum.all?(headers, &at_most_one_star?/1)
+      Enum.all?(headers, &at_most_one_star?/1) and
+      optional_string?(id) and optional_non_negative_integer?(max_age)
   end
+
+  defp valid_rule?(_r), do: false
+
+  defp list_of_strings?(values) when is_list(values), do: Enum.all?(values, &is_binary/1)
+  defp list_of_strings?(_values), do: false
+
+  defp optional_string?(nil), do: true
+  defp optional_string?(value), do: is_binary(value)
+
+  defp optional_non_negative_integer?(nil), do: true
+  defp optional_non_negative_integer?(value) when is_integer(value), do: value >= 0
+  defp optional_non_negative_integer?(_value), do: false
 
   defp at_most_one_star?(s) do
     s |> String.graphemes() |> Enum.count(&(&1 == "*")) <= 1

@@ -120,9 +120,41 @@ config :maxio, :authoritative_source, read: :pg, list: :pg, write: :pg
 # ROUTE B B5-2 派生索引周期 reconcile scanner（默认关——先发布不改行为，可整体回滚）：
 # enabled: true 时 Maxio.Storage.Scanner 每 interval_ms 跑一轮「盘上 sidecar 权威 → PG 派生索引」
 # reconcile（缺行 upsert / stale 修正）+ 保守 reverse-GC（PG 孤儿行仅在所有端点可达且全部显式
-# missing 时删除，任一端点 down → skip 绝不猜）。batch_size 限定每批 reconcile 工作量（铁律 4 有界）。
-# 手动触发/取证：mix maxio.reconcile_index [--dry-run] [--bucket <name>]。
-config :maxio, :scanner, enabled: false, interval_ms: 86_400_000, batch_size: 500
+# missing 时删除，任一端点 down → skip 绝不猜）+ orphan shard 取证（part.0 无 sidecar、
+# delete-marker 残留 part.0 计数/日志）。orphan byte 清理默认关闭；显式 CLI/opts 开启后仍要求
+# sidecar 写权威、全端点可达、对象锁、二次探针与年龄门，且只删除 part.0。batch_size 限定每批
+# reconcile 工作量（铁律 4 有界）。手动触发/取证：
+# mix maxio.reconcile_index [--dry-run] [--bucket <name>] [--cleanup-orphan-shards]。
+config :maxio, :scanner,
+  enabled: false,
+  interval_ms: 86_400_000,
+  batch_size: 500,
+  orphan_cleanup_min_age_ms: 172_800_000,
+  orphan_cleanup_max_deletes: 100
+
+# M8-3 auto-heal scrubber（默认关——启动进程但不调度，避免 dev/test 意外扫盘）：
+# 与 ROUTE B Storage.Scanner 分离。本 scrubber 从 PG 对象元数据分页枚举对象，刷新 usage
+# 快照；FS 后端只统计 usage，ErasureCoded/Distributed 后端按 erasure set 短租约锁调度既有
+# heal 引擎。reconcile_index:true 时先复用 Storage.Scanner 做 disk/peer sidecar→PG 派生索引收敛。
+# 周期轮按 sample_inverse 做确定性 1/N 深度 heal 检查（每 cycle 轮换分区），但
+# 手动触发/取证 `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle]` 默认全量扫描。
+config :maxio, :scrubber,
+  enabled: false,
+  interval_ms: 86_400_000,
+  initial_delay_ms: 60_000,
+  page_size: 500,
+  scan_versions: false,
+  sample_inverse: 1024,
+  reconcile_index: false,
+  max_objects_per_sec: 200,
+  sleep_between_batches_ms: 50,
+  lock_ttl_ms: 60_000,
+  lock_timeout_ms: 3_000
+
+# S3 Lifecycle 周期调度器（默认关——启动进程但不调度，避免 dev/test 意外删对象）。
+# enabled: true 时 Maxio.Lifecycle.Scheduler 每 interval_ms 调用 Maxio.Lifecycle.run/1。
+# 支持动作与 `mix maxio.lifecycle.run` 完全相同；Transition / NoncurrentVersionTransition 仍 no-op。
+config :maxio, :lifecycle_scheduler, enabled: false, interval_ms: 86_400_000
 
 # ROUTE B B5-1 PREFER 索引读门控（默认关）：仅当 authoritative_source(:read)=:sidecar 时生效——
 # true → 单对象读先查 PG 派生索引（scanner 维护新鲜度），命中即返回（快路径），miss 走盘 sidecar；

@@ -14,9 +14,16 @@ defmodule Maxio.Application do
           Maxio.Repo,
           {DNSCluster, query: Application.get_env(:maxio, :dns_cluster_query) || :ignore},
           {Phoenix.PubSub, name: Maxio.PubSub},
+          Maxio.Cluster.CacheInvalidator,
           # ROUTE B B5-2：派生索引周期 reconcile scanner（默认 disabled——启动但不调度，
           # init 显式日志声明状态；config :maxio, :scanner, enabled: true 开启周期轮）。
           Maxio.Storage.Scanner,
+          # M8-3：运维 scrubber（默认 disabled——启动但不调度）。职责与 Storage.Scanner 分离：
+          # 从 PG 元数据分页枚举对象，刷新 usage 快照，并对纠删码/分布式后端调度 auto-heal。
+          Maxio.Cluster.Scrubber,
+          # S3 Lifecycle 周期调度器（默认 disabled——与 scanner 一样启动但不调度；手动 CLI
+          # 与后台轮次共用 Maxio.Lifecycle.run/1，Transition 仍显式 no-op）。
+          Maxio.Lifecycle.Scheduler,
           # Start a worker by calling: Maxio.Worker.start_link(arg)
           # {Maxio.Worker, arg},
           # Start to serve requests, typically the last entry
@@ -48,16 +55,25 @@ defmodule Maxio.Application do
         do: [],
         else: [{Cluster.Supervisor, [topologies, [name: Maxio.Cluster.ClusterSupervisor]]}]
 
-    libcluster ++ [Maxio.Cluster.Topology, Maxio.Cluster.ShardServer]
+    libcluster ++ [Maxio.Cluster.Topology, Maxio.Cluster.ShardServer, Maxio.Cluster.LockServer]
   end
 
-  # 诚实暴露 M4 defer（铁律 3：绝不假装已生效）。
+  # 诚实暴露仍未完成的高级特性（铁律 3：绝不假装已生效）。
   defp log_deferred_features do
     require Logger
 
+    lifecycle_scheduler =
+      if Application.get_env(:maxio, :lifecycle_scheduler, [])[:enabled] do
+        "lifecycle background scheduler enabled for supported sweeps; "
+      else
+        "lifecycle background scheduler disabled by default (enable config :maxio, :lifecycle_scheduler or run mix maxio.lifecycle.run); "
+      end
+
     Logger.info(
-      "maxio M4 deferred: bucket lifecycle EXPIRATION execution not implemented (config stored/served only); " <>
-        "SSE-S3 uses single static master key (no rotation/KMS); MFA Delete not enforced; SSE-C/SSE-KMS return 501"
+      "maxio deferred: " <>
+        lifecycle_scheduler <>
+        "lifecycle transition actions remain no-op; SSE-S3 uses single static master key " <>
+        "(no rotation/KMS); MFA Delete not enforced; SSE-C/SSE-KMS return 501"
     )
   end
 

@@ -51,7 +51,7 @@ defmodule Maxio.S3.Views.ListBucket do
       element("LastModified", [], characters(XML.iso8601(last_modified(obj)))),
       element("ETag", [], characters(XML.quote_etag(etag(obj)))),
       element("Size", [], characters(Integer.to_string(size(obj)))),
-      element("StorageClass", [], characters("STANDARD"))
+      element("StorageClass", [], characters(storage_class(obj)))
     ])
   end
 
@@ -63,6 +63,9 @@ defmodule Maxio.S3.Views.ListBucket do
 
   defp size(%{size: s}) when is_integer(s), do: s
   defp size(_), do: 0
+
+  defp storage_class(%{storage_class: s}) when is_binary(s) and s != "", do: s
+  defp storage_class(_), do: "STANDARD"
 
   # encoding-type=url → MinIO s3URLEncode（保留字面 '/' 与 '*'，空格→'+'，其余字节→%XX 大写）。
   # 用 Maxio.S3.URLEncode（与 SigV4 的 RFC3986 编码不同：S3 list 编码不转义 '/'，故 delimiter /

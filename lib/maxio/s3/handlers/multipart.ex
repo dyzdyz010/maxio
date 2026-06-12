@@ -6,7 +6,19 @@ defmodule Maxio.S3.Handlers.Multipart do
   """
   import Plug.Conn
   alias Maxio.{Buckets, Multipart, Objects, Storage}
-  alias Maxio.S3.{BodyReader, Error, Log, XML}
+  alias Maxio.Policy.ACL
+
+  alias Maxio.S3.{
+    BodyReader,
+    Error,
+    Log,
+    PublicAccessBlock,
+    SSE,
+    StorageClass,
+    SystemHeaders,
+    XML
+  }
+
   alias Maxio.S3.RequestParsers.CompleteMultipartUpload, as: CompleteParser
 
   alias Maxio.S3.Views.{
@@ -34,6 +46,11 @@ defmodule Maxio.S3.Handlers.Multipart do
     :ok = validate_object_key!(bucket, key)
 
     content_type = header(conn, "content-type") || "binary/octet-stream"
+    system_headers = SystemHeaders.from_req_headers(conn.req_headers)
+    storage_class = StorageClass.parse!(header(conn, "x-amz-storage-class"))
+    acl_input = acl_from_headers!(conn)
+    :ok = PublicAccessBlock.reject_public_acl_write!(bucket, acl_input)
+    sse_algorithm = SSE.resolve_target!(conn.req_headers, bucket)
     owner = conn.assigns.principal.arn
 
     # ROUTE B B4-6 fidelity：CreateMultipartUpload 须捕获客户端 x-amz-meta-*（与 PutObject 同源解析器），
@@ -44,12 +61,19 @@ defmodule Maxio.S3.Handlers.Multipart do
     user_metadata = Maxio.Metadata.parse_headers(conn.req_headers)
     :ok = Maxio.Metadata.validate_size!(user_metadata)
 
-    {:ok, upload} =
-      Multipart.initiate(bucket, key, %{
+    attrs =
+      %{
         content_type: content_type,
+        storage_class: storage_class,
+        acl_canned: acl_input.canned,
+        acl_grants: acl_input.grants_doc,
+        sse_algorithm: sse_algorithm,
         owner: owner,
         metadata: user_metadata
-      })
+      }
+      |> Map.merge(system_headers)
+
+    {:ok, upload} = Multipart.initiate(bucket, key, attrs)
 
     Log.info("create multipart upload",
       action: :create_multipart_upload,
@@ -62,6 +86,7 @@ defmodule Maxio.S3.Handlers.Multipart do
 
     conn
     |> put_resp_content_type("application/xml")
+    |> SSE.put_response_header(sse_algorithm)
     |> send_resp(200, body)
   end
 
@@ -97,6 +122,9 @@ defmodule Maxio.S3.Handlers.Multipart do
         # 新会话已被 create_multipart_upload 入口守卫拦截，此分支仅兜历史在途上传。
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
+      {:error, reason} when reason in [:write_quorum, :rename_busy] ->
+        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+
       {:error, reason} ->
         raise Error.new(:internal_error, message: inspect(reason))
     end
@@ -118,20 +146,31 @@ defmodule Maxio.S3.Handlers.Multipart do
         {:error, :malformed_xml} -> raise Error.new(:malformed_xml, resource: "/#{bucket}/#{key}")
       end
 
-    # B1-1：提交 seam（assemble 字节 via Multipart.complete + Objects.put_metadata 元数据）
-    # 纳入同一对象锁，避免与并发同 key PUT/Complete 交错（获锁失败 -> 503 SlowDown，铁律 3）。
+    # B1-1：提交 seam（assemble 字节 via Multipart.complete + Objects.put_version_with_id 元数据）
+    # 纳入同一对象锁，避免与并发同 key PUT/Complete 交错（获锁失败 -> 503 RequestTimeout，铁律 3）。
     # 后端 assemble 不再自持锁（锁责任收敛到 handler 单点，避免 :global.trans 非重入死等）。
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
-        case Multipart.complete(upload, requested) do
-          {:ok, %{etag: etag, size: size}} ->
+        bucket_record = ensure_bucket!(bucket)
+        version_id = complete_version_id(bucket_record)
+
+        case Multipart.complete(upload, requested, version_id: version_id) do
+          {:ok, %{etag: etag, size: size, sse_envelope: sse_envelope, version_id: version_id}} ->
             # ROUTE B B5-1：元数据提交按写权威分流（与 object.ex commit_metadata 同模式）。
             :ok =
-              commit_complete_metadata(bucket, key, %{
+              commit_complete_metadata(bucket, key, version_id, %{
                 size: size,
                 etag: etag,
                 content_type: upload.content_type,
+                content_encoding: upload.content_encoding,
+                content_disposition: upload.content_disposition,
+                cache_control: upload.cache_control,
+                expires: upload.expires,
                 storage_class: upload.storage_class,
+                acl_canned: upload.acl_canned,
+                acl_grants: upload.acl_grants || ACL.empty_grants_doc(),
+                sse_algorithm: upload.sse_algorithm,
+                sse_envelope: sse_envelope,
                 # ROUTE B B4-6 fidelity：会话捕获的 user_metadata 也写入 PG 索引行，
                 # 消除已完成多段对象在 :pg(默认) 读路径下 metadata=%{} 的 D3-style 分裂——
                 # 与 sidecar 透传（assemble_object_meta.user_metadata）保持两路一致。
@@ -139,7 +178,7 @@ defmodule Maxio.S3.Handlers.Multipart do
               })
 
             _ = Multipart.abort(upload)
-            {:ok, {etag, size}}
+            {:ok, {etag, size, upload.sse_algorithm, version_id}}
 
           {:error, reason} ->
             {:error, reason}
@@ -147,7 +186,7 @@ defmodule Maxio.S3.Handlers.Multipart do
       end)
 
     case commit_result do
-      {:ok, {:ok, {etag, size}}} ->
+      {:ok, {:ok, {etag, size, sse_algorithm, version_id}}} ->
         Log.info("complete multipart upload",
           action: :complete_multipart_upload,
           bucket: bucket,
@@ -165,13 +204,15 @@ defmodule Maxio.S3.Handlers.Multipart do
 
         conn
         |> put_resp_content_type("application/xml")
+        |> SSE.put_response_header(sse_algorithm)
+        |> maybe_put_version_id(version_id)
         |> send_resp(200, body)
 
       {:ok, {:error, reason}} ->
         raise complete_error(reason, bucket, key)
 
       {:error, :locked} ->
-        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+        raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -282,17 +323,17 @@ defmodule Maxio.S3.Handlers.Multipart do
   # ROUTE B B5-1 —— CompleteMultipartUpload 元数据提交按写权威分流
   # （镜像 object.ex 的 commit_metadata/5，铁律 2 同一分流模式）：
   #
-  #   :pg（默认）→ 维持既有致命语义：put_metadata 失败则 {:ok,_} 模式匹配失败上抛
+  #   :pg（默认）→ 维持既有致命语义：put_version_with_id 失败则 {:ok,_} 模式匹配失败上抛
   #     （PG 即权威，绝不静默接受落库失败，铁律 3）——字节级不变。
   #
   #   :sidecar → 盘上 assemble 已写出权威 maxio/2 sidecar（达 write_quorum = 最终对象已耐久落盘）；
-  #     PG 仅派生索引，用 put_metadata_index best-effort：失败 → Log.error（绝不静默）+ 不失败请求
+  #     PG 仅派生索引，用 put_version_index best-effort：失败 → Log.error（绝不静默）+ 不失败请求
   #     （索引滞后由 B5-2 scanner reconcile）。响应（etag/size）来自 Multipart.complete，
   #     本就不依赖 PG 读回，无需内存视图。
-  defp commit_complete_metadata(bucket, key, attrs) do
+  defp commit_complete_metadata(bucket, key, version_id, attrs) do
     case Maxio.ObjectMeta.authoritative_source(:write) do
       :sidecar ->
-        case Objects.put_metadata_index(bucket, key, attrs) do
+        case Objects.put_version_index(bucket, key, version_id, attrs) do
           :ok ->
             :ok
 
@@ -308,10 +349,20 @@ defmodule Maxio.S3.Handlers.Multipart do
         end
 
       _pg ->
-        {:ok, _obj} = Objects.put_metadata(bucket, key, attrs)
+        {:ok, _obj} = Objects.put_version_with_id(bucket, key, version_id, attrs)
         :ok
     end
   end
+
+  defp complete_version_id(%{versioning: "Enabled"}),
+    do: Maxio.Versioning.VersionId.generate()
+
+  defp complete_version_id(_bucket), do: "null"
+
+  defp maybe_put_version_id(conn, "null"), do: conn
+
+  defp maybe_put_version_id(conn, version_id),
+    do: put_resp_header(conn, "x-amz-version-id", version_id)
 
   defp ensure_bucket!(bucket) do
     case Buckets.lookup(bucket) do
@@ -403,4 +454,50 @@ defmodule Maxio.S3.Handlers.Multipart do
   end
 
   defp header(conn, name), do: conn |> get_req_header(name) |> List.first()
+
+  defp acl_from_headers!(conn) do
+    grant_headers? = ACL.grant_headers?(conn.req_headers)
+
+    case header(conn, "x-amz-acl") do
+      canned when is_binary(canned) and grant_headers? ->
+        raise Error.new(:invalid_request,
+                message: "Cannot specify both x-amz-acl and x-amz-grant-*"
+              )
+
+      nil ->
+        if grant_headers? do
+          grants =
+            conn.req_headers
+            |> parse_grant_headers!()
+            |> ACL.drop_owner_grants(@owner_id)
+
+          %{canned: ACL.classify_grants(grants), grants_doc: ACL.grants_doc(grants)}
+        else
+          %{canned: "private", grants_doc: ACL.empty_grants_doc()}
+        end
+
+      canned ->
+        if ACL.known?(canned) do
+          %{canned: canned, grants_doc: ACL.empty_grants_doc()}
+        else
+          raise Error.new(:invalid_argument, message: "Unsupported x-amz-acl: #{canned}")
+        end
+    end
+  end
+
+  defp parse_grant_headers!(headers) do
+    case ACL.parse_grant_headers(headers) do
+      {:ok, grants} ->
+        grants
+
+      {:error, :unsupported_email} ->
+        raise Error.new(:invalid_argument, message: "Email grantee ACLs are not supported")
+
+      {:error, :too_many_grants} ->
+        raise Error.new(:invalid_argument, message: "ACL can contain at most 100 grants")
+
+      {:error, :invalid_grant} ->
+        raise Error.new(:invalid_argument, message: "Invalid ACL grant")
+    end
+  end
 end

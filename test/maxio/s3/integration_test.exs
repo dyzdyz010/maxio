@@ -75,6 +75,18 @@ defmodule Maxio.S3.IntegrationTest do
     assert get.resp_body == "2345"
   end
 
+  test "empty object suffix Range → 416 InvalidRange" do
+    SigV4Request.signed_conn(:put, "/emptyrange") |> call()
+    SigV4Request.signed_conn(:put, "/emptyrange/k.txt", body: "") |> call()
+
+    get =
+      SigV4Request.signed_conn(:get, "/emptyrange/k.txt", headers: [{"range", "bytes=-1"}])
+      |> call()
+
+    assert get.status == 416
+    assert get.resp_body =~ "<Code>InvalidRange</Code>"
+  end
+
   test "HeadObject → 200 空体 + 元数据头" do
     SigV4Request.signed_conn(:put, "/data") |> call()
     SigV4Request.signed_conn(:put, "/data/h.txt", body: "abc") |> call()
@@ -498,5 +510,31 @@ defmodule Maxio.S3.IntegrationTest do
       |> call()
 
     assert copy.status == 412
+  end
+
+  test "CopyObject source delete-marker version returns structured 400" do
+    SigV4Request.signed_conn(:put, "/copydm") |> call()
+
+    versioning_xml =
+      ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
+
+    SigV4Request.signed_conn(:put, "/copydm", query: %{"versioning" => ""}, body: versioning_xml)
+    |> call()
+
+    SigV4Request.signed_conn(:put, "/copydm/s.txt", body: "y") |> call()
+
+    delete = SigV4Request.signed_conn(:delete, "/copydm/s.txt") |> call()
+    assert delete.status == 204
+    assert ["true"] = get_resp_header(delete, "x-amz-delete-marker")
+    assert [delete_marker_version_id] = get_resp_header(delete, "x-amz-version-id")
+
+    copy =
+      SigV4Request.signed_conn(:put, "/copydm/d.txt",
+        headers: [{"x-amz-copy-source", "/copydm/s.txt?versionId=#{delete_marker_version_id}"}]
+      )
+      |> call()
+
+    assert copy.status == 400
+    assert copy.resp_body =~ "<Code>InvalidArgument</Code>"
   end
 end

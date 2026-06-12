@@ -4,9 +4,11 @@ defmodule Maxio.S3.Handlers.Lifecycle do
   GetBucketLifecycleConfiguration（200+XML，无→404 NoSuchLifecycleConfiguration）、
   DeleteBucketLifecycle（204）。
 
-  ⚠️ 仅存储 + 校验 + 出站；后台过期执行 DEFER（未实现，见 README + mix maxio.lifecycle.run stub）。
+  ⚠️ 本 handler 仅存储 + 校验 + 出站；实际过期/中止 MPU 由 `mix maxio.lifecycle.run`
+  或后续后台调度调用 `Maxio.Lifecycle.run/1` 执行。
   校验：每 rule 必须有 Status（Enabled|Disabled）；Expiration 不能同时 Days+Date；
-  ExpiredObjectDeleteMarker 不能与 Days/Date 共存；≤1000 rule。违反 → MalformedXML/InvalidRequest 400。
+  ExpiredObjectDeleteMarker 不能与 Days/Date 共存；数值/Tag filter 必须完整且非正数会被拒；
+  NewerNoncurrentVersions 必须为 1..100 且请求含 Filter；≤1000 rule。违反 → MalformedXML/InvalidRequest 400。
   Transition/NoncurrentVersionTransition 单层 maxio 接受持久化但 no-op（文档化）。
   """
   import Plug.Conn
@@ -28,11 +30,11 @@ defmodule Maxio.S3.Handlers.Lifecycle do
         :ok = validate!(rules)
         :ok = BucketConfigs.put(bucket, :lifecycle, rules)
 
-        Log.warn(
-          "put bucket lifecycle (config stored; expiration execution NOT implemented — defer)",
+        Log.info(
+          "put bucket lifecycle (config stored; execution handled by lifecycle runner)",
           action: :put_bucket_lifecycle,
           bucket: bucket,
-          reason: :execution_deferred
+          reason: :runner_required
         )
 
         send_resp(conn, 200, "")
@@ -66,7 +68,8 @@ defmodule Maxio.S3.Handlers.Lifecycle do
   end
 
   # ── 校验 ──
-  defp validate!(rules) do
+  @spec validate!(term()) :: :ok
+  def validate!(rules) when is_list(rules) do
     cond do
       length(rules) > 1000 ->
         raise Error.new(:invalid_request, message: "Too many lifecycle rules (max 1000)")
@@ -79,9 +82,14 @@ defmodule Maxio.S3.Handlers.Lifecycle do
     end
   end
 
-  defp valid_rule?(r) do
+  def validate!(_rules),
+    do: raise(Error.new(:malformed_xml, message: "Invalid lifecycle configuration"))
+
+  defp valid_rule?(r) when is_map(r) do
     status_ok = r["status"] in ["Enabled", "Disabled"]
     not_both_days_date = not (r["expiration_days"] != nil and r["expiration_date"] != nil)
+    no_parse_errors = (r["parse_errors"] || []) == []
+    scalar_fields_ok = scalar_fields_ok?(r)
 
     eodm_exclusive =
       if r["expired_object_delete_marker"] == true do
@@ -90,7 +98,75 @@ defmodule Maxio.S3.Handlers.Lifecycle do
         true
       end
 
-    status_ok and not_both_days_date and eodm_exclusive
+    status_ok and not_both_days_date and eodm_exclusive and no_parse_errors and
+      scalar_fields_ok and numbers_ok?(r) and newer_noncurrent_filter_ok?(r) and tags_ok?(r)
+  end
+
+  defp valid_rule?(_r), do: false
+
+  defp scalar_fields_ok?(r) do
+    string_fields =
+      ~w(id prefix filter_prefix expiration_date transition_date transition_storage_class
+         noncurrent_transition_storage_class)
+
+    Enum.all?(string_fields, &optional_string?(r[&1])) and
+      optional_boolean?(r["expired_object_delete_marker"])
+  end
+
+  defp optional_string?(nil), do: true
+  defp optional_string?(value), do: is_binary(value)
+
+  defp optional_boolean?(nil), do: true
+  defp optional_boolean?(value), do: is_boolean(value)
+
+  defp numbers_ok?(r) do
+    [
+      {"expiration_days", 1, nil},
+      {"noncurrent_days", 1, nil},
+      {"newer_noncurrent_versions", 1, 100},
+      {"abort_days_after_initiation", 1, nil},
+      {"transition_days", 1, nil},
+      {"noncurrent_transition_days", 1, nil},
+      {"noncurrent_transition_newer_noncurrent_versions", 1, 100},
+      {"filter_size_gt", 0, nil},
+      {"filter_size_lt", 1, nil}
+    ]
+    |> Enum.all?(fn {field, min, max} -> number_ok?(r[field], min, max) end)
+  end
+
+  defp number_ok?(nil, _min, _max), do: true
+
+  defp number_ok?(value, min, nil) when is_integer(value),
+    do: value >= min
+
+  defp number_ok?(value, min, max) when is_integer(value),
+    do: value >= min and value <= max
+
+  defp number_ok?(_value, _min, _max), do: false
+
+  defp newer_noncurrent_filter_ok?(r) do
+    (Map.get(r, "newer_noncurrent_versions") == nil and
+       Map.get(r, "noncurrent_transition_newer_noncurrent_versions") == nil) or
+      r["has_filter"] == true
+  end
+
+  defp tags_ok?(r) do
+    case r["filter_tags"] || [] do
+      tags when is_list(tags) ->
+        Enum.all?(tags, fn
+          %{"key" => key, "value" => value} when is_binary(key) and is_binary(value) ->
+            key != ""
+
+          %{"Key" => key, "Value" => value} when is_binary(key) and is_binary(value) ->
+            key != ""
+
+          _other ->
+            false
+        end)
+
+      _other ->
+        false
+    end
   end
 
   defp ensure_bucket!(bucket) do

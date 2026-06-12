@@ -15,7 +15,7 @@ defmodule MaxioWeb.BucketLiveSettingsTest do
     assert has_element?(view, "#tab-policy")
   end
 
-  test "7 个 tab 链接全部存在", %{conn: conn} do
+  test "8 个 tab 链接全部存在", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/buckets/cfg-bucket/settings")
     assert has_element?(view, "#tab-versioning")
     assert has_element?(view, "#tab-policy")
@@ -24,6 +24,7 @@ defmodule MaxioWeb.BucketLiveSettingsTest do
     assert has_element?(view, "#tab-cors")
     assert has_element?(view, "#tab-lifecycle")
     assert has_element?(view, "#tab-encryption")
+    assert has_element?(view, "#tab-public_access_block")
   end
 
   test "无效 tab 回退 versioning", %{conn: conn} do
@@ -122,13 +123,44 @@ defmodule MaxioWeb.BucketLiveSettingsTest do
     assert html =~ "JSON 非法"
   end
 
-  test "lifecycle tab 显式 defer 告警 + 保存 JSON", %{conn: conn} do
+  test "cors tab 拒绝 S3 PutBucketCors 会拒的规则", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/buckets/cfg-bucket/settings?tab=cors")
+    json = ~s([{"allowed_origins":["*"],"allowed_methods":["TRACE"]}])
+    html = view |> form("#cors-form", cors: %{json: json}) |> render_submit()
+
+    assert html =~ "CORS 规则非法"
+    assert :none = Maxio.BucketConfigs.get("cfg-bucket", :cors)
+  end
+
+  test "lifecycle tab shows execution options and remaining transition defer + saves JSON", %{
+    conn: conn
+  } do
     {:ok, view, html} = live(conn, ~p"/buckets/cfg-bucket/settings?tab=lifecycle")
     assert has_element?(view, "#lifecycle-defer-alert")
-    assert html =~ "后台过期/转储执行尚未实现"
+    assert html =~ "mix maxio.lifecycle.run"
+    assert html =~ "config :maxio, :lifecycle_scheduler"
+    assert html =~ "Transition"
     json = ~s([{"id":"expire-30","status":"Enabled"}])
     view |> form("#lifecycle-form", lifecycle: %{json: json}) |> render_submit()
     assert {:ok, [%{"id" => "expire-30"}]} = Maxio.BucketConfigs.get("cfg-bucket", :lifecycle)
+  end
+
+  test "lifecycle tab 拒绝 S3 PutBucketLifecycle 会拒的规则", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/buckets/cfg-bucket/settings?tab=lifecycle")
+    json = ~s([{"status":"Enabled","expiration_days":0}])
+    html = view |> form("#lifecycle-form", lifecycle: %{json: json}) |> render_submit()
+
+    assert html =~ "生命周期 规则非法"
+    assert :none = Maxio.BucketConfigs.get("cfg-bucket", :lifecycle)
+  end
+
+  test "lifecycle tab 拒绝非 string 标量字段，避免 runner 后续崩溃", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/buckets/cfg-bucket/settings?tab=lifecycle")
+    json = ~s([{"status":"Enabled","filter_prefix":5,"expiration_days":1}])
+    html = view |> form("#lifecycle-form", lifecycle: %{json: json}) |> render_submit()
+
+    assert html =~ "生命周期 规则非法"
+    assert :none = Maxio.BucketConfigs.get("cfg-bucket", :lifecycle)
   end
 
   test "encryption tab 设 AES256，KMS 被拒", %{conn: conn} do
@@ -149,5 +181,50 @@ defmodule MaxioWeb.BucketLiveSettingsTest do
     {:ok, view, _html} = live(conn, ~p"/buckets/cfg-bucket/settings?tab=encryption")
     view |> form("#encryption-form", encryption: %{algorithm: "none"}) |> render_submit()
     assert :none = Maxio.BucketConfigs.get("cfg-bucket", :encryption)
+  end
+
+  test "public access block tab 保存四布尔项并可删除", %{conn: conn} do
+    {:ok, view, html} = live(conn, ~p"/buckets/cfg-bucket/settings?tab=public_access_block")
+    assert has_element?(view, "#public-access-block-form")
+    assert has_element?(view, "#public-access-block-context")
+    assert html =~ "bucket-level PublicAccessBlock"
+
+    view
+    |> form("#public-access-block-form",
+      public_access_block: %{
+        block_public_acls: "true",
+        ignore_public_acls: "false",
+        block_public_policy: "true",
+        restrict_public_buckets: "true"
+      }
+    )
+    |> render_submit()
+
+    assert {:ok,
+            %{
+              "BlockPublicAcls" => true,
+              "IgnorePublicAcls" => false,
+              "BlockPublicPolicy" => true,
+              "RestrictPublicBuckets" => true
+            }} = Maxio.BucketConfigs.get("cfg-bucket", :public_access_block)
+
+    view |> element("#public-access-block-delete") |> render_click()
+    assert :none = Maxio.BucketConfigs.get("cfg-bucket", :public_access_block)
+  end
+
+  test "public access block tab 回显已保存配置", %{conn: conn} do
+    :ok =
+      Maxio.BucketConfigs.put("cfg-bucket", :public_access_block, %{
+        "BlockPublicAcls" => true,
+        "IgnorePublicAcls" => true,
+        "BlockPublicPolicy" => false,
+        "RestrictPublicBuckets" => true
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/buckets/cfg-bucket/settings?tab=public_access_block")
+    assert has_element?(view, "#public_access_block_block_public_acls:checked")
+    assert has_element?(view, "#public_access_block_ignore_public_acls:checked")
+    refute has_element?(view, "#public_access_block_block_public_policy:checked")
+    assert has_element?(view, "#public_access_block_restrict_public_buckets:checked")
   end
 end

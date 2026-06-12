@@ -16,8 +16,9 @@ defmodule Maxio.Cluster.ShardServer do
 
     * `begin_tmp/1`：在 `<drive_root>/.tmp/<uuid>` 建空 temp obj-dir（与 final 同 drive 卷 -> rename 原子）。
       调用方随后用既有 `put_shard/4`、`put_sidecar/2` 把 part.0 / meta.json 逐块流式写进 **temp**。
-    * `commit/3`：fsync part.0 文件 -> 原子 rename part.0 到 final（**数据先于元数据**，对齐 MinIO PR
-      #10734）-> fsync final 目录 -> 原子 rename meta.json 到 final -> fsync final 目录 -> 删 temp。
+    * `commit/3`：fsync temp part.0 + temp meta.json -> 原子 rename part.0 到 final
+      （**数据先于元数据**，对齐 MinIO PR #10734）-> fsync final 目录 -> 原子 rename meta.json
+      到 final -> fsync final 目录 -> 删 temp。
       crash 在两 rename 之间：数据在、meta 旧/无（harmless，旧值或交 heal），**绝不 meta 指向不存在数据**。
     * `prepare_commit/5`：把整对象 block_map + sidecar 一次写进 temp（小对象/单测用原语；不流式）。
 
@@ -111,23 +112,44 @@ defmodule Maxio.Cluster.ShardServer do
 
   @doc """
   读单层目录 drive_dir 下的条目（ROUTE B P3 drive-walk LIST 原语，本机；被 :erpc 寻址，无 node 首参）。
-  返回 `{:ok, [%{name, object?}]}`（name 升序）；object? = 该子目录内含 meta.json（即一个 null 版本对象目录）。
-  跳过内部前缀 .versions/.uploads/.tmp 与 meta.json/part.0 文件本身。目录不存在 -> {:ok, []}。
+  默认返回 `{:ok, [%{name, object?}]}`（name 升序）；object? = 该子目录内含 meta.json
+  （即一个 null 版本对象目录）。默认跳过内部前缀 .versions/.uploads/.tmp 与 meta.json/part.0
+  文件本身。目录不存在 -> {:ok, []}。
+
+  `opts[:include_layout_files]` 仅给 scanner orphan-shard 取证使用：在保持内部前缀过滤的同时，
+  额外返回当前目录下的 `meta.json` / `part.0` 文件条目（`type: :file`）。默认调用路径仍只看目录。
   """
   @spec list_dir(String.t(), keyword()) ::
           {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
-  def list_dir(drive_dir, _opts \\ []) do
+  def list_dir(drive_dir, opts \\ []) do
     case File.ls(drive_dir) do
       {:ok, names} ->
+        include_layout_files? = Keyword.get(opts, :include_layout_files, false)
+
         entries =
           names
           |> Enum.reject(&(&1 in @internal_prefixes))
-          |> Enum.reject(&(&1 in [@meta_file, @part_file]))
-          |> Enum.filter(fn n -> File.dir?(Path.join(drive_dir, n)) end)
-          |> Enum.sort()
-          |> Enum.map(fn n ->
-            %{name: n, object?: File.regular?(Path.join([drive_dir, n, @meta_file]))}
+          |> Enum.flat_map(fn n ->
+            path = Path.join(drive_dir, n)
+
+            cond do
+              File.dir?(path) ->
+                [
+                  %{
+                    name: n,
+                    object?: File.regular?(Path.join([drive_dir, n, @meta_file])),
+                    type: :dir
+                  }
+                ]
+
+              include_layout_files? and n in [@meta_file, @part_file] and File.regular?(path) ->
+                [%{name: n, object?: false, type: :file}]
+
+              true ->
+                []
+            end
           end)
+          |> Enum.sort_by(& &1.name)
 
         {:ok, entries}
 
@@ -148,11 +170,34 @@ defmodule Maxio.Cluster.ShardServer do
     end
   end
 
+  @doc "stat：该 drive 上 part.0 字节数与 mtime（scanner orphan cleanup 安全年龄门使用）。"
+  @spec stat_shard_info(String.t()) ::
+          {:ok, %{size: non_neg_integer(), mtime_ms: integer()}} | {:error, :enoent}
+  def stat_shard_info(drive_obj_dir) do
+    case File.stat(Path.join(drive_obj_dir, @part_file), time: :posix) do
+      {:ok, %File.Stat{size: size, mtime: mtime}} ->
+        {:ok, %{size: size, mtime_ms: mtime_ms(mtime)}}
+
+      {:error, _} ->
+        {:error, :enoent}
+    end
+  end
+
   @doc "删该 drive 上对象的整个目录（part.0 + meta.json）。幂等。"
   @spec delete_shard(String.t()) :: :ok
   def delete_shard(drive_obj_dir) do
     _ = File.rm_rf(drive_obj_dir)
     :ok
+  end
+
+  @doc "只删除该 drive 上对象目录里的 part.0，保留 meta.json 与子目录。幂等。"
+  @spec delete_part_file(String.t()) :: :ok | {:error, term()}
+  def delete_part_file(drive_obj_dir) do
+    case File.rm(Path.join(drive_obj_dir, @part_file)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   # ── 原子提交原语（ROUTE B B1-2）──
@@ -229,9 +274,10 @@ defmodule Maxio.Cluster.ShardServer do
     src_meta = Path.join(tmp_dir, @meta_file)
     if fsync? and File.exists?(src_part), do: sync_path(src_part)
 
-    # meta_only 提交：meta.json 即数据本体（delete marker 无 part.0）→ 提交前 fsync 它，
-    # 使 write_quorum 对纯元数据版本同样不是耐久谎言。
-    if fsync? and meta_only?, do: sync_path(src_meta)
+    # meta.json 是对象可见性的真值源：正常对象提交也必须在暴露元数据 rename 前 fsync，
+    # 否则 write_quorum 成功后掉电可能只耐久 part.0，读侧看不见对象或看见旧 sidecar。
+    # meta_only（delete marker）同理，meta.json 即数据本体。
+    if fsync?, do: sync_path(src_meta)
 
     # mkdir 失败（:enametoolong 段超 NAME_MAX / :eacces / 盘满等）→ 结构化 {:error, posix}，
     # 绝不 raise——File.mkdir_p! 的异常 message 内嵌服务器绝对盘路径，曾沿 500 InternalError
@@ -330,7 +376,7 @@ defmodule Maxio.Cluster.ShardServer do
 
   # 打开路径短持 + fsync（part.0 文件/meta.json 文件落盘）。
   defp sync_path(path) do
-    case :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
+    case :file.open(String.to_charlist(path), [:read, :write, :binary, :raw]) do
       {:ok, fd} ->
         _ = sync_fd(fd)
         :file.close(fd)
@@ -402,5 +448,14 @@ defmodule Maxio.Cluster.ShardServer do
         _ = shard_len
         :ok
     end
+  end
+
+  defp mtime_ms(mtime) when is_integer(mtime), do: mtime * 1_000
+
+  defp mtime_ms({{year, month, day}, {hour, minute, second}}) do
+    {:ok, date} = Date.new(year, month, day)
+    {:ok, time} = Time.new(hour, minute, second)
+    {:ok, datetime} = DateTime.new(date, time)
+    DateTime.to_unix(datetime, :millisecond)
   end
 end

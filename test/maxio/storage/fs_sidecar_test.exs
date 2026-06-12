@@ -28,6 +28,11 @@ defmodule Maxio.Storage.FSSidecarTest do
 
   defp opts(dir), do: [data_dir: dir]
 
+  defp tmp_empty?(dir) do
+    tmp = Path.join(dir, ".tmp")
+    not File.dir?(tmp) or File.ls!(tmp) == []
+  end
+
   defp rich_object_meta do
     %{
       content_type: "text/plain",
@@ -140,6 +145,113 @@ defmodule Maxio.Storage.FSSidecarTest do
       {:ok, stream} = FS.get("b", "replace-me", "null", nil, opts(dir))
       assert IO.iodata_to_binary(Enum.to_list(stream)) == "new bytes"
     end
+
+    test "put 覆盖旧布局对象 commit 失败 → 恢复旧单文件字节", %{dir: dir} do
+      legacy = Path.join([dir, "b", "replace-fail"])
+      File.write!(legacy, "old bytes stay")
+      fail_rename = fn _src, _dst -> {:error, :erofs} end
+
+      log =
+        capture_log(fn ->
+          assert {:error, :erofs} =
+                   FS.put(
+                     "b",
+                     "replace-fail",
+                     "null",
+                     ["new bytes"],
+                     opts(dir) ++ [rename_fun: fail_rename]
+                   )
+        end)
+
+      assert log =~ "legacy single-file layout object replaced"
+      assert log =~ "legacy single-file layout restored"
+      assert File.regular?(legacy)
+      assert File.read!(legacy) == "old bytes stay"
+      assert tmp_empty?(dir)
+
+      {:ok, stream} = FS.get("b", "replace-fail", "null", nil, opts(dir))
+      assert IO.iodata_to_binary(Enum.to_list(stream)) == "old bytes stay"
+    end
+  end
+
+  describe "FS stat 错误语义（真实 IO 错误绝不折叠成 404）" do
+    test "part.0 stat 真实 IO 错误经 GET/HEAD 透传并结构化记录", %{dir: dir} do
+      {:ok, _} = FS.put("b", "io-fail", "null", ["bytes"], opts(dir))
+
+      fault_opts =
+        opts(dir) ++
+          [
+            stat_fun: fn path ->
+              if Path.basename(path) == "part.0" and String.contains?(path, "io-fail") do
+                {:error, :eacces}
+              else
+                File.stat(path)
+              end
+            end
+          ]
+
+      log =
+        capture_log(fn ->
+          assert {:error, :eacces} = FS.stat("b", "io-fail", "null", fault_opts)
+          assert {:error, :eacces} = FS.get("b", "io-fail", "null", nil, fault_opts)
+        end)
+
+      assert log =~ "fs object stat failed"
+      assert log =~ "io-fail"
+      assert log =~ "eacces"
+    end
+
+    test "旧单文件布局回退仍限于 part.0 missing/not-directory 探测", %{dir: dir} do
+      legacy = Path.join([dir, "b", "legacy-enotdir"])
+      File.write!(legacy, "legacy bytes")
+
+      fault_opts =
+        opts(dir) ++
+          [
+            stat_fun: fn path ->
+              if Path.basename(path) == "part.0" and String.contains?(path, "legacy-enotdir") do
+                {:error, :enotdir}
+              else
+                File.stat(path)
+              end
+            end
+          ]
+
+      assert {:ok, %{size: 12}} = FS.stat("b", "legacy-enotdir", "null", fault_opts)
+      {:ok, stream} = FS.get("b", "legacy-enotdir", "null", nil, fault_opts)
+      assert IO.iodata_to_binary(Enum.to_list(stream)) == "legacy bytes"
+    end
+
+    test "legacy path 真实 stat 错误也透传并保留结构化原因映射", %{dir: dir} do
+      fault_opts =
+        opts(dir) ++
+          [
+            stat_fun: fn path ->
+              cond do
+                Path.basename(path) == "part.0" and String.contains?(path, "legacy-stat-fail") ->
+                  {:error, :enoent}
+
+                String.contains?(path, "legacy-stat-fail") ->
+                  {:error, :enametoolong}
+
+                true ->
+                  File.stat(path)
+              end
+            end
+          ]
+
+      log =
+        capture_log(fn ->
+          assert {:error, :key_too_long} = FS.stat("b", "legacy-stat-fail", "null", fault_opts)
+
+          assert {:error, :key_too_long} =
+                   FS.get("b", "legacy-stat-fail", "null", nil, fault_opts)
+        end)
+
+      assert log =~ "legacy_stat_object"
+      assert log =~ "legacy-stat-fail"
+      assert log =~ "enametoolong"
+    end
   end
 
   describe "put_delete_marker e2e（B6-1 条目 3：quorum=1 + Suspended null 替换）" do
@@ -182,7 +294,7 @@ defmodule Maxio.Storage.FSSidecarTest do
       assert entry["version_id"] == vid
     end
 
-    test "marker 落点被旧布局文件占据 → 先摘除（legacy_layout_replace 日志）", %{dir: dir} do
+    test "marker 落点被旧布局文件占据 → backup 后替换（legacy_layout_replace 日志）", %{dir: dir} do
       legacy = Path.join([dir, "b", "legacy-marker"])
       File.write!(legacy, "pre-B6-1 null bytes")
 
@@ -194,6 +306,33 @@ defmodule Maxio.Storage.FSSidecarTest do
       assert log =~ "legacy single-file layout object replaced"
       meta = read_sidecar!(Path.join(legacy, "meta.json"))
       assert [%{"type" => "delete_marker"}] = meta["versions"]
+    end
+
+    test "marker 覆盖旧布局对象 commit 失败 → 恢复旧单文件字节", %{dir: dir} do
+      legacy = Path.join([dir, "b", "legacy-marker-fail"])
+      File.write!(legacy, "old marker bytes")
+      fail_rename = fn _src, _dst -> {:error, :erofs} end
+
+      log =
+        capture_log(fn ->
+          assert {:error, :erofs} =
+                   FS.put_delete_marker(
+                     "b",
+                     "legacy-marker-fail",
+                     "null",
+                     [],
+                     opts(dir) ++ [rename_fun: fail_rename]
+                   )
+        end)
+
+      assert log =~ "legacy single-file layout object replaced"
+      assert log =~ "legacy single-file layout restored"
+      assert File.regular?(legacy)
+      assert File.read!(legacy) == "old marker bytes"
+      assert tmp_empty?(dir)
+
+      {:ok, stream} = FS.get("b", "legacy-marker-fail", "null", nil, opts(dir))
+      assert IO.iodata_to_binary(Enum.to_list(stream)) == "old marker bytes"
     end
   end
 end

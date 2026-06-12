@@ -56,4 +56,21 @@ defmodule Maxio.Cluster.ListDirTest do
     {:ok, entries} = ShardServer.list_dir(Path.join(root, "b"), [])
     assert Enum.map(entries, & &1.name) == ["a", "m", "z"]
   end
+
+  test "list_dir can opt into layout file visibility for scanner evidence", %{root: root} do
+    mkobj(root, "b/k.txt")
+    File.write!(Path.join([root, "b", "part.0"]), "orphan")
+    File.write!(Path.join([root, "b", "meta.json"]), "{}")
+
+    {:ok, default_entries} = ShardServer.list_dir(Path.join(root, "b"), [])
+    refute Enum.any?(default_entries, &(&1.name == "part.0"))
+    refute Enum.any?(default_entries, &(&1.name == "meta.json"))
+
+    {:ok, entries} = ShardServer.list_dir(Path.join(root, "b"), include_layout_files: true)
+    by_name = Map.new(entries, fn entry -> {entry.name, entry} end)
+
+    assert by_name["k.txt"].type == :dir
+    assert by_name["part.0"].type == :file
+    assert by_name["meta.json"].type == :file
+  end
 end

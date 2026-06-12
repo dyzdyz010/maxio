@@ -39,6 +39,53 @@ defmodule Maxio.ObjectMeta do
   end
 
   @doc """
+  ROUTE B B6-2 —— 解析「有效 topology」（单一来源 helper；读/列权威与 scanner 三处共用）。
+
+  返回**应注入 `opts[:topology]` 的拓扑 map**，或 `nil`（= 维持现状：走全局
+  `Maxio.Cluster.Topology` 的 :persistent_term 路径，或本就无拓扑）：
+
+    * `opts[:topology]` 已显式注入（test/调用方）→ 原样返回之（最高优先，既有注入语义不变）；
+    * 否则全局 `Topology.configured?/0` 为真 → `nil`（真集群拓扑在 :persistent_term，
+      下游 `Topology.endpoints/1` 等全局读 API 照常工作，零改动）;
+    * 否则当前 backend == `Maxio.Storage.FS` → `Maxio.Storage.FS.local_topology(opts)`
+      （合成单端点 `{Node.self(), data_dir}`：B6-1 起 FS 盘上布局与 EC/Distributed 端点同构，
+      node=Node.self() 使 `Transport.Erpc` 走本地直调快路径，data_shards=1 使既有
+      `opts[:topology].data_shards` 优先逻辑自然给 read/write quorum=1）；
+    * 其余（无拓扑且非 FS）→ `nil`（既有「sidecar 不可达 → PG fallback」语义不变）。
+
+  只在**翻权威的入口**（`get/4` 与 `list/3` 的 `:sidecar` 分支、`Scanner.run_once/1`）经
+  `put_effective_topology/1` 注入——`:pg` 默认路径（read shadow / list shadow）**零改动**，
+  默认配置行为与基线字节级一致。
+  """
+  @spec effective_topology(keyword()) :: map() | nil
+  def effective_topology(opts) do
+    case Keyword.get(opts, :topology) do
+      %{} = t ->
+        t
+
+      _ ->
+        cond do
+          Topology.configured?() -> nil
+          Maxio.Storage.backend() == Maxio.Storage.FS -> Maxio.Storage.FS.local_topology(opts)
+          true -> nil
+        end
+    end
+  end
+
+  @doc """
+  `effective_topology/1` 的 opts 注入形态：解析出有效拓扑则写进 `opts[:topology]`
+  （下游 endpoints/quorum/Listing 走盘全部经既有 `opts[:topology]` 优先逻辑消费），
+  `nil` 则 opts 原样返回。幂等（已注入的 opts 再过一遍不变）。
+  """
+  @spec put_effective_topology(keyword()) :: keyword()
+  def put_effective_topology(opts) do
+    case effective_topology(opts) do
+      nil -> opts
+      t -> Keyword.put(opts, :topology, t)
+    end
+  end
+
+  @doc """
   读对象元数据。按 `authoritative_source(:read)` 分流（opts 可覆盖 for tests）：
 
     * `:pg`（默认）→ SHADOW 模式：返回 PG 权威 `%Object{}`（或 `{:error,:not_found}`），
@@ -68,6 +115,11 @@ defmodule Maxio.ObjectMeta do
   def get(bucket, key, version_id \\ nil, opts \\ []) do
     case authoritative_source(:read, opts) do
       :sidecar ->
+        # ROUTE B B6-2：翻读权威入口处一次性解析有效 topology（FS 无全局拓扑 → 注入合成单端点），
+        # 下游 endpoints_for / read_quorum / discover_current_version（Listing）全经既有
+        # opts[:topology] 优先逻辑消费。:pg 默认分支零改动。
+        opts = put_effective_topology(opts)
+
         if read_prefer_index?(opts) do
           prefer_index_read(bucket, key, version_id, opts)
         else
@@ -231,9 +283,14 @@ defmodule Maxio.ObjectMeta do
       size: view.size,
       etag: view.etag,
       content_type: view.content_type,
+      content_encoding: view.content_encoding,
+      content_disposition: view.content_disposition,
+      cache_control: view.cache_control,
+      expires: view.expires,
       metadata: view.metadata,
       storage_class: view.storage_class,
       acl_canned: view.acl_canned,
+      acl_grants: view.acl_grants,
       tags: view.tags,
       sse_algorithm: view.sse_algorithm,
       # 信封从 sidecar 版本 entry 携带（Sidecar.to_view 读 e["sse"]["envelope"]）——绝不再硬编码 nil。
@@ -376,8 +433,13 @@ defmodule Maxio.ObjectMeta do
         field_diff(:etag, pg.etag, view.etag),
         field_diff(:size, pg.size, view.size),
         field_diff(:content_type, pg.content_type, view.content_type),
+        field_diff(:content_encoding, pg.content_encoding, view.content_encoding),
+        field_diff(:content_disposition, pg.content_disposition, view.content_disposition),
+        field_diff(:cache_control, pg.cache_control, view.cache_control),
+        field_diff(:expires, pg.expires, view.expires),
         field_diff(:is_delete_marker, pg.is_delete_marker, view.is_delete_marker),
-        field_diff(:storage_class, pg.storage_class, view.storage_class)
+        field_diff(:storage_class, pg.storage_class, view.storage_class),
+        field_diff(:acl_grants, pg.acl_grants, view.acl_grants)
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -429,7 +491,12 @@ defmodule Maxio.ObjectMeta do
         # 续点 token 形态不同：PG SQL 的 continuation token 是 key 游标、drive-walk 是版本树游标，
         # 混读两源会产生不可续的分页断点。read_prefer_index 仅作用于单对象 get/4；
         # LIST 在 :sidecar 权威下恒走盘（正确性优先）。
-        Maxio.Listing.list_objects_v2(bucket, list_opts, Keyword.put(opts, :require_quorum, true))
+        # B6-2：翻列权威入口同样解析有效 topology（FS → 合成单端点；见 effective_topology/1）。
+        Maxio.Listing.list_objects_v2(
+          bucket,
+          list_opts,
+          opts |> put_effective_topology() |> Keyword.put(:require_quorum, true)
+        )
 
       _pg ->
         res = Objects.list_objects_v2(bucket, list_opts)

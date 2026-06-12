@@ -51,3 +51,6 @@ config :maxio, Maxio.Cluster, topologies: []
 
 # B1-2：test 默认关 fsync 提速（fsync 单测显式传 opts[:fsync] true 断言 :file.sync 被调用）。
 config :maxio, :durability, fsync: false
+
+# M8-3 scrubber test runs are explicit; background scheduling remains disabled.
+config :maxio, :scrubber, enabled: false, initial_delay_ms: 0, page_size: 50

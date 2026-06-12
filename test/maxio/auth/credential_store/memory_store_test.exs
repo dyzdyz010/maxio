@@ -21,4 +21,13 @@ defmodule Maxio.Auth.CredentialStore.MemoryStoreTest do
     {:ok, %{secret_key: "SK2", principal: principal}} = MemoryStore.get_secret("AK2")
     assert principal.type == :iam_user
   end
+
+  test "invalidate 删除指定 access key" do
+    :ok = MemoryStore.put_access_key(%{access_key: "AKINVALIDATE", secret_key: "SK"})
+    assert {:ok, %{secret_key: "SK"}} = MemoryStore.get_secret("AKINVALIDATE")
+
+    assert :ok = MemoryStore.invalidate({:access_key, "AKINVALIDATE"})
+
+    assert :error = MemoryStore.get_secret("AKINVALIDATE")
+  end
 end

@@ -7,7 +7,9 @@ defmodule Maxio.IAM do
   """
   import Ecto.Query
   alias Maxio.Repo
+  alias Maxio.Cluster.Notify
   alias Maxio.IAM.AccessKey
+  alias Maxio.Policy.Store
 
   @doc "从 config :maxio, :s3 的 root_user/root_password 幂等引导 root（boot 调用）。"
   @spec bootstrap_root() :: :ok
@@ -22,10 +24,11 @@ defmodule Maxio.IAM do
       secret_key: sk,
       principal_arn: "arn:aws:iam:::root",
       type: "root",
-      status: "active"
+      status: "active",
+      tags: %{}
     })
     |> Repo.insert(
-      on_conflict: {:replace, [:secret_key, :principal_arn, :type, :status, :updated_at]},
+      on_conflict: {:replace, [:secret_key, :principal_arn, :type, :status, :tags, :updated_at]},
       conflict_target: :access_key_id
     )
 
@@ -38,6 +41,7 @@ defmodule Maxio.IAM do
     ak = Keyword.get(opts, :access_key_id) || gen_access_key_id()
     sk = Keyword.get(opts, :secret_key) || gen_secret_key()
     type = Keyword.get(opts, :type, "iam_user")
+    tags = opts |> Keyword.get(:tags, %{}) |> normalize_tags()
     arn = if type == "root", do: "arn:aws:iam:::root", else: "arn:aws:iam:::user/#{ak}"
 
     case %AccessKey{}
@@ -46,11 +50,21 @@ defmodule Maxio.IAM do
            secret_key: sk,
            principal_arn: arn,
            type: type,
-           status: "active"
+           status: "active",
+           tags: tags
          })
          |> Repo.insert() do
       {:ok, row} ->
-        {:ok, %{access_key_id: row.access_key_id, secret_key: sk, principal_arn: arn, type: type}}
+        Notify.broadcast({:iam_changed, row.access_key_id})
+
+        {:ok,
+         %{
+           access_key_id: row.access_key_id,
+           secret_key: sk,
+           principal_arn: arn,
+           type: type,
+           tags: tags
+         }}
 
       {:error, cs} ->
         {:error, cs}
@@ -66,7 +80,8 @@ defmodule Maxio.IAM do
         access_key_id: a.access_key_id,
         principal_arn: a.principal_arn,
         type: a.type,
-        status: a.status
+        status: a.status,
+        tags: a.tags || %{}
       }
     end)
   end
@@ -76,6 +91,7 @@ defmodule Maxio.IAM do
   def delete_access_key(access_key_id) do
     case Repo.get_by(AccessKey, access_key_id: access_key_id) do
       nil ->
+        Notify.broadcast({:iam_changed, access_key_id})
         :ok
 
       %AccessKey{type: "root"} = row ->
@@ -85,17 +101,55 @@ defmodule Maxio.IAM do
           {:error, :cannot_delete_last_root}
         else
           Repo.delete!(row)
+          Notify.broadcast({:iam_changed, access_key_id})
           :ok
         end
 
       %AccessKey{} = row ->
         Repo.delete!(row)
+        Notify.broadcast({:iam_changed, access_key_id})
         :ok
     end
   end
+
+  @doc """
+  绑定或覆盖一个 principal identity policy。
+
+  identity policy 不允许显式 Principal；principal 由绑定的 principal ARN 隐式提供。
+  """
+  @spec put_principal_policy(String.t(), String.t(), binary()) :: :ok | {:error, term()}
+  def put_principal_policy(principal_arn, name, json)
+      when is_binary(principal_arn) and is_binary(name) and is_binary(json),
+      do: Store.put_principal_policy(principal_arn, name, json)
+
+  def put_principal_policy(_principal_arn, _name, _json), do: {:error, :malformed}
+
+  @doc "列出某 principal 绑定的 identity policies（不解析为 Statement，用于 CLI/Console 展示）。"
+  @spec list_principal_policies(String.t()) :: [map()]
+  def list_principal_policies(principal_arn) when is_binary(principal_arn),
+    do: Store.list_principal_policies(principal_arn)
+
+  def list_principal_policies(_principal_arn), do: []
+
+  @doc "删除某 principal 的一个 identity policy（幂等）。"
+  @spec delete_principal_policy(String.t(), String.t()) :: :ok
+  def delete_principal_policy(principal_arn, name)
+      when is_binary(principal_arn) and is_binary(name),
+      do: Store.delete_principal_policy(principal_arn, name)
+
+  def delete_principal_policy(_principal_arn, _name), do: :ok
 
   defp gen_access_key_id,
     do: "AKIA" <> (:crypto.strong_rand_bytes(8) |> Base.encode32(padding: false))
 
   defp gen_secret_key, do: :crypto.strong_rand_bytes(30) |> Base.encode64() |> binary_part(0, 40)
+
+  defp normalize_tags(tags) when is_map(tags) do
+    Map.new(tags, fn {key, value} -> {to_string(key), tag_value(value)} end)
+  end
+
+  defp normalize_tags(_tags), do: %{}
+
+  defp tag_value(nil), do: ""
+  defp tag_value(value), do: to_string(value)
 end

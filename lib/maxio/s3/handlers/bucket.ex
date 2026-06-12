@@ -2,16 +2,24 @@ defmodule Maxio.S3.Handlers.Bucket do
   @moduledoc "Bucket 级 handler：create / delete / head / list_objects_v2 / get_location。"
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Storage}
+  alias Maxio.Policy.ACL
   alias Maxio.S3.{Error, Log}
   alias Maxio.S3.Views.{ListBucket, LocationConstraint, ListVersions}
+
+  @max_keys_limit 1000
+  @owner_id "maxio"
 
   @spec create(Plug.Conn.t()) :: Plug.Conn.t()
   def create(conn) do
     bucket = conn.assigns.s3_bucket
     owner = conn.assigns.principal.arn
-    acl = bucket_canned(conn |> get_req_header("x-amz-acl") |> List.first())
+    acl_input = bucket_acl_from_headers!(conn)
 
-    case Buckets.create(bucket, owner, region: region(), acl_canned: acl) do
+    case Buckets.create(bucket, owner,
+           region: region(),
+           acl_canned: acl_input.canned,
+           acl_grants: acl_input.grants_doc
+         ) do
       {:ok, _b} ->
         :ok = Storage.put_bucket(bucket)
         Log.info("create bucket", action: :create_bucket, bucket: bucket)
@@ -71,7 +79,7 @@ defmodule Maxio.S3.Handlers.Bucket do
     with {:ok, b} <- bucket_or_raise(bucket) do
       prefix = Map.get(qp, "prefix", "")
       delimiter = Map.get(qp, "delimiter")
-      max_keys = parse_int(Map.get(qp, "max-keys"), 1000)
+      max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       continuation = Map.get(qp, "continuation-token")
       start_after = Map.get(qp, "start-after")
       encoding_type = Map.get(qp, "encoding-type")
@@ -90,15 +98,16 @@ defmodule Maxio.S3.Handlers.Bucket do
       # marker 在盘无痕迹导致的保证性伪分歧。默认 :pg 行为与 P3 完全一致（向后兼容、可回滚）。
       res = Maxio.ObjectMeta.list(bucket, list_opts, bucket_versioning: versioning_of(b))
 
-      # objects 元素：:pg 分支为 %Objects.Object{}（富元数据）；:sidecar 分支为 %{key: ...}（走盘只到
-      # key 级，无 LastModified/ETag/Size）。统一用 Map.get 取，富字段缺失留 nil（翻权威读 sidecar 富集留后续）。
+      # objects 元素：:pg 分支为 %Objects.Object{}（富元数据）；:sidecar 分支为 %{key: ...}
+      # （B6-2 后同样富集 LastModified/ETag/Size/StorageClass）。统一用 Map.get 取，缺失留 nil。
       objects =
         Enum.map(res.objects, fn o ->
           %{
             key: o.key,
             last_modified: Map.get(o, :updated_at) || Map.get(o, :last_modified),
             etag: Map.get(o, :etag),
-            size: Map.get(o, :size)
+            size: Map.get(o, :size),
+            storage_class: Map.get(o, :storage_class)
           }
         end)
 
@@ -134,7 +143,7 @@ defmodule Maxio.S3.Handlers.Bucket do
     with {:ok, _b} <- bucket_or_raise(bucket) do
       prefix = Map.get(qp, "prefix", "")
       delimiter = Map.get(qp, "delimiter")
-      max_keys = parse_int(Map.get(qp, "max-keys"), 1000)
+      max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       key_marker = Map.get(qp, "key-marker")
       version_id_marker = Map.get(qp, "version-id-marker")
       encoding_type = Map.get(qp, "encoding-type")
@@ -196,19 +205,64 @@ defmodule Maxio.S3.Handlers.Bucket do
   defp versioning_of(%{versioning: v}) when is_binary(v), do: v
   defp versioning_of(_), do: "Unversioned"
 
-  defp parse_int(nil, default), do: default
+  defp parse_int(nil, default, _limit), do: default
 
-  defp parse_int(str, default) do
+  defp parse_int(str, default, limit) do
     case Integer.parse(str) do
-      {n, ""} when n > 0 -> n
+      {n, ""} when n > 0 -> min(n, limit)
       _ -> default
     end
   end
 
   defp region, do: Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:region)
 
-  # CreateBucket 的 x-amz-acl：对象专属 canned（bucket-owner-*）在桶级被静默忽略（官方），落 private。
-  defp bucket_canned(nil), do: "private"
-  defp bucket_canned(c) when c in ~w(bucket-owner-read bucket-owner-full-control), do: "private"
-  defp bucket_canned(c), do: c
+  # CreateBucket 的对象专属 canned（bucket-owner-*）在桶级被官方忽略，落 private。
+  defp bucket_acl_from_headers!(conn) do
+    grant_headers? = ACL.grant_headers?(conn.req_headers)
+
+    case conn |> get_req_header("x-amz-acl") |> List.first() do
+      canned when is_binary(canned) and grant_headers? ->
+        raise Error.new(:invalid_request,
+                message: "Cannot specify both x-amz-acl and x-amz-grant-*"
+              )
+
+      nil ->
+        if grant_headers? do
+          grants =
+            conn.req_headers
+            |> parse_grant_headers!()
+            |> ACL.drop_owner_grants(@owner_id)
+
+          %{canned: ACL.classify_grants(grants), grants_doc: ACL.grants_doc(grants)}
+        else
+          %{canned: "private", grants_doc: ACL.empty_grants_doc()}
+        end
+
+      canned when canned in ~w(bucket-owner-read bucket-owner-full-control) ->
+        %{canned: "private", grants_doc: ACL.empty_grants_doc()}
+
+      canned ->
+        if ACL.known?(canned) do
+          %{canned: canned, grants_doc: ACL.empty_grants_doc()}
+        else
+          raise Error.new(:invalid_argument, message: "Unsupported x-amz-acl: #{canned}")
+        end
+    end
+  end
+
+  defp parse_grant_headers!(headers) do
+    case ACL.parse_grant_headers(headers) do
+      {:ok, grants} ->
+        grants
+
+      {:error, :unsupported_email} ->
+        raise Error.new(:invalid_argument, message: "Email grantee ACLs are not supported")
+
+      {:error, :too_many_grants} ->
+        raise Error.new(:invalid_argument, message: "ACL can contain at most 100 grants")
+
+      {:error, :invalid_grant} ->
+        raise Error.new(:invalid_argument, message: "Invalid ACL grant")
+    end
+  end
 end

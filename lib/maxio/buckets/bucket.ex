@@ -12,6 +12,7 @@ defmodule Maxio.Buckets.Bucket do
     field :region, :string, default: "us-east-1"
     field :owner, :string
     field :acl_canned, :string, default: "private"
+    field :acl_grants, :map, default: %{"grants" => []}
     field :versioning, :string, default: "Unversioned"
     field :mfa_delete, :string
     field :tags, :map, default: %{}
@@ -20,7 +21,7 @@ defmodule Maxio.Buckets.Bucket do
   end
 
   @required [:name, :owner]
-  @optional [:region, :acl_canned, :versioning, :mfa_delete, :tags]
+  @optional [:region, :acl_canned, :acl_grants, :versioning, :mfa_delete, :tags]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(bucket, attrs) do

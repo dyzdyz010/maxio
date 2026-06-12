@@ -13,9 +13,14 @@ defmodule Maxio.Objects.Object do
     field :size, :integer, default: 0
     field :etag, :string
     field :content_type, :string, default: "binary/octet-stream"
+    field :content_encoding, :string
+    field :content_disposition, :string
+    field :cache_control, :string
+    field :expires, :string
     field :metadata, :map, default: %{}
     field :storage_class, :string, default: "STANDARD"
     field :acl_canned, :string, default: "private"
+    field :acl_grants, :map, default: %{"grants" => []}
     field :version_id, :string, default: "null"
     field :is_latest, :boolean, default: true
     field :is_delete_marker, :boolean, default: false
@@ -40,9 +45,14 @@ defmodule Maxio.Objects.Object do
     :size,
     :etag,
     :content_type,
+    :content_encoding,
+    :content_disposition,
+    :cache_control,
+    :expires,
     :metadata,
     :storage_class,
     :acl_canned,
+    :acl_grants,
     :version_id,
     :is_latest,
     :is_delete_marker,

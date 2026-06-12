@@ -7,10 +7,14 @@ defmodule Maxio.Objects do
   import Ecto.Query
   alias Maxio.Repo
   alias Maxio.Buckets
+  alias Maxio.Cluster.Notify
   alias Maxio.Objects.Object
   alias Maxio.S3.Log
+  alias Maxio.S3.SystemHeaders
   alias Maxio.Sidecar
   alias Maxio.Versioning.VersionId
+
+  @max_keys_limit 1000
 
   # ROUTE B B5-1 —— reconcile upsert 的 on_conflict 全字段替换集：scanner 以盘上 sidecar 为权威
   # 收敛 PG 行，**所有读可见字段**都必须被替换（含 tags/sse/metadata——与写路径 upsert 的最小替换集
@@ -19,9 +23,14 @@ defmodule Maxio.Objects do
     :size,
     :etag,
     :content_type,
+    :content_encoding,
+    :content_disposition,
+    :cache_control,
+    :expires,
     :metadata,
     :storage_class,
     :acl_canned,
+    :acl_grants,
     :tags,
     :sse_algorithm,
     :sse_envelope,
@@ -50,31 +59,36 @@ defmodule Maxio.Objects do
 
   @doc """
   写入/覆盖对象元数据（按 (bucket, key) 的 "null" 版本行 upsert，并置 latest）。`attrs` 至少含
-  size、etag；可含 content_type、metadata、storage_class。桶不存在 → {:error, :no_such_bucket}。
+  size、etag；可含 content_type、metadata、storage_class、SSE 字段与可控系统头。桶不存在 → {:error, :no_such_bucket}。
   CopyObject / Multipart Complete 走此路径（字节落 null 路径，对象当 null 版本）。
   """
   @spec put_metadata(String.t(), String.t(), map()) ::
           {:ok, Object.t()} | {:error, :no_such_bucket | Ecto.Changeset.t()}
   def put_metadata(bucket_name, key, attrs) do
     with {:ok, bucket} <- bucket_or_error(bucket_name) do
-      base = %{
-        bucket_id: bucket.id,
-        bucket_name: bucket_name,
-        key: key,
-        size: Map.fetch!(attrs, :size),
-        etag: Map.fetch!(attrs, :etag),
-        content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
-        metadata: Map.get(attrs, :metadata, %{}),
-        storage_class: Map.get(attrs, :storage_class, "STANDARD"),
-        acl_canned: Map.get(attrs, :acl_canned, "private"),
-        version_id: "null",
-        is_latest: true,
-        is_delete_marker: false,
-        # ROUTE B B5-1：写穿即视作与盘上 sidecar 同步（写路径盘先 PG 后，提交时盘上已权威落盘）；
-        # generation 来自 attrs（MPU complete 当前恒缺省 0），B5-2 scanner 据此判 stale。
-        synced_at: DateTime.utc_now(),
-        index_generation: Map.get(attrs, :generation, 0)
-      }
+      base =
+        %{
+          bucket_id: bucket.id,
+          bucket_name: bucket_name,
+          key: key,
+          size: Map.fetch!(attrs, :size),
+          etag: Map.fetch!(attrs, :etag),
+          content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
+          metadata: Map.get(attrs, :metadata, %{}),
+          storage_class: Map.get(attrs, :storage_class, "STANDARD"),
+          acl_canned: Map.get(attrs, :acl_canned, "private"),
+          acl_grants: Map.get(attrs, :acl_grants, %{"grants" => []}),
+          sse_algorithm: Map.get(attrs, :sse_algorithm),
+          sse_envelope: Map.get(attrs, :sse_envelope),
+          version_id: "null",
+          is_latest: true,
+          is_delete_marker: false,
+          # ROUTE B B5-1：写穿即视作与盘上 sidecar 同步（写路径盘先 PG 后，提交时盘上已权威落盘）；
+          # generation 来自 attrs（MPU complete 当前恒缺省 0），B5-2 scanner 据此判 stale。
+          synced_at: DateTime.utc_now(),
+          index_generation: Map.get(attrs, :generation, 0)
+        }
+        |> Map.merge(SystemHeaders.take(attrs))
 
       Repo.transaction(fn ->
         unset_latest(bucket.id, key)
@@ -89,13 +103,21 @@ defmodule Maxio.Objects do
                  :size,
                  :etag,
                  :content_type,
+                 :content_encoding,
+                 :content_disposition,
+                 :cache_control,
+                 :expires,
                  :metadata,
                  :storage_class,
                  :acl_canned,
+                 :acl_grants,
+                 :sse_algorithm,
+                 :sse_envelope,
                  :is_latest,
                  :is_delete_marker,
                  :synced_at,
                  :index_generation,
+                 :inserted_at,
                  :updated_at
                ]},
             conflict_target: [:bucket_id, :key, :version_id]
@@ -126,18 +148,50 @@ defmodule Maxio.Objects do
     e -> {:error, e}
   end
 
-  @doc "更新对象的 canned ACL（PutObjectAcl）。对象不存在 → :not_found。"
-  @spec put_acl(String.t(), String.t(), String.t()) :: :ok | {:error, :not_found}
-  def put_acl(bucket_name, key, canned) do
-    case get_metadata(bucket_name, key) do
+  @doc "更新当前对象版本 ACL（PutObjectAcl）。对象不存在 → :not_found。"
+  @spec put_acl(String.t(), String.t(), String.t(), map()) :: :ok | {:error, :not_found}
+  def put_acl(bucket_name, key, canned, grants_doc \\ %{"grants" => []}) do
+    put_acl_version(bucket_name, key, nil, canned, grants_doc)
+  end
+
+  @doc "更新对象指定版本 ACL。version_id=nil 表示当前版本。对象不存在 → :not_found。"
+  @spec put_acl_version(
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          String.t(),
+          map(),
+          integer() | nil
+        ) ::
+          :ok | {:error, :not_found}
+  def put_acl_version(bucket_name, key, version_id, canned, grants_doc, generation \\ nil) do
+    fetch =
+      if version_id,
+        do: get_version(bucket_name, key, version_id),
+        else: get_metadata(bucket_name, key)
+
+    case fetch do
       {:ok, obj} ->
-        obj |> Object.changeset(%{acl_canned: canned}) |> Repo.update!()
+        attrs =
+          %{acl_canned: canned, acl_grants: grants_doc}
+          |> maybe_synced_generation(generation)
+
+        obj |> Object.changeset(attrs) |> Repo.update!()
+        Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
         :ok
 
       {:error, :not_found} ->
         {:error, :not_found}
     end
   end
+
+  defp maybe_synced_generation(attrs, generation) when is_integer(generation) do
+    attrs
+    |> Map.put(:synced_at, DateTime.utc_now())
+    |> Map.put(:index_generation, generation)
+  end
+
+  defp maybe_synced_generation(attrs, _generation), do: attrs
 
   @doc "读对象 tag（current 或指定版本）。返回 [{Key,Value}]（空集 → []）。对象不存在 → {:error, :not_found}。"
   @spec get_tags(String.t(), String.t(), String.t() | nil) ::
@@ -166,6 +220,7 @@ defmodule Maxio.Objects do
     case fetch do
       {:ok, obj} ->
         obj |> Object.changeset(%{tags: Maxio.Tags.list_to_map(tags)}) |> Repo.update!()
+        Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
         :ok
 
       {:error, :not_found} ->
@@ -204,7 +259,8 @@ defmodule Maxio.Objects do
   versioning ∈ "Enabled" | "Suspended" | "Unversioned"：
     * Enabled → 生成新 ULID version_id，插入新行并置 latest（旧 latest 置 false）。
     * Suspended/Unversioned → version_id="null"，upsert 既有 null 行并置 latest（其余非 null 版本不动）。
-  attrs 至少含 size、etag；可含 content_type/metadata/storage_class/acl_canned/tags/sse_algorithm。
+  attrs 至少含 size、etag；可含 content_type/metadata/storage_class/acl_canned/tags/sse_algorithm
+  与可控系统头。
   返回 {:ok, Object.t()}（含其 version_id）。
   """
   @spec put_version(String.t(), String.t(), String.t(), map()) ::
@@ -223,9 +279,14 @@ defmodule Maxio.Objects do
         attrs
         |> Map.take([
           :content_type,
+          :content_encoding,
+          :content_disposition,
+          :cache_control,
+          :expires,
           :metadata,
           :storage_class,
           :acl_canned,
+          :acl_grants,
           :tags,
           :sse_algorithm,
           :sse_envelope
@@ -257,13 +318,21 @@ defmodule Maxio.Objects do
                     :size,
                     :etag,
                     :content_type,
+                    :content_encoding,
+                    :content_disposition,
+                    :cache_control,
+                    :expires,
                     :metadata,
                     :storage_class,
                     :acl_canned,
+                    :acl_grants,
+                    :sse_algorithm,
+                    :sse_envelope,
                     :is_latest,
                     :is_delete_marker,
                     :synced_at,
                     :index_generation,
+                    :inserted_at,
                     :updated_at
                   ]},
                conflict_target: [:bucket_id, :key, :version_id]
@@ -349,6 +418,7 @@ defmodule Maxio.Objects do
                  :is_delete_marker,
                  :synced_at,
                  :index_generation,
+                 :inserted_at,
                  :updated_at
                ]},
             conflict_target: [:bucket_id, :key, :version_id]
@@ -478,7 +548,7 @@ defmodule Maxio.Objects do
   ROUTE B B5-1 —— PG 索引行相对盘上 sidecar 权威 entry 是否过期（B5-2 Scanner 契约函数）。
 
   比对 generation（row.index_generation vs entry generation）+ 读可见字段集（etag/size/content_type/
-  metadata/tags/storage_class/acl_canned/sse/is_latest/is_delete_marker——Sidecar.signature/1 身份
+  可控系统头/metadata/tags/storage_class/acl_canned/sse/is_latest/is_delete_marker——Sidecar.signature/1 身份
   字段的 PG 可表达超集；modtime 无 PG 列不比，version_id 即查找键不比）。任一不一致 → true（stale，
   scanner 走 reconcile_from_sidecar/3 收敛）。
   """
@@ -491,10 +561,15 @@ defmodule Maxio.Objects do
       row.etag != attrs.etag or
       row.size != attrs.size or
       row.content_type != attrs.content_type or
+      row.content_encoding != attrs.content_encoding or
+      row.content_disposition != attrs.content_disposition or
+      row.cache_control != attrs.cache_control or
+      row.expires != attrs.expires or
       (row.metadata || %{}) != attrs.metadata or
       (row.tags || %{}) != attrs.tags or
       row.storage_class != attrs.storage_class or
       row.acl_canned != attrs.acl_canned or
+      (row.acl_grants || %{"grants" => []}) != attrs.acl_grants or
       row.sse_algorithm != attrs.sse_algorithm or
       row.sse_envelope != attrs.sse_envelope or
       row.is_latest != attrs.is_latest or
@@ -593,7 +668,7 @@ defmodule Maxio.Objects do
   def list_object_versions(bucket_name, opts \\ %{}) do
     prefix = Map.get(opts, :prefix, "") || ""
     delimiter = Map.get(opts, :delimiter)
-    max_keys = Map.get(opts, :max_keys, 1000)
+    max_keys = normalize_max_keys(Map.get(opts, :max_keys, @max_keys_limit))
     key_marker = Map.get(opts, :key_marker)
     version_id_marker = Map.get(opts, :version_id_marker)
 
@@ -754,7 +829,7 @@ defmodule Maxio.Objects do
   def list_objects_v2(bucket_name, opts \\ %{}) do
     prefix = Map.get(opts, :prefix, "") || ""
     delimiter = Map.get(opts, :delimiter)
-    max_keys = Map.get(opts, :max_keys, 1000)
+    max_keys = normalize_max_keys(Map.get(opts, :max_keys, @max_keys_limit))
     cursor = Map.get(opts, :continuation_token) || Map.get(opts, :start_after)
 
     # 拉取候选 key（升序），从游标之后开始，仅取该 prefix。多取以便折叠后仍能判断截断。
@@ -882,6 +957,9 @@ defmodule Maxio.Objects do
     hard_limit = Application.get_env(:maxio, :listing, [])[:sql_hard_limit] || 100_000
     min(hard_limit, max_keys * 4 + 1000)
   end
+
+  defp normalize_max_keys(n) when is_integer(n) and n > 0, do: min(n, @max_keys_limit)
+  defp normalize_max_keys(_), do: @max_keys_limit
 
   # 转义 LIKE 通配（% 与 _ 与 \）。
   defp escape_like(str) do

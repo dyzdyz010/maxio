@@ -72,6 +72,20 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:ok, :delete_objects} = Dispatcher.resolve(:bucket, "POST", keys(["delete"]))
   end
 
+  test "PublicAccessBlock 子资源 → bucket-level actions" do
+    assert {:ok, :put_public_access_block} =
+             Dispatcher.resolve(:bucket, "PUT", keys(["publicaccessblock"]))
+
+    assert {:ok, :get_public_access_block} =
+             Dispatcher.resolve(:bucket, "GET", keys(["publicaccessblock"]))
+
+    assert {:ok, :delete_public_access_block} =
+             Dispatcher.resolve(:bucket, "DELETE", keys(["publicaccessblock"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["publicaccessblock"]))
+  end
+
   test "无匹配方法 → method_not_allowed" do
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))

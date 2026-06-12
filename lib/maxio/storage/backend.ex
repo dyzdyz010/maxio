@@ -20,9 +20,14 @@ defmodule Maxio.Storage.Backend do
 
       %{
         content_type: String.t(),
+        content_encoding: String.t() | nil,
+        content_disposition: String.t() | nil,
+        cache_control: String.t() | nil,
+        expires: String.t() | nil,
         tags: %{String.t() => String.t()},
         sse: nil | %{"algo" => "AES256", "envelope" => map()},
         acl_canned: String.t(),
+        acl_grants: %{String.t() => term()},
         storage_class: String.t(),
         user_metadata: %{String.t() => String.t()},
         # B6-2a（仅 assemble 路径，可选）：S3 可见 ETag 覆盖——多段完成对象的 sidecar versions
@@ -79,7 +84,11 @@ defmodule Maxio.Storage.Backend do
   @callback get_part_stream(bucket(), key(), upload_id(), part_number(), opts :: keyword()) ::
               {:ok, Enumerable.t()} | {:error, :enoent | term()}
 
-  @doc "按给定 part number 升序把各 part 字节拼成最终对象（落到对象路径），返回总大小。"
+  @doc """
+  按给定 part number 升序把各 part 字节拼成最终对象（落到对象路径），返回总大小。
+
+  `opts[:version_id]` 指定最终对象版本路径；缺省为 `"null"` 以保持既有未版本化调用语义。
+  """
   @callback assemble(
               bucket(),
               key(),

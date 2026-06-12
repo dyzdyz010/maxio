@@ -48,6 +48,8 @@ defmodule Maxio.S3.Error do
     bucket_not_empty:
       {"BucketNotEmpty", 409, "The bucket that you tried to delete is not empty."},
     invalid_argument: {"InvalidArgument", 400, "Invalid Argument"},
+    invalid_storage_class:
+      {"InvalidStorageClass", 400, "The storage class that you specified is not valid."},
     invalid_tag:
       {"InvalidTag", 400,
        "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation."},
@@ -89,6 +91,9 @@ defmodule Maxio.S3.Error do
     not_implemented:
       {"NotImplemented", 501,
        "A header that you provided implies functionality that is not implemented."},
+    request_timeout:
+      {"RequestTimeout", 503,
+       "A timeout occurred while trying to lock a resource, please reduce your request rate"},
     slow_down: {"SlowDown", 503, "Please reduce your request rate."},
     # MinIO 区分写/读 quorum 不足为可重试的 503（cmd/api-errors.go:
     # errErasureWriteQuorum -> ErrSlowDownWrite{Code:"SlowDownWrite",503}；
@@ -125,6 +130,9 @@ defmodule Maxio.S3.Error do
     malformed_policy:
       {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'."},
     no_such_bucket_policy: {"NoSuchBucketPolicy", 404, "The bucket policy does not exist."},
+    no_such_public_access_block_configuration:
+      {"NoSuchPublicAccessBlockConfiguration", 404,
+       "The public access block configuration was not found."},
     access_forbidden:
       {"AccessForbidden", 403,
        "CORSResponse: This CORS request is not allowed. This is usually because the evaluation of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted."},

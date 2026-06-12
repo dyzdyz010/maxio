@@ -31,6 +31,21 @@ defmodule Maxio.Policy.StatementTest do
     assert s.principals == {:aws, ["arn:aws:iam::111:user/x"]}
   end
 
+  test "NotAction / NotResource / NotPrincipal 归一化并按反向 selector 匹配" do
+    json =
+      ~s({"Statement":{"Effect":"Deny","NotPrincipal":{"AWS":"arn:aws:iam:::user/alice"},"NotAction":"s3:GetObject","NotResource":"arn:aws:s3:::b/public/*"}})
+
+    assert {:ok, [s]} = Statement.parse_policy(json)
+    assert s.not_principal?
+    assert s.not_action?
+    assert s.not_resource?
+
+    refute Statement.action_match?(s, "s3:GetObject")
+    assert Statement.action_match?(s, "s3:PutObject")
+    refute Statement.resource_match?(s, "arn:aws:s3:::b/public/a.txt")
+    assert Statement.resource_match?(s, "arn:aws:s3:::b/private/a.txt")
+  end
+
   test "AWS:* 归一化为 :any" do
     json =
       ~s({"Statement":{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
@@ -57,8 +72,76 @@ defmodule Maxio.Policy.StatementTest do
     assert {:error, :malformed} = Statement.parse_policy(json)
   end
 
+  test "identity policy 缺 Principal 合法并隐式绑定当前 principal" do
+    json =
+      ~s({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
+    assert {:ok, [s]} = Statement.parse_identity_policy(json)
+    assert s.principals == :any
+    assert s.actions == ["s3:GetObject"]
+  end
+
+  test "identity policy 显式 Principal → malformed" do
+    json =
+      ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
+    assert {:error, :malformed} = Statement.parse_identity_policy(json)
+  end
+
+  test "identity policy 显式 NotPrincipal → malformed" do
+    json =
+      ~s({"Statement":{"Effect":"Deny","NotPrincipal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
+    assert {:error, :malformed} = Statement.parse_identity_policy(json)
+  end
+
   test "畸形：缺 Action" do
     json = ~s({"Statement":{"Effect":"Allow","Principal":"*","Resource":"arn:aws:s3:::b"}})
+    assert {:error, :malformed} = Statement.parse_policy(json)
+  end
+
+  test "畸形：Action/NotAction、Resource/NotResource、Principal/NotPrincipal 互斥" do
+    both_action =
+      ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","NotAction":"s3:PutObject","Resource":"arn:aws:s3:::b/*"}})
+
+    both_resource =
+      ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","NotResource":"arn:aws:s3:::b/private/*"}})
+
+    both_principal =
+      ~s({"Statement":{"Effect":"Deny","Principal":"*","NotPrincipal":{"AWS":"arn:aws:iam:::user/alice"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
+    assert {:error, :malformed} = Statement.parse_policy(both_action)
+    assert {:error, :malformed} = Statement.parse_policy(both_resource)
+    assert {:error, :malformed} = Statement.parse_policy(both_principal)
+  end
+
+  test "畸形：selector 与 principal 列表中混入非法值时整体拒绝" do
+    bad_action =
+      ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":["s3:GetObject",123],"Resource":"arn:aws:s3:::b/*"}})
+
+    bad_not_resource =
+      ~s({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","NotResource":["arn:aws:s3:::b/public/*",""]}})
+
+    bad_principal =
+      ~s({"Statement":{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/alice",123]},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
+    bad_empty_principal =
+      ~s({"Statement":{"Effect":"Allow","Principal":{"AWS":""},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
+    bad_deferred_principal =
+      ~s({"Statement":{"Effect":"Allow","Principal":{"Service":["logging.s3.amazonaws.com",123]},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
+    assert {:error, :malformed} = Statement.parse_policy(bad_action)
+    assert {:error, :malformed} = Statement.parse_policy(bad_not_resource)
+    assert {:error, :malformed} = Statement.parse_policy(bad_principal)
+    assert {:error, :malformed} = Statement.parse_policy(bad_empty_principal)
+    assert {:error, :malformed} = Statement.parse_policy(bad_deferred_principal)
+  end
+
+  test "畸形：NotPrincipal 只支持 Deny" do
+    json =
+      ~s({"Statement":{"Effect":"Allow","NotPrincipal":{"AWS":"arn:aws:iam:::user/alice"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+
     assert {:error, :malformed} = Statement.parse_policy(json)
   end
 
@@ -91,6 +174,38 @@ defmodule Maxio.Policy.StatementTest do
     assert {:ok, [_]} = Statement.parse_policy(json, "mybucket")
   end
 
+  test "parse_policy/2 accepts policy variables in the object-key part of Resource" do
+    json =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::mybucket/home/${aws:username}/*"}]})
+
+    assert {:ok, [s]} = Statement.parse_policy(json, "mybucket")
+    assert s.variables_enabled?
+  end
+
+  test "missing or legacy policy Version keeps variables disabled" do
+    missing =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::mybucket/home/${aws:username}/*"}]})
+
+    legacy =
+      ~s({"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::mybucket/home/${aws:username}/*"}]})
+
+    assert {:ok, [s1]} = Statement.parse_policy(missing, "mybucket")
+    assert {:ok, [s2]} = Statement.parse_policy(legacy, "mybucket")
+    refute s1.variables_enabled?
+    refute s2.variables_enabled?
+  end
+
+  test "parse_policy/2 接受引用目标桶的 NotResource，拒绝跨桶 NotResource" do
+    ok_json =
+      ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","NotResource":["arn:aws:s3:::mybucket/public/*"]}]})
+
+    bad_json =
+      ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","NotResource":["arn:aws:s3:::other/public/*"]}]})
+
+    assert {:ok, [_]} = Statement.parse_policy(ok_json, "mybucket")
+    assert {:error, :malformed} = Statement.parse_policy(bad_json, "mybucket")
+  end
+
   test "parse_policy/2 精确桶名（无 /*）也接受" do
     json =
       ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]})
@@ -119,6 +234,21 @@ defmodule Maxio.Policy.StatementTest do
     assert {:error, :malformed} = Statement.parse_policy(json, "b")
   end
 
+  test "parse_conditions 拒绝显式空 Condition 和空 operator map" do
+    empty_condition =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{}}]})
+
+    empty_operator =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{}}}]})
+
+    empty_key =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"":"x"}}}]})
+
+    assert {:error, :malformed} = Statement.parse_policy(empty_condition, "b")
+    assert {:error, :malformed} = Statement.parse_policy(empty_operator, "b")
+    assert {:error, :malformed} = Statement.parse_policy(empty_key, "b")
+  end
+
   test "parse_conditions 接受已实现求值的算子（Bool）" do
     json =
       ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"Bool":{"aws:SecureTransport":"true"}}}]})
@@ -126,7 +256,7 @@ defmodule Maxio.Policy.StatementTest do
     assert {:ok, [_]} = Statement.parse_policy(json, "b")
   end
 
-  test "parse_conditions 接受合法但未实现求值的算子（StringEqualsIgnoreCase/NumericLessThan/Null）" do
+  test "parse_conditions 接受 StringEqualsIgnoreCase/NumericLessThan/Null 算子" do
     json =
       ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEqualsIgnoreCase":{"s3:prefix":"x"},"NumericLessThan":{"s3:max-keys":"10"},"Null":{"s3:x-amz-server-side-encryption":"true"}}}]})
 
@@ -138,5 +268,28 @@ defmodule Maxio.Policy.StatementTest do
       ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringLikeIfExists":{"s3:prefix":"home/*"}}}]})
 
     assert {:ok, [_]} = Statement.parse_policy(json, "b")
+  end
+
+  test "parse_conditions 接受 ForAnyValue / ForAllValues 集合算子与 IfExists 组合" do
+    json =
+      ~s({"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::b","Condition":{"ForAnyValue:StringLike":{"s3:prefix":["home/*","public/*"]},"ForAllValues:StringEqualsIfExists":{"s3:delimiter":"/"}}}]})
+
+    assert {:ok, [s]} = Statement.parse_policy(json, "b")
+    assert Map.has_key?(s.conditions, "ForAnyValue:StringLike")
+    assert Map.has_key?(s.conditions, "ForAllValues:StringEqualsIfExists")
+  end
+
+  test "parse_conditions 拒绝 Null 的 IfExists 或集合算子变体" do
+    for op <- [
+          "NullIfExists",
+          "ForAnyValue:Null",
+          "ForAllValues:Null",
+          "ForAnyValue:NullIfExists"
+        ] do
+      json =
+        ~s({"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"#{op}":{"s3:x-amz-server-side-encryption":"true"}}}]})
+
+      assert {:error, :malformed} = Statement.parse_policy(json, "b")
+    end
   end
 end

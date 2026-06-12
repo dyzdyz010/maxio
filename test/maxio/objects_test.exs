@@ -2,6 +2,7 @@ defmodule Maxio.ObjectsTest do
   use Maxio.DataCase, async: true
 
   alias Maxio.{Buckets, Objects}
+  alias Maxio.Cluster.Notify
 
   setup do
     {:ok, _} = Buckets.create("lb-test", "arn:aws:iam:::root")
@@ -33,6 +34,18 @@ defmodule Maxio.ObjectsTest do
 
   test "put 到不存在桶报 no_such_bucket" do
     assert {:error, :no_such_bucket} = Objects.put_metadata("nope", "k", %{size: 1, etag: "e"})
+  end
+
+  test "object ACL/tag metadata mutations broadcast invalidation" do
+    :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Notify.topic())
+    {:ok, obj} = put("notify.txt")
+    version_id = obj.version_id
+
+    assert :ok = Objects.put_tags("lb-test", "notify.txt", [{"env", "test"}])
+    assert_receive {:object_metadata_changed, "lb-test", "notify.txt", ^version_id}
+
+    assert :ok = Objects.put_acl("lb-test", "notify.txt", "private")
+    assert_receive {:object_metadata_changed, "lb-test", "notify.txt", ^version_id}
   end
 
   test "list_objects_v2 基础：返回全部对象，未截断" do

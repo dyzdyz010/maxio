@@ -125,6 +125,25 @@ defmodule Maxio.Storage.AtomicCommitTest do
     Agent.stop(events2)
   end
 
+  test "commit fsyncs both part.0 and meta.json for normal object commits", %{root: root} do
+    obj_dir = Path.join([root, "bucket", "keyf-meta"])
+    {:ok, tmp} = ShardServer.begin_tmp(root)
+    :ok = ShardServer.put_shard(tmp, 0, <<1, 2>>, 2)
+    :ok = ShardServer.put_sidecar(tmp, %{"etag" => "x", "shards" => [], "size" => 2})
+
+    {events, ref} = attach_fsync_counter()
+
+    :ok = ShardServer.commit(tmp, obj_dir, fsync: true)
+    :telemetry.detach(ref)
+
+    # Commit itself must fsync the data file and sidecar before their renames. Directory fsync is
+    # platform-dependent, so assert only the two file syncs that prove the durability contract.
+    file_syncs = Enum.count(Agent.get(events, & &1), fn kind -> kind == :file end)
+    assert file_syncs >= 2
+
+    Agent.stop(events)
+  end
+
   test "commit maps Windows busy rename to {:error, :rename_busy} after bounded retries", %{
     root: root
   } do

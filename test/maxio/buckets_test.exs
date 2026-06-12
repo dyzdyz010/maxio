@@ -2,6 +2,7 @@ defmodule Maxio.BucketsTest do
   use Maxio.DataCase, async: true
 
   alias Maxio.Buckets
+  alias Maxio.Cluster.Notify
 
   describe "validate_name/1" do
     test "合法名通过" do
@@ -88,6 +89,25 @@ defmodule Maxio.BucketsTest do
         })
 
       assert {:error, :not_empty} = Buckets.delete("ne-bucket")
+    end
+
+    test "bucket metadata mutations broadcast invalidation" do
+      :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Notify.topic())
+
+      assert {:ok, _bucket} = Buckets.create("notify-bucket", "arn:aws:iam:::root")
+      assert_receive {:bucket_metadata_changed, "notify-bucket"}
+
+      assert :ok = Buckets.put_acl("notify-bucket", "private")
+      assert_receive {:bucket_metadata_changed, "notify-bucket"}
+
+      assert :ok = Buckets.put_tags("notify-bucket", [{"env", "test"}])
+      assert_receive {:bucket_metadata_changed, "notify-bucket"}
+
+      assert :ok = Buckets.put_versioning("notify-bucket", "Enabled", nil)
+      assert_receive {:bucket_metadata_changed, "notify-bucket"}
+
+      assert :ok = Buckets.delete("notify-bucket")
+      assert_receive {:bucket_metadata_changed, "notify-bucket"}
     end
   end
 end

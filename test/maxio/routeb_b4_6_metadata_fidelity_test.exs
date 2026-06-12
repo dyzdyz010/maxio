@@ -140,10 +140,18 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
       File.rm_rf(@data_dir)
       File.mkdir_p!(@data_dir)
       prev = Application.get_env(:maxio, :s3)
+      prev_multipart_min_part_size = Application.get_env(:maxio, :multipart_min_part_size, :unset)
       Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
+      Application.put_env(:maxio, :multipart_min_part_size, 1)
 
       on_exit(fn ->
         Application.put_env(:maxio, :s3, prev)
+
+        case prev_multipart_min_part_size do
+          :unset -> Application.delete_env(:maxio, :multipart_min_part_size)
+          value -> Application.put_env(:maxio, :multipart_min_part_size, value)
+        end
+
         File.rm_rf(@data_dir)
       end)
 
@@ -537,6 +545,140 @@ defmodule Maxio.RouteBB46MetadataFidelityTest do
 
       assert init.status == 400
       assert init.resp_body =~ "MetadataTooLarge"
+    end
+  end
+
+  # ── E3：入口级请求头 8 KiB 闸 + x-minio-meta-* 前缀兼容 ──
+
+  describe "E3 — 请求头/MinIO 元数据前缀入口级限制" do
+    setup do
+      File.rm_rf(@data_dir)
+      File.mkdir_p!(@data_dir)
+      prev = Application.get_env(:maxio, :s3)
+      Application.put_env(:maxio, :s3, Keyword.put(prev, :data_dir, @data_dir))
+
+      on_exit(fn ->
+        Application.put_env(:maxio, :s3, prev)
+        File.rm_rf(@data_dir)
+      end)
+
+      :ok
+    end
+
+    test "PutObject(x-minio-meta-*) → 存储为用户元数据并经 HEAD 以 x-amz-meta-* 回显" do
+      SigV4Request.signed_conn(:put, "/e3a") |> call()
+
+      put =
+        SigV4Request.signed_conn(:put, "/e3a/k.txt",
+          body: "payload",
+          headers: [{"x-minio-meta-origin", "minio-client"}]
+        )
+        |> call()
+
+      assert put.status == 200
+      {:ok, obj} = Objects.get_metadata("e3a", "k.txt")
+      assert obj.metadata == %{"origin" => "minio-client"}
+
+      head = SigV4Request.signed_conn(:head, "/e3a/k.txt") |> call()
+      assert head.status == 200
+      assert get_resp_header(head, "x-amz-meta-origin") == ["minio-client"]
+    end
+
+    test "CopyObject(REPLACE, x-minio-meta-*) → 目标 HEAD 以 x-amz-meta-* 回显" do
+      SigV4Request.signed_conn(:put, "/e3d") |> call()
+      SigV4Request.signed_conn(:put, "/e3d/src.txt", body: "x") |> call()
+
+      copy =
+        SigV4Request.signed_conn(:put, "/e3d/dst.txt",
+          headers: [
+            {"x-amz-copy-source", "/e3d/src.txt"},
+            {"x-amz-metadata-directive", "REPLACE"},
+            {"x-minio-meta-dst", "replaced-via-minio-prefix"}
+          ]
+        )
+        |> call()
+
+      assert copy.status == 200
+      {:ok, obj} = Objects.get_metadata("e3d", "dst.txt")
+      assert obj.metadata == %{"dst" => "replaced-via-minio-prefix"}
+
+      head = SigV4Request.signed_conn(:head, "/e3d/dst.txt") |> call()
+      assert head.status == 200
+      assert get_resp_header(head, "x-amz-meta-dst") == ["replaced-via-minio-prefix"]
+    end
+
+    test "Multipart Create(x-minio-meta-*) → Complete → HEAD 以 x-amz-meta-* 回显" do
+      SigV4Request.signed_conn(:put, "/e3e") |> call()
+
+      init =
+        SigV4Request.signed_conn(:post, "/e3e/mp.bin",
+          query: %{"uploads" => ""},
+          headers: [{"x-minio-meta-author", "alice"}]
+        )
+        |> call()
+
+      assert init.status == 200
+      uid = upload_id(init.resp_body)
+
+      up =
+        SigV4Request.signed_conn(:put, "/e3e/mp.bin",
+          query: %{"partNumber" => "1", "uploadId" => uid},
+          body: "multipart payload"
+        )
+        |> call()
+
+      assert up.status == 200
+      [etag1] = get_resp_header(up, "etag")
+
+      complete_xml =
+        "<CompleteMultipartUpload>" <>
+          "<Part><PartNumber>1</PartNumber><ETag>#{etag1}</ETag></Part>" <>
+          "</CompleteMultipartUpload>"
+
+      complete =
+        SigV4Request.signed_conn(:post, "/e3e/mp.bin",
+          query: %{"uploadId" => uid},
+          body: complete_xml
+        )
+        |> call()
+
+      assert complete.status == 200
+      {:ok, obj} = Objects.get_metadata("e3e", "mp.bin")
+      assert obj.metadata == %{"author" => "alice"}
+
+      head = SigV4Request.signed_conn(:head, "/e3e/mp.bin") |> call()
+      assert head.status == 200
+      assert get_resp_header(head, "x-amz-meta-author") == ["alice"]
+    end
+
+    test "PutObject >2 KB x-minio-meta-* → 400 MetadataTooLarge（入口级用户元数据闸）" do
+      SigV4Request.signed_conn(:put, "/e3b") |> call()
+
+      conn =
+        SigV4Request.signed_conn(:put, "/e3b/k.txt",
+          body: "payload",
+          headers: [{"x-minio-meta-big", String.duplicate("x", 2049)}]
+        )
+        |> call()
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "MetadataTooLarge"
+      assert {:error, :not_found} = Objects.get_metadata("e3b", "k.txt")
+    end
+
+    test "PutObject 总请求头 >8 KiB（非 metadata 头）→ 400 MetadataTooLarge 且不写对象" do
+      SigV4Request.signed_conn(:put, "/e3c") |> call()
+
+      conn =
+        SigV4Request.signed_conn(:put, "/e3c/k.txt",
+          body: "payload",
+          headers: [{"x-debug-pad", String.duplicate("z", 9_000)}]
+        )
+        |> call()
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "MetadataTooLarge"
+      assert {:error, :not_found} = Objects.get_metadata("e3c", "k.txt")
     end
   end
 

@@ -1,6 +1,6 @@
 defmodule Maxio.Policy.ArnTest do
   use ExUnit.Case, async: true
-  alias Maxio.Policy.Arn
+  alias Maxio.Policy.{Arn, Variables}
 
   test "ARN 构造" do
     assert Arn.bucket_arn("mybucket") == "arn:aws:s3:::mybucket"
@@ -35,5 +35,28 @@ defmodule Maxio.Policy.ArnTest do
   test "正则元字符被转义（点不当通配）" do
     assert Arn.glob_match?("arn:aws:s3:::b/a.txt", "arn:aws:s3:::b/a.txt")
     refute Arn.glob_match?("arn:aws:s3:::b/a.txt", "arn:aws:s3:::b/aXtxt")
+  end
+
+  test "policy variable special literals are not reinterpreted as wildcards" do
+    assert {:ok, pattern} = Variables.expand_string("arn:aws:s3:::b/file${*}${?}.txt", %{})
+
+    assert Arn.glob_match?(pattern, "arn:aws:s3:::b/file*?.txt")
+    refute Arn.glob_match?(pattern, "arn:aws:s3:::b/file-anything.txt")
+    refute Arn.glob_match?(pattern, "arn:aws:s3:::b/fileab.txt")
+  end
+
+  test "unexpanded variable tokens are literal even if they contain wildcard characters" do
+    pattern = "arn:aws:s3:::b/file${*}${?}.txt"
+
+    assert Arn.glob_match?(pattern, "arn:aws:s3:::b/file${*}${?}.txt")
+    refute Arn.glob_match?(pattern, "arn:aws:s3:::b/file${abc}.txt")
+    refute Arn.glob_match?(pattern, "arn:aws:s3:::b/fileab.txt")
+  end
+
+  test "wildcards outside unexpanded variable tokens still work" do
+    pattern = "arn:aws:s3:::b/file${*}*.txt"
+
+    assert Arn.glob_match?(pattern, "arn:aws:s3:::b/file${*}tail.txt")
+    refute Arn.glob_match?(pattern, "arn:aws:s3:::b/fileXYZtail.txt")
   end
 end

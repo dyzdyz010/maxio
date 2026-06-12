@@ -8,6 +8,13 @@ defmodule Maxio.Listing do
   **逐字段一致**的 list_result（`objects, common_prefixes, is_truncated, next_continuation_token,
   key_count`）+ walk-position 续点（绝不 offset）。
 
+  ROUTE B B6-2：FS 后端（无全局 `Maxio.Cluster.Topology`）的权威路径由**调用方**
+  （`Maxio.ObjectMeta` 的 `:sidecar` 分支 / `Maxio.Storage.Scanner.run_once`）经
+  `Maxio.ObjectMeta.put_effective_topology/1` 把 `Maxio.Storage.FS.local_topology/1`
+  （合成单端点 `{Node.self(), data_dir}`，quorum=1）注入 `opts[:topology]`——本模块既有
+  `opts[:topology]` 优先逻辑零改动即在 FS 单机上工作。无注入且无全局拓扑时（:pg 默认路径的
+  list shadow）行为维持基线（raise 被 shadow 自吞，绝不翻权威）。
+
   ## 版本树枚举（修复版本化对象 LIST 失明 —— 关键保真）
 
   对象布局（`Maxio.Cluster.Paths.object_rel/3`）：null 版本落 `<bucket>/<encoded-key>/meta.json`；
@@ -64,6 +71,7 @@ defmodule Maxio.Listing do
   alias Maxio.Storage.Erasure.Config
 
   @versions_prefix ".versions"
+  @max_keys_limit 1000
 
   defmodule Continuation do
     @moduledoc """
@@ -86,11 +94,11 @@ defmodule Maxio.Listing do
   def list_objects_v2(bucket, list_opts, opts \\ []) do
     prefix = Map.get(list_opts, :prefix, "") || ""
     delimiter = Map.get(list_opts, :delimiter)
-    max_keys = Map.get(list_opts, :max_keys, 1000) || 1000
+    max_keys = normalize_max_keys(Map.get(list_opts, :max_keys, @max_keys_limit))
     cursor = continuation_cursor(list_opts)
 
     # collect_keys 返回 {keys, meta_index}：keys 是当前版本存活（quorum 确认、非 DM）的对象 key；
-    # meta_index 是 key => %{last_modified, etag, size}（从当前版本 sidecar 富集，B4 翻 list 权威）。
+    # meta_index 是 key => %{last_modified, etag, size, storage_class}（从当前版本 sidecar 富集）。
     {all_keys, meta_index} = collect_keys(bucket, opts)
 
     keys =
@@ -303,10 +311,11 @@ defmodule Maxio.Listing do
     |> then(fn {keys, idx} -> {keys |> Enum.reverse() |> Enum.uniq(), idx} end)
   end
 
-  # 从当前版本 sidecar meta 提取 ListObjectsV2 富字段（LastModified/ETag/Size）。
+  # 从当前版本 sidecar meta 提取 ListObjectsV2 富字段（LastModified/ETag/Size/StorageClass）。
   # meta 形态二选一：(1) maxio/2 versions 数组——取当前版本 entry（找不到则 latest）；
   # (2) 旧扁平 meta（build_meta 风格，顶层 size/etag）。两者都缺 -> 字段留 nil（XML view 安全兜底）。
-  defp list_attrs(nil, _current_vid), do: %{last_modified: nil, etag: nil, size: nil}
+  defp list_attrs(nil, _current_vid),
+    do: %{last_modified: nil, etag: nil, size: nil, storage_class: nil}
 
   defp list_attrs(meta, current_vid) do
     entry = version_entry(meta, current_vid)
@@ -314,7 +323,8 @@ defmodule Maxio.Listing do
     %{
       last_modified: modtime_to_datetime(entry["modtime"] || meta["modtime"]),
       etag: entry["etag"] || meta["etag"],
-      size: entry["size"] || meta["size"]
+      size: entry["size"] || meta["size"],
+      storage_class: entry["storage_class"] || meta["storage_class"]
     }
   end
 
@@ -552,7 +562,7 @@ defmodule Maxio.Listing do
 
   # 惰性折叠：升序 key 流逐条扫描，累计到 max_keys（对象与公共前缀各计一个 key_count）。
   # last = 已纳入本页的最后一条原始遍历 key（续点 walk-position）；候选耗尽 -> 不截断。
-  # meta_index：key => %{last_modified, etag, size}（当前版本 sidecar 富集），纳入对象时附带。
+  # meta_index：key => %{last_modified, etag, size, storage_class}（当前版本 sidecar 富集），纳入对象时附带。
   defp fold([], _idx, _prefix, _delim, _max, objs, _seen, cps, _last), do: {objs, cps, false, nil}
 
   defp fold([key | rest], idx, prefix, delimiter, max, objs, seen, cps, last) do
@@ -576,7 +586,7 @@ defmodule Maxio.Listing do
   end
 
   # 对象列表元素：恒带 :key（向后兼容现有 shadow 比对/调用方），并附当前版本富字段
-  # （:last_modified/:etag/:size，缺失留 nil——handler 透传、XML view 安全兜底）。
+  # （:last_modified/:etag/:size/:storage_class，缺失留 nil——handler 透传、XML view 安全兜底）。
   defp object_elem(key, idx) do
     attrs = Map.get(idx, key, %{})
 
@@ -584,7 +594,8 @@ defmodule Maxio.Listing do
       key: key,
       last_modified: Map.get(attrs, :last_modified),
       etag: Map.get(attrs, :etag),
-      size: Map.get(attrs, :size)
+      size: Map.get(attrs, :size),
+      storage_class: Map.get(attrs, :storage_class)
     }
   end
 
@@ -600,4 +611,7 @@ defmodule Maxio.Listing do
       :nomatch -> nil
     end
   end
+
+  defp normalize_max_keys(n) when is_integer(n) and n > 0, do: min(n, @max_keys_limit)
+  defp normalize_max_keys(_), do: @max_keys_limit
 end

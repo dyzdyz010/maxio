@@ -12,7 +12,7 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
 
   @spec parse(binary()) :: {:ok, [map()]} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    init = %{rules: [], cur: nil, path: [], in: nil, text: nil}
+    init = %{rules: [], cur: nil, path: [], in: nil, text: nil, tag: nil}
 
     case Saxy.parse_string(xml, __MODULE__, init) do
       {:ok, %{rules: rules}} -> {:ok, Enum.reverse(rules)}
@@ -29,7 +29,13 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
 
     cond do
       l == "Rule" ->
-        {:ok, %{s | cur: new_rule(), path: ["Rule"], in: nil}}
+        {:ok, %{s | cur: new_rule(), path: ["Rule"], in: nil, tag: nil}}
+
+      l == "Filter" and is_map(s.cur) ->
+        {:ok, %{s | cur: %{s.cur | "has_filter" => true}, in: nil, path: [l | s.path]}}
+
+      l == "Tag" and ("Filter" in s.path or "And" in s.path) ->
+        {:ok, %{s | path: ["Tag" | s.path], in: nil, tag: %{}}}
 
       l in leaf_tags() ->
         {:ok, %{s | in: l, text: "", path: [l | s.path]}}
@@ -51,9 +57,22 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
 
     cond do
       l == "Rule" and is_map(cur) ->
-        {:ok, %{s | rules: [cur | s.rules], cur: nil, path: tl_safe(s.path), in: nil}}
+        {:ok, %{s | rules: [cur | s.rules], cur: nil, path: tl_safe(s.path), in: nil, tag: nil}}
+
+      l == "Tag" and is_map(cur) ->
+        {:ok,
+         %{
+           s
+           | cur: append_tag(cur, s.tag),
+             in: nil,
+             text: nil,
+             tag: nil,
+             path: tl_safe(s.path)
+         }}
 
       l in leaf_tags() and is_map(cur) ->
+        s = put_tag(s, l, trim(s.text))
+
         {:ok,
          %{
            s
@@ -80,6 +99,7 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
       "filter_tags" => [],
       "filter_size_gt" => nil,
       "filter_size_lt" => nil,
+      "has_filter" => false,
       "expiration_days" => nil,
       "expiration_date" => nil,
       "expired_object_delete_marker" => nil,
@@ -87,7 +107,12 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
       "newer_noncurrent_versions" => nil,
       "abort_days_after_initiation" => nil,
       "transition_days" => nil,
-      "transition_storage_class" => nil
+      "transition_date" => nil,
+      "transition_storage_class" => nil,
+      "noncurrent_transition_days" => nil,
+      "noncurrent_transition_newer_noncurrent_versions" => nil,
+      "noncurrent_transition_storage_class" => nil,
+      "parse_errors" => []
     }
   end
 
@@ -107,30 +132,89 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
       else: %{cur | "prefix" => v}
   end
 
-  defp store(cur, "Days", path, v),
-    do:
-      if("Transition" in path,
-        do: %{cur | "transition_days" => int(v)},
-        else: %{cur | "expiration_days" => int(v)}
-      )
+  defp store(cur, "Days", path, v) do
+    cond do
+      "Transition" in path -> put_int(cur, "transition_days", v, 1)
+      "Expiration" in path -> put_int(cur, "expiration_days", v, 1)
+      true -> cur
+    end
+  end
 
-  defp store(cur, "Date", _path, v), do: %{cur | "expiration_date" => v}
+  defp store(cur, "Date", path, v) do
+    cond do
+      "Transition" in path -> %{cur | "transition_date" => v}
+      "Expiration" in path -> %{cur | "expiration_date" => v}
+      true -> cur
+    end
+  end
 
   defp store(cur, "ExpiredObjectDeleteMarker", _p, v),
     do: %{cur | "expired_object_delete_marker" => v == "true"}
 
-  defp store(cur, "NoncurrentDays", _p, v), do: %{cur | "noncurrent_days" => int(v)}
+  defp store(cur, "NoncurrentDays", path, v) do
+    cond do
+      "NoncurrentVersionExpiration" in path -> put_int(cur, "noncurrent_days", v, 1)
+      "NoncurrentVersionTransition" in path -> put_int(cur, "noncurrent_transition_days", v, 1)
+      true -> cur
+    end
+  end
 
-  defp store(cur, "NewerNoncurrentVersions", _p, v),
-    do: %{cur | "newer_noncurrent_versions" => int(v)}
+  defp store(cur, "NewerNoncurrentVersions", path, v) do
+    cond do
+      "NoncurrentVersionExpiration" in path ->
+        put_int(cur, "newer_noncurrent_versions", v, 1)
+
+      "NoncurrentVersionTransition" in path ->
+        put_int(cur, "noncurrent_transition_newer_noncurrent_versions", v, 1)
+
+      true ->
+        cur
+    end
+  end
 
   defp store(cur, "DaysAfterInitiation", _p, v),
-    do: %{cur | "abort_days_after_initiation" => int(v)}
+    do: put_int(cur, "abort_days_after_initiation", v, 1)
 
-  defp store(cur, "StorageClass", _p, v), do: %{cur | "transition_storage_class" => v}
-  defp store(cur, "ObjectSizeGreaterThan", _p, v), do: %{cur | "filter_size_gt" => int(v)}
-  defp store(cur, "ObjectSizeLessThan", _p, v), do: %{cur | "filter_size_lt" => int(v)}
+  defp store(cur, "StorageClass", path, v) do
+    cond do
+      "NoncurrentVersionTransition" in path -> %{cur | "noncurrent_transition_storage_class" => v}
+      "Transition" in path -> %{cur | "transition_storage_class" => v}
+      true -> cur
+    end
+  end
+
+  defp store(cur, "ObjectSizeGreaterThan", _p, v),
+    do: put_int(cur, "filter_size_gt", v, 0)
+
+  defp store(cur, "ObjectSizeLessThan", _p, v),
+    do: put_int(cur, "filter_size_lt", v, 1)
+
   defp store(cur, _other, _path, _v), do: cur
+
+  defp append_tag(cur, %{"key" => key, "value" => value}) when is_binary(key) do
+    Map.update!(cur, "filter_tags", fn tags ->
+      tags ++ [%{"key" => key, "value" => value || ""}]
+    end)
+  end
+
+  defp append_tag(cur, tag) when is_map(tag),
+    do: add_parse_error(cur, "invalid_filter_tag")
+
+  defp append_tag(cur, _tag), do: cur
+
+  defp put_tag(%{tag: tag} = s, "Key", v) when is_map(tag), do: %{s | tag: Map.put(tag, "key", v)}
+
+  defp put_tag(%{tag: tag} = s, "Value", v) when is_map(tag),
+    do: %{s | tag: Map.put(tag, "value", v)}
+
+  defp put_tag(s, _l, _v), do: s
+
+  defp put_int(cur, field, value, min) do
+    case int(value) do
+      n when is_integer(n) and n >= min -> %{cur | field => n}
+      _ -> add_parse_error(cur, "invalid_integer:#{field}")
+    end
+  end
 
   defp int(s) do
     case Integer.parse(s) do
@@ -138,6 +222,9 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
       _ -> nil
     end
   end
+
+  defp add_parse_error(cur, error),
+    do: Map.update!(cur, "parse_errors", &[error | &1])
 
   defp trim(nil), do: ""
   defp trim(t), do: String.trim(t)

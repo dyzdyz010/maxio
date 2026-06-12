@@ -1,0 +1,83 @@
+defmodule Mix.Tasks.Maxio.Scan do
+  @shortdoc "Run one metadata-driven usage and auto-heal scan"
+  @moduledoc """
+  Run one operational scrubber round.
+
+      mix maxio.scan
+      mix maxio.scan --bucket my-bucket
+      mix maxio.scan --versions
+      mix maxio.scan --no-throttle
+      mix maxio.scan --reconcile-index
+      mix maxio.scan --reconcile-index --cleanup-orphan-shards
+
+  FS backends refresh scan-derived usage only. Erasure-coded backends also invoke
+  the existing local or distributed heal engine for each enumerated object.
+  `--reconcile-index` first runs the disk/peer sidecar reconcile scanner, using
+  its existing authority gate; `--force-reconcile-index` explicitly crosses that
+  gate when the operator accepts disk sidecars as the source of truth. Orphan
+  shard byte cleanup remains independently gated by sidecar write authority,
+  full endpoint visibility, object locks, age, and per-run delete limits.
+  """
+  use Mix.Task
+
+  @impl true
+  def run(args) do
+    {opts, rest, invalid} =
+      OptionParser.parse(args,
+        strict: [
+          bucket: :string,
+          versions: :boolean,
+          no_throttle: :boolean,
+          reconcile_index: :boolean,
+          force_reconcile_index: :boolean,
+          cleanup_orphan_shards: :boolean,
+          orphan_cleanup_dry_run: :boolean,
+          orphan_cleanup_min_age_ms: :integer,
+          orphan_cleanup_max_deletes: :integer
+        ],
+        aliases: [b: :bucket]
+      )
+
+    if rest != [] or invalid != [] do
+      unexpected = rest ++ Enum.map(invalid, &elem(&1, 0))
+
+      Mix.raise(
+        "usage: mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] " <>
+          "[--reconcile-index] [--force-reconcile-index] [--cleanup-orphan-shards] " <>
+          "[--orphan-cleanup-dry-run] [--orphan-cleanup-min-age-ms <ms>] " <>
+          "[--orphan-cleanup-max-deletes <n>] " <>
+          "(unexpected: #{inspect(unexpected)})"
+      )
+    end
+
+    Mix.Task.run("app.start")
+
+    {:ok, summary} =
+      Maxio.Cluster.Scrubber.run_once(
+        bucket: opts[:bucket],
+        scan_versions: Keyword.get(opts, :versions, false),
+        no_throttle: Keyword.get(opts, :no_throttle, false),
+        reconcile_index: Keyword.get(opts, :reconcile_index, false),
+        force_reconcile_index: Keyword.get(opts, :force_reconcile_index, false),
+        cleanup_orphan_shards: Keyword.get(opts, :cleanup_orphan_shards, false),
+        orphan_cleanup_dry_run: Keyword.get(opts, :orphan_cleanup_dry_run, false),
+        orphan_cleanup_min_age_ms: Keyword.get(opts, :orphan_cleanup_min_age_ms),
+        orphan_cleanup_max_deletes: Keyword.get(opts, :orphan_cleanup_max_deletes)
+      )
+
+    IO.puts(
+      "[maxio scan] status=#{summary.status} backend=#{inspect(summary.backend)} " <>
+        "buckets=#{summary.buckets} scanned=#{summary.scanned} damaged=#{summary.damaged} " <>
+        "healed=#{summary.healed} unrecoverable=#{summary.unrecoverable} " <>
+        "missing=#{summary.missing} skipped=#{summary.skipped} sampled_out=#{summary.sampled_out} " <>
+        "index_status=#{summary.index_status} index_scanned=#{summary.index_scanned} " <>
+        "index_upserted=#{summary.index_upserted} index_gc=#{summary.index_gc} " <>
+        "index_skipped=#{summary.index_skipped} index_divergent=#{summary.index_divergent} " <>
+        "index_orphan_shards=#{summary.index_orphan_shards} " <>
+        "index_orphan_bytes=#{summary.index_orphan_bytes} " <>
+        "index_orphan_cleaned=#{summary.index_orphan_cleaned} " <>
+        "index_orphan_cleaned_bytes=#{summary.index_orphan_cleaned_bytes} " <>
+        "objects=#{summary.object_count} bytes=#{summary.total_size}"
+    )
+  end
+end

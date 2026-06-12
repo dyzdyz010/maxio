@@ -5,11 +5,25 @@ defmodule Maxio.S3.Handlers.Object do
   """
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Storage}
-  alias Maxio.S3.{BodyReader, Conditional, Error, Log, XML}
+  alias Maxio.Policy.ACL
+
+  alias Maxio.S3.{
+    BodyReader,
+    Conditional,
+    Error,
+    Log,
+    PublicAccessBlock,
+    SSE,
+    StorageClass,
+    SystemHeaders,
+    XML
+  }
+
   alias Maxio.S3.RequestParsers.Delete, as: DeleteParser
   alias Maxio.S3.Views.DeleteResult
 
   @complete_xml_limit 1_048_576
+  @owner_id "maxio"
 
   @spec put(Plug.Conn.t()) :: Plug.Conn.t()
   def put(conn) do
@@ -31,6 +45,10 @@ defmodule Maxio.S3.Handlers.Object do
     :ok = validate_object_key!(bucket, key)
 
     content_type = header(conn, "content-type") || "binary/octet-stream"
+    system_headers = SystemHeaders.from_req_headers(conn.req_headers)
+    storage_class = StorageClass.parse!(header(conn, "x-amz-storage-class"))
+    acl_input = acl_from_headers!(conn)
+    :ok = PublicAccessBlock.reject_public_acl_write!(bucket, acl_input)
     payload_mode = conn.assigns.payload_mode
     chunks = BodyReader.stream(conn, payload_mode)
 
@@ -45,18 +63,23 @@ defmodule Maxio.S3.Handlers.Object do
     tags_map = parse_tagging_header!(conn)
 
     # SSE-S3：请求头或桶默认加密 = AES256 → 真实加密字节；非 AES256/SSE-C → 501（绝不静默）。
-    sse_requested = resolve_sse!(conn, bucket)
+    sse_requested = SSE.resolve_target!(conn.req_headers, bucket)
 
     # ROUTE B B4-6 D2/D3：用户元数据（x-amz-meta-*）解析一次，喂两路（sidecar object_meta + PG attrs），
     # 消除 :pg/:sidecar 读分裂（D3）。写任何字节/sidecar 之前先做 2 KB 大小闸（D2）——超限 →
-    # MetadataTooLarge 400、失败 pre-commit、无孤儿（铁律 3，与 parse_tagging_header!/resolve_sse! 并列）。
+    # MetadataTooLarge 400、失败 pre-commit、无孤儿（铁律 3，与 parse_tagging_header!/SSE.resolve_target! 并列）。
     user_metadata = parse_user_metadata(conn)
     :ok = Maxio.Metadata.validate_size!(user_metadata)
 
-    {chunks, sse_envelope} =
+    {chunks, sse_envelope, visible_size} =
       case sse_requested do
-        "AES256" -> Maxio.Crypto.SSE.wrap_stream(chunks)
-        nil -> {chunks, nil}
+        "AES256" ->
+          {plain_chunks, visible_size} = counted_stream(chunks)
+          {cipher_stream, envelope} = Maxio.Crypto.SSE.wrap_stream(plain_chunks)
+          {cipher_stream, envelope, visible_size}
+
+        nil ->
+          {chunks, nil, nil}
       end
 
     # ROUTE B B4-5：把已算出的富 S3 元数据组成 object_meta，透传进 Storage.put，使纠删/分布式后端
@@ -64,43 +87,59 @@ defmodule Maxio.S3.Handlers.Object do
     # PutObject 当前未捕获 x-amz-meta-*，此处用既有 parse_user_metadata/1 解析并入 sidecar（自描述完整）；
     # PG 索引侧 attrs 保持不变（:pg 默认路径字节级可回滚，user_metadata 仅注入 sidecar）。
     object_meta =
-      build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope, user_metadata)
+      build_object_meta(
+        content_type,
+        system_headers,
+        storage_class,
+        tags_map,
+        sse_requested,
+        sse_envelope,
+        user_metadata,
+        visible_size,
+        acl_input
+      )
 
     # B1-1：把整个提交 seam（字节经 Storage.put + 元数据经 Objects.put_version_with_id）纳入
     # 同一对象锁，消灭并发同 key 写的「A 字节 + B 元数据」交错（静默 ETag/bytes 分歧）。
-    # version_id/SSE/tags 等纯计算/读保持锁外；获锁失败 -> {:error,:locked} -> 503 SlowDown（铁律 3）。
+    # version_id/SSE/tags 等纯计算/读保持锁外；获锁失败 -> {:error,:locked} -> 503 RequestTimeout（铁律 3）。
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
         case Storage.put(bucket, key, version_id, chunks, object_meta: object_meta) do
-          {:ok, %{size: size, etag: etag, sha256: sha256}} ->
+          {:ok, %{size: stored_size, etag: etag, sha256: sha256}} ->
             # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
-            # SSE 加密对象：x-amz-decoded-content-length / x-amz-content-sha256 是针对明文传输完整性的闸，
-            # 而落盘字节是密文（密文≠明文必失配）；传输层完整性已由 SigV4/chunked 在 BodyReader 内验过，
-            # 故加密分支跳过这两个校验（铁律 3 仍由 GCM 认证 + 上游签名保证）。
+            # SSE 加密对象：后端返回的 stored_size 是密文帧长度；S3 可见 size 用明文计数流统计。
+            # x-amz-decoded-content-length 仍按明文 size 校验；x-amz-content-sha256 在 SSE 路径暂不复算
+            # 明文 SHA（SigV4/chunked 已在 BodyReader 层验签，后续再补明文 checksum 取证任务）。
             #
             # 传输完整性（decoded-length / content-sha256）失败在两条权威分支下都**致命 + 回滚孤儿**
             # （这是 digest/签名失配，与 PG 无关，铁律 3 绝不静默接受）；仅 PG 索引写在
             # authoritative_source(:write)==:sidecar 时降为 best-effort（见下）。
+            size = if sse_requested == "AES256", do: visible_size.(), else: stored_size
+
             obj =
               try do
+                :ok = verify_decoded_length!(conn, payload_mode, size)
+
                 unless sse_requested do
-                  :ok = verify_decoded_length!(conn, payload_mode, size)
                   :ok = verify_content_sha256!(conn, payload_mode, sha256)
                 end
 
-                attrs = %{
-                  size: size,
-                  etag: etag,
-                  content_type: content_type,
-                  storage_class: "STANDARD",
-                  acl_canned: header(conn, "x-amz-acl") || "private",
-                  # ROUTE B B4-6 D3：user metadata 也写入 PG 索引（键 :metadata，与 CopyObject 的
-                  # metadata: meta_map 对齐），消除 :pg(默认) 与 :sidecar 两路读 user metadata 的分裂。
-                  metadata: user_metadata,
-                  tags: tags_map,
-                  sse_algorithm: sse_requested,
-                  sse_envelope: sse_envelope
-                }
+                attrs =
+                  %{
+                    size: size,
+                    etag: etag,
+                    content_type: content_type,
+                    storage_class: storage_class,
+                    acl_canned: acl_input.canned,
+                    acl_grants: acl_input.grants_doc,
+                    # ROUTE B B4-6 D3：user metadata 也写入 PG 索引（键 :metadata，与 CopyObject 的
+                    # metadata: meta_map 对齐），消除 :pg(默认) 与 :sidecar 两路读 user metadata 的分裂。
+                    metadata: user_metadata,
+                    tags: tags_map,
+                    sse_algorithm: sse_requested,
+                    sse_envelope: sse_envelope
+                  }
+                  |> Map.merge(system_headers)
 
                 commit_metadata(bucket, key, version_id, attrs)
               rescue
@@ -136,7 +175,7 @@ defmodule Maxio.S3.Handlers.Object do
 
         conn
         |> maybe_put_version_id(obj.version_id)
-        |> maybe_put_sse(sse_requested)
+        |> SSE.put_response_header(sse_requested)
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
 
@@ -162,7 +201,7 @@ defmodule Maxio.S3.Handlers.Object do
         raise Error.new(:internal_error, message: inspect(reason))
 
       {:error, :locked} ->
-        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+        raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -221,27 +260,20 @@ defmodule Maxio.S3.Handlers.Object do
                       )
 
               _ when object.sse_algorithm == "AES256" ->
-                # SSE-S3 加密对象：整对象解密返回明文（密文是帧化的，对密文做 byte-range 会取错字节，
-                # 故 MVP 对加密对象忽略 Range，整对象解密 + 200，content-length 用解密后明文长度）。
-                # 大对象逐帧流式解密留 defer（密文与明文同量级，正确性优先）。
-                {:ok, raw_stream} = Storage.get(bucket, key, object.version_id, nil)
+                # SSE-S3 加密对象：密文是帧化的，Range 必须作用在解密后的明文字节上。
+                # 对单区间 Range，先映射到覆盖该明文区间的完整密文帧 byte-range，再解密和裁剪首尾
+                # 明文帧；避免为了小范围读取/认证无关的后续密文帧。
+                {cipher_range, plain_slice} = sse_ranges(range, total)
+                {:ok, raw_stream} = Storage.get(bucket, key, object.version_id, cipher_range)
 
-                plain =
-                  Maxio.Crypto.SSE.unwrap_stream(raw_stream, object.sse_envelope)
-                  |> Enum.to_list()
-                  |> IO.iodata_to_binary()
-
-                conn
-                |> maybe_put_version_id(object.version_id)
-                |> maybe_put_sse(object.sse_algorithm)
-                |> put_resp_content_type(object.content_type)
-                |> put_resp_header("etag", XML.quote_etag(object.etag))
-                |> put_resp_header("last-modified", http_date(object.updated_at))
-                |> put_resp_header("accept-ranges", "bytes")
-                |> put_resp_header("content-length", Integer.to_string(byte_size(plain)))
-                |> put_user_metadata_headers(object)
-                |> maybe_tagging_count(object)
-                |> send_resp(200, plain)
+                send_authenticated_sse_object!(
+                  conn,
+                  object,
+                  total,
+                  range,
+                  raw_stream,
+                  plain_slice
+                )
 
               _ ->
                 {:ok, stream} = Storage.get(bucket, key, object.version_id, range_tuple(range))
@@ -298,7 +330,7 @@ defmodule Maxio.S3.Handlers.Object do
             :proceed ->
               conn
               |> maybe_put_version_id(object.version_id)
-              |> maybe_put_sse(object.sse_algorithm)
+              |> SSE.put_response_header(object.sse_algorithm)
               |> put_common_object_headers(object, object.size)
               |> send_resp(200, "")
 
@@ -423,7 +455,7 @@ defmodule Maxio.S3.Handlers.Object do
 
       true ->
         # Unversioned：真删（删 null 行 + 字节）。B1-1：元数据 + 字节删除纳入同一对象锁，
-        # 避免与并发同 key PUT 的提交 seam 交错（获锁失败 -> 503 SlowDown，铁律 3）。
+        # 避免与并发同 key PUT 的提交 seam 交错（获锁失败 -> 503 RequestTimeout，铁律 3）。
         case Maxio.Lock.with_object_lock({bucket, key}, fn ->
                :ok = Objects.delete_metadata(bucket, key)
                _ = Storage.delete(bucket, key)
@@ -434,7 +466,7 @@ defmodule Maxio.S3.Handlers.Object do
             send_resp(conn, 204, "")
 
           {:error, :locked} ->
-            raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+            raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
         end
     end
   end
@@ -609,15 +641,32 @@ defmodule Maxio.S3.Handlers.Object do
     # 非法形状 → 400 InvalidArgument，先于任何源查找/盘路径构造。
     :ok = validate_version_id!(src_bucket, src_key, src_version_id)
 
-    # 源对象按真实版本解析（默认 current/latest，?versionId= 选特定版本）。
+    directive = parse_copy_directive!(conn, "x-amz-metadata-directive")
+    tagging_directive = parse_copy_directive!(conn, "x-amz-tagging-directive")
+    storage_class = StorageClass.parse!(header(conn, "x-amz-storage-class"))
+    acl_input = acl_from_headers!(conn)
+    :ok = PublicAccessBlock.reject_public_acl_write!(dest_bucket, acl_input)
+    target_sse = SSE.resolve_target!(conn.req_headers, dest_bucket)
+    SSE.reject_copy_source_customer_headers!(conn.req_headers)
+
+    # 源对象按真实版本解析（默认 current/latest，?versionId= 选特定版本），并经 ObjectMeta
+    # 统一读权威入口分流：:pg 默认行为不变；:read=:sidecar 时 CopyObject 继承的是盘上权威元数据。
     {src_obj, _total} = object_or_raise(src_bucket, src_key, src_version_id)
 
-    # 源当前版本是 delete marker（src_version_id == nil 即取 latest）→ 对齐 AWS/MinIO：
-    # 「If the current version is a delete marker, Amazon S3 behaves as if the object was deleted」
-    # → 404 NoSuchKey（铁律 3：已知条件绝不静默 500）。get_metadata 会返回 delete-marker 行
-    # （objects.ex 文档），copy 必须像 GET 处理器一样显式判 is_delete_marker，否则后续读不到字节会崩成 500。
-    if src_version_id == nil and src_obj.is_delete_marker do
-      raise Error.new(:no_such_key, resource: "/#{src_bucket}/#{src_key}")
+    # 源是 delete marker 时必须在读字节前结构化拒绝：latest marker → 404（表现为已删除）；
+    # 显式 versionId 指向 marker → 400 InvalidArgument（CopySource 不允许 marker 版本）。
+    cond do
+      src_obj.is_delete_marker and src_version_id == nil ->
+        raise Error.new(:no_such_key, resource: "/#{src_bucket}/#{src_key}")
+
+      src_obj.is_delete_marker ->
+        raise Error.new(:invalid_argument,
+                message: "Cannot copy a delete marker version",
+                resource: "/#{src_bucket}/#{src_key}"
+              )
+
+      true ->
+        :ok
     end
 
     # 源条件头（对源对象求值；失败 412）。
@@ -629,17 +678,7 @@ defmodule Maxio.S3.Handlers.Object do
         raise Error.new(:precondition_failed, resource: "/#{src_bucket}/#{src_key}")
     end
 
-    directive = header(conn, "x-amz-metadata-directive") || "COPY"
-
-    # 自拷贝守卫：src==dest 且 COPY 且无元数据变化 → 400 InvalidRequest。
-    if src_bucket == dest_bucket and src_key == dest_key and directive == "COPY" do
-      raise Error.new(:invalid_request,
-              message:
-                "This copy request is illegal because it is trying to copy an object to itself " <>
-                  "without changing the object's metadata, storage class, website redirect location " <>
-                  "or encryption attributes."
-            )
-    end
+    system_headers = copy_system_headers(conn, src_obj, directive)
 
     content_type =
       case directive do
@@ -659,7 +698,22 @@ defmodule Maxio.S3.Handlers.Object do
     # tags 受 tagging-directive 独立控制（与 metadata-directive 正交，对齐 AWS/MinIO，铁律 5）：
     # COPY（默认）→ 目标继承源 tag-set；REPLACE → 用 x-amz-tagging 头解析的新 tag-set
     # （复用 PutObject helper，非法 → InvalidTag 400）。
-    tagging_directive = header(conn, "x-amz-tagging-directive") || "COPY"
+
+    # 自拷贝守卫：src==dest 且没有 metadata / tag / storage-class / ACL 变化 → 400 InvalidRequest。
+    # AWS CopyObject 可用 x-amz-storage-class 或 x-amz-acl 改现有对象；这种自拷贝是合法变化，
+    # 不能被旧的「directive == COPY 即拒」粗守卫挡住。SSE 状态变化（加密/解密）同样是合法变化。
+    if src_bucket == dest_bucket and src_key == dest_key and directive == "COPY" and
+         tagging_directive == "COPY" and storage_class == (src_obj.storage_class || "STANDARD") and
+         acl_input.canned == (src_obj.acl_canned || "private") and
+         acl_input.grants_doc == (src_obj.acl_grants || ACL.empty_grants_doc()) and
+         target_sse == src_obj.sse_algorithm and not SSE.explicit_target?(conn.req_headers) do
+      raise Error.new(:invalid_request,
+              message:
+                "This copy request is illegal because it is trying to copy an object to itself " <>
+                  "without changing the object's metadata, storage class, website redirect location " <>
+                  "or encryption attributes."
+            )
+    end
 
     tags =
       case tagging_directive do
@@ -667,7 +721,7 @@ defmodule Maxio.S3.Handlers.Object do
         _ -> src_obj.tags || %{}
       end
 
-    # 拷贝字节（铁律 4 不全缓冲）。自拷贝（src==dest，此处必为 REPLACE）必须避免
+    # 拷贝字节（铁律 4 不全缓冲）。合法自拷贝必须避免
     # 「截断 dest 早于读 source」的数据丢失：先流式写到唯一临时 key，再流式搬到 dest，最后删临时。
     self_copy? = src_bucket == dest_bucket and src_key == dest_key
 
@@ -692,58 +746,77 @@ defmodule Maxio.S3.Handlers.Object do
         dest_key
       )
 
-    # ROUTE B B4-5：CopyObject 同样透传 object_meta（content_type/tags/user_metadata 已按
-    # metadata/tagging-directive 解析），使复制对象也写出完整 maxio/2 sidecar。CopyObject MVP 不做
-    # SSE（sse: nil）；acl/storage_class 用默认（与 :pg 分支 put_version_with_id 的 STANDARD 一致）。
-    dest_object_meta = %{
-      content_type: content_type,
-      tags: tags,
-      acl_canned: "private",
-      storage_class: "STANDARD",
-      sse: nil,
-      user_metadata: meta_map
-    }
-
     commit_result =
-      Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
-        {size, etag} =
-          case Storage.put(dest_bucket, dest_key, dest_version_id, src_stream.stream,
-                 object_meta: dest_object_meta
-               ) do
-            {:ok, %{size: size, etag: etag}} -> {size, etag}
-            {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
-          end
+      try do
+        {copy_stream, target_sse_envelope, visible_size} =
+          prepare_copy_payload(src_obj, src_stream.stream, target_sse)
 
-        # ROUTE B B5-1：CopyObject 元数据提交收敛到与 do_put 同一 commit_metadata 分流
-        # （铁律 2 单一提交路径）：:pg（默认）→ put_version_with_id 致命（{:ok,obj} 匹配失败上抛），
-        # 字节级不变；:sidecar → put_version_index best-effort（失败 Log.error 非致命——目标 sidecar
-        # 已随 Storage.put 达 write_quorum 权威落盘）+ build_put_view 内存构造响应视图（不依赖 PG 读回）。
-        obj =
-          commit_metadata(
-            dest_bucket,
-            dest_key,
-            dest_version_id,
-            %{
-              size: size,
-              etag: etag,
-              content_type: content_type,
-              storage_class: "STANDARD",
-              metadata: meta_map,
-              tags: tags
-            },
-            :copy_object
-          )
+        # ROUTE B B4-5：CopyObject 同样透传 object_meta（content_type/tags/user_metadata 已按
+        # metadata/tagging-directive 解析），使复制对象也写出完整 maxio/2 sidecar。SSE-S3 源对象先解密
+        # 成明文；目标是否加密由目标请求头 / 目标桶默认加密决定（对齐 CopyObject 的“新对象”语义）。
+        # ACL 不继承源对象（AWS CopyObject 默认 private），显式 x-amz-acl 才应用到目标。
+        dest_object_meta =
+          %{
+            size: visible_size,
+            content_type: content_type,
+            tags: tags,
+            acl_canned: acl_input.canned,
+            acl_grants: acl_input.grants_doc,
+            storage_class: storage_class,
+            sse: sse_meta(target_sse, target_sse_envelope),
+            user_metadata: meta_map
+          }
+          |> Map.merge(SystemHeaders.to_object_meta(system_headers))
 
-        {size, etag, obj}
-      end)
+        Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
+          {_stored_size, etag} =
+            case Storage.put(dest_bucket, dest_key, dest_version_id, copy_stream,
+                   object_meta: dest_object_meta
+                 ) do
+              {:ok, %{size: size, etag: etag}} -> {size, etag}
+              {:error, reason} -> raise_storage_write_error(reason, dest_bucket, dest_key)
+            end
 
-    # 自拷贝的临时 key 在锁外清理（与目标 key 无关，绝不放锁内拖长持锁时间）。
-    cleanup_copy_source(src_stream)
+          size = visible_size.()
+
+          # ROUTE B B5-1：CopyObject 元数据提交收敛到与 do_put 同一 commit_metadata 分流
+          # （铁律 2 单一提交路径）：:pg（默认）→ put_version_with_id 致命（{:ok,obj} 匹配失败上抛），
+          # 字节级不变；:sidecar → put_version_index best-effort（失败 Log.error 非致命——目标 sidecar
+          # 已随 Storage.put 达 write_quorum 权威落盘）+ build_put_view 内存构造响应视图（不依赖 PG 读回）。
+          obj =
+            commit_metadata(
+              dest_bucket,
+              dest_key,
+              dest_version_id,
+              %{
+                size: size,
+                etag: etag,
+                content_type: content_type,
+                storage_class: storage_class,
+                acl_canned: acl_input.canned,
+                acl_grants: acl_input.grants_doc,
+                metadata: meta_map,
+                tags: tags,
+                sse_algorithm: target_sse,
+                sse_envelope: target_sse_envelope
+              }
+              |> Map.merge(system_headers),
+              :copy_object
+            )
+
+          {size, etag, obj}
+        end)
+      after
+        cleanup_copy_source(src_stream)
+      end
 
     {_size, etag, obj} =
       case commit_result do
-        {:ok, committed} -> committed
-        {:error, :locked} -> raise Error.new(:slow_down, resource: "/#{dest_bucket}/#{dest_key}")
+        {:ok, committed} ->
+          committed
+
+        {:error, :locked} ->
+          raise Error.new(:request_timeout, resource: "/#{dest_bucket}/#{dest_key}")
       end
 
     Log.info("copy object",
@@ -764,7 +837,35 @@ defmodule Maxio.S3.Handlers.Object do
     |> put_resp_content_type("application/xml")
     |> maybe_put_version_id(obj.version_id)
     |> maybe_put_copy_source_version_id(src_obj.version_id)
+    |> SSE.put_response_header(target_sse)
     |> send_resp(200, body)
+  end
+
+  defp prepare_copy_payload(src_obj, raw_stream, target_sse) do
+    plain_stream =
+      case src_obj.sse_algorithm do
+        nil ->
+          raw_stream
+
+        "AES256" ->
+          Maxio.Crypto.SSE.unwrap_stream(raw_stream, src_obj.sse_envelope)
+
+        alg ->
+          raise Error.new(:not_implemented,
+                  message: "CopyObject for #{alg} source objects not implemented"
+                )
+      end
+
+    {plain_stream, visible_size} = counted_stream(plain_stream)
+
+    case target_sse do
+      "AES256" ->
+        {cipher_stream, envelope} = Maxio.Crypto.SSE.wrap_stream(plain_stream)
+        {cipher_stream, envelope, visible_size}
+
+      nil ->
+        {plain_stream, nil, visible_size}
+    end
   end
 
   # 非自拷贝：直接返回源对象「真实版本」流（锁外打开，目标写时消费）。
@@ -793,7 +894,7 @@ defmodule Maxio.S3.Handlers.Object do
         %{stream: tmp_stream, dest_bucket: dest_bucket, tmp_key: tmp_key}
 
       {:error, reason} ->
-        raise Error.new(:internal_error, message: inspect(reason))
+        raise_storage_write_error(reason, dest_bucket, dest_key)
     end
   end
 
@@ -804,6 +905,13 @@ defmodule Maxio.S3.Handlers.Object do
     _ = Storage.delete(dest_bucket, tmp_key, "null")
     :ok
   end
+
+  defp raise_storage_write_error(reason, bucket, key)
+       when reason in [:write_quorum, :rename_busy],
+       do: raise(Error.new(:slow_down_write, resource: "/#{bucket}/#{key}"))
+
+  defp raise_storage_write_error(reason, _bucket, _key),
+    do: raise(Error.new(:internal_error, message: inspect(reason)))
 
   # ── helpers ──
 
@@ -829,7 +937,7 @@ defmodule Maxio.S3.Handlers.Object do
   #     才做 Suspended null 版本字节清理 + 盘上 marker 镜像，两者均 best-effort（删除已权威提交，
   #     盘上残留对 PG 读/列权威不可见，只是垃圾字节）。
   #
-  # 返回 delete marker 的 version_id；获锁失败 → 503 SlowDown，盘 quorum 不足 → 503 SlowDownWrite（铁律 3）。
+  # 返回 delete marker 的 version_id；获锁失败 → 503 RequestTimeout，盘 quorum 不足 → 503 SlowDownWrite（铁律 3）。
   defp commit_delete_marker(bucket, key, versioning) do
     version_id =
       if versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
@@ -858,7 +966,7 @@ defmodule Maxio.S3.Handlers.Object do
         raise Error.new(:internal_error, message: inspect(reason))
 
       {:error, :locked} ->
-        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+        raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -882,7 +990,7 @@ defmodule Maxio.S3.Handlers.Object do
   #     静默丢弃**（失败 Log.warn 归因，铁律 3 不静默；PG 权威下盘上残留对读/列不可见，仅垃圾字节）。
   #
   # 幂等：版本不存在（盘上全端点显式 missing / PG 无行）也回 204（对齐 AWS）。
-  # 获锁失败 → 503 SlowDown；盘 quorum 不足 → 503 SlowDownWrite（铁律 3）。
+  # 获锁失败 → 503 RequestTimeout；盘 quorum 不足 → 503 SlowDownWrite（铁律 3）。
   defp commit_version_delete(bucket, key, version_id) do
     result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
@@ -903,7 +1011,7 @@ defmodule Maxio.S3.Handlers.Object do
         raise Error.new(:internal_error, message: inspect(reason))
 
       {:error, :locked} ->
-        raise Error.new(:slow_down, resource: "/#{bucket}/#{key}")
+        raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -1066,8 +1174,13 @@ defmodule Maxio.S3.Handlers.Object do
       size: Map.fetch!(attrs, :size),
       etag: Map.fetch!(attrs, :etag),
       content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
+      content_encoding: Map.get(attrs, :content_encoding),
+      content_disposition: Map.get(attrs, :content_disposition),
+      cache_control: Map.get(attrs, :cache_control),
+      expires: Map.get(attrs, :expires),
       storage_class: Map.get(attrs, :storage_class, "STANDARD"),
       acl_canned: Map.get(attrs, :acl_canned, "private"),
+      acl_grants: Map.get(attrs, :acl_grants, ACL.empty_grants_doc()),
       # B5-1：user metadata 随视图携带（PutObject/CopyObject attrs 均含 :metadata），与 :pg 分支
       # 返回的 PG 行同构（视图字段越全，下游对两权威分支的读取越不分裂）。
       metadata: Map.get(attrs, :metadata, %{}),
@@ -1086,16 +1199,104 @@ defmodule Maxio.S3.Handlers.Object do
   defp copy_user_metadata(conn, _src_obj, "REPLACE"), do: parse_user_metadata(conn)
   defp copy_user_metadata(_conn, src_obj, _copy), do: src_obj.metadata || %{}
 
+  defp copy_system_headers(conn, _src_obj, "REPLACE"),
+    do: SystemHeaders.from_req_headers(conn.req_headers)
+
+  defp copy_system_headers(_conn, src_obj, _directive), do: SystemHeaders.from_object(src_obj)
+
+  defp parse_copy_directive!(conn, header_name) do
+    case header(conn, header_name) do
+      nil ->
+        "COPY"
+
+      value ->
+        value = value |> String.trim() |> String.upcase()
+
+        if value in ["COPY", "REPLACE"] do
+          value
+        else
+          raise Error.new(:invalid_argument,
+                  message: "#{header_name} must be COPY or REPLACE"
+                )
+        end
+    end
+  end
+
+  defp acl_from_headers!(conn) do
+    grant_headers? = ACL.grant_headers?(conn.req_headers)
+
+    case header(conn, "x-amz-acl") do
+      canned when is_binary(canned) and grant_headers? ->
+        raise Error.new(:invalid_request,
+                message: "Cannot specify both x-amz-acl and x-amz-grant-*"
+              )
+
+      nil ->
+        if grant_headers? do
+          grants =
+            conn.req_headers
+            |> parse_grant_headers!()
+            |> ACL.drop_owner_grants(@owner_id)
+
+          %{
+            canned: ACL.classify_grants(grants),
+            grants_doc: ACL.grants_doc(grants)
+          }
+        else
+          %{canned: "private", grants_doc: ACL.empty_grants_doc()}
+        end
+
+      canned ->
+        if ACL.known?(canned) do
+          %{canned: canned, grants_doc: ACL.empty_grants_doc()}
+        else
+          raise Error.new(:invalid_argument, message: "Unsupported x-amz-acl: #{canned}")
+        end
+    end
+  end
+
+  defp parse_grant_headers!(headers) do
+    case ACL.parse_grant_headers(headers) do
+      {:ok, grants} ->
+        grants
+
+      {:error, :unsupported_email} ->
+        raise Error.new(:invalid_argument, message: "Email grantee ACLs are not supported")
+
+      {:error, :too_many_grants} ->
+        raise Error.new(:invalid_argument, message: "ACL can contain at most 100 grants")
+
+      {:error, :invalid_grant} ->
+        raise Error.new(:invalid_argument, message: "Invalid ACL grant")
+    end
+  end
+
   # ROUTE B B4-5：组装透传给 Storage.put 的 object_meta（让后端写出完整 maxio/2 sidecar）。
   # 各字段均来自 do_put/copy 已就绪的计算值（content_type/tags/acl/storage_class/sse），加
-  # 用户 metadata（x-amz-meta-*，PutObject 现注入 sidecar 使其自描述完整）。sse 形状须匹配
+  # 用户 metadata（x-amz-meta-* / x-minio-meta-*，PutObject 现注入 sidecar 使其自描述完整）。sse 形状须匹配
   # Sidecar.to_view 读 e["sse"]["algo"] / e["sse"]["envelope"]（信封随读视图携带，绝不丢）。
-  defp build_object_meta(conn, content_type, tags_map, sse_requested, sse_envelope, user_metadata) do
+  defp build_object_meta(
+         content_type,
+         system_headers,
+         storage_class,
+         tags_map,
+         sse_requested,
+         sse_envelope,
+         user_metadata,
+         visible_size,
+         acl_input
+       ) do
     %{
+      size: visible_size,
       content_type: content_type,
+      content_encoding: Map.get(system_headers, :content_encoding),
+      content_disposition: Map.get(system_headers, :content_disposition),
+      cache_control: Map.get(system_headers, :cache_control),
+      expires: Map.get(system_headers, :expires),
       tags: tags_map,
-      acl_canned: header(conn, "x-amz-acl") || "private",
-      storage_class: "STANDARD",
+      acl_canned: acl_input.canned,
+      acl_grants: acl_input.grants_doc,
+      storage_class: storage_class,
       sse: sse_meta(sse_requested, sse_envelope),
       user_metadata: user_metadata
     }
@@ -1105,7 +1306,7 @@ defmodule Maxio.S3.Handlers.Object do
   defp sse_meta(nil, _envelope), do: nil
   defp sse_meta(algo, envelope), do: %{"algo" => algo, "envelope" => envelope}
 
-  # x-amz-meta-* 头 → %{"name" => "value"}：复用 Maxio.Metadata 的单一解析器
+  # 用户 metadata 头 → %{"name" => "value"}：复用 Maxio.Metadata 的单一解析器
   # （PutObject / CopyObject(REPLACE) / CreateMultipartUpload 同源，铁律 2）。
   defp parse_user_metadata(conn), do: Maxio.Metadata.parse_headers(conn.req_headers)
 
@@ -1208,6 +1409,133 @@ defmodule Maxio.S3.Handlers.Object do
     end)
   end
 
+  defp counted_stream(stream) do
+    counter = :counters.new(1, [])
+
+    counted =
+      Stream.map(stream, fn chunk ->
+        :counters.add(counter, 1, IO.iodata_length(chunk))
+        chunk
+      end)
+
+    {counted, fn -> :counters.get(counter, 1) end}
+  end
+
+  defp send_authenticated_sse_object!(conn, object, total, range, raw_stream, plain_slice) do
+    expected_length = expected_plain_length(range, total)
+    path = stage_sse_plain_file!(raw_stream, object.sse_envelope, plain_slice, expected_length)
+
+    try do
+      plain_stream =
+        File.stream!(path, Maxio.Crypto.SSE.plaintext_block_size(), [:read, :binary])
+
+      conn
+      |> maybe_put_version_id(object.version_id)
+      |> SSE.put_response_header(object.sse_algorithm)
+      |> send_object(object, total, range, plain_stream)
+    after
+      _ = File.rm(path)
+    end
+  end
+
+  defp stage_sse_plain_file!(raw_stream, envelope, plain_slice, expected_length) do
+    path = sse_plain_temp_path()
+    counter = :counters.new(1, [])
+
+    try do
+      File.open!(path, [:write, :binary], fn io ->
+        raw_stream
+        |> Maxio.Crypto.SSE.unwrap_stream(envelope)
+        |> slice_plain_stream(plain_slice)
+        |> Enum.each(fn chunk ->
+          :counters.add(counter, 1, IO.iodata_length(chunk))
+          IO.binwrite(io, chunk)
+        end)
+      end)
+
+      if :counters.get(counter, 1) == expected_length do
+        path
+      else
+        raise "SSE-S3 decryption failed: missing plaintext bytes"
+      end
+    rescue
+      err in Error ->
+        _ = File.rm(path)
+        reraise(err, __STACKTRACE__)
+
+      err ->
+        _ = File.rm(path)
+
+        Log.warn("sse object authentication failed before response",
+          action: :get_object,
+          reason: Exception.message(err)
+        )
+
+        raise Error.new(:internal_error)
+    end
+  end
+
+  defp sse_plain_temp_path do
+    name = "maxio_sse_get_#{System.unique_integer([:monotonic, :positive])}.bin"
+    Path.join(System.tmp_dir!(), name)
+  end
+
+  defp expected_plain_length(range, total) when range in [nil, :full], do: total
+  defp expected_plain_length({first, last}, _total), do: last - first + 1
+
+  defp slice_plain_stream(stream, nil), do: stream
+  defp slice_plain_stream(stream, :full), do: stream
+
+  defp slice_plain_stream(stream, {first, last}) do
+    Stream.transform(stream, {first, last - first + 1}, fn chunk, {skip, remaining} ->
+      cond do
+        remaining <= 0 ->
+          {:halt, {0, 0}}
+
+        true ->
+          chunk
+          |> IO.iodata_to_binary()
+          |> slice_chunk(skip, remaining)
+      end
+    end)
+  end
+
+  defp slice_chunk(chunk, skip, remaining) when skip >= byte_size(chunk),
+    do: {[], {skip - byte_size(chunk), remaining}}
+
+  defp slice_chunk(chunk, skip, remaining) when skip > 0 do
+    <<_skipped::binary-size(^skip), rest::binary>> = chunk
+    emit_slice(rest, remaining)
+  end
+
+  defp slice_chunk(chunk, 0, remaining), do: emit_slice(chunk, remaining)
+
+  defp emit_slice(chunk, remaining) do
+    emit_size = min(byte_size(chunk), remaining)
+    <<emit::binary-size(^emit_size), _tail::binary>> = chunk
+    {[emit], {0, remaining - emit_size}}
+  end
+
+  defp sse_ranges(nil, _total), do: {nil, nil}
+  defp sse_ranges(:full, _total), do: {nil, :full}
+
+  defp sse_ranges({first, last}, total) do
+    block_size = Maxio.Crypto.SSE.plaintext_block_size()
+    frame_header_size = Maxio.Crypto.SSE.frame_header_size()
+    full_frame_size = frame_header_size + block_size
+    first_frame = div(first, block_size)
+    last_frame = div(last, block_size)
+
+    cipher_first = first_frame * full_frame_size
+    last_frame_plain_size = min(block_size, total - last_frame * block_size)
+    cipher_last = last_frame * full_frame_size + frame_header_size + last_frame_plain_size - 1
+
+    plain_first = rem(first, block_size)
+    plain_last = plain_first + last - first
+
+    {{cipher_first, cipher_last}, {plain_first, plain_last}}
+  end
+
   defp put_common_object_headers(conn, object, content_length) do
     conn
     |> put_resp_header("content-type", object.content_type)
@@ -1215,9 +1543,18 @@ defmodule Maxio.S3.Handlers.Object do
     |> put_resp_header("last-modified", http_date(object.updated_at))
     |> put_resp_header("accept-ranges", "bytes")
     |> put_resp_header("content-length", Integer.to_string(content_length))
+    |> maybe_put_storage_class(object)
+    |> SystemHeaders.put_response_headers(object)
     |> put_user_metadata_headers(object)
     |> maybe_tagging_count(object)
   end
+
+  defp maybe_put_storage_class(conn, %{storage_class: storage_class})
+       when is_binary(storage_class) and storage_class not in ["", "STANDARD"] do
+    put_resp_header(conn, "x-amz-storage-class", storage_class)
+  end
+
+  defp maybe_put_storage_class(conn, _object), do: conn
 
   # ROUTE B B4-6 fidelity：把对象持久化的用户元数据原样回显为 x-amz-meta-<name> 响应头
   # （name 已去前缀、小写），闭合 PutObject/CopyObject/MPU 写入 → GET/HEAD 读回的 round-trip。
@@ -1264,7 +1601,7 @@ defmodule Maxio.S3.Handlers.Object do
 
       ["", suffix] ->
         case Integer.parse(suffix) do
-          {n, ""} when n > 0 -> {max(total - n, 0), total - 1}
+          {n, ""} when n > 0 and total > 0 -> {max(total - n, 0), total - 1}
           _ -> :invalid
         end
 
@@ -1346,21 +1683,25 @@ defmodule Maxio.S3.Handlers.Object do
 
   # version_id == nil → 取当前版本（latest）；否则取指定版本行。缺失 → NoSuchKey。
   # src_obj.version_id 即源真实字节所在版本路径（版本化源为 ULID，未版本化源为 "null"）。
-  defp object_or_raise(bucket, key, nil) do
-    _ = ensure_bucket!(bucket)
-
-    case Objects.get_metadata(bucket, key) do
-      {:ok, object} -> {object, object.size}
-      {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
-    end
-  end
-
   defp object_or_raise(bucket, key, version_id) do
     _ = ensure_bucket!(bucket)
 
-    case Objects.get_version(bucket, key, version_id) do
-      {:ok, object} -> {object, object.size}
-      {:error, :not_found} -> raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+    case Maxio.ObjectMeta.get(bucket, key, version_id, []) do
+      %Objects.Object{} = object ->
+        {object, object.size}
+
+      {:error, :not_found} ->
+        raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+
+      {:error, :read_quorum} ->
+        Log.warn("copy source unavailable: sidecar read_quorum unmet",
+          action: :copy_object,
+          bucket: bucket,
+          key: key,
+          reason: :read_quorum
+        )
+
+        raise Error.new(:slow_down_read, resource: "/#{bucket}/#{key}")
     end
   end
 
@@ -1410,44 +1751,6 @@ defmodule Maxio.S3.Handlers.Object do
 
   defp maybe_put_copy_source_version_id(conn, version_id),
     do: put_resp_header(conn, "x-amz-copy-source-version-id", version_id)
-
-  # 决定 SSE：请求头优先；其次桶默认加密配置。非 AES256/SSE-C → 501（绝不静默，铁律 3）。
-  defp resolve_sse!(conn, bucket) do
-    sse_c = header(conn, "x-amz-server-side-encryption-customer-algorithm")
-
-    if sse_c not in [nil, ""] do
-      raise Error.new(:not_implemented, message: "SSE-C (customer-provided keys) not implemented")
-    end
-
-    case header(conn, "x-amz-server-side-encryption") do
-      "AES256" ->
-        "AES256"
-
-      alg when alg in ["aws:kms", "aws:kms:dsse"] ->
-        raise Error.new(:not_implemented,
-                message: "Only SSE-S3 (AES256) is supported; #{alg} not implemented"
-              )
-
-      nil ->
-        bucket_default_sse(bucket)
-
-      "" ->
-        bucket_default_sse(bucket)
-
-      _other ->
-        raise Error.new(:invalid_argument, message: "Invalid x-amz-server-side-encryption value")
-    end
-  end
-
-  defp bucket_default_sse(bucket) do
-    case Maxio.BucketConfigs.get(bucket, :encryption) do
-      {:ok, %{"algorithm" => "AES256"}} -> "AES256"
-      _ -> nil
-    end
-  end
-
-  defp maybe_put_sse(conn, nil), do: conn
-  defp maybe_put_sse(conn, alg), do: put_resp_header(conn, "x-amz-server-side-encryption", alg)
 
   # 流式 PUT 解帧后长度须等于声明的 decoded-content-length（aws-chunked 完整性闸，铁律 3）。
   defp verify_decoded_length!(conn, :streaming, actual_size) do

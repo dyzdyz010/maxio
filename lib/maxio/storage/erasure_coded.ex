@@ -196,8 +196,9 @@ defmodule Maxio.Storage.ErasureCoded do
 
   defp do_assemble(bucket, key, upload_id, part_numbers, opts) do
     cfg = Config.load!(opts)
+    version_id = Keyword.get(opts, :version_id, "null")
 
-    with {:ok, commit_pairs} <- commit_pairs(bucket, key, "null", cfg) do
+    with {:ok, commit_pairs} <- commit_pairs(bucket, key, version_id, cfg) do
       # B1-2 原子提交：组装对象同样先写各盘 temp obj-dir，commit 数据先于元数据原子 rename 到 final。
       tmps = Enum.map(commit_pairs, fn {drive_root, _final} -> begin_tmp!(drive_root) end)
       fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
@@ -230,14 +231,14 @@ defmodule Maxio.Storage.ErasureCoded do
       sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
       shard_len = acc.shard_len || 0
 
-      # 多段 assemble 的最终对象落 null 布局（commit_pairs(..., "null", ...)）；同样产 maxio/2 sidecar
+      # 多段 assemble 的最终对象落 opts[:version_id] 指定布局（缺省 null）；同样产 maxio/2 sidecar
       # 使其 sidecar-可读/可列。ROUTE B B4-6 D1：透传 assemble 的 opts（携 opts[:object_meta]，由
       # Multipart.complete 从 upload 会话取 content_type/user_metadata 构造），version_opts 据此自描述
       # 真实 content_type/user_metadata（替换原硬编码 []，消除多段 :sidecar 读 content-type 错误）。
       meta =
         build_meta(
           cfg,
-          "null",
+          version_id,
           opts,
           acc.size,
           etag,
@@ -539,14 +540,27 @@ defmodule Maxio.Storage.ErasureCoded do
       version_id: version_id,
       data_dir: version_id,
       modtime: modtime,
+      size: object_meta_value(om, :size),
       etag: Map.get(om, :etag),
       content_type: Map.get(om, :content_type, "binary/octet-stream"),
+      content_encoding: Map.get(om, :content_encoding),
+      content_disposition: Map.get(om, :content_disposition),
+      cache_control: Map.get(om, :cache_control),
+      expires: Map.get(om, :expires),
       tags: Map.get(om, :tags, %{}),
       sse: Map.get(om, :sse),
       acl_canned: Map.get(om, :acl_canned, "private"),
+      acl_grants: Map.get(om, :acl_grants, %{"grants" => []}),
       storage_class: Map.get(om, :storage_class, "STANDARD"),
       user_metadata: Map.get(om, :user_metadata, %{})
     ]
+  end
+
+  defp object_meta_value(om, key) do
+    case Map.get(om, key) do
+      fun when is_function(fun, 0) -> fun.()
+      value -> value
+    end
   end
 
   defp write_sidecars(dirs, meta) do

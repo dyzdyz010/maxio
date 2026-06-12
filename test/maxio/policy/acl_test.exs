@@ -13,6 +13,17 @@ defmodule Maxio.Policy.ACLTest do
     }
   end
 
+  defp user(arn, action, resource, conds \\ %{}) do
+    %RequestContext{
+      principal: %{type: :iam_user, access_key: "ak", arn: arn},
+      authenticated?: true,
+      owner?: false,
+      action: action,
+      resource: resource,
+      conditions: Map.put_new(conds, "maxio:Authenticated", "true")
+    }
+  end
+
   test "private 对象 ACL → 无公共 statement（匿名隐拒）" do
     stmts = ACL.canned_to_statements("private", :object, "b", "k")
     assert stmts == []
@@ -68,5 +79,59 @@ defmodule Maxio.Policy.ACLTest do
         </AccessControlList></AccessControlPolicy>))
 
     assert canned == "public-read"
+  end
+
+  test "x-amz-grant-* headers parse group grants and reject email grantees" do
+    {:ok, grants} =
+      ACL.parse_grant_headers([
+        {"x-amz-grant-read", ~s(uri="http://acs.amazonaws.com/groups/global/AllUsers")},
+        {"x-amz-grant-write-acp", "uri=http://acs.amazonaws.com/groups/global/AuthenticatedUsers"}
+      ])
+
+    assert ACL.classify_grants(grants) == "custom"
+    assert length(grants) == 2
+
+    assert {:error, :unsupported_email} =
+             ACL.parse_grant_headers([{"x-amz-grant-read", ~s(emailAddress="a@example.com")}])
+
+    assert {:error, :invalid_grant} = ACL.parse_grant_headers([{"x-amz-grant-read", ""}])
+  end
+
+  test "explicit AllUsers READ object grant allows anonymous GetObject only" do
+    {:ok, grants} =
+      ACL.normalize_grants([
+        %{
+          "grantee" => %{
+            "type" => "Group",
+            "uri" => "http://acs.amazonaws.com/groups/global/AllUsers"
+          },
+          "permission" => "READ"
+        }
+      ])
+
+    stmts = ACL.grants_to_statements(grants, :object, "b", "k")
+    assert Evaluator.evaluate(anon("s3:GetObject", "arn:aws:s3:::b/k"), stmts) == :allow
+
+    assert Evaluator.evaluate(anon("s3:PutObject", "arn:aws:s3:::b/k"), stmts) ==
+             {:deny, :implicit_deny}
+  end
+
+  test "explicit canonical user grant matches principal ARN exactly" do
+    alice = "arn:aws:iam:::user/alice"
+    bob = "arn:aws:iam:::user/bob"
+
+    {:ok, grants} =
+      ACL.normalize_grants([
+        %{
+          "grantee" => %{"type" => "CanonicalUser", "id" => alice},
+          "permission" => "READ_ACP"
+        }
+      ])
+
+    stmts = ACL.grants_to_statements(grants, :object, "b", "k")
+    assert Evaluator.evaluate(user(alice, "s3:GetObjectAcl", "arn:aws:s3:::b/k"), stmts) == :allow
+
+    assert Evaluator.evaluate(user(bob, "s3:GetObjectAcl", "arn:aws:s3:::b/k"), stmts) ==
+             {:deny, :implicit_deny}
   end
 end

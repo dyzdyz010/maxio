@@ -13,12 +13,13 @@ defmodule Maxio.IAM.AccessKey do
     field :principal_arn, :string
     field :type, :string, default: "iam_user"
     field :status, :string, default: "active"
+    field :tags, :map, default: %{}
 
     timestamps(type: :utc_datetime_usec)
   end
 
   @required [:access_key_id, :secret_key, :principal_arn]
-  @optional [:type, :status]
+  @optional [:type, :status, :tags]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(ak, attrs) do

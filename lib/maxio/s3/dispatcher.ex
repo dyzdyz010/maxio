@@ -16,7 +16,7 @@ defmodule Maxio.S3.Dispatcher do
   @m2_subresources ~w(website
                       notification replication object-lock legal-hold retention
                       attributes select torrent restore accelerate analytics inventory metrics
-                      ownershipcontrols publicaccessblock requestpayment logging)
+                      ownershipcontrols requestpayment logging)
 
   @spec resolve(level(), String.t(), MapSet.t()) ::
           {:ok, action()} | {:error, :method_not_allowed | :not_implemented}
@@ -53,6 +53,17 @@ defmodule Maxio.S3.Dispatcher do
           "DELETE" -> {:ok, :delete_bucket_encryption}
           _ -> {:error, :method_not_allowed}
         end
+
+      level == :bucket and MapSet.member?(query_keys, "publicaccessblock") ->
+        case method do
+          "PUT" -> {:ok, :put_public_access_block}
+          "GET" -> {:ok, :get_public_access_block}
+          "DELETE" -> {:ok, :delete_public_access_block}
+          _ -> {:error, :method_not_allowed}
+        end
+
+      MapSet.member?(query_keys, "publicaccessblock") ->
+        {:error, :method_not_allowed}
 
       level == :bucket and MapSet.member?(query_keys, "lifecycle") ->
         case method do

@@ -33,7 +33,14 @@ defmodule Maxio.S3.ErrorTest do
     assert Error.new(:missing_security_header).http_status == 400
   end
 
-  test "SlowDown / SlowDownWrite / SlowDownRead 均为可重试 503（对齐 MinIO）" do
+  test "RequestTimeout 与 SlowDown* 均为可重试 503（对齐 MinIO）" do
+    rt = Error.new(:request_timeout)
+    assert rt.code == "RequestTimeout"
+    assert rt.http_status == 503
+
+    assert rt.message ==
+             "A timeout occurred while trying to lock a resource, please reduce your request rate"
+
     sd = Error.new(:slow_down)
     assert sd.code == "SlowDown"
     assert sd.http_status == 503

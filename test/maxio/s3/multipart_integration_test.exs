@@ -6,6 +6,7 @@ defmodule Maxio.S3.MultipartIntegrationTest do
   alias Maxio.S3.Endpoint
 
   @data_dir Path.join(System.tmp_dir!(), "maxio_mp_int_test")
+  @all_users "http://acs.amazonaws.com/groups/global/AllUsers"
 
   setup do
     File.rm_rf(@data_dir)
@@ -30,6 +31,57 @@ defmodule Maxio.S3.MultipartIntegrationTest do
     [_, rest] = String.split(xml, "<UploadId>")
     [id, _] = String.split(rest, "</UploadId>")
     id
+  end
+
+  defp enable_versioning(bucket) do
+    body = ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
+
+    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"versioning" => ""}, body: body)
+    |> call()
+  end
+
+  defp suspend_versioning(bucket) do
+    body = ~s(<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>)
+
+    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"versioning" => ""}, body: body)
+    |> call()
+  end
+
+  defp complete_single_part(bucket, key, body, headers \\ []) do
+    init =
+      SigV4Request.signed_conn(:post, "/#{bucket}/#{key}",
+        query: %{"uploads" => ""},
+        headers: headers
+      )
+      |> call()
+
+    assert init.status == 200
+    uid = upload_id(init.resp_body)
+
+    upload_part =
+      SigV4Request.signed_conn(:put, "/#{bucket}/#{key}",
+        query: %{"partNumber" => "1", "uploadId" => uid},
+        body: body
+      )
+      |> call()
+
+    assert upload_part.status == 200
+    [etag] = get_resp_header(upload_part, "etag")
+
+    complete_xml =
+      "<CompleteMultipartUpload>" <>
+        "<Part><PartNumber>1</PartNumber><ETag>#{etag}</ETag></Part>" <>
+        "</CompleteMultipartUpload>"
+
+    complete =
+      SigV4Request.signed_conn(:post, "/#{bucket}/#{key}",
+        query: %{"uploadId" => uid},
+        body: complete_xml
+      )
+      |> call()
+
+    assert complete.status == 200
+    complete
   end
 
   test "Create→UploadPart x2→Complete→GET 取回完整对象 + multipart ETag(-2)" do
@@ -81,10 +133,106 @@ defmodule Maxio.S3.MultipartIntegrationTest do
     assert complete.status == 200
     assert complete.resp_body =~ "<ETag>"
     assert complete.resp_body =~ "-2&quot;</ETag>" or complete.resp_body =~ ~s(-2"</ETag>)
+    assert get_resp_header(complete, "x-amz-version-id") == []
 
     get = SigV4Request.signed_conn(:get, "/mpbk/big.bin") |> call()
     assert get.status == 200
     assert get.resp_body == p1body <> p2body
+
+    assert {:ok, null_row} = Maxio.Objects.get_version("mpbk", "big.bin", "null")
+    assert null_row.is_latest == true
+  end
+
+  test "CompleteMultipartUpload 在 Enabled 桶中创建独立对象版本并回 x-amz-version-id" do
+    bucket = "mpverb"
+    key = "big.bin"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    assert enable_versioning(bucket).status == 200
+
+    first = complete_single_part(bucket, key, "first multipart body")
+    assert [vid1] = get_resp_header(first, "x-amz-version-id")
+    assert vid1 != "null"
+
+    second = complete_single_part(bucket, key, "second multipart body")
+    assert [vid2] = get_resp_header(second, "x-amz-version-id")
+    assert vid2 != "null"
+    assert vid2 != vid1
+
+    latest = SigV4Request.signed_conn(:get, "/#{bucket}/#{key}") |> call()
+    assert latest.status == 200
+    assert latest.resp_body == "second multipart body"
+    assert get_resp_header(latest, "x-amz-version-id") == [vid2]
+
+    old =
+      SigV4Request.signed_conn(:get, "/#{bucket}/#{key}", query: %{"versionId" => vid1})
+      |> call()
+
+    assert old.status == 200
+    assert old.resp_body == "first multipart body"
+    assert get_resp_header(old, "x-amz-version-id") == [vid1]
+
+    assert {:ok, old_row} = Maxio.Objects.get_version(bucket, key, vid1)
+    assert old_row.is_latest == false
+    assert {:ok, latest_row} = Maxio.Objects.get_version(bucket, key, vid2)
+    assert latest_row.is_latest == true
+  end
+
+  test "CompleteMultipartUpload 在 Suspended 桶中继续写 null 版本且不回 version header" do
+    bucket = "mpversusp"
+    key = "big.bin"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    assert suspend_versioning(bucket).status == 200
+
+    first = complete_single_part(bucket, key, "first suspended body")
+    assert get_resp_header(first, "x-amz-version-id") == []
+
+    second = complete_single_part(bucket, key, "second suspended body")
+    assert get_resp_header(second, "x-amz-version-id") == []
+
+    latest = SigV4Request.signed_conn(:get, "/#{bucket}/#{key}") |> call()
+    assert latest.status == 200
+    assert latest.resp_body == "second suspended body"
+    assert get_resp_header(latest, "x-amz-version-id") == []
+
+    assert {:ok, null_row} = Maxio.Objects.get_version(bucket, key, "null")
+    assert null_row.is_latest == true
+    assert null_row.size == byte_size("second suspended body")
+  end
+
+  test "CompleteMultipartUpload AES256 在 Enabled 桶中写加密的非 null 版本" do
+    bucket = "mpversse"
+    key = "sse.bin"
+    plain = "versioned multipart sse body"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    assert enable_versioning(bucket).status == 200
+
+    complete =
+      complete_single_part(bucket, key, plain, [{"x-amz-server-side-encryption", "AES256"}])
+
+    assert get_resp_header(complete, "x-amz-server-side-encryption") == ["AES256"]
+    assert [vid] = get_resp_header(complete, "x-amz-version-id")
+    assert vid != "null"
+
+    get =
+      SigV4Request.signed_conn(:get, "/#{bucket}/#{key}", query: %{"versionId" => vid})
+      |> call()
+
+    assert get.status == 200
+    assert get.resp_body == plain
+    assert get_resp_header(get, "x-amz-version-id") == [vid]
+    assert get_resp_header(get, "x-amz-server-side-encryption") == ["AES256"]
+
+    assert {:ok, obj} = Maxio.Objects.get_version(bucket, key, vid)
+    assert obj.sse_algorithm == "AES256"
+    assert is_map(obj.sse_envelope)
+    assert obj.size == byte_size(plain)
+
+    on_disk = File.read!(Path.join([@data_dir, ".versions", bucket, key, vid, "part.0"]))
+    refute on_disk =~ plain
+    refute File.exists?(Path.join([@data_dir, bucket, key, "part.0"]))
   end
 
   test "Complete 引用不存在的 part → 400 InvalidPart" do
@@ -154,5 +302,27 @@ defmodule Maxio.S3.MultipartIntegrationTest do
     assert lmu.status == 200
     assert lmu.resp_body =~ "<Key>aaa</Key>"
     assert lmu.resp_body =~ "<Key>bbb</Key>"
+  end
+
+  test "CreateMultipartUpload x-amz-grant-read persists to completed object ACL" do
+    bucket = "mpacl"
+    key = "granted.bin"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    complete =
+      complete_single_part(bucket, key, "multipart body", [
+        {"x-amz-grant-read", ~s(uri="#{@all_users}")}
+      ])
+
+    assert complete.status == 200
+
+    {:ok, obj} = Maxio.Objects.get_metadata(bucket, key)
+    assert obj.acl_canned == "public-read"
+    assert [%{"permission" => "READ"}] = obj.acl_grants["grants"]
+
+    anon = SigV4Request.anon_conn(:get, "/#{bucket}/#{key}") |> call()
+    assert anon.status == 200
+    assert anon.resp_body == "multipart body"
   end
 end

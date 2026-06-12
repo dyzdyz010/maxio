@@ -5,8 +5,10 @@ defmodule Maxio.Multipart do
   及 Complete 时的校验（InvalidPart/InvalidPartOrder/EntityTooSmall/NoSuchUpload，铁律 3）。
   """
   import Ecto.Query
+  alias Maxio.Crypto.SSE, as: CryptoSSE
   alias Maxio.Repo
   alias Maxio.Multipart.{Upload, Part}
+  alias Maxio.S3.SystemHeaders
 
   @default_min_part_size 5_242_880
 
@@ -16,15 +18,20 @@ defmodule Maxio.Multipart do
   def initiate(bucket_name, key, attrs \\ %{}) do
     upload_id = generate_upload_id()
 
-    base = %{
-      upload_id: upload_id,
-      bucket_name: bucket_name,
-      key: key,
-      content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
-      storage_class: Map.get(attrs, :storage_class, "STANDARD"),
-      owner: Map.get(attrs, :owner, "arn:aws:iam:::root"),
-      metadata: Map.get(attrs, :metadata, %{})
-    }
+    base =
+      %{
+        upload_id: upload_id,
+        bucket_name: bucket_name,
+        key: key,
+        content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
+        storage_class: Map.get(attrs, :storage_class, "STANDARD"),
+        sse_algorithm: Map.get(attrs, :sse_algorithm),
+        owner: Map.get(attrs, :owner, "arn:aws:iam:::root"),
+        acl_canned: Map.get(attrs, :acl_canned, "private"),
+        acl_grants: Map.get(attrs, :acl_grants, %{"grants" => []}),
+        metadata: Map.get(attrs, :metadata, %{})
+      }
+      |> Map.merge(SystemHeaders.take(attrs))
 
     %Upload{} |> Upload.changeset(base) |> Repo.insert()
   end
@@ -122,14 +129,22 @@ defmodule Maxio.Multipart do
 
   @doc """
   完成分段上传：按客户端给的 requested_parts（[%{part_number, etag}]，须升序）校验后组装。
-  返回 {:ok, %{etag, size}} | {:error, reason}，reason ∈
+  返回 {:ok, %{etag, size, sse_envelope, version_id}} | {:error, reason}，reason ∈
   :no_such_upload | :invalid_part | :invalid_part_order | :entity_too_small | :no_parts。
-  opts: :min_part_size（默认 5_242_880；测试可注入小值）。
+  opts: :min_part_size（默认 5_242_880；测试可注入小值）、:version_id（最终对象版本路径，缺省 "null"）。
   """
   @spec complete(Upload.t(), [%{part_number: pos_integer(), etag: String.t()}], keyword()) ::
-          {:ok, %{etag: String.t(), size: non_neg_integer()}} | {:error, atom()}
+          {:ok,
+           %{
+             etag: String.t(),
+             size: non_neg_integer(),
+             sse_envelope: map() | nil,
+             version_id: String.t()
+           }}
+          | {:error, atom()}
   def complete(%Upload{} = upload, requested_parts, opts \\ []) do
     min_part_size = Keyword.get(opts, :min_part_size, min_part_size())
+    version_id = Keyword.get(opts, :version_id, "null")
     stored = list_all_parts(upload) |> Map.new(fn p -> {p.part_number, p} end)
 
     with :ok <- ensure_nonempty(requested_parts),
@@ -137,34 +152,19 @@ defmodule Maxio.Multipart do
          {:ok, ordered} <- match_parts(requested_parts, stored),
          :ok <- ensure_min_size(ordered, min_part_size) do
       part_numbers = Enum.map(ordered, & &1.part_number)
+      visible_size = Enum.reduce(ordered, 0, fn part, acc -> acc + part.size end)
       md5_raws = Enum.map(ordered, fn p -> Base.decode16!(p.etag, case: :mixed) end)
       etag = multipart_etag(md5_raws)
 
-      # ROUTE B B4-6 D1：从 upload 会话取真实 content_type/user_metadata 构造 object_meta，经
-      # Storage.assemble 透传给后端，使多段完成对象的 maxio/2 sidecar 自描述真实 content_type/user_metadata
+      # ROUTE B B4-6 D1/B4-14：从 upload 会话取真实 content_type/user_metadata/SSE 构造 object_meta，经
+      # Storage.assemble 或 SSE 加密后的 Storage.put 透传给后端，使多段完成对象的 maxio/2 sidecar 自描述真实元数据
       # （消除 :sidecar 读多段对象 content-type 回落 binary/octet-stream 的偏离）。caller opts（如测试注入的
       # transport/topology）一并转发到后端，object_meta 覆盖任何同名键（会话才是元数据权威）。
-      # NOTE(defer)：多段对象版本化（assemble 无 version_id 形参、CompleteMPU 在 Enabled 桶不建新版本）
-      # 是预存在基础设施限制，非本单元目标——故 assemble 仍落 "null" 布局，version_id 通道留后续里程碑。
+      # version_id 由 handler 按桶版本化状态生成并贯穿字节路径、sidecar 与 PG/索引；缺省 "null"
+      # 保持内部/未版本化调用语义。
       # B6-2a：S3 多段 ETag（"...-N"）随 object_meta 透传后端——sidecar versions entry 的 S3 可见
       # etag 必须是多段形态（耐久 core 顶层 etag 仍为整体字节 MD5，完整性校验语义不动）。
-      assemble_opts = Keyword.put(opts, :object_meta, assemble_object_meta(upload, etag))
-
-      case Maxio.Storage.assemble(
-             upload.bucket_name,
-             upload.key,
-             upload.upload_id,
-             part_numbers,
-             assemble_opts
-           ) do
-        {:ok, %{size: size}} ->
-          # part 字节清理 + 会话/分块元数据删除统一由调用方 handler 的 Multipart.abort/1 负责
-          # （单一职责，不在此重复 abort_upload）。
-          {:ok, %{etag: etag, size: size}}
-
-        {:error, _} = err ->
-          err
-      end
+      assemble_final_object(upload, part_numbers, etag, visible_size, version_id, opts)
     end
   end
 
@@ -189,24 +189,120 @@ defmodule Maxio.Multipart do
 
   # ── 内部 ──
 
-  # ROUTE B B4-6 D1：从 upload 会话构造透传给 Storage.assemble 的 object_meta（形状对齐
+  defp assemble_final_object(
+         %Upload{sse_algorithm: "AES256"} = upload,
+         part_numbers,
+         s3_etag,
+         visible_size,
+         version_id,
+         opts
+       ) do
+    with {:ok, part_streams} <- part_streams(upload, part_numbers, opts) do
+      plain_stream = Stream.flat_map(part_streams, fn stream -> stream end)
+      {cipher_stream, sse_envelope} = CryptoSSE.wrap_stream(plain_stream)
+
+      put_opts =
+        Keyword.put(
+          opts,
+          :object_meta,
+          assemble_object_meta(upload, s3_etag, sse_envelope, visible_size)
+        )
+
+      case Maxio.Storage.put(upload.bucket_name, upload.key, version_id, cipher_stream, put_opts) do
+        {:ok, %{size: _stored_size}} ->
+          # part 字节清理 + 会话/分块元数据删除统一由调用方 handler 的 Multipart.abort/1 负责
+          # （单一职责，不在此重复 abort_upload）。
+          {:ok,
+           %{
+             etag: s3_etag,
+             size: visible_size,
+             sse_envelope: sse_envelope,
+             version_id: version_id
+           }}
+
+        {:error, _} = err ->
+          err
+      end
+    end
+  end
+
+  defp assemble_final_object(
+         %Upload{} = upload,
+         part_numbers,
+         s3_etag,
+         _visible_size,
+         version_id,
+         opts
+       ) do
+    assemble_opts =
+      opts
+      |> Keyword.put(:version_id, version_id)
+      |> Keyword.put(:object_meta, assemble_object_meta(upload, s3_etag, nil, nil))
+
+    case Maxio.Storage.assemble(
+           upload.bucket_name,
+           upload.key,
+           upload.upload_id,
+           part_numbers,
+           assemble_opts
+         ) do
+      {:ok, %{size: size}} ->
+        # part 字节清理 + 会话/分块元数据删除统一由调用方 handler 的 Multipart.abort/1 负责
+        # （单一职责，不在此重复 abort_upload）。
+        {:ok, %{etag: s3_etag, size: size, sse_envelope: nil, version_id: version_id}}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp part_streams(%Upload{} = upload, part_numbers, opts) do
+    Enum.reduce_while(part_numbers, {:ok, []}, fn part_number, {:ok, acc} ->
+      case Maxio.Storage.get_part_stream(
+             upload.bucket_name,
+             upload.key,
+             upload.upload_id,
+             part_number,
+             opts
+           ) do
+        {:ok, stream} -> {:cont, {:ok, [stream | acc]}}
+        {:error, _reason} -> {:halt, {:error, :invalid_part}}
+      end
+    end)
+    |> case do
+      {:ok, streams} -> {:ok, Enum.reverse(streams)}
+      {:error, _} = err -> err
+    end
+  end
+
+  # ROUTE B B4-6 D1：从 upload 会话构造透传给 Storage.assemble/put 的 object_meta（形状对齐
   # Maxio.Storage.Backend 的 :object_meta 契约）。content_type/storage_class/user_metadata 取自
-  # CreateMultipartUpload 落盘的会话行（handlers/multipart.ex initiate）；MPU MVP 不支持 SSE/per-key ACL
-  # 故 sse=nil、acl_canned 默认 private；会话表无 tags 列故 tags=%{}（多段 tagging 留后续里程碑）。
+  # CreateMultipartUpload 落盘的会话行（handlers/multipart.ex initiate）；SSE-S3 会话在 Complete 时
+  # 生成 envelope 后写入 sidecar/PG；per-key ACL 默认 private；会话表无 tags 列故 tags=%{}（多段 tagging 留后续里程碑）。
   # B6-2a：:etag = S3 多段 ETag（hex(MD5(concat part MD5s))-N）——后端 version_opts 据此让 sidecar
   # versions entry 的 S3 可见 etag 取多段形态（PG 路径早已如此；:read=:sidecar 下 GET/HEAD/LIST 的
   # ETag 头才与 AWS/MinIO 一致）；耐久 core 顶层 etag 仍由后端写整体字节 MD5（完整性校验语义不变）。
-  defp assemble_object_meta(%Upload{} = upload, s3_etag) do
+  defp assemble_object_meta(%Upload{} = upload, s3_etag, sse_envelope, visible_size) do
     %{
+      size: visible_size,
       content_type: upload.content_type || "binary/octet-stream",
+      content_encoding: upload.content_encoding,
+      content_disposition: upload.content_disposition,
+      cache_control: upload.cache_control,
+      expires: upload.expires,
       tags: %{},
-      sse: nil,
-      acl_canned: "private",
+      sse: sse_meta(upload.sse_algorithm, sse_envelope),
+      acl_canned: upload.acl_canned || "private",
+      acl_grants: upload.acl_grants || %{"grants" => []},
       storage_class: upload.storage_class || "STANDARD",
       user_metadata: upload.metadata || %{},
       etag: s3_etag
     }
   end
+
+  defp sse_meta(nil, _envelope), do: nil
+  defp sse_meta("", _envelope), do: nil
+  defp sse_meta(algo, envelope), do: %{"algo" => algo, "envelope" => envelope}
 
   defp list_all_parts(%Upload{id: uid}) do
     Repo.all(from p in Part, where: p.upload_id == ^uid, order_by: [asc: p.part_number])

@@ -48,6 +48,28 @@ defmodule Maxio.ObjectsLimitTest do
     assert length(res.versions) == 10
   end
 
+  test "list_objects_v2：max_keys 超过 S3 单页上限时夹到 1000" do
+    for i <- 1..1002, do: put("clamp/" <> pad(i))
+
+    res = Objects.list_objects_v2("limit-test", %{prefix: "clamp/", max_keys: 5_000})
+
+    assert length(res.objects) == 1000
+    assert res.key_count == 1000
+    assert res.is_truncated == true
+    assert res.next_continuation_token == "clamp/1000"
+  end
+
+  test "list_object_versions：max_keys 超过 S3 单页上限时夹到 1000" do
+    for i <- 1..1002, do: put("vclamp/" <> pad(i))
+
+    res = Objects.list_object_versions("limit-test", %{prefix: "vclamp/", max_keys: 5_000})
+
+    assert length(res.versions) == 1000
+    assert res.is_truncated == true
+    assert res.next_key_marker == "vclamp/1000"
+    assert res.next_version_id_marker == "null"
+  end
+
   test "Multipart.list_uploads：sql_hard_limit 封顶 SQL 取数行数" do
     Application.put_env(:maxio, :listing, sql_hard_limit: 10)
 

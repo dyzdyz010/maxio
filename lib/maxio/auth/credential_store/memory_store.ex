@@ -66,6 +66,22 @@ defmodule Maxio.Auth.CredentialStore.MemoryStore do
     |> Enum.map(fn {ak, _sk, principal} -> %{access_key: ak, principal: principal} end)
   end
 
+  @impl true
+  def invalidate({:access_key, access_key}) when is_binary(access_key) do
+    ensure_table()
+    :ets.delete(@table, access_key)
+    :ok
+  end
+
+  def invalidate(:all) do
+    ensure_table()
+    :ets.delete_all_objects(@table)
+    bootstrap_root()
+    :ok
+  end
+
+  def invalidate(_scope), do: :ok
+
   # 惰性建表 + 注入 root（幂等）。并发安全：用 :public named table，已存在则忽略。
   defp ensure_table do
     case :ets.whereis(@table) do

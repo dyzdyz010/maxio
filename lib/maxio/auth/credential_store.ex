@@ -7,6 +7,9 @@ defmodule Maxio.Auth.CredentialStore do
               {:ok, %{secret_key: String.t(), principal: map()}} | :error
   @callback put_access_key(map()) :: :ok | {:error, term()}
   @callback list_keys() :: [map()]
+  @callback invalidate(scope :: term()) :: :ok
+
+  @optional_callbacks invalidate: 1
 
   @doc "当前配置的凭据后端模块。"
   @spec impl() :: module()
@@ -20,4 +23,15 @@ defmodule Maxio.Auth.CredentialStore do
 
   @spec list_keys() :: [map()]
   def list_keys, do: impl().list_keys()
+
+  @spec invalidate(term()) :: :ok
+  def invalidate(scope) do
+    backend = impl()
+
+    if function_exported?(backend, :invalidate, 1) do
+      backend.invalidate(scope)
+    else
+      :ok
+    end
+  end
 end

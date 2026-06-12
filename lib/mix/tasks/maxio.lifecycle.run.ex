@@ -1,19 +1,65 @@
 defmodule Mix.Tasks.Maxio.Lifecycle.Run do
-  @shortdoc "（占位）生命周期过期执行——M4 未实现，仅打印 defer 说明"
+  @shortdoc "Run one maxio S3 lifecycle sweep"
   @moduledoc """
-  生命周期后台执行 stub。M4 只存储/校验/出站生命周期配置；**实际过期/中止 MPU 删除未实现**（defer）。
-  本任务存在仅为诚实暴露该 defer（铁律 3：绝不假装已生效）。后续里程碑实现真实 sweeper。
+  Executes one deterministic lifecycle sweep.
+
+      mix maxio.lifecycle.run
+      mix maxio.lifecycle.run --bucket my-bucket
+      mix maxio.lifecycle.run --dry-run
+
+  Implemented actions:
+
+    * current-version Expiration
+    * NoncurrentVersionExpiration
+    * ExpiredObjectDeleteMarker cleanup
+    * AbortIncompleteMultipartUpload
+
+  Transition actions remain explicit defers until maxio has tiering backends.
   """
   use Mix.Task
 
   @impl true
-  def run(_args) do
-    IO.puts("""
-    [maxio lifecycle] Lifecycle expiration execution is NOT implemented in M4 (deferred).
-    Lifecycle configurations are stored, validated, and served byte-faithfully for S3 client
-    compatibility (aws-cli / SDK round-trip), but NO objects are expired and NO incomplete
-    multipart uploads are aborted by maxio. Transition/NoncurrentVersionTransition are inert
-    (single-tier storage). See README "Lifecycle (config-only)" section.
-    """)
+  def run(args) do
+    {opts, rest, invalid} =
+      OptionParser.parse(args,
+        strict: [bucket: :string, dry_run: :boolean],
+        aliases: [b: :bucket]
+      )
+
+    if rest != [] or invalid != [] do
+      unexpected = rest ++ Enum.map(invalid, &elem(&1, 0))
+
+      Mix.raise(
+        "usage: mix maxio.lifecycle.run [--bucket <name>] [--dry-run] " <>
+          "(unexpected: #{inspect(unexpected)})"
+      )
+    end
+
+    Mix.Task.run("app.start")
+
+    summary =
+      Maxio.Lifecycle.run(
+        bucket: opts[:bucket],
+        dry_run: Keyword.get(opts, :dry_run, false)
+      )
+
+    IO.puts(
+      "[maxio lifecycle] buckets=#{summary.buckets_scanned} " <>
+        "objects_expired=#{summary.objects_expired} " <>
+        "noncurrent_versions_expired=#{summary.noncurrent_versions_expired} " <>
+        "delete_markers_removed=#{summary.delete_markers_removed} " <>
+        "multipart_uploads_aborted=#{summary.multipart_uploads_aborted} " <>
+        "unsupported_rules=#{summary.unsupported_rules} errors=#{length(summary.errors)}"
+    )
+
+    if summary.errors != [] do
+      Enum.each(summary.errors, fn err ->
+        IO.puts(
+          "[maxio lifecycle] error bucket=#{err.bucket} key=#{err.key} reason=#{err.reason}"
+        )
+      end)
+
+      Mix.raise("lifecycle sweep failed with #{length(summary.errors)} errors")
+    end
   end
 end

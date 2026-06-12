@@ -7,7 +7,7 @@ defmodule Maxio.S3.Handlers.Tagging do
   """
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Tags}
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{Authz, Error, Log}
   alias Maxio.S3.RequestParsers.Tagging, as: Parser
   alias Maxio.S3.Views.Tagging, as: View
   alias Maxio.Versioning.VersionId
@@ -20,6 +20,7 @@ defmodule Maxio.S3.Handlers.Tagging do
     {bucket, key, vid, conn} = obj_ctx(conn)
     {conn, xml} = read_small_body!(conn)
     tags = parse_validate!(xml, :object)
+    :ok = Authz.authorize_put_object_tagging(conn, bucket, key, vid, tags)
 
     case Objects.put_tags(bucket, key, tags, vid) do
       :ok ->

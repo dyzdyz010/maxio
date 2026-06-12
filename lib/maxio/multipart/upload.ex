@@ -12,7 +12,14 @@ defmodule Maxio.Multipart.Upload do
     field :bucket_name, :string
     field :key, :string
     field :content_type, :string, default: "binary/octet-stream"
+    field :content_encoding, :string
+    field :content_disposition, :string
+    field :cache_control, :string
+    field :expires, :string
     field :storage_class, :string, default: "STANDARD"
+    field :acl_canned, :string, default: "private"
+    field :acl_grants, :map, default: %{"grants" => []}
+    field :sse_algorithm, :string
     field :owner, :string
     field :metadata, :map, default: %{}
 
@@ -22,7 +29,18 @@ defmodule Maxio.Multipart.Upload do
   end
 
   @required [:upload_id, :bucket_name, :key, :owner]
-  @optional [:content_type, :storage_class, :metadata]
+  @optional [
+    :content_type,
+    :content_encoding,
+    :content_disposition,
+    :cache_control,
+    :expires,
+    :storage_class,
+    :acl_canned,
+    :acl_grants,
+    :sse_algorithm,
+    :metadata
+  ]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(upload, attrs) do

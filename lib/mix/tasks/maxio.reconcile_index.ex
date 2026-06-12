@@ -7,6 +7,7 @@ defmodule Mix.Tasks.Maxio.ReconcileIndex do
       mix maxio.reconcile_index --dry-run          # 只报告（would-计数）绝不写 PG
       mix maxio.reconcile_index --bucket <name>    # 仅扫指定桶（可与 --dry-run 组合）
       mix maxio.reconcile_index --force            # 写权威非 :sidecar 时仍强制执行（危险，见下）
+      mix maxio.reconcile_index --cleanup-orphan-shards --orphan-cleanup-min-age-ms 172800000
 
   **写权威前置条件（安全闸）**：reconcile 以「盘上 sidecar = 写权威」为前提，仅在
   `config :maxio, :authoritative_source` 的 `write: :sidecar` 下有意义。默认 `:pg` 权威下
@@ -18,20 +19,38 @@ defmodule Mix.Tasks.Maxio.ReconcileIndex do
   以盘为权威重写 PG 索引的全部后果。
 
   报告字段：scanned（盘上检视的版本数）/ upserted（缺行/stale 收敛）/ gc（孤儿行删除）/
-  skipped（端点不可达跳过 + 写失败留待下轮）/ divergent（quorum 仲裁失败，绝不写）。
+  skipped（端点不可达跳过 + 写失败留待下轮）/ divergent（quorum 仲裁失败，绝不写）/
+  orphan_shards/orphan_bytes（盘上残留 part.0 取证）/ orphan_cleaned/orphan_cleaned_bytes。
+  orphan shard 清理默认关闭；`--cleanup-orphan-shards` 显式开启真实删除，仍要求 sidecar 写权威、
+  全端点可达、对象锁、二次探针、年龄门和 per-run 删除上限；`--orphan-cleanup-dry-run`
+  只计 would-clean 且保留字节。全局 `--dry-run` 会把清理降级为 dry-run。
   逐对象动作的结构化日志（action: :reconcile_index / :reverse_gc）随轮输出。
-  无分布式拓扑（单机 FS / dev）→ status=no_topology 安全 no-op（盘上枚举需要拓扑端点）。
+  无分布式拓扑且非 FS 后端 → status=no_topology 安全 no-op（盘上枚举需要拓扑端点）；
+  FS 后端无需拓扑配置——B6-2 起 `run_once` 自动注入合成单端点 topology
+  （`{Node.self(), data_dir}`，quorum=1），FS 单机同样可 reconcile。
   """
   use Mix.Task
 
   @impl true
   def run(args) do
     {opts, rest, invalid} =
-      OptionParser.parse(args, strict: [dry_run: :boolean, bucket: :string, force: :boolean])
+      OptionParser.parse(args,
+        strict: [
+          dry_run: :boolean,
+          bucket: :string,
+          force: :boolean,
+          cleanup_orphan_shards: :boolean,
+          orphan_cleanup_dry_run: :boolean,
+          orphan_cleanup_min_age_ms: :integer,
+          orphan_cleanup_max_deletes: :integer
+        ]
+      )
 
     if rest != [] or invalid != [] do
       Mix.raise(
         "usage: mix maxio.reconcile_index [--dry-run] [--bucket <name>] [--force] " <>
+          "[--cleanup-orphan-shards] [--orphan-cleanup-dry-run] " <>
+          "[--orphan-cleanup-min-age-ms <ms>] [--orphan-cleanup-max-deletes <n>] " <>
           "(unexpected: #{inspect(rest ++ Enum.map(invalid, &elem(&1, 0)))})"
       )
     end
@@ -42,19 +61,27 @@ defmodule Mix.Tasks.Maxio.ReconcileIndex do
       Maxio.Storage.Scanner.run_once(
         dry_run: Keyword.get(opts, :dry_run, false),
         bucket: Keyword.get(opts, :bucket),
-        force: Keyword.get(opts, :force, false)
+        force: Keyword.get(opts, :force, false),
+        cleanup_orphan_shards: Keyword.get(opts, :cleanup_orphan_shards, false),
+        orphan_cleanup_dry_run: Keyword.get(opts, :orphan_cleanup_dry_run, false),
+        orphan_cleanup_min_age_ms: Keyword.get(opts, :orphan_cleanup_min_age_ms),
+        orphan_cleanup_max_deletes: Keyword.get(opts, :orphan_cleanup_max_deletes)
       )
 
     IO.puts(
       "[maxio reconcile_index] status=#{report.status} dry_run=#{report.dry_run} " <>
         "buckets=#{report.buckets} scanned=#{report.scanned} upserted=#{report.upserted} " <>
-        "gc=#{report.gc} skipped=#{report.skipped} divergent=#{report.divergent}"
+        "gc=#{report.gc} skipped=#{report.skipped} divergent=#{report.divergent} " <>
+        "orphan_shards=#{report.orphan_shards} orphan_bytes=#{report.orphan_bytes} " <>
+        "orphan_cleaned=#{report.orphan_cleaned} " <>
+        "orphan_cleaned_bytes=#{report.orphan_cleaned_bytes}"
     )
 
     if report.status == :no_topology do
       IO.puts(
         "[maxio reconcile_index] no distributed topology configured — nothing scanned " <>
-          "(reconcile requires Maxio.Cluster.Topology; FS 单机 sidecar 接线 = B6-1 defer)"
+          "(reconcile requires Maxio.Cluster.Topology for non-FS backends; FS 后端会自动" <>
+          "注入合成单端点 topology，B6-2)"
       )
     end
 

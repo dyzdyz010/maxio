@@ -244,7 +244,9 @@ defmodule Maxio.RouteBRealPutSidecarAuthorityE2ETest do
       {:ok, raw_stream} =
         Maxio.Storage.Distributed.get(@bucket, "ksse", "null", nil, put_opts(topo))
 
-      decrypted = SSE.unwrap_stream(raw_stream, obj.sse_envelope) |> IO.iodata_to_binary()
+      decrypted =
+        SSE.unwrap_stream(raw_stream, obj.sse_envelope) |> Enum.to_list() |> IO.iodata_to_binary()
+
       assert decrypted == plaintext
     end
   end
