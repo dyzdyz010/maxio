@@ -5,11 +5,12 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
 
       mix maxio.rebalance.run --job-id <uuid> --destination-set 1
       mix maxio.rebalance.run <uuid> --destination-set 1 --max-versions 500
+      mix maxio.rebalance.run --auto-destination
       mix maxio.rebalance.run --destination-set 1 --dry-run --json
 
   The command copies versions/delete markers from the job's target set to the
-  explicit destination set, then switches PG placement. It does not delete source
-  shards, mutate topology, or choose destinations automatically.
+  explicit or free-space selected destination set, then switches PG placement. It
+  does not delete source shards, mutate topology, or remove pools.
   """
   use Mix.Task
 
@@ -22,6 +23,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
         strict: [
           job_id: :string,
           destination_set: :integer,
+          auto_destination: :boolean,
           max_versions: :integer,
           page_size: :integer,
           dry_run: :boolean,
@@ -37,7 +39,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
 
       Mix.raise(
         "usage: mix maxio.rebalance.run [JOB_ID|--job-id <uuid>] --destination-set <id> " <>
-          "[--max-versions <n>] [--page-size <n>] [--dry-run] [--json] " <>
+          "[--auto-destination] [--max-versions <n>] [--page-size <n>] [--dry-run] [--json] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
     end
@@ -57,6 +59,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
   defp run_opts(opts) do
     [
       destination_set_id: Keyword.get(opts, :destination_set),
+      auto_destination: Keyword.get(opts, :auto_destination, false),
       max_versions: Keyword.get(opts, :max_versions),
       page_size: Keyword.get(opts, :page_size),
       dry_run: Keyword.get(opts, :dry_run, false)
@@ -81,13 +84,16 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
           "target_set_id=#{report.target_set_id} destination_set_id=#{report.destination_set_id} " <>
           "dry_run=#{report.dry_run} scanned=#{report.scanned} moved=#{report.moved} " <>
           "skipped=#{report.skipped} errors=#{report.errors} truncated=#{report.truncated} " <>
-          "source_cleanup=false topology_mutation=false"
+          "source_cleanup=false free_space_placement=#{report.free_space_placement} " <>
+          "topology_mutation=false"
       )
     end
   end
 
   defp error_message(:not_found), do: "no active decommission job found"
-  defp error_message(:missing_destination_set_id), do: "missing required --destination-set <id>"
+
+  defp error_message(:missing_destination_set_id),
+    do: "missing required --destination-set <id> or --auto-destination"
 
   defp error_message(:destination_matches_target),
     do: "--destination-set must differ from the decommission target set"
@@ -120,6 +126,14 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
 
   defp error_message({:destination_mismatch, existing, requested}) do
     "job destination_set_id=#{inspect(existing)} does not match requested --destination-set #{inspect(requested)}"
+  end
+
+  defp error_message({:no_healthy_destination_set, target, _bytes, candidates}) do
+    "no healthy destination set available for decommission target #{inspect(target)}; candidates=#{inspect(candidates)}"
+  end
+
+  defp error_message({:insufficient_destination_free_space, target, bytes, candidates}) do
+    "no destination set has enough free space for target #{inspect(target)} bytes=#{bytes}; candidates=#{inspect(candidates)}"
   end
 
   defp error_message(reason), do: "rebalance run failed: #{inspect(reason)}"

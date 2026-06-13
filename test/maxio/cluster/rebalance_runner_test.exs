@@ -179,6 +179,39 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
     assert is_nil(finished.cursor_bucket)
   end
 
+  test "auto_destination chooses healthy set by DriveStats free space", ctx do
+    bucket = bucket_name("rebalance-auto-destination")
+    opts = dist_opts(ctx)
+    source_opts = Keyword.put(opts, :placement_set_id, 0)
+    destination_opts = Keyword.put(opts, :placement_set_id, 1)
+    key = key_for_set(bucket, ctx.topology, 0)
+    body = "auto-destination-body"
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    :ok = Distributed.put_bucket(bucket, opts)
+    {:ok, _object} = put_object_version!(bucket, key, "v1", body, source_opts)
+    {:ok, job} = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
+
+    assert {:ok, report} =
+             Runner.run_once(job.id,
+               topology: ctx.topology,
+               transport: InProcess,
+               auto_destination: true,
+               provider: free_space_provider(%{"s0" => 2_000, "s1" => 8_000})
+             )
+
+    assert report.status == :ok
+    assert report.destination_set_id == 1
+    assert report.free_space_placement
+    assert report.moved == 1
+
+    assert {:ok, moved} = Objects.get_version(bucket, key, "v1")
+    assert moved.placement_set_id == 1
+
+    assert {:ok, stream} = Distributed.get(bucket, key, "v1", nil, destination_opts)
+    assert IO.iodata_to_binary(Enum.to_list(stream)) == body
+  end
+
   test "runner refuses sidecar read or list authority", ctx do
     bucket = bucket_name("rebalance-authority")
     {:ok, _bucket} = Buckets.create(bucket, @owner)
@@ -310,6 +343,38 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
   end
 
   defp dist_opts(ctx), do: [topology: ctx.topology, transport: InProcess]
+
+  defp put_object_version!(bucket, key, version_id, body, opts) do
+    {:ok, write_result} = Distributed.put(bucket, key, version_id, [body], opts)
+
+    Objects.put_version_with_id(
+      bucket,
+      key,
+      version_id,
+      %{size: byte_size(body), etag: write_result.etag}
+      |> Map.merge(Placement.attrs_from_result(write_result))
+    )
+  end
+
+  defp free_space_provider(prefix_free_bytes) do
+    fn drive ->
+      normalized = String.replace(drive, "\\", "/")
+
+      free_bytes =
+        Enum.find_value(prefix_free_bytes, 1_000, fn {fragment, free} ->
+          if String.contains?(normalized, fragment), do: free
+        end)
+
+      {:ok,
+       %{
+         mount_root: drive,
+         capacity_bytes: 10_000,
+         free_bytes: free_bytes,
+         source: :test,
+         precision: :exact
+       }}
+    end
+  end
 
   defp delete_marker_sidecar?(topology, key, bucket, version_id, set_id) do
     {:ok, rel} = Paths.object_rel(bucket, key, version_id)

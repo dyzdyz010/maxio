@@ -7,9 +7,9 @@ defmodule Maxio.Cluster.Rebalance.Scheduler do
     * `Maxio.Cluster.Rebalance.Runner.run_once/2` for the copy pass.
     * `Maxio.Cluster.Rebalance.SourceCleanup.cleanup_once/2` for old source copies.
 
-  It does not choose free-space placement, mutate topology, or remove pools from
-  the deployment. Operators must still create the job and either persist or
-  configure a destination set before background copy can start.
+  It does not mutate topology or remove pools from the deployment. When no
+  explicit destination is configured, it can ask the runner to choose one from
+  DriveStats free-space telemetry.
   """
 
   use GenServer
@@ -24,10 +24,15 @@ defmodule Maxio.Cluster.Rebalance.Scheduler do
     :job_id,
     :destination_set_id,
     :destination_sets,
+    :auto_destination,
     :max_versions,
     :page_size,
     :topology,
     :transport,
+    :provider,
+    :drive_stats_fun,
+    :now_ms,
+    :now_fun,
     :authoritative_source,
     :runner_lock_opts
   ]
@@ -227,10 +232,15 @@ defmodule Maxio.Cluster.Rebalance.Scheduler do
       cfg[:destination_set_id] ||
         destination_from_mapping(cfg[:destination_sets], job.target_set_id)
 
-    if is_integer(destination) do
-      Keyword.put(opts, :destination_set_id, destination)
-    else
-      opts
+    cond do
+      is_integer(destination) ->
+        Keyword.put(opts, :destination_set_id, destination)
+
+      cfg[:auto_destination] ->
+        Keyword.put(opts, :auto_destination, true)
+
+      true ->
+        opts
     end
   end
 
@@ -297,6 +307,8 @@ defmodule Maxio.Cluster.Rebalance.Scheduler do
         ),
       auto_source_cleanup:
         Keyword.get(opts, :auto_source_cleanup, Keyword.get(cfg, :auto_source_cleanup, true)),
+      auto_destination:
+        Keyword.get(opts, :auto_destination, Keyword.get(cfg, :auto_destination, true)),
       destination_set_id:
         Keyword.get(opts, :destination_set_id, Keyword.get(cfg, :destination_set_id)),
       destination_sets: Keyword.get(opts, :destination_sets, Keyword.get(cfg, :destination_sets)),

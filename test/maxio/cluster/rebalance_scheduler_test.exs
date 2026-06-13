@@ -74,7 +74,7 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
   test "missing destination fails closed and is logged", ctx do
     {:ok, job} = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
 
-    pid = start_scheduler!(enabled: false, topology: ctx.topology)
+    pid = start_scheduler!(enabled: false, topology: ctx.topology, auto_destination: false)
 
     log =
       capture_log(fn ->
@@ -110,6 +110,27 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
     assert {:ok, %{phase: :copy, scheduler: true, status: :partial}} = Scheduler.run_now(pid, [])
     assert_receive {:copy_runner, ^job_id, opts}
     assert Keyword.fetch!(opts, :destination_set_id) == 1
+    assert Keyword.fetch!(opts, :topology) == ctx.topology
+  end
+
+  test "run_now asks runner for auto destination when no explicit mapping exists", ctx do
+    parent = self()
+    {:ok, job} = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
+    job_id = job.id
+
+    pid =
+      start_scheduler!(
+        enabled: false,
+        topology: ctx.topology,
+        copy_runner: fn job_id, opts ->
+          send(parent, {:copy_runner, job_id, opts})
+          {:ok, %{status: :partial, job_id: job_id}}
+        end
+      )
+
+    assert {:ok, %{phase: :copy, scheduler: true, status: :partial}} = Scheduler.run_now(pid, [])
+    assert_receive {:copy_runner, ^job_id, opts}
+    assert Keyword.fetch!(opts, :auto_destination)
     assert Keyword.fetch!(opts, :topology) == ctx.topology
   end
 
@@ -195,6 +216,7 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
         enabled: false,
         topology: ctx.topology,
         transport: InProcess,
+        auto_destination: false,
         destination_sets: %{0 => 1}
       )
 
@@ -214,6 +236,7 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
         topology: ctx.topology,
         transport: InProcess,
         auto_source_cleanup: false,
+        auto_destination: false,
         destination_sets: %{0 => 1}
       )
 
@@ -243,8 +266,7 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
       start_scheduler!(
         enabled: false,
         topology: ctx.topology,
-        transport: InProcess,
-        destination_sets: %{0 => 1}
+        transport: InProcess
       )
 
     assert {:ok, copy} = Scheduler.run_now(pid, [])

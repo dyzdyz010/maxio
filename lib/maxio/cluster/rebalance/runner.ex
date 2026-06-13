@@ -4,13 +4,14 @@ defmodule Maxio.Cluster.Rebalance.Runner do
 
   This is a restricted M8 data movement primitive: it copies object versions and
   delete markers from a persisted source set to an operator-selected destination
-  set, then atomically switches the PG placement row. It never deletes source
-  shards, mutates topology, or chooses a destination automatically.
+  set, then atomically switches the PG placement row. It can choose a bounded
+  DriveStats-based destination when explicitly requested, but it never deletes
+  source shards or mutates topology.
   """
 
   alias Maxio.{Buckets, ObjectMeta, Objects, Storage}
   alias Maxio.Cluster.{Lock, Placement, Topology}
-  alias Maxio.Cluster.Rebalance.{Job, Jobs}
+  alias Maxio.Cluster.Rebalance.{Destination, Job, Jobs}
   alias Maxio.S3.Log
 
   @type report :: %{
@@ -21,7 +22,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
           dry_run: boolean(),
           truncated: boolean(),
           source_cleanup: false,
-          free_space_placement: false,
+          free_space_placement: boolean(),
           topology_mutation: false,
           scanned: non_neg_integer(),
           moved: non_neg_integer(),
@@ -34,7 +35,8 @@ defmodule Maxio.Cluster.Rebalance.Runner do
 
   Options:
 
-    * `:destination_set_id` - required until the job has a persisted destination.
+    * `:destination_set_id` - explicit destination set.
+    * `:auto_destination` - when true, choose a destination by DriveStats free space.
     * `:max_versions` - cap versions/delete markers processed in this invocation.
     * `:page_size` - ListObjectVersions page size; defaults to job page size.
     * `:dry_run` - enumerate target rows without writing bytes or job progress.
@@ -56,6 +58,9 @@ defmodule Maxio.Cluster.Rebalance.Runner do
          :ok <- ensure_pg_authority(opts),
          {:ok, destination_set_id} <- resolve_destination(job, opts),
          :ok <- validate_sets(job.target_set_id, destination_set_id, opts) do
+      opts =
+        Keyword.put(opts, :free_space_destination, free_space_destination_selected?(job, opts))
+
       run_job(job, destination_set_id, opts)
     end
   end
@@ -135,6 +140,15 @@ defmodule Maxio.Cluster.Rebalance.Runner do
       is_integer(job.destination_set_id) ->
         {:ok, job.destination_set_id}
 
+      Keyword.get(opts, :auto_destination, false) ->
+        case Destination.select_decommission_destination(
+               job.target_set_id,
+               destination_selection_opts(job, opts)
+             ) do
+          {:ok, %{set_id: set_id}} -> {:ok, set_id}
+          {:error, reason} -> {:error, reason}
+        end
+
       true ->
         {:error, :missing_destination_set_id}
     end
@@ -180,6 +194,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
       page_size: positive_int(Keyword.get(opts, :page_size), job.page_size || 500),
       max_versions: positive_int_or_nil(Keyword.get(opts, :max_versions)),
       dry_run: Keyword.get(opts, :dry_run, false),
+      free_space_placement: Keyword.get(opts, :free_space_destination, false),
       common_opts: common_opts,
       destination_opts: Keyword.put(common_opts, :placement_set_id, destination_set_id)
     ]
@@ -196,7 +211,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
       truncated: false,
       canceled: false,
       source_cleanup: false,
-      free_space_placement: false,
+      free_space_placement: Keyword.get(opts, :free_space_destination, false),
       topology_mutation: false,
       cursor_bucket: job.cursor_bucket,
       cursor_key_marker: job.cursor_key_marker,
@@ -571,7 +586,8 @@ defmodule Maxio.Cluster.Rebalance.Runner do
         "job_id=#{report.job_id} status=#{report.status} target_set_id=#{report.target_set_id} " <>
           "destination_set_id=#{report.destination_set_id} scanned=#{report.scanned} " <>
           "moved=#{report.moved} skipped=#{report.skipped} errors=#{report.errors} " <>
-          "truncated=#{report.truncated} source_cleanup=false topology_mutation=false"
+          "truncated=#{report.truncated} source_cleanup=false " <>
+          "free_space_placement=#{report.free_space_placement} topology_mutation=false"
     )
   end
 
@@ -620,6 +636,25 @@ defmodule Maxio.Cluster.Rebalance.Runner do
       :error ->
         if Topology.configured?(), do: Topology.all_set_ids(), else: []
     end
+  end
+
+  defp destination_selection_opts(job, opts) do
+    opts
+    |> Keyword.take([
+      :topology,
+      :transport,
+      :provider,
+      :drive_stats_fun,
+      :now_ms,
+      :now_fun
+    ])
+    |> Keyword.put(:bytes_required, job.plan_bytes || 0)
+  end
+
+  defp free_space_destination_selected?(%Job{} = job, opts) do
+    Keyword.get(opts, :auto_destination, false) and
+      not is_integer(Keyword.get(opts, :destination_set_id)) and
+      not is_integer(job.destination_set_id)
   end
 
   defp modtime_ns(%{updated_at: %DateTime{} = updated_at}),

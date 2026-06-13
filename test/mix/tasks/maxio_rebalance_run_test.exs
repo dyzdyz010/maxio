@@ -57,6 +57,39 @@ defmodule Mix.Tasks.Maxio.RebalanceRunTest do
     assert is_nil(unchanged.destination_set_id)
   end
 
+  test "dry-run can choose destination from free space telemetry" do
+    topology = topology()
+    :persistent_term.put(@topology_key, topology)
+
+    bucket = bucket_name("rebalance-run-cli-auto")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 5,
+        etag: "e5",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, job} = Jobs.start_decommission(0, include_drive_stats: false)
+
+    output =
+      capture_io(fn ->
+        Run.run(["--job-id", job.id, "--auto-destination", "--dry-run"])
+      end)
+
+    assert output =~ "[maxio rebalance.run]"
+    assert output =~ "status=dry_run"
+    assert output =~ "destination_set_id=1"
+    assert output =~ "free_space_placement=true"
+
+    assert {:ok, unchanged} = Jobs.get(job.id)
+    assert unchanged.status == "planned"
+    assert is_nil(unchanged.destination_set_id)
+  end
+
   test "locked foreground runner fails loudly" do
     topology = topology()
     :persistent_term.put(@topology_key, topology)

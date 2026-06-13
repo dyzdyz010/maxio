@@ -164,13 +164,15 @@ config :maxio, :fresh_drive_heal_scheduler,
 
 # M8 decommission scheduler. Disabled by default; when enabled it advances the
 # existing decommission copy-pass and guarded source cleanup primitives. Operators
-# must still create jobs and configure/persist destination sets. It does not pick
-# free-space placement, mutate topology, or remove pools from deployment config.
+# must still create jobs. If no destination set is explicitly configured, the
+# scheduler asks the runner to choose one from DriveStats free-space telemetry.
+# It does not mutate topology or remove pools from deployment config.
 config :maxio, :rebalance_scheduler,
   enabled: false,
   interval_ms: 300_000,
   initial_delay_ms: 60_000,
   auto_source_cleanup: true,
+  auto_destination: true,
   destination_sets: %{},
   run_opts: [],
   lock_ttl_ms: 60_000,
