@@ -336,7 +336,8 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
    同时满足后删除 `part.0`。M8 续作已补保守 token-bucket object pacing、本节点
    S3 handler in-flight + ShardServer storage-op 自适应对象间暂停、cached peer pressure aggregation、
    node-local drive health 长窗口离线观测、persistent software drive identity replacement detection、
-   operator-triggered fresh-drive heal pass，以及默认关闭的 marker-based 自动 fresh-drive heal scheduler；
+   operator-triggered fresh-drive heal pass、默认关闭的 marker-based 自动 fresh-drive heal scheduler，以及
+   read-only rebalance/decommission planning telemetry；
    仍 defer：OS/设备级 drive queue/吞吐采样、硬件/物理 drive identity 与完整 replacement/rebalance/decommission workflow。
 5. **多 parity / storage class**：单一 (K,M)；`x-amz-storage-class` → 不同 EC = defer（沿用 M6）。
 6. **parity upgrade on degraded write**：写未达 write_quorum 即 `{:error, :write_quorum}`（绝不静默）；
@@ -360,7 +361,7 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 **node-local drive health long-window offline registry**、**software drive identity replacement detection**、
 **drive IO latency/throughput telemetry CLI**、**drive filesystem capacity stats CLI**、
 **operator-triggered fresh-drive heal workflow** 和
-**config-gated fresh-drive heal scheduler**。
+**config-gated fresh-drive heal scheduler**，并新增 **read-only rebalance/decommission planning CLI**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -413,6 +414,12 @@ M8-3a/b/c/d/e 已提供：
   默认 provider 使用 OTP `os_mon`/`disksup`，测试和特殊部署可经 `config :maxio, :drive_stats, provider: fun/1`
   注入。该信号是 filesystem capacity 观测，不是 queue depth、SMART、硬件身份、物理吞吐，也暂不参与
   对象路由、free-space placement 或 rebalance。
+- `Maxio.Cluster.Rebalance` / `mix maxio.rebalance.plan [--current-only] [--decommission-set <id>] [--page-size <n>] [--no-drive-stats] [--json]`：
+  对当前 topology 做只读规划取证，从 PG 对象元数据分页枚举对象/版本/delete marker，并按现有
+  `Router.set_for/3` 汇总每个 erasure set 的 logical bytes、版本数、delete marker 数与可选 drive
+  capacity/free-space。`--decommission-set` 仅估算目标 set 受影响对象范围；不移动数据、不改路由、
+  不实现 MinIO `mc admin rebalance/decommission` 状态机。该估算基于当前 topology，历史 topology
+  写入对象和物理 shard bytes 仍需后续迁移层处理。
 - `Maxio.Cluster.PressureAggregator`：监督树内缓存 peer node 的 `IOPressure.local_snapshot/0`，
   后台按 `config :maxio, :io_pressure` 刷新；scrubber/fresh-drive gate 只读本地计数 + 新鲜缓存，
   peer timeout/stale/down 均 fail-open，不在对象间同步 RPC。
@@ -470,5 +477,6 @@ M8 剩余：
   当前已有保守 token-bucket object pacing（`max_objects_per_sec` + `object_burst`，允许 burst 后限制下一次对象扫描开始），
   本节点/缓存 peer 的 S3 handler in-flight + ShardServer storage-op 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-combined`）、
   node-local ShardServer IO latency/throughput telemetry、filesystem capacity/free-space stats、node-local drive-offline 长窗口观测、software UUID same-path replacement detection，
-  手动 `mix maxio.heal.fresh_drives` marker 消费，以及默认关闭的 fresh-drive heal scheduler；
+  手动 `mix maxio.heal.fresh_drives` marker 消费、默认关闭的 fresh-drive heal scheduler，以及只读
+  `mix maxio.rebalance.plan` 当前 topology logical inventory；
   尚未接入 OS/设备级磁盘队列/硬件吞吐反馈、硬件/物理 replacement identity、free-space placement、decommission 或 rebalance 数据迁移。
