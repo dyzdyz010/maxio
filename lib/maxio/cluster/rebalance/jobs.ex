@@ -112,6 +112,13 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
       target_set_id: job.target_set_id,
       destination_set_id: job.destination_set_id,
       source_cleanup_status: job.source_cleanup_status,
+      source_cleanup_cursor_bucket: job.source_cleanup_cursor_bucket,
+      source_cleanup_cursor_key_marker: job.source_cleanup_cursor_key_marker,
+      source_cleanup_cursor_version_id_marker: job.source_cleanup_cursor_version_id_marker,
+      source_cleanup_scanned: job.source_cleanup_scanned,
+      source_cleanup_deleted: job.source_cleanup_deleted,
+      source_cleanup_skipped: job.source_cleanup_skipped,
+      source_cleanup_errors: job.source_cleanup_errors,
       current_only: job.current_only,
       include_drive_stats: job.include_drive_stats,
       page_size: job.page_size,
@@ -215,6 +222,77 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
           finished_at: now(opts)
         },
         ["running"]
+      )
+    end
+  end
+
+  @doc "Enter or resume the guarded source-shard cleanup phase for a decommission job."
+  @spec begin_source_cleanup(Job.t() | String.t(), keyword()) ::
+          {:ok, Job.t()} | {:error, term()}
+  def begin_source_cleanup(job_or_id, opts \\ []) do
+    with {:ok, job} <- fetch_job(job_or_id),
+         :ok <- ensure_source_cleanup_ready(job),
+         :ok <- ensure_no_other_active_job(job) do
+      guarded_begin_source_cleanup(job, opts)
+    end
+  end
+
+  @doc "Persist source cleanup counters and resume cursor."
+  @spec record_source_cleanup_progress(Job.t() | String.t(), map(), map()) ::
+          {:ok, Job.t()} | {:error, term()}
+  def record_source_cleanup_progress(job_or_id, counters, cursor_attrs \\ %{}) do
+    with {:ok, job} <- fetch_job(job_or_id) do
+      attrs =
+        %{
+          source_cleanup_scanned: Map.get(counters, :scanned, job.source_cleanup_scanned),
+          source_cleanup_deleted: Map.get(counters, :deleted, job.source_cleanup_deleted),
+          source_cleanup_skipped: Map.get(counters, :skipped, job.source_cleanup_skipped),
+          source_cleanup_errors: Map.get(counters, :errors, job.source_cleanup_errors)
+        }
+        |> Map.merge(
+          Map.take(cursor_attrs, [
+            :source_cleanup_cursor_bucket,
+            :source_cleanup_cursor_key_marker,
+            :source_cleanup_cursor_version_id_marker
+          ])
+        )
+
+      monotonic_source_cleanup_update(job, attrs)
+    end
+  end
+
+  @doc "Mark source cleanup complete and clear its resume cursor."
+  @spec complete_source_cleanup(Job.t() | String.t(), keyword()) ::
+          {:ok, Job.t()} | {:error, term()}
+  def complete_source_cleanup(job_or_id, opts \\ []) do
+    with {:ok, job} <- fetch_job(job_or_id) do
+      guarded_finish_source_cleanup(
+        job,
+        %{
+          status: "complete",
+          source_cleanup_status: "complete",
+          source_cleanup_cursor_bucket: nil,
+          source_cleanup_cursor_key_marker: nil,
+          source_cleanup_cursor_version_id_marker: nil,
+          finished_at: now(opts)
+        }
+      )
+    end
+  end
+
+  @doc "Mark source cleanup failed with a structured reason summary."
+  @spec fail_source_cleanup(Job.t() | String.t(), term(), keyword()) ::
+          {:ok, Job.t()} | {:error, term()}
+  def fail_source_cleanup(job_or_id, reason, opts \\ []) do
+    with {:ok, job} <- fetch_job(job_or_id) do
+      guarded_finish_source_cleanup(
+        job,
+        %{
+          status: "failed",
+          source_cleanup_status: "failed",
+          error_reason: inspect(reason),
+          finished_at: now(opts)
+        }
       )
     end
   end
@@ -333,6 +411,10 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
       progress_moved: 0,
       progress_skipped: 0,
       progress_errors: 0,
+      source_cleanup_scanned: 0,
+      source_cleanup_deleted: 0,
+      source_cleanup_skipped: 0,
+      source_cleanup_errors: 0,
       started_at: now(opts),
       requested_by: Keyword.get(opts, :requested_by, "mix")
     }
@@ -358,12 +440,7 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
     job_result =
       guarded_update_job(
         job,
-        %{
-          status: "canceled",
-          data_movement_status: "canceled",
-          cancel_requested_at: finished_at,
-          finished_at: finished_at
-        },
+        cancel_attrs(job, finished_at),
         @active_statuses
       )
 
@@ -382,6 +459,32 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
   end
 
   defp cancel_job(%Job{} = job, _opts), do: {:error, {:not_cancelable, job.status}}
+
+  defp cancel_attrs(
+         %Job{
+           kind: "decommission",
+           data_movement_status: "complete",
+           source_cleanup_status: "moving"
+         },
+         finished_at
+       ) do
+    %{
+      status: "canceled",
+      data_movement_status: "complete",
+      source_cleanup_status: "skipped",
+      cancel_requested_at: finished_at,
+      finished_at: finished_at
+    }
+  end
+
+  defp cancel_attrs(_job, finished_at) do
+    %{
+      status: "canceled",
+      data_movement_status: "canceled",
+      cancel_requested_at: finished_at,
+      finished_at: finished_at
+    }
+  end
 
   defp ensure_destination_compatible(
          %Job{kind: "decommission", target_set_id: target},
@@ -410,6 +513,43 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
 
   defp ensure_destination_compatible(%Job{kind: kind}, _destination),
     do: {:error, {:unsupported_job_kind, kind}}
+
+  defp ensure_source_cleanup_ready(%Job{kind: kind}) when kind != "decommission",
+    do: {:error, {:unsupported_job_kind, kind}}
+
+  defp ensure_source_cleanup_ready(%Job{data_movement_status: status})
+       when status != "complete",
+       do: {:error, {:data_movement_not_complete, status}}
+
+  defp ensure_source_cleanup_ready(%Job{status: "canceled"}), do: {:error, :canceled}
+
+  defp ensure_source_cleanup_ready(%Job{source_cleanup_status: "complete"}),
+    do: {:error, :source_cleanup_complete}
+
+  defp ensure_source_cleanup_ready(%Job{source_cleanup_status: "skipped"}),
+    do: {:error, :source_cleanup_skipped}
+
+  defp ensure_source_cleanup_ready(%Job{target_set_id: target, destination_set_id: destination})
+       when is_integer(target) and is_integer(destination) and target != destination,
+       do: :ok
+
+  defp ensure_source_cleanup_ready(%Job{target_set_id: target, destination_set_id: destination})
+       when target == destination,
+       do: {:error, :destination_matches_target}
+
+  defp ensure_source_cleanup_ready(%Job{destination_set_id: nil}),
+    do: {:error, :missing_destination_set_id}
+
+  defp ensure_source_cleanup_ready(%Job{target_set_id: nil}),
+    do: {:error, :missing_target_set_id}
+
+  defp ensure_no_other_active_job(%Job{id: id}) do
+    case active_job() do
+      nil -> :ok
+      %Job{id: ^id} -> :ok
+      %Job{} = job -> {:error, {:active_job_exists, job}}
+    end
+  end
 
   defp fetch_job(%Job{} = job), do: {:ok, job}
   defp fetch_job(id) when is_binary(id), do: get(id)
@@ -509,6 +649,84 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
     end
   end
 
+  defp monotonic_source_cleanup_update(%Job{} = job, attrs) do
+    changeset = Job.changeset(job, attrs)
+
+    if changeset.valid? do
+      scanned = Ecto.Changeset.get_field(changeset, :source_cleanup_scanned)
+      deleted = Ecto.Changeset.get_field(changeset, :source_cleanup_deleted)
+      skipped = Ecto.Changeset.get_field(changeset, :source_cleanup_skipped)
+      errors = Ecto.Changeset.get_field(changeset, :source_cleanup_errors)
+
+      cursor_bucket =
+        Ecto.Changeset.get_field(changeset, :source_cleanup_cursor_bucket)
+
+      cursor_key_marker =
+        Ecto.Changeset.get_field(changeset, :source_cleanup_cursor_key_marker)
+
+      cursor_version_id_marker =
+        Ecto.Changeset.get_field(changeset, :source_cleanup_cursor_version_id_marker)
+
+      now = DateTime.utc_now()
+
+      query =
+        from(j in Job,
+          where:
+            j.id == ^job.id and j.status == "running" and
+              j.source_cleanup_status == "moving",
+          update: [
+            set: [
+              source_cleanup_scanned:
+                fragment("GREATEST(?, ?)", j.source_cleanup_scanned, ^scanned),
+              source_cleanup_deleted:
+                fragment("GREATEST(?, ?)", j.source_cleanup_deleted, ^deleted),
+              source_cleanup_skipped:
+                fragment("GREATEST(?, ?)", j.source_cleanup_skipped, ^skipped),
+              source_cleanup_errors: fragment("GREATEST(?, ?)", j.source_cleanup_errors, ^errors),
+              source_cleanup_cursor_bucket:
+                fragment(
+                  "CASE WHEN ? > ? THEN ? ELSE ? END",
+                  ^scanned,
+                  j.source_cleanup_scanned,
+                  ^cursor_bucket,
+                  j.source_cleanup_cursor_bucket
+                ),
+              source_cleanup_cursor_key_marker:
+                fragment(
+                  "CASE WHEN ? > ? THEN ? ELSE ? END",
+                  ^scanned,
+                  j.source_cleanup_scanned,
+                  ^cursor_key_marker,
+                  j.source_cleanup_cursor_key_marker
+                ),
+              source_cleanup_cursor_version_id_marker:
+                fragment(
+                  "CASE WHEN ? > ? THEN ? ELSE ? END",
+                  ^scanned,
+                  j.source_cleanup_scanned,
+                  ^cursor_version_id_marker,
+                  j.source_cleanup_cursor_version_id_marker
+                ),
+              updated_at: ^now
+            ]
+          ]
+        )
+
+      case Repo.update_all(query, []) do
+        {1, _rows} ->
+          get(job.id)
+
+        {0, _rows} ->
+          case get(job.id) do
+            {:ok, %Job{} = stale} -> {:error, {:stale_job_status, stale.status}}
+            {:error, reason} -> {:error, reason}
+          end
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
   defp guarded_begin_data_movement(%Job{} = job, attrs, destination_set_id) do
     changeset = Job.changeset(job, attrs)
 
@@ -550,6 +768,81 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
 
           {:error, reason} ->
             {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp guarded_begin_source_cleanup(%Job{} = job, opts) do
+    attrs = %{
+      status: "running",
+      source_cleanup_status: "moving",
+      error_reason: nil,
+      finished_at: nil
+    }
+
+    attrs = if job.started_at, do: attrs, else: Map.put(attrs, :started_at, now(opts))
+    changeset = Job.changeset(job, attrs)
+
+    if changeset.valid? do
+      changes =
+        changeset.changes
+        |> Map.put(:updated_at, DateTime.utc_now())
+        |> Enum.into([])
+
+      query =
+        from(j in Job,
+          where:
+            j.id == ^job.id and j.kind == "decommission" and
+              j.data_movement_status == "complete" and
+              j.status in ^["complete", "running", "failed"] and
+              j.source_cleanup_status in ^["not_started", "moving", "failed"] and
+              not is_nil(j.target_set_id) and not is_nil(j.destination_set_id) and
+              j.target_set_id != j.destination_set_id
+        )
+
+      case Repo.update_all(query, set: changes) do
+        {1, _rows} -> get(job.id)
+        {0, _rows} -> explain_source_cleanup_conflict(job.id)
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp guarded_finish_source_cleanup(%Job{} = job, attrs) do
+    changeset = Job.changeset(job, attrs)
+
+    if changeset.valid? do
+      changes =
+        changeset.changes
+        |> Map.put(:updated_at, DateTime.utc_now())
+        |> Enum.into([])
+
+      query =
+        from(j in Job,
+          where:
+            j.id == ^job.id and j.kind == "decommission" and j.status == "running" and
+              j.data_movement_status == "complete" and j.source_cleanup_status == "moving"
+        )
+
+      case Repo.update_all(query, set: changes) do
+        {1, _rows} -> get(job.id)
+        {0, _rows} -> explain_source_cleanup_conflict(job.id)
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp explain_source_cleanup_conflict(job_id) do
+    case get(job_id) do
+      {:ok, %Job{} = current} ->
+        case ensure_source_cleanup_ready(current) do
+          :ok -> {:error, :stale_job}
+          {:error, reason} -> {:error, reason}
         end
 
       {:error, reason} ->

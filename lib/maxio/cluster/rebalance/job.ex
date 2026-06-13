@@ -14,6 +14,13 @@ defmodule Maxio.Cluster.Rebalance.Job do
     field :target_set_id, :integer
     field :destination_set_id, :integer
     field :source_cleanup_status, :string, default: "not_started"
+    field :source_cleanup_cursor_bucket, :string
+    field :source_cleanup_cursor_key_marker, :string
+    field :source_cleanup_cursor_version_id_marker, :string
+    field :source_cleanup_scanned, :integer, default: 0
+    field :source_cleanup_deleted, :integer, default: 0
+    field :source_cleanup_skipped, :integer, default: 0
+    field :source_cleanup_errors, :integer, default: 0
     field :current_only, :boolean, default: false
     field :include_drive_stats, :boolean, default: true
     field :page_size, :integer, default: 500
@@ -41,7 +48,7 @@ defmodule Maxio.Cluster.Rebalance.Job do
   @kinds ~w(rebalance decommission)
   @statuses ~w(planned running cancel_requested complete failed canceled)
   @data_movement_statuses ~w(not_started moving paused complete failed canceled)
-  @source_cleanup_statuses ~w(not_started skipped complete failed)
+  @source_cleanup_statuses ~w(not_started moving skipped complete failed)
 
   @required [
     :kind,
@@ -60,12 +67,19 @@ defmodule Maxio.Cluster.Rebalance.Job do
     :progress_moved,
     :progress_skipped,
     :progress_errors,
+    :source_cleanup_scanned,
+    :source_cleanup_deleted,
+    :source_cleanup_skipped,
+    :source_cleanup_errors,
     :started_at
   ]
 
   @optional [
     :target_set_id,
     :destination_set_id,
+    :source_cleanup_cursor_bucket,
+    :source_cleanup_cursor_key_marker,
+    :source_cleanup_cursor_version_id_marker,
     :cursor_bucket,
     :cursor_key_marker,
     :cursor_version_id_marker,
@@ -93,6 +107,10 @@ defmodule Maxio.Cluster.Rebalance.Job do
     |> validate_number(:progress_moved, greater_than_or_equal_to: 0)
     |> validate_number(:progress_skipped, greater_than_or_equal_to: 0)
     |> validate_number(:progress_errors, greater_than_or_equal_to: 0)
+    |> validate_number(:source_cleanup_scanned, greater_than_or_equal_to: 0)
+    |> validate_number(:source_cleanup_deleted, greater_than_or_equal_to: 0)
+    |> validate_number(:source_cleanup_skipped, greater_than_or_equal_to: 0)
+    |> validate_number(:source_cleanup_errors, greater_than_or_equal_to: 0)
     |> validate_target_set()
     |> unique_constraint(:status, name: :cluster_rebalance_jobs_active_singleton_index)
   end

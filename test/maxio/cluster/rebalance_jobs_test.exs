@@ -263,6 +263,89 @@ defmodule Maxio.Cluster.RebalanceJobsTest do
     assert advanced.cursor_key_marker == "k-6"
   end
 
+  test "source cleanup progress is monotonic and active job guard blocks reentry" do
+    topology = topology()
+    bucket = bucket_name("cleanup-progress-job")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+
+    assert {:ok, job} = Jobs.start_decommission(0, topology: topology, include_drive_stats: false)
+    assert {:ok, running} = Jobs.begin_data_movement(job.id, 1)
+    assert {:ok, complete} = Jobs.complete_data_movement(running.id)
+    assert complete.status == "complete"
+    assert complete.data_movement_status == "complete"
+
+    assert {:ok, cleaning} = Jobs.begin_source_cleanup(complete.id)
+    assert cleaning.status == "running"
+    assert cleaning.source_cleanup_status == "moving"
+
+    assert {:ok, progressed} =
+             Jobs.record_source_cleanup_progress(
+               cleaning.id,
+               %{scanned: 5, deleted: 4, skipped: 1, errors: 0},
+               %{
+                 source_cleanup_cursor_bucket: bucket,
+                 source_cleanup_cursor_key_marker: "k-5",
+                 source_cleanup_cursor_version_id_marker: "v5"
+               }
+             )
+
+    assert progressed.source_cleanup_scanned == 5
+    assert progressed.source_cleanup_deleted == 4
+    assert progressed.source_cleanup_cursor_key_marker == "k-5"
+
+    assert {:ok, stale} =
+             Jobs.record_source_cleanup_progress(
+               cleaning.id,
+               %{scanned: 3, deleted: 2, skipped: 0, errors: 0},
+               %{
+                 source_cleanup_cursor_bucket: bucket,
+                 source_cleanup_cursor_key_marker: "k-3",
+                 source_cleanup_cursor_version_id_marker: "v3"
+               }
+             )
+
+    assert stale.source_cleanup_scanned == 5
+    assert stale.source_cleanup_deleted == 4
+    assert stale.source_cleanup_skipped == 1
+    assert stale.source_cleanup_cursor_key_marker == "k-5"
+    assert stale.source_cleanup_cursor_version_id_marker == "v5"
+
+    assert {:ok, cleaned} = Jobs.complete_source_cleanup(cleaning.id)
+    assert cleaned.status == "complete"
+    assert cleaned.source_cleanup_status == "complete"
+
+    assert {:ok, pending} =
+             Jobs.start_decommission(0, topology: topology, include_drive_stats: false)
+
+    assert {:ok, pending_running} = Jobs.begin_data_movement(pending.id, 1)
+    assert {:ok, pending_complete} = Jobs.complete_data_movement(pending_running.id)
+    assert {:ok, active} = Jobs.start_rebalance(topology: topology, include_drive_stats: false)
+
+    assert {:error, {:active_job_exists, blocker}} =
+             Jobs.begin_source_cleanup(pending_complete.id)
+
+    assert blocker.id == active.id
+  end
+
+  test "cancel during source cleanup preserves completed data movement state" do
+    topology = topology()
+    bucket = bucket_name("cleanup-cancel-job")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+
+    assert {:ok, job} = Jobs.start_decommission(0, topology: topology, include_drive_stats: false)
+    assert {:ok, running} = Jobs.begin_data_movement(job.id, 1)
+    assert {:ok, complete} = Jobs.complete_data_movement(running.id)
+    assert {:ok, cleaning} = Jobs.begin_source_cleanup(complete.id)
+
+    assert {:ok, canceled} = Jobs.cancel(cleaning.id)
+    assert canceled.status == "canceled"
+    assert canceled.data_movement_status == "complete"
+    assert canceled.source_cleanup_status == "skipped"
+    assert %DateTime{} = canceled.finished_at
+
+    assert {:error, :canceled} = Jobs.begin_source_cleanup(canceled.id)
+  end
+
   test "start fails loudly when plan has placement fallbacks" do
     topology = topology()
     bucket = bucket_name("fallback-job")

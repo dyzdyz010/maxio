@@ -301,6 +301,18 @@ defmodule Maxio.Objects do
 
   def update_placement_if_current(%Object{}, _attrs), do: {:error, :stale}
 
+  @doc "Return true when any object version row is still authoritative on the given placement set."
+  @spec any_version_with_placement_set?(integer()) :: boolean()
+  def any_version_with_placement_set?(set_id) when is_integer(set_id) do
+    query =
+      from o in Object,
+        where: o.placement_set_id == ^set_id,
+        select: o.id,
+        limit: 1
+
+    not is_nil(Repo.one(query))
+  end
+
   @doc "删除对象元数据（幂等：不存在也返回 :ok）。"
   @spec delete_metadata(String.t(), String.t()) :: :ok
   def delete_metadata(bucket_name, key) do
