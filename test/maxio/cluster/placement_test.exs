@@ -39,6 +39,39 @@ defmodule Maxio.Cluster.PlacementTest do
     assert is_binary(placement.topology_hash)
   end
 
+  test "resolve_write applies decommission route while resolve_object fallback stays read-routed" do
+    topology = topology()
+    bucket = "placement-write-freeze"
+    key = key_for_set(bucket, topology, 0)
+    opts = [topology: topology, decommission_write_routes: %{0 => 1}]
+
+    assert {:ok, write_placement} = Placement.resolve_write(bucket, key, opts)
+    assert write_placement.set_id == 1
+    assert write_placement.source == :decommission_redirect
+
+    object = %Maxio.Objects.Object{bucket_name: bucket, key: key, version_id: "null"}
+
+    assert {:ok, read_placement} = Placement.resolve_object(bucket, object, opts)
+    assert read_placement.set_id == 0
+    assert read_placement.source == :router
+  end
+
+  test "resolve_write preserves explicit placement override for internal movement callers" do
+    topology = topology()
+    bucket = "placement-write-override"
+    key = key_for_set(bucket, topology, 0)
+
+    assert {:ok, placement} =
+             Placement.resolve_write(bucket, key,
+               topology: topology,
+               placement_set_id: 0,
+               decommission_write_routes: %{0 => 1}
+             )
+
+    assert placement.set_id == 0
+    assert placement.source == :override
+  end
+
   test "unknown explicit placement fails loudly" do
     topology = topology()
 

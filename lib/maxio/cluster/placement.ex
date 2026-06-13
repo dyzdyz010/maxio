@@ -8,9 +8,10 @@ defmodule Maxio.Cluster.Placement do
   """
 
   alias Maxio.Cluster.{Router, Topology}
+  alias Maxio.Cluster.Rebalance.WriteRouting
   alias Maxio.Objects.Object
 
-  @type source :: :persisted | :override | :router | :no_topology
+  @type source :: :persisted | :override | :router | :decommission_redirect | :no_topology
   @type resolution :: %{
           set_id: Topology.set_id() | nil,
           pool_id: non_neg_integer() | nil,
@@ -36,6 +37,22 @@ defmodule Maxio.Cluster.Placement do
                source: :override
              }}
           end
+      end
+    end
+  end
+
+  @doc """
+  Resolve placement for a new write.
+
+  This keeps explicit placement overrides authoritative for internal movement
+  tools, but reroutes ordinary hash-based writes away from decommission targets.
+  """
+  @spec resolve_write(String.t(), String.t(), keyword()) :: {:ok, resolution()} | {:error, term()}
+  def resolve_write(bucket, key, opts \\ []) do
+    with {:ok, view} <- topology_view(opts) do
+      case normalize_set_id(Keyword.get(opts, :placement_set_id)) do
+        nil -> resolve_routed_write(bucket, key, view, opts)
+        _set_id -> resolve(bucket, key, opts)
       end
     end
   end
@@ -74,7 +91,29 @@ defmodule Maxio.Cluster.Placement do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
+  def storage_opts(%{set_id: set_id} = placement) when is_integer(set_id) do
+    [
+      placement_set_id: set_id,
+      placement_pool_id: Map.get(placement, :pool_id),
+      placement_topology_hash: Map.get(placement, :topology_hash)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
   def storage_opts(_object), do: []
+
+  @doc "Opts to pass into Storage calls for an upload's temporary part placement."
+  @spec upload_storage_opts(map() | nil) :: keyword()
+  def upload_storage_opts(%{placement_set_id: set_id} = upload) when is_integer(set_id) do
+    [
+      upload_placement_set_id: set_id,
+      upload_placement_pool_id: Map.get(upload, :placement_pool_id),
+      upload_placement_topology_hash: Map.get(upload, :placement_topology_hash)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  def upload_storage_opts(_upload), do: []
 
   @doc "Persistable placement attrs returned from a storage write result."
   @spec attrs_from_result(map() | term()) :: map()
@@ -97,7 +136,7 @@ defmodule Maxio.Cluster.Placement do
   @doc "Persistable attrs when the caller only has bucket/key and backend opts."
   @spec attrs_for_write(String.t(), String.t(), keyword()) :: map()
   def attrs_for_write(bucket, key, opts \\ []) do
-    case resolve(bucket, key, opts) do
+    case resolve_write(bucket, key, opts) do
       {:ok, %{set_id: nil}} -> %{}
       {:ok, placement} -> attrs_from_result(placement)
       {:error, _reason} -> %{}
@@ -133,6 +172,24 @@ defmodule Maxio.Cluster.Placement do
        topology_hash: topology_hash(view),
        source: :router
      }}
+  end
+
+  defp resolve_routed_write(_bucket, _key, {:configured, nil}, _opts),
+    do: {:ok, no_topology()}
+
+  defp resolve_routed_write(bucket, key, {:injected, _topology} = view, opts) do
+    with {:ok, placement} <- resolve_routed(bucket, key, view),
+         {:ok, set_id} <- WriteRouting.reroute_set(placement.set_id, opts),
+         :ok <- validate_set_id(set_id, view) do
+      source =
+        if set_id == placement.set_id do
+          placement.source
+        else
+          :decommission_redirect
+        end
+
+      {:ok, %{placement | set_id: set_id, source: source}}
+    end
   end
 
   defp topology_view(opts) do

@@ -74,21 +74,36 @@ defmodule Maxio.S3.Handlers.Multipart do
       }
       |> Map.merge(system_headers)
 
-    {:ok, upload} = Multipart.initiate(bucket, key, attrs)
+    case Multipart.initiate(bucket, key, attrs) do
+      {:ok, upload} ->
+        Log.info("create multipart upload",
+          action: :create_multipart_upload,
+          bucket: bucket,
+          key: key
+        )
 
-    Log.info("create multipart upload",
-      action: :create_multipart_upload,
-      bucket: bucket,
-      key: key
-    )
+        body =
+          InitiateMultipartUpload.render(%{
+            bucket: bucket,
+            key: key,
+            upload_id: upload.upload_id
+          })
 
-    body =
-      InitiateMultipartUpload.render(%{bucket: bucket, key: key, upload_id: upload.upload_id})
+        conn
+        |> put_resp_content_type("application/xml")
+        |> SSE.put_response_header(sse_algorithm)
+        |> send_resp(200, body)
 
-    conn
-    |> put_resp_content_type("application/xml")
-    |> SSE.put_response_header(sse_algorithm)
-    |> send_resp(200, body)
+      {:error, reason} ->
+        Log.error("create multipart upload failed",
+          action: :create_multipart_upload,
+          bucket: bucket,
+          key: key,
+          reason: inspect(reason)
+        )
+
+        raise initiate_error(reason, bucket, key)
+    end
   end
 
   @spec upload_part(Plug.Conn.t()) :: Plug.Conn.t()
@@ -102,7 +117,14 @@ defmodule Maxio.S3.Handlers.Multipart do
     upload = upload_or_raise(bucket, key, upload_id)
     chunks = BodyReader.stream(conn, conn.assigns.payload_mode)
 
-    case Storage.put_part(bucket, key, upload_id, part_number, chunks) do
+    case Storage.put_part(
+           bucket,
+           key,
+           upload_id,
+           part_number,
+           chunks,
+           Placement.upload_storage_opts(upload)
+         ) do
       {:ok, %{size: size, etag: etag}} ->
         {:ok, _} = Multipart.put_part(upload, part_number, %{etag: etag, size: size})
 
@@ -445,6 +467,23 @@ defmodule Maxio.S3.Handlers.Multipart do
     do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
 
   defp complete_error(_other, b, k), do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+
+  defp initiate_error({:write_routing_unavailable, _reason}, b, k),
+    do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+
+  defp initiate_error({:unknown_set_id, _set_id, _known}, b, k),
+    do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+
+  defp initiate_error({:decommission_write_route_cycle, _set_id, _destination}, b, k),
+    do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+
+  defp initiate_error({:invalid_decommission_write_destination, _set_id, _destination}, b, k),
+    do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+
+  defp initiate_error(reason, b, k) when reason in [:write_quorum, :rename_busy],
+    do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+
+  defp initiate_error(_reason, b, k), do: Error.new(:internal_error, resource: "/#{b}/#{k}")
 
   defp parse_part_number!(str) do
     case Integer.parse(str) do

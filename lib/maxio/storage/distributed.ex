@@ -115,8 +115,15 @@ defmodule Maxio.Storage.Distributed do
     end
   end
 
-  defp endpoints_with_placement(bucket, key, opts) do
-    case Placement.resolve(bucket, key, opts) do
+  defp endpoints_for_write(bucket, key, opts) do
+    case Placement.resolve_write(bucket, key, opts) do
+      {:ok, placement} -> {:ok, endpoints_for_set(placement.set_id, opts)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp endpoints_with_write_placement(bucket, key, opts) do
+    case Placement.resolve_write(bucket, key, opts) do
       {:ok, placement} -> {:ok, {endpoints_for_set(placement.set_id, opts), placement}}
       {:error, reason} -> {:error, reason}
     end
@@ -133,7 +140,29 @@ defmodule Maxio.Storage.Distributed do
 
   # part 的端点：以 upload_id 作 key 路由（同 upload 全 part + assemble 同 set）。
   defp endpoints_for_upload(bucket, upload_id, opts),
-    do: endpoints_for(bucket, ".uploads/" <> upload_id, opts)
+    do: endpoints_for(bucket, ".uploads/" <> upload_id, upload_placement_opts(opts))
+
+  defp endpoints_for_upload_write(bucket, upload_id, opts),
+    do: endpoints_for_write(bucket, ".uploads/" <> upload_id, upload_placement_opts(opts))
+
+  defp upload_placement_opts(opts) do
+    case Keyword.get(opts, :upload_placement_set_id) do
+      nil ->
+        opts
+
+      set_id ->
+        opts
+        |> Keyword.put(:placement_set_id, set_id)
+        |> maybe_put_opt(:placement_pool_id, Keyword.get(opts, :upload_placement_pool_id))
+        |> maybe_put_opt(
+          :placement_topology_hash,
+          Keyword.get(opts, :upload_placement_topology_hash)
+        )
+    end
+  end
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp transport(opts), do: Transport.impl(opts)
 
@@ -209,7 +238,7 @@ defmodule Maxio.Storage.Distributed do
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
-        case endpoints_with_placement(bucket, key, opts) do
+        case endpoints_with_write_placement(bucket, key, opts) do
           {:ok, {endpoints, placement}} ->
             put_locked(bucket, key, version_id, obj_rel, chunks, opts, endpoints, placement)
 
@@ -682,7 +711,7 @@ defmodule Maxio.Storage.Distributed do
     part_rel = Paths.part_rel(bucket, upload_id, part_number)
     c = cfg(opts)
 
-    with {:ok, endpoints} <- endpoints_for_upload(bucket, upload_id, opts) do
+    with {:ok, endpoints} <- endpoints_for_upload_write(bucket, upload_id, opts) do
       dirs = endpoint_dirs(endpoints, part_rel)
       tx = transport(opts)
       n = Config.total(c)
@@ -795,7 +824,7 @@ defmodule Maxio.Storage.Distributed do
 
       {:ok, obj_rel} ->
         # 不自持对象锁（B1-1：锁由 handler 层 Maxio.Lock 横跨 assemble 字节 + put_metadata 元数据单点持有）。
-        case endpoints_with_placement(bucket, key, opts) do
+        case endpoints_with_write_placement(bucket, key, opts) do
           {:ok, {endpoints, placement}} ->
             assemble_locked(
               bucket,
@@ -934,7 +963,7 @@ defmodule Maxio.Storage.Distributed do
       {:ok, obj_rel} ->
         c = cfg(opts)
 
-        with {:ok, endpoints} <- endpoints_for(bucket, key, opts) do
+        with {:ok, endpoints} <- endpoints_for_write(bucket, key, opts) do
           tx = transport(opts)
 
           commit_targets = begin_commit_targets(tx, endpoints, obj_rel)

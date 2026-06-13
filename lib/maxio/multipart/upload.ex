@@ -22,6 +22,9 @@ defmodule Maxio.Multipart.Upload do
     field :sse_algorithm, :string
     field :owner, :string
     field :metadata, :map, default: %{}
+    field :placement_set_id, :integer
+    field :placement_pool_id, :integer
+    field :placement_topology_hash, :string
 
     has_many :parts, Maxio.Multipart.Part, foreign_key: :upload_id, references: :id
 
@@ -39,7 +42,10 @@ defmodule Maxio.Multipart.Upload do
     :acl_canned,
     :acl_grants,
     :sse_algorithm,
-    :metadata
+    :metadata,
+    :placement_set_id,
+    :placement_pool_id,
+    :placement_topology_hash
   ]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()

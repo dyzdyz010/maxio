@@ -90,7 +90,7 @@ defmodule Maxio.Lifecycle do
         |> incr(:buckets_scanned)
         |> count_unsupported(rules)
         |> run_object_actions(bucket, rules, now, dry_run?, opts)
-        |> run_multipart_abort_actions(bucket, rules, now, dry_run?)
+        |> run_multipart_abort_actions(bucket, rules, now, dry_run?, opts)
 
       :none ->
         incr(summary, :buckets_scanned)
@@ -393,8 +393,8 @@ defmodule Maxio.Lifecycle do
   defp put_delete_marker(bucket, key, version_id, opts) do
     case Maxio.Lock.with_object_lock({bucket, key}, fn ->
            case Maxio.ObjectMeta.authoritative_source(:write, opts) do
-             :sidecar -> put_delete_marker_sidecar(bucket, key, version_id)
-             _pg -> put_delete_marker_pg(bucket, key, version_id)
+             :sidecar -> put_delete_marker_sidecar(bucket, key, version_id, opts)
+             _pg -> put_delete_marker_pg(bucket, key, version_id, opts)
            end
          end) do
       {:ok, result} -> result
@@ -402,9 +402,17 @@ defmodule Maxio.Lifecycle do
     end
   end
 
-  defp put_delete_marker_sidecar(bucket, key, version_id) do
-    with :ok <- Storage.put_delete_marker(bucket, key, version_id) do
-      placement_attrs = Placement.attrs_for_write(bucket, key)
+  defp put_delete_marker_sidecar(bucket, key, version_id, opts) do
+    with {:ok, placement} <- Placement.resolve_write(bucket, key, opts),
+         :ok <-
+           Storage.put_delete_marker(
+             bucket,
+             key,
+             version_id,
+             [],
+             Keyword.merge(opts, Placement.storage_opts(placement))
+           ) do
+      placement_attrs = Placement.attrs_from_result(placement)
 
       case Objects.insert_delete_marker_index(bucket, key, version_id, placement_attrs) do
         :ok ->
@@ -423,13 +431,15 @@ defmodule Maxio.Lifecycle do
     end
   end
 
-  defp put_delete_marker_pg(bucket, key, version_id) do
+  defp put_delete_marker_pg(bucket, key, version_id, opts) do
     old_null_opts = storage_opts_for_version(bucket, key, "null")
-    placement_attrs = Placement.attrs_for_write(bucket, key)
+    {:ok, placement} = Placement.resolve_write(bucket, key, opts)
+    placement_storage_opts = Keyword.merge(opts, Placement.storage_opts(placement))
+    placement_attrs = Placement.attrs_from_result(placement)
 
     {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id, placement_attrs)
     if version_id == "null", do: _ = Storage.delete(bucket, key, "null", old_null_opts)
-    _ = Storage.put_delete_marker(bucket, key, version_id)
+    _ = Storage.put_delete_marker(bucket, key, version_id, [], placement_storage_opts)
     :ok
   end
 
@@ -490,12 +500,12 @@ defmodule Maxio.Lifecycle do
     end
   end
 
-  defp run_multipart_abort_actions(summary, %Bucket{} = bucket, rules, now, dry_run?) do
+  defp run_multipart_abort_actions(summary, %Bucket{} = bucket, rules, now, dry_run?, opts) do
     bucket.name
     |> pending_uploads()
     |> Enum.reduce(summary, fn upload, acc ->
       if Enum.any?(rules, &abort_upload_expired?(upload, &1, now)) do
-        apply_upload_action(acc, upload, dry_run?)
+        apply_upload_action(acc, upload, dry_run?, opts)
       else
         acc
       end
@@ -519,7 +529,7 @@ defmodule Maxio.Lifecycle do
       rule["filter_size_lt"] == nil
   end
 
-  defp apply_upload_action(summary, %Upload{} = upload, true = _dry_run?) do
+  defp apply_upload_action(summary, %Upload{} = upload, true = _dry_run?, _opts) do
     Log.info("lifecycle would abort multipart upload",
       action: :lifecycle,
       bucket: upload.bucket_name,
@@ -529,8 +539,8 @@ defmodule Maxio.Lifecycle do
     incr(summary, :multipart_uploads_aborted)
   end
 
-  defp apply_upload_action(summary, %Upload{} = upload, false = _dry_run?) do
-    :ok = Multipart.abort(upload)
+  defp apply_upload_action(summary, %Upload{} = upload, false = _dry_run?, opts) do
+    :ok = Multipart.abort(upload, opts)
 
     Log.info("lifecycle aborted multipart upload",
       action: :lifecycle,

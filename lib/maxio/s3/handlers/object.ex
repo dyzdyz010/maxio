@@ -932,9 +932,16 @@ defmodule Maxio.S3.Handlers.Object do
       Storage.get(src_bucket, src_key, src_version_id, nil, Placement.storage_opts(src_obj))
 
     case Storage.put(dest_bucket, tmp_key, "null", src_stream) do
-      {:ok, _tmp} ->
-        {:ok, tmp_stream} = Storage.get(dest_bucket, tmp_key, "null", nil)
-        %{stream: tmp_stream, dest_bucket: dest_bucket, tmp_key: tmp_key}
+      {:ok, tmp_result} ->
+        tmp_storage_opts = Placement.storage_opts(tmp_result)
+        {:ok, tmp_stream} = Storage.get(dest_bucket, tmp_key, "null", nil, tmp_storage_opts)
+
+        %{
+          stream: tmp_stream,
+          dest_bucket: dest_bucket,
+          tmp_key: tmp_key,
+          tmp_storage_opts: tmp_storage_opts
+        }
 
       {:error, reason} ->
         raise_storage_write_error(reason, dest_bucket, dest_key)
@@ -944,8 +951,12 @@ defmodule Maxio.S3.Handlers.Object do
   # 清理自拷贝的临时副本（非自拷贝 tmp_key=nil，无操作）。
   defp cleanup_copy_source(%{tmp_key: nil}), do: :ok
 
-  defp cleanup_copy_source(%{dest_bucket: dest_bucket, tmp_key: tmp_key}) do
-    _ = Storage.delete(dest_bucket, tmp_key, "null")
+  defp cleanup_copy_source(%{
+         dest_bucket: dest_bucket,
+         tmp_key: tmp_key,
+         tmp_storage_opts: tmp_storage_opts
+       }) do
+    _ = Storage.delete(dest_bucket, tmp_key, "null", tmp_storage_opts)
     :ok
   end
 
@@ -1154,8 +1165,16 @@ defmodule Maxio.S3.Handlers.Object do
   # quorum 成功后 best-effort GC。marker quorum 失败 {:error,reason} 原样上抛（→ 503 SlowDownWrite，
   # 旧对象完好可读，重试收敛）；PG 索引 best-effort（盘上 marker 已权威耐久）。
   defp commit_delete_marker_sidecar(bucket, key, version_id) do
-    with :ok <- Storage.put_delete_marker(bucket, key, version_id) do
-      placement_attrs = Placement.attrs_for_write(bucket, key)
+    with {:ok, placement} <- Placement.resolve_write(bucket, key),
+         :ok <-
+           Storage.put_delete_marker(
+             bucket,
+             key,
+             version_id,
+             [],
+             Placement.storage_opts(placement)
+           ) do
+      placement_attrs = Placement.attrs_from_result(placement)
 
       case Objects.insert_delete_marker_index(bucket, key, version_id, placement_attrs) do
         :ok ->
@@ -1180,13 +1199,15 @@ defmodule Maxio.S3.Handlers.Object do
   # marker sidecar）不影响已权威提交的删除（盘上残留对 PG 读/列权威不可见），绝不让 :pg 路径因盘失败而失败。
   defp commit_delete_marker_pg(bucket, key, version_id, versioning) do
     old_null_opts = storage_opts_for_version(bucket, key, "null")
-    placement_attrs = Placement.attrs_for_write(bucket, key)
+    {:ok, placement} = Placement.resolve_write(bucket, key)
+    placement_storage_opts = Placement.storage_opts(placement)
+    placement_attrs = Placement.attrs_from_result(placement)
 
     {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id, placement_attrs)
 
     # Suspended：null marker 替换既有 null 版本 → 清理被替换的 null 版本字节 + sidecar。
     if versioning == "Suspended", do: _ = Storage.delete(bucket, key, "null", old_null_opts)
-    _ = Storage.put_delete_marker(bucket, key, version_id)
+    _ = Storage.put_delete_marker(bucket, key, version_id, [], placement_storage_opts)
     :ok
   end
 

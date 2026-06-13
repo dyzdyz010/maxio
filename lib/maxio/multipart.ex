@@ -5,6 +5,7 @@ defmodule Maxio.Multipart do
   及 Complete 时的校验（InvalidPart/InvalidPartOrder/EntityTooSmall/NoSuchUpload，铁律 3）。
   """
   import Ecto.Query
+  alias Maxio.Cluster.Placement
   alias Maxio.Crypto.SSE, as: CryptoSSE
   alias Maxio.Repo
   alias Maxio.Multipart.{Upload, Part}
@@ -13,27 +14,30 @@ defmodule Maxio.Multipart do
   @default_min_part_size 5_242_880
 
   @doc "发起分段上传：生成 UploadId（UUID hex），落会话元数据。"
-  @spec initiate(String.t(), String.t(), map()) ::
-          {:ok, Upload.t()} | {:error, Ecto.Changeset.t()}
-  def initiate(bucket_name, key, attrs \\ %{}) do
+  @spec initiate(String.t(), String.t(), map(), keyword()) ::
+          {:ok, Upload.t()} | {:error, Ecto.Changeset.t() | term()}
+  def initiate(bucket_name, key, attrs \\ %{}, opts \\ []) do
     upload_id = generate_upload_id()
 
-    base =
-      %{
-        upload_id: upload_id,
-        bucket_name: bucket_name,
-        key: key,
-        content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
-        storage_class: Map.get(attrs, :storage_class, "STANDARD"),
-        sse_algorithm: Map.get(attrs, :sse_algorithm),
-        owner: Map.get(attrs, :owner, "arn:aws:iam:::root"),
-        acl_canned: Map.get(attrs, :acl_canned, "private"),
-        acl_grants: Map.get(attrs, :acl_grants, %{"grants" => []}),
-        metadata: Map.get(attrs, :metadata, %{})
-      }
-      |> Map.merge(SystemHeaders.take(attrs))
+    with {:ok, placement} <- Placement.resolve_write(bucket_name, upload_key(upload_id), opts) do
+      base =
+        %{
+          upload_id: upload_id,
+          bucket_name: bucket_name,
+          key: key,
+          content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
+          storage_class: Map.get(attrs, :storage_class, "STANDARD"),
+          sse_algorithm: Map.get(attrs, :sse_algorithm),
+          owner: Map.get(attrs, :owner, "arn:aws:iam:::root"),
+          acl_canned: Map.get(attrs, :acl_canned, "private"),
+          acl_grants: Map.get(attrs, :acl_grants, %{"grants" => []}),
+          metadata: Map.get(attrs, :metadata, %{})
+        }
+        |> Map.merge(SystemHeaders.take(attrs))
+        |> Map.merge(Placement.attrs_from_result(placement))
 
-    %Upload{} |> Upload.changeset(base) |> Repo.insert()
+      %Upload{} |> Upload.changeset(base) |> Repo.insert()
+    end
   end
 
   @doc "按 (bucket, key, upload_id) 取会话。"
@@ -169,9 +173,16 @@ defmodule Maxio.Multipart do
   end
 
   @doc "中止分段上传：删会话（级联删 part 元数据）+ 清理 part 字节。幂等。"
-  @spec abort(Upload.t()) :: :ok
-  def abort(%Upload{} = upload) do
-    _ = Maxio.Storage.abort_upload(upload.bucket_name, upload.key, upload.upload_id)
+  @spec abort(Upload.t(), keyword()) :: :ok
+  def abort(%Upload{} = upload, opts \\ []) do
+    _ =
+      Maxio.Storage.abort_upload(
+        upload.bucket_name,
+        upload.key,
+        upload.upload_id,
+        Keyword.merge(opts, Placement.upload_storage_opts(upload))
+      )
+
     Repo.delete_all(from u in Upload, where: u.id == ^upload.id)
     :ok
   end
@@ -197,7 +208,7 @@ defmodule Maxio.Multipart do
          version_id,
          opts
        ) do
-    with {:ok, part_streams} <- part_streams(upload, part_numbers, opts) do
+    with {:ok, part_streams} <- part_streams(upload, part_numbers, with_upload_opts(upload, opts)) do
       plain_stream = Stream.flat_map(part_streams, fn stream -> stream end)
       {cipher_stream, sse_envelope} = CryptoSSE.wrap_stream(plain_stream)
 
@@ -239,6 +250,7 @@ defmodule Maxio.Multipart do
        ) do
     assemble_opts =
       opts
+      |> with_upload_opts(upload)
       |> Keyword.put(:version_id, version_id)
       |> Keyword.put(:object_meta, assemble_object_meta(upload, s3_etag, nil, nil))
 
@@ -368,6 +380,14 @@ defmodule Maxio.Multipart do
   defp generate_upload_id do
     :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
   end
+
+  defp upload_key(upload_id), do: ".uploads/" <> upload_id
+
+  defp with_upload_opts(opts, %Upload{} = upload),
+    do: Keyword.merge(opts, Placement.upload_storage_opts(upload))
+
+  defp with_upload_opts(%Upload{} = upload, opts),
+    do: with_upload_opts(opts, upload)
 
   defp escape_like(str) do
     str
