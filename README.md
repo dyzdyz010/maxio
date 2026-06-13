@@ -362,8 +362,8 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 **drive IO latency/throughput telemetry CLI**、**drive filesystem capacity stats CLI**、
 **operator-triggered fresh-drive heal workflow** 和
 **config-gated fresh-drive heal scheduler**，并新增 **read-only rebalance/decommission planning CLI**
-与 **object placement contract**、**persistent rebalance/decommission job control plane**，
-以及 **restricted foreground decommission copy-pass runner**。
+与 **object placement contract**、**persistent rebalance/decommission job control plane**、
+**restricted foreground decommission copy-pass runner**，以及 **rebalance runner singleton lock + monotonic progress**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -433,7 +433,8 @@ M8-3a/b/c/d/e 已提供：
   受限前台 decommission copy-pass。runner 只处理 decommission job，要求 operator 显式指定目标 erasure set；
   在 PG object placement 作为 read/list 权威时，逐版本/marker 把 `target_set_id` 上的对象写入
   `destination_set_id`，目标写成功后用乐观条件更新对象 placement。`--max-versions` 可分批推进 cursor；
-  `--dry-run` 只返回计划报告，不修改 job。边界：不启动后台 worker、不删除源 shard、不做 source cleanup、
+  非 dry-run 会先获取 job 级 quorum lock，锁内重新读取 job 并重新校验；progress/cursor 只单调前进，
+  stale runner 不能回退计数或 cursor。`--dry-run` 只返回计划报告，不修改 job。边界：不启动后台 worker、不删除源 shard、不做 source cleanup、
   不改 topology/pool、不做 free-space placement；若 read/list authority 不是 PG 会 fail-closed。
 - `Maxio.Cluster.PressureAggregator`：监督树内缓存 peer node 的 `IOPressure.local_snapshot/0`，
   后台按 `config :maxio, :io_pressure` 刷新；scrubber/fresh-drive gate 只读本地计数 + 新鲜缓存，
@@ -495,6 +496,6 @@ M8 剩余：
   手动 `mix maxio.heal.fresh_drives` marker 消费、默认关闭的 fresh-drive heal scheduler，以及只读
   `mix maxio.rebalance.plan` logical inventory（优先对象持久化 placement，旧行计 `placement_fallbacks`）
   和 `mix maxio.rebalance.start|status|cancel` 持久化 job 控制面，以及受限前台
-  `mix maxio.rebalance.run` decommission copy-pass；
+  `mix maxio.rebalance.run` decommission copy-pass（job-level singleton lock + monotonic progress/cursor）；
   尚未接入 OS/设备级磁盘队列/硬件吞吐反馈、硬件/物理 replacement identity、source cleanup、free-space placement、
   后台 worker、topology/pool mutation 或完整 decommission/rebalance workflow。

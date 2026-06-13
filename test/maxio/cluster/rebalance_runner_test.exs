@@ -2,7 +2,7 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
   use Maxio.DataCase, async: false
 
   alias Maxio.{Buckets, Objects}
-  alias Maxio.Cluster.{Paths, Placement, Rebalance.Jobs, Rebalance.Runner, Router, Topology}
+  alias Maxio.Cluster.{Lock, Paths, Placement, Rebalance.Jobs, Rebalance.Runner, Router, Topology}
   alias Maxio.Cluster.Transport.InProcess
   alias Maxio.Storage.Distributed
 
@@ -236,6 +236,79 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
              Runner.run_once(job.id, destination_set_id: 0, topology: ctx.topology)
   end
 
+  test "runner refuses to start when the job-level runner lock is held", ctx do
+    bucket = bucket_name("rebalance-runner-lock")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, ctx.topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 1,
+        etag: "e1",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, job} = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
+    resource = {:rebalance_job_runner, job.id}
+    lock_holder = hold_lock(resource)
+
+    try do
+      assert {:error, :runner_locked} =
+               Runner.run_once(job.id,
+                 destination_set_id: 1,
+                 topology: ctx.topology,
+                 transport: InProcess,
+                 runner_lock_opts: [nodes: [Node.self()], refresh: false]
+               )
+
+      assert {:ok, unchanged} = Jobs.get(job.id)
+      assert unchanged.status == "planned"
+      assert unchanged.progress_scanned == 0
+      assert is_nil(unchanged.destination_set_id)
+    after
+      release_lock(lock_holder)
+    end
+  end
+
+  test "dry-run bypasses held job-level runner lock and does not mutate job", ctx do
+    bucket = bucket_name("rebalance-dry-run-lock")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, ctx.topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 1,
+        etag: "e1",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, job} = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
+    lock_holder = hold_lock({:rebalance_job_runner, job.id})
+
+    try do
+      assert {:ok, report} =
+               Runner.run_once(job.id,
+                 destination_set_id: 1,
+                 topology: ctx.topology,
+                 transport: InProcess,
+                 dry_run: true
+               )
+
+      assert report.status == :dry_run
+      assert report.scanned == 1
+      assert report.moved == 1
+
+      assert {:ok, unchanged} = Jobs.get(job.id)
+      assert unchanged.status == "planned"
+      assert unchanged.progress_scanned == 0
+      assert is_nil(unchanged.destination_set_id)
+    after
+      release_lock(lock_holder)
+    end
+  end
+
   defp dist_opts(ctx), do: [topology: ctx.topology, transport: InProcess]
 
   defp delete_marker_sidecar?(topology, key, bucket, version_id, set_id) do
@@ -262,5 +335,28 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
       |> String.replace("-", "")
 
     "#{prefix}-#{suffix}"
+  end
+
+  defp hold_lock(resource) do
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        {:ok, lease} = Lock.acquire(resource, nodes: [Node.self()], refresh: false)
+        send(parent, {:lock_held, self()})
+
+        receive do
+          :release_lock -> :ok = Lock.release(lease)
+        end
+      end)
+
+    ref = Process.monitor(pid)
+    assert_receive {:lock_held, ^pid}
+    {pid, ref}
+  end
+
+  defp release_lock({pid, ref}) do
+    send(pid, :release_lock)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
   end
 end

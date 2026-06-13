@@ -177,7 +177,7 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
           Map.take(cursor_attrs, [:cursor_bucket, :cursor_key_marker, :cursor_version_id_marker])
         )
 
-      guarded_update_job(job, attrs, ["running"])
+      monotonic_progress_update(job, attrs)
     end
   end
 
@@ -428,6 +428,73 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
              from(j in Job, where: j.id == ^job.id and j.status in ^allowed_statuses),
              set: changes
            ) do
+        {1, _rows} ->
+          get(job.id)
+
+        {0, _rows} ->
+          case get(job.id) do
+            {:ok, %Job{} = stale} -> {:error, {:stale_job_status, stale.status}}
+            {:error, reason} -> {:error, reason}
+          end
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp monotonic_progress_update(%Job{} = job, attrs) do
+    changeset = Job.changeset(job, attrs)
+
+    if changeset.valid? do
+      scanned = Ecto.Changeset.get_field(changeset, :progress_scanned)
+      moved = Ecto.Changeset.get_field(changeset, :progress_moved)
+      skipped = Ecto.Changeset.get_field(changeset, :progress_skipped)
+      errors = Ecto.Changeset.get_field(changeset, :progress_errors)
+      cursor_bucket = Ecto.Changeset.get_field(changeset, :cursor_bucket)
+      cursor_key_marker = Ecto.Changeset.get_field(changeset, :cursor_key_marker)
+      cursor_version_id_marker = Ecto.Changeset.get_field(changeset, :cursor_version_id_marker)
+
+      now = DateTime.utc_now()
+
+      query =
+        from(j in Job,
+          where: j.id == ^job.id and j.status == "running",
+          update: [
+            set: [
+              progress_scanned: fragment("GREATEST(?, ?)", j.progress_scanned, ^scanned),
+              progress_moved: fragment("GREATEST(?, ?)", j.progress_moved, ^moved),
+              progress_skipped: fragment("GREATEST(?, ?)", j.progress_skipped, ^skipped),
+              progress_errors: fragment("GREATEST(?, ?)", j.progress_errors, ^errors),
+              cursor_bucket:
+                fragment(
+                  "CASE WHEN ? > ? THEN ? ELSE ? END",
+                  ^scanned,
+                  j.progress_scanned,
+                  ^cursor_bucket,
+                  j.cursor_bucket
+                ),
+              cursor_key_marker:
+                fragment(
+                  "CASE WHEN ? > ? THEN ? ELSE ? END",
+                  ^scanned,
+                  j.progress_scanned,
+                  ^cursor_key_marker,
+                  j.cursor_key_marker
+                ),
+              cursor_version_id_marker:
+                fragment(
+                  "CASE WHEN ? > ? THEN ? ELSE ? END",
+                  ^scanned,
+                  j.progress_scanned,
+                  ^cursor_version_id_marker,
+                  j.cursor_version_id_marker
+                ),
+              updated_at: ^now
+            ]
+          ]
+        )
+
+      case Repo.update_all(query, []) do
         {1, _rows} ->
           get(job.id)
 

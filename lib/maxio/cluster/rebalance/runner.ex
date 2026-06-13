@@ -9,7 +9,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
   """
 
   alias Maxio.{Buckets, ObjectMeta, Objects, Storage}
-  alias Maxio.Cluster.{Placement, Topology}
+  alias Maxio.Cluster.{Lock, Placement, Topology}
   alias Maxio.Cluster.Rebalance.{Job, Jobs}
   alias Maxio.S3.Log
 
@@ -43,6 +43,14 @@ defmodule Maxio.Cluster.Rebalance.Runner do
   """
   @spec run_once(String.t(), keyword()) :: {:ok, report()} | {:error, term()}
   def run_once(job_id, opts \\ []) when is_binary(job_id) do
+    if Keyword.get(opts, :dry_run, false) do
+      run_once_unlocked(job_id, opts)
+    else
+      with_runner_lock(job_id, opts, fn -> run_once_unlocked(job_id, opts) end)
+    end
+  end
+
+  defp run_once_unlocked(job_id, opts) do
     with {:ok, job} <- Jobs.get(job_id),
          :ok <- validate_job(job),
          :ok <- ensure_pg_authority(opts),
@@ -50,6 +58,29 @@ defmodule Maxio.Cluster.Rebalance.Runner do
          :ok <- validate_sets(job.target_set_id, destination_set_id, opts) do
       run_job(job, destination_set_id, opts)
     end
+  end
+
+  defp with_runner_lock(job_id, opts, fun) do
+    resource = runner_lock_resource(job_id)
+
+    case Lock.quorum_with_lock(resource, fun, runner_lock_opts(opts)) do
+      {:ok, result} ->
+        result
+
+      {:error, :no_quorum} ->
+        Log.error("rebalance runner lock unavailable",
+          action: :rebalance_run,
+          reason: "job_id=#{job_id} resource=#{inspect(resource)}"
+        )
+
+        {:error, :runner_locked}
+    end
+  end
+
+  defp runner_lock_resource(job_id), do: {:rebalance_job_runner, job_id}
+
+  defp runner_lock_opts(opts) do
+    Keyword.get(opts, :runner_lock_opts, [])
   end
 
   defp run_job(%Job{} = job, destination_set_id, opts) do

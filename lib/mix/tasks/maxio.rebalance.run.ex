@@ -97,6 +97,9 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
 
   defp error_message(:canceled), do: "decommission job is canceled"
 
+  defp error_message(:runner_locked),
+    do: "decommission job runner is already active for this job"
+
   defp error_message({:not_runnable, status}),
     do: "decommission job is not runnable from status=#{status}"
 

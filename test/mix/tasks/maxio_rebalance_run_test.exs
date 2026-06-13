@@ -4,7 +4,7 @@ defmodule Mix.Tasks.Maxio.RebalanceRunTest do
   import ExUnit.CaptureIO
 
   alias Maxio.{Buckets, Objects}
-  alias Maxio.Cluster.{Rebalance.Jobs, Router, Topology}
+  alias Maxio.Cluster.{Lock, Rebalance.Jobs, Router, Topology}
   alias Mix.Tasks.Maxio.Rebalance.Run
 
   @owner "arn:aws:iam:::root"
@@ -57,6 +57,34 @@ defmodule Mix.Tasks.Maxio.RebalanceRunTest do
     assert is_nil(unchanged.destination_set_id)
   end
 
+  test "locked foreground runner fails loudly" do
+    topology = topology()
+    :persistent_term.put(@topology_key, topology)
+
+    bucket = bucket_name("rebalance-run-cli-lock")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 5,
+        etag: "e5",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, job} = Jobs.start_decommission(0, include_drive_stats: false)
+    lock_holder = hold_lock({:rebalance_job_runner, job.id})
+
+    try do
+      assert_raise Mix.Error, ~r/runner is already active/, fn ->
+        Run.run(["--job-id", job.id, "--destination-set", "1"])
+      end
+    after
+      release_lock(lock_holder)
+    end
+  end
+
   defp topology do
     base = Path.join(System.tmp_dir!(), "maxio_rebalance_run_cli")
 
@@ -93,4 +121,27 @@ defmodule Mix.Tasks.Maxio.RebalanceRunTest do
 
   defp restore_topology(topology),
     do: :persistent_term.put(@topology_key, topology)
+
+  defp hold_lock(resource) do
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        {:ok, lease} = Lock.acquire(resource, refresh: false)
+        send(parent, {:lock_held, self()})
+
+        receive do
+          :release_lock -> :ok = Lock.release(lease)
+        end
+      end)
+
+    ref = Process.monitor(pid)
+    assert_receive {:lock_held, ^pid}
+    {pid, ref}
+  end
+
+  defp release_lock({pid, ref}) do
+    send(pid, :release_lock)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+  end
 end

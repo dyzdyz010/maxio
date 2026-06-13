@@ -181,6 +181,88 @@ defmodule Maxio.Cluster.RebalanceJobsTest do
     assert unchanged.destination_set_id == 1
   end
 
+  test "record_progress is monotonic and does not move cursor backward" do
+    topology = topology()
+    bucket = bucket_name("movement-progress-job")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "null", %{
+        size: 3,
+        etag: "e3",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    assert {:ok, job} = Jobs.start_decommission(0, topology: topology, include_drive_stats: false)
+    assert {:ok, running} = Jobs.begin_data_movement(job.id, 1)
+
+    assert {:ok, progressed} =
+             Jobs.record_progress(
+               running.id,
+               %{scanned: 5, moved: 4, skipped: 1, errors: 0},
+               %{
+                 cursor_bucket: bucket,
+                 cursor_key_marker: "k-5",
+                 cursor_version_id_marker: "v5"
+               }
+             )
+
+    assert progressed.progress_scanned == 5
+    assert progressed.progress_moved == 4
+    assert progressed.cursor_key_marker == "k-5"
+
+    assert {:ok, stale} =
+             Jobs.record_progress(
+               running.id,
+               %{scanned: 3, moved: 2, skipped: 0, errors: 0},
+               %{
+                 cursor_bucket: bucket,
+                 cursor_key_marker: "k-3",
+                 cursor_version_id_marker: "v3"
+               }
+             )
+
+    assert stale.progress_scanned == 5
+    assert stale.progress_moved == 4
+    assert stale.progress_skipped == 1
+    assert stale.cursor_key_marker == "k-5"
+    assert stale.cursor_version_id_marker == "v5"
+
+    assert {:ok, equal_counter_stale_cursor} =
+             Jobs.record_progress(
+               running.id,
+               %{scanned: 5, moved: 4, skipped: 1, errors: 0},
+               %{
+                 cursor_bucket: bucket,
+                 cursor_key_marker: "k-equal",
+                 cursor_version_id_marker: "v-equal"
+               }
+             )
+
+    assert equal_counter_stale_cursor.progress_scanned == 5
+    assert equal_counter_stale_cursor.cursor_key_marker == "k-5"
+    assert equal_counter_stale_cursor.cursor_version_id_marker == "v5"
+
+    assert {:ok, advanced} =
+             Jobs.record_progress(
+               running.id,
+               %{scanned: 6, moved: 4, skipped: 2, errors: 1},
+               %{
+                 cursor_bucket: bucket,
+                 cursor_key_marker: "k-6",
+                 cursor_version_id_marker: "v6"
+               }
+             )
+
+    assert advanced.progress_scanned == 6
+    assert advanced.progress_moved == 4
+    assert advanced.progress_skipped == 2
+    assert advanced.progress_errors == 1
+    assert advanced.cursor_key_marker == "k-6"
+  end
+
   test "start fails loudly when plan has placement fallbacks" do
     topology = topology()
     bucket = bucket_name("fallback-job")
