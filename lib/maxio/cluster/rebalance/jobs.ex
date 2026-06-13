@@ -100,6 +100,27 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
     |> Repo.one()
   end
 
+  @doc """
+  Return the next decommission job a background worker may safely advance.
+
+  Data movement jobs are selected first while they are planned/running. Once the
+  copy phase has completed, the same job becomes selectable for guarded source
+  cleanup unless another active job is already running.
+  """
+  @spec next_runnable_decommission(keyword()) :: {:ok, Job.t()} | {:error, :not_found}
+  def next_runnable_decommission(opts \\ []) do
+    case Keyword.get(opts, :job_id) do
+      id when is_binary(id) ->
+        get(id)
+
+      _other ->
+        case next_decommission_copy_job() || next_decommission_cleanup_job_if_unblocked() do
+          %Job{} = job -> {:ok, job}
+          nil -> {:error, :not_found}
+        end
+    end
+  end
+
   @doc "Machine-friendly map for CLI JSON output and tests."
   @spec to_view(Job.t()) :: map()
   def to_view(%Job{} = job) do
@@ -349,6 +370,45 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
       nil -> :ok
       %Job{} = job -> {:error, {:active_job_exists, job}}
     end
+  end
+
+  defp next_decommission_copy_job do
+    Job
+    |> where([j], j.kind == "decommission")
+    |> where([j], j.status in ^["planned", "running"])
+    |> where([j], j.data_movement_status in ^["not_started", "moving"])
+    |> order_by([j], asc: j.inserted_at)
+    |> limit(1)
+    |> Repo.one()
+  end
+
+  defp next_decommission_cleanup_job_if_unblocked do
+    case active_job() do
+      nil ->
+        next_decommission_cleanup_job()
+
+      %Job{
+        kind: "decommission",
+        data_movement_status: "complete",
+        source_cleanup_status: status
+      } = job
+      when status in ["not_started", "moving", "failed"] ->
+        job
+
+      %Job{} ->
+        nil
+    end
+  end
+
+  defp next_decommission_cleanup_job do
+    Job
+    |> where([j], j.kind == "decommission")
+    |> where([j], j.data_movement_status == "complete")
+    |> where([j], j.status in ^["complete", "running", "failed"])
+    |> where([j], j.source_cleanup_status in ^["not_started", "moving", "failed"])
+    |> order_by([j], asc: j.inserted_at)
+    |> limit(1)
+    |> Repo.one()
   end
 
   defp build_plan("rebalance", opts), do: Rebalance.plan(plan_opts(opts))

@@ -21,6 +21,9 @@ defmodule Maxio.Application do
           Maxio.Cluster.CacheInvalidator,
           Maxio.Cluster.DriveHealth,
           Maxio.Cluster.FreshDriveHeal.Scheduler,
+          # M8 decommission 后台推进器（默认 disabled）：只编排既有 copy-pass/source-cleanup，
+          # 不做 topology mutation / free-space placement / pool removal。
+          Maxio.Cluster.Rebalance.Scheduler,
           # ROUTE B B5-2：派生索引周期 reconcile scanner（默认 disabled——启动但不调度，
           # init 显式日志声明状态；config :maxio, :scanner, enabled: true 开启周期轮）。
           Maxio.Storage.Scanner,
