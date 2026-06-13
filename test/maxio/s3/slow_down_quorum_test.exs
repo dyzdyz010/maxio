@@ -39,11 +39,11 @@ defmodule Maxio.S3.SlowDownQuorumTest do
     def assemble(_bucket, _key, _upload_id, _part_numbers, _opts), do: {:error, injected_reason()}
 
     @impl true
-    def get(b, k, v, r), do: Maxio.Storage.FS.get(b, k, v, r)
+    def get(b, k, v, r, o), do: Maxio.Storage.FS.get(b, k, v, r, o)
     @impl true
-    def stat(b, k, v), do: Maxio.Storage.FS.stat(b, k, v)
+    def stat(b, k, v, o), do: Maxio.Storage.FS.stat(b, k, v, o)
     @impl true
-    def delete(b, k, v), do: Maxio.Storage.FS.delete(b, k, v)
+    def delete(b, k, v, o), do: Maxio.Storage.FS.delete(b, k, v, o)
     @impl true
     def put_bucket(b), do: Maxio.Storage.FS.put_bucket(b)
     @impl true

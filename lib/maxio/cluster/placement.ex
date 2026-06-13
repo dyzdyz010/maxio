@@ -1,0 +1,194 @@
+defmodule Maxio.Cluster.Placement do
+  @moduledoc """
+  Object placement contract for distributed erasure sets.
+
+  New writes persist the chosen set into object metadata. Reads, deletes and
+  planning can then use the persisted set instead of re-hashing under a later
+  topology. Rows written before this contract fall back to the current router.
+  """
+
+  alias Maxio.Cluster.{Router, Topology}
+  alias Maxio.Objects.Object
+
+  @type source :: :persisted | :override | :router | :no_topology
+  @type resolution :: %{
+          set_id: Topology.set_id() | nil,
+          pool_id: non_neg_integer() | nil,
+          topology_hash: String.t() | nil,
+          source: source()
+        }
+
+  @doc "Resolve the set for a request, preferring an explicit placement override."
+  @spec resolve(String.t(), String.t(), keyword()) :: {:ok, resolution()} | {:error, term()}
+  def resolve(bucket, key, opts \\ []) do
+    with {:ok, view} <- topology_view(opts) do
+      case normalize_set_id(Keyword.get(opts, :placement_set_id)) do
+        nil ->
+          resolve_routed(bucket, key, view)
+
+        set_id ->
+          with :ok <- validate_set_id(set_id, view) do
+            {:ok,
+             %{
+               set_id: set_id,
+               pool_id: Keyword.get(opts, :placement_pool_id),
+               topology_hash: topology_hash(view),
+               source: :override
+             }}
+          end
+      end
+    end
+  end
+
+  @doc "Resolve placement for an object row, preferring persisted placement."
+  @spec resolve_object(String.t(), Object.t(), keyword()) ::
+          {:ok, resolution()} | {:error, term()}
+  def resolve_object(bucket, %Object{} = object, opts \\ []) do
+    persisted_opts = storage_opts(object)
+
+    opts =
+      opts
+      |> Keyword.merge(persisted_opts)
+
+    case persisted_opts do
+      [] ->
+        with {:ok, placement} <- resolve(bucket, object.key, opts) do
+          {:ok, %{placement | source: fallback_source(placement.source)}}
+        end
+
+      _persisted ->
+        with {:ok, placement} <- resolve(bucket, object.key, opts) do
+          {:ok, %{placement | source: :persisted}}
+        end
+    end
+  end
+
+  @doc "Opts to pass into Storage calls for an already resolved object row."
+  @spec storage_opts(map() | nil) :: keyword()
+  def storage_opts(%{placement_set_id: set_id} = object) when is_integer(set_id) do
+    [
+      placement_set_id: set_id,
+      placement_pool_id: Map.get(object, :placement_pool_id),
+      placement_topology_hash: Map.get(object, :placement_topology_hash)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  def storage_opts(_object), do: []
+
+  @doc "Persistable placement attrs returned from a storage write result."
+  @spec attrs_from_result(map() | term()) :: map()
+  def attrs_from_result(%{} = result) do
+    %{}
+    |> maybe_put(:placement_set_id, Map.get(result, :placement_set_id))
+    |> maybe_put(:placement_pool_id, Map.get(result, :placement_pool_id))
+    |> maybe_put(:placement_topology_hash, Map.get(result, :placement_topology_hash))
+  end
+
+  def attrs_from_result(_result), do: %{}
+
+  @doc "Persistable attrs when the caller only has bucket/key and backend opts."
+  @spec attrs_for_write(String.t(), String.t(), keyword()) :: map()
+  def attrs_for_write(bucket, key, opts \\ []) do
+    case resolve(bucket, key, opts) do
+      {:ok, %{set_id: nil}} -> %{}
+      {:ok, placement} -> attrs_from_result(placement)
+      {:error, _reason} -> %{}
+    end
+  end
+
+  @doc "Stable fingerprint for a topology view, suitable for telemetry and stale-risk checks."
+  @spec topology_hash(nil | Topology.t() | {:configured, nil} | {:injected, Topology.t()}) ::
+          String.t() | nil
+  def topology_hash({:configured, nil}), do: topology_hash(nil)
+  def topology_hash({:injected, topology}), do: topology_hash(topology)
+  def topology_hash(nil), do: nil
+
+  def topology_hash(topology) when is_map(topology) do
+    material = %{
+      data_shards: Map.get(topology, :data_shards),
+      parity_shards: Map.get(topology, :parity_shards),
+      block_size: Map.get(topology, :block_size),
+      set_ids: Topology.all_set_ids_from(topology)
+    }
+
+    :crypto.hash(:sha256, :erlang.term_to_binary(material))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp resolve_routed(_bucket, _key, {:configured, nil}), do: {:ok, no_topology()}
+
+  defp resolve_routed(bucket, key, {:injected, topology} = view) do
+    {:ok,
+     %{
+       set_id: Router.set_for(bucket, key, topology),
+       pool_id: nil,
+       topology_hash: topology_hash(view),
+       source: :router
+     }}
+  end
+
+  defp topology_view(opts) do
+    cond do
+      Keyword.has_key?(opts, :topology) and is_nil(Keyword.get(opts, :topology)) ->
+        {:ok, {:configured, nil}}
+
+      topology = Keyword.get(opts, :topology) ->
+        {:ok, {:injected, topology}}
+
+      Topology.configured?() ->
+        {:ok, {:injected, current_topology!()}}
+
+      true ->
+        {:ok, {:configured, nil}}
+    end
+  end
+
+  defp current_topology! do
+    set_ids = Topology.all_set_ids()
+
+    %{
+      data_shards: Keyword.fetch!(Topology.ec_params(), :data_shards),
+      parity_shards: Keyword.fetch!(Topology.ec_params(), :parity_shards),
+      block_size: Keyword.fetch!(Topology.ec_params(), :block_size),
+      set_ids: set_ids,
+      sets:
+        Map.new(set_ids, fn set_id ->
+          {set_id, %{id: set_id, endpoints: Topology.endpoints(set_id)}}
+        end)
+    }
+  end
+
+  defp validate_set_id(set_id, {:configured, nil}), do: {:error, {:unknown_set_id, set_id, []}}
+
+  defp validate_set_id(set_id, {:injected, topology}) do
+    set_ids = Topology.all_set_ids_from(topology)
+
+    if set_id in set_ids do
+      :ok
+    else
+      {:error, {:unknown_set_id, set_id, set_ids}}
+    end
+  end
+
+  defp normalize_set_id(nil), do: nil
+  defp normalize_set_id(set_id) when is_integer(set_id), do: set_id
+
+  defp normalize_set_id(set_id) when is_binary(set_id) do
+    case Integer.parse(set_id) do
+      {int, ""} -> int
+      _ -> nil
+    end
+  end
+
+  defp normalize_set_id(_value), do: nil
+
+  defp no_topology,
+    do: %{set_id: nil, pool_id: nil, topology_hash: nil, source: :no_topology}
+
+  defp fallback_source(:no_topology), do: :no_topology
+  defp fallback_source(_source), do: :router
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+end

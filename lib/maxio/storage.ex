@@ -20,17 +20,19 @@ defmodule Maxio.Storage do
   def put(bucket, key, version_id, chunks, opts),
     do: backend().put(bucket, key, version_id, chunks, opts)
 
-  @spec get(String.t(), String.t(), String.t(), Maxio.Storage.Backend.range()) ::
+  @spec get(String.t(), String.t(), String.t(), Maxio.Storage.Backend.range(), keyword()) ::
           {:ok, Enumerable.t()} | {:error, term()}
-  def get(bucket, key, version_id \\ "null", range \\ nil),
-    do: backend().get(bucket, key, version_id, range)
+  def get(bucket, key, version_id \\ "null", range \\ nil, opts \\ []),
+    do: backend().get(bucket, key, version_id, range, opts)
 
-  @spec stat(String.t(), String.t(), String.t()) ::
+  @spec stat(String.t(), String.t(), String.t(), keyword()) ::
           {:ok, %{size: non_neg_integer()}} | {:error, :enoent}
-  def stat(bucket, key, version_id \\ "null"), do: backend().stat(bucket, key, version_id)
+  def stat(bucket, key, version_id \\ "null", opts \\ []),
+    do: backend().stat(bucket, key, version_id, opts)
 
-  @spec delete(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
-  def delete(bucket, key, version_id \\ "null"), do: backend().delete(bucket, key, version_id)
+  @spec delete(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def delete(bucket, key, version_id \\ "null", opts \\ []),
+    do: backend().delete(bucket, key, version_id, opts)
 
   @spec put_bucket(String.t()) :: :ok | {:error, term()}
   def put_bucket(bucket), do: backend().put_bucket(bucket)

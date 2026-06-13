@@ -27,6 +27,9 @@ defmodule Maxio.Objects.Object do
     field :tags, :map, default: %{}
     field :sse_algorithm, :string
     field :sse_envelope, :map
+    field :placement_set_id, :integer
+    field :placement_pool_id, :integer
+    field :placement_topology_hash, :string
 
     # ROUTE B B5-1 —— PG 派生索引同步追踪：synced_at = 最后一次与盘上 sidecar 权威确认同步的时刻
     # （NULL=尚未经 scanner 确认）；index_generation = 同步时对应的 sidecar 版本 generation（判 stale 用）。
@@ -59,6 +62,9 @@ defmodule Maxio.Objects.Object do
     :tags,
     :sse_algorithm,
     :sse_envelope,
+    :placement_set_id,
+    :placement_pool_id,
+    :placement_topology_hash,
     :synced_at,
     :index_generation
   ]

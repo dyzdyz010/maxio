@@ -12,6 +12,7 @@ defmodule MaxioWeb.ObjectLive.Index do
   require Logger
 
   alias Maxio.{Buckets, Objects, Storage}
+  alias Maxio.Cluster.Placement
   alias Maxio.Objects.Object
   alias Maxio.Versioning.VersionId
 
@@ -230,14 +231,20 @@ defmodule MaxioWeb.ObjectLive.Index do
         chunks = File.stream!(tmp_path, @chunk_bytes)
 
         case Storage.put(bucket, key, version_id, chunks) do
-          {:ok, %{size: size, etag: etag}} ->
+          {:ok, %{size: size, etag: etag} = write_result} ->
             {:ok, obj} =
-              Objects.put_version_with_id(bucket, key, version_id, %{
-                size: size,
-                etag: etag,
-                content_type: entry.client_type || "binary/octet-stream",
-                storage_class: "STANDARD"
-              })
+              Objects.put_version_with_id(
+                bucket,
+                key,
+                version_id,
+                %{
+                  size: size,
+                  etag: etag,
+                  content_type: entry.client_type || "binary/octet-stream",
+                  storage_class: "STANDARD"
+                }
+                |> Map.merge(Placement.attrs_from_result(write_result))
+              )
 
             {:ok, obj}
 
@@ -286,13 +293,19 @@ defmodule MaxioWeb.ObjectLive.Index do
         key = prefix <> name <> "/"
 
         case Storage.put(bucket, key, "null", []) do
-          {:ok, %{size: size, etag: etag}} ->
+          {:ok, %{size: size, etag: etag} = write_result} ->
             {:ok, _obj} =
-              Objects.put_version_with_id(bucket, key, "null", %{
-                size: size,
-                etag: etag,
-                content_type: "application/x-directory"
-              })
+              Objects.put_version_with_id(
+                bucket,
+                key,
+                "null",
+                %{
+                  size: size,
+                  etag: etag,
+                  content_type: "application/x-directory"
+                }
+                |> Map.merge(Placement.attrs_from_result(write_result))
+              )
 
             {:noreply,
              socket
@@ -313,10 +326,19 @@ defmodule MaxioWeb.ObjectLive.Index do
     case Objects.get_metadata(bucket, key) do
       {:ok, obj} ->
         if versioning == "Enabled" do
-          {:ok, _} = Objects.insert_delete_marker(bucket, key, versioning)
+          version_id = VersionId.generate()
+
+          {:ok, _} =
+            Objects.insert_delete_marker_with_id(
+              bucket,
+              key,
+              version_id,
+              Placement.attrs_for_write(bucket, key)
+            )
         else
+          storage_opts = Placement.storage_opts(obj)
           :ok = Objects.delete_metadata(bucket, key)
-          _ = Storage.delete(bucket, key)
+          _ = Storage.delete(bucket, key, "null", storage_opts)
         end
 
         {:noreply,

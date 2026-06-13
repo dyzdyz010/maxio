@@ -32,7 +32,7 @@ defmodule Maxio.Storage.Distributed do
   require Logger
 
   alias Maxio.Storage.Erasure.{Codec, Config}
-  alias Maxio.Cluster.{Paths, Router, Topology, Transport}
+  alias Maxio.Cluster.{Paths, Placement, Topology, Transport}
   alias Maxio.Sidecar
 
   # ── Backend callbacks（签名与 FS/ErasureCoded 一致）──
@@ -109,14 +109,25 @@ defmodule Maxio.Storage.Distributed do
   end
 
   defp endpoints_for(bucket, key, opts) do
-    case topology(opts) do
-      nil ->
-        set_id = Router.set_for(bucket, key, nil)
-        Topology.endpoints(set_id)
+    case Placement.resolve(bucket, key, opts) do
+      {:ok, placement} -> {:ok, endpoints_for_set(placement.set_id, opts)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-      t ->
-        set_id = Router.set_for(bucket, key, t)
-        Topology.endpoints_from(t, set_id)
+  defp endpoints_with_placement(bucket, key, opts) do
+    case Placement.resolve(bucket, key, opts) do
+      {:ok, placement} -> {:ok, {endpoints_for_set(placement.set_id, opts), placement}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp endpoints_for_set(nil, _opts), do: Topology.endpoints(nil)
+
+  defp endpoints_for_set(set_id, opts) do
+    case topology(opts) do
+      nil -> Topology.endpoints(set_id)
+      t -> Topology.endpoints_from(t, set_id)
     end
   end
 
@@ -198,13 +209,18 @@ defmodule Maxio.Storage.Distributed do
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
-        put_locked(bucket, key, version_id, obj_rel, chunks, opts)
+        case endpoints_with_placement(bucket, key, opts) do
+          {:ok, {endpoints, placement}} ->
+            put_locked(bucket, key, version_id, obj_rel, chunks, opts, endpoints, placement)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 
-  defp put_locked(bucket, key, version_id, obj_rel, chunks, opts) do
+  defp put_locked(bucket, key, version_id, obj_rel, chunks, opts, endpoints, placement) do
     c = cfg(opts)
-    endpoints = endpoints_for(bucket, key, opts)
     tx = transport(opts)
     n = Config.total(c)
 
@@ -252,7 +268,15 @@ defmodule Maxio.Storage.Distributed do
     ok_endpoints = commit_all(tx, commit_targets, opts)
 
     if ok_endpoints >= c.write_quorum do
-      {:ok, %{size: acc.size, etag: etag, sha256: sha256}}
+      {:ok,
+       %{
+         size: acc.size,
+         etag: etag,
+         sha256: sha256,
+         placement_set_id: placement.set_id,
+         placement_pool_id: placement.pool_id,
+         placement_topology_hash: placement.topology_hash
+       }}
     else
       Logger.error("distributed put below write quorum",
         bucket: bucket,
@@ -433,25 +457,38 @@ defmodule Maxio.Storage.Distributed do
 
       {:ok, obj_rel} ->
         c = cfg(opts)
-        endpoints = endpoints_for(bucket, key, opts)
-        dirs = endpoint_dirs(endpoints, obj_rel)
-        tx = transport(opts)
 
-        case read_any_sidecar(tx, dirs) do
-          {:ok, meta} ->
-            size = meta["size"]
-            block_size = get_in(meta, ["ec", "block_size"])
-            {first, last} = normalize_range(range, size)
+        with {:ok, endpoints} <- endpoints_for(bucket, key, opts) do
+          dirs = endpoint_dirs(endpoints, obj_rel)
+          tx = transport(opts)
 
-            if size == 0 or last < first do
-              {:ok, []}
-            else
-              {:ok,
-               stream_object(c, bucket, key, version_id, tx, dirs, meta, block_size, first, last)}
-            end
+          case read_any_sidecar(tx, dirs) do
+            {:ok, meta} ->
+              size = meta["size"]
+              block_size = get_in(meta, ["ec", "block_size"])
+              {first, last} = normalize_range(range, size)
 
-          {:error, :enoent} ->
-            {:error, :enoent}
+              if size == 0 or last < first do
+                {:ok, []}
+              else
+                {:ok,
+                 stream_object(
+                   c,
+                   bucket,
+                   key,
+                   version_id,
+                   tx,
+                   dirs,
+                   meta,
+                   block_size,
+                   first,
+                   last
+                 )}
+              end
+
+            {:error, :enoent} ->
+              {:error, :enoent}
+          end
         end
     end
   end
@@ -566,13 +603,14 @@ defmodule Maxio.Storage.Distributed do
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
-        endpoints = endpoints_for(bucket, key, opts)
-        dirs = endpoint_dirs(endpoints, obj_rel)
-        tx = transport(opts)
+        with {:ok, endpoints} <- endpoints_for(bucket, key, opts) do
+          dirs = endpoint_dirs(endpoints, obj_rel)
+          tx = transport(opts)
 
-        case read_any_sidecar(tx, dirs) do
-          {:ok, meta} -> {:ok, %{size: meta["size"]}}
-          {:error, :enoent} -> {:error, :enoent}
+          case read_any_sidecar(tx, dirs) do
+            {:ok, meta} -> {:ok, %{size: meta["size"]}}
+            {:error, :enoent} -> {:error, :enoent}
+          end
         end
     end
   end
@@ -583,13 +621,14 @@ defmodule Maxio.Storage.Distributed do
         {:error, :invalid_key}
 
       {:ok, obj_rel} ->
-        endpoints = endpoints_for(bucket, key, opts)
-        dirs = endpoint_dirs(endpoints, obj_rel)
-        tx = transport(opts)
+        with {:ok, endpoints} <- endpoints_for(bucket, key, opts) do
+          dirs = endpoint_dirs(endpoints, obj_rel)
+          tx = transport(opts)
 
-        # 不自持对象锁（B1-1：锁由 handler 层 Maxio.Lock 横跨提交 seam 单点持有）。
-        Enum.each(dirs, fn {node, dir} -> tx.delete_shard(node, dir) end)
-        :ok
+          # 不自持对象锁（B1-1：锁由 handler 层 Maxio.Lock 横跨提交 seam 单点持有）。
+          Enum.each(dirs, fn {node, dir} -> tx.delete_shard(node, dir) end)
+          :ok
+        end
     end
   end
 
@@ -641,35 +680,37 @@ defmodule Maxio.Storage.Distributed do
   defp do_put_part(bucket, _key, upload_id, part_number, chunks, opts) do
     part_rel = Paths.part_rel(bucket, upload_id, part_number)
     c = cfg(opts)
-    endpoints = endpoints_for_upload(bucket, upload_id, opts)
-    dirs = endpoint_dirs(endpoints, part_rel)
-    tx = transport(opts)
-    n = Config.total(c)
 
-    acc0 = %{
-      md5: :crypto.hash_init(:md5),
-      sha: nil,
-      size: 0,
-      shard_len: nil,
-      block_hashes: List.duplicate([], n),
-      buffer: <<>>,
-      block_index: 0,
-      dirs: dirs,
-      tx: tx
-    }
+    with {:ok, endpoints} <- endpoints_for_upload(bucket, upload_id, opts) do
+      dirs = endpoint_dirs(endpoints, part_rel)
+      tx = transport(opts)
+      n = Config.total(c)
 
-    acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed_part(c, acc, chunk) end)
-    acc = flush_final(c, acc)
+      acc0 = %{
+        md5: :crypto.hash_init(:md5),
+        sha: nil,
+        size: 0,
+        shard_len: nil,
+        block_hashes: List.duplicate([], n),
+        buffer: <<>>,
+        block_index: 0,
+        dirs: dirs,
+        tx: tx
+      }
 
-    md5_raw = :crypto.hash_final(acc.md5)
-    etag = Base.encode16(md5_raw, case: :lower)
-    shard_len = acc.shard_len || 0
+      acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed_part(c, acc, chunk) end)
+      acc = flush_final(c, acc)
 
-    meta =
-      build_part_meta(c, acc.size, etag, shard_len, Enum.map(acc.block_hashes, &Enum.reverse/1))
+      md5_raw = :crypto.hash_final(acc.md5)
+      etag = Base.encode16(md5_raw, case: :lower)
+      shard_len = acc.shard_len || 0
 
-    _ = write_sidecars(tx, dirs, meta)
-    {:ok, %{size: acc.size, etag: etag, md5_raw: md5_raw}}
+      meta =
+        build_part_meta(c, acc.size, etag, shard_len, Enum.map(acc.block_hashes, &Enum.reverse/1))
+
+      _ = write_sidecars(tx, dirs, meta)
+      {:ok, %{size: acc.size, etag: etag, md5_raw: md5_raw}}
+    end
   end
 
   # 与 feed/3 同，但只更新 MD5（part 不需 sha256）。
@@ -710,35 +751,37 @@ defmodule Maxio.Storage.Distributed do
   defp do_get_part_stream(bucket, _key, upload_id, part_number, opts) do
     part_rel = Paths.part_rel(bucket, upload_id, part_number)
     c = cfg(opts)
-    endpoints = endpoints_for_upload(bucket, upload_id, opts)
-    dirs = endpoint_dirs(endpoints, part_rel)
-    tx = transport(opts)
 
-    case read_any_sidecar(tx, dirs) do
-      {:ok, meta} ->
-        size = meta["size"]
-        block_size = get_in(meta, ["ec", "block_size"])
+    with {:ok, endpoints} <- endpoints_for_upload(bucket, upload_id, opts) do
+      dirs = endpoint_dirs(endpoints, part_rel)
+      tx = transport(opts)
 
-        if size == 0 do
-          {:ok, []}
-        else
-          {:ok,
-           stream_object(
-             c,
-             bucket,
-             "#{upload_id}/#{part_number}",
-             "null",
-             tx,
-             dirs,
-             meta,
-             block_size,
-             0,
-             size - 1
-           )}
-        end
+      case read_any_sidecar(tx, dirs) do
+        {:ok, meta} ->
+          size = meta["size"]
+          block_size = get_in(meta, ["ec", "block_size"])
 
-      {:error, :enoent} ->
-        {:error, :enoent}
+          if size == 0 do
+            {:ok, []}
+          else
+            {:ok,
+             stream_object(
+               c,
+               bucket,
+               "#{upload_id}/#{part_number}",
+               "null",
+               tx,
+               dirs,
+               meta,
+               block_size,
+               0,
+               size - 1
+             )}
+          end
+
+        {:error, :enoent} ->
+          {:error, :enoent}
+      end
     end
   end
 
@@ -751,13 +794,38 @@ defmodule Maxio.Storage.Distributed do
 
       {:ok, obj_rel} ->
         # 不自持对象锁（B1-1：锁由 handler 层 Maxio.Lock 横跨 assemble 字节 + put_metadata 元数据单点持有）。
-        assemble_locked(bucket, key, upload_id, version_id, obj_rel, part_numbers, opts)
+        case endpoints_with_placement(bucket, key, opts) do
+          {:ok, {endpoints, placement}} ->
+            assemble_locked(
+              bucket,
+              key,
+              upload_id,
+              version_id,
+              obj_rel,
+              part_numbers,
+              opts,
+              endpoints,
+              placement
+            )
+
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 
-  defp assemble_locked(bucket, key, upload_id, version_id, obj_rel, part_numbers, opts) do
+  defp assemble_locked(
+         bucket,
+         key,
+         upload_id,
+         version_id,
+         obj_rel,
+         part_numbers,
+         opts,
+         endpoints,
+         placement
+       ) do
     c = cfg(opts)
-    endpoints = endpoints_for(bucket, key, opts)
     tx = transport(opts)
     n = Config.total(c)
 
@@ -811,7 +879,13 @@ defmodule Maxio.Storage.Distributed do
     ok_endpoints = commit_all(tx, commit_targets, opts)
 
     if ok_endpoints >= c.write_quorum do
-      {:ok, %{size: acc.size}}
+      {:ok,
+       %{
+         size: acc.size,
+         placement_set_id: placement.set_id,
+         placement_pool_id: placement.pool_id,
+         placement_topology_hash: placement.topology_hash
+       }}
     else
       Logger.error("distributed assemble below write quorum",
         bucket: bucket,
@@ -826,11 +900,13 @@ defmodule Maxio.Storage.Distributed do
 
   defp do_abort_upload(bucket, _key, upload_id, opts) do
     upload_rel = Paths.upload_rel(bucket, upload_id)
-    endpoints = endpoints_for_upload(bucket, upload_id, opts)
-    dirs = endpoint_dirs(endpoints, upload_rel)
-    tx = transport(opts)
-    Enum.each(dirs, fn {node, dir} -> tx.delete_shard(node, dir) end)
-    :ok
+
+    with {:ok, endpoints} <- endpoints_for_upload(bucket, upload_id, opts) do
+      dirs = endpoint_dirs(endpoints, upload_rel)
+      tx = transport(opts)
+      Enum.each(dirs, fn {node, dir} -> tx.delete_shard(node, dir) end)
+      :ok
+    end
   end
 
   # ── delete marker 落盘（ROUTE B B5-0；B5-3 R2 非破坏化）──
@@ -856,41 +932,43 @@ defmodule Maxio.Storage.Distributed do
 
       {:ok, obj_rel} ->
         c = cfg(opts)
-        endpoints = endpoints_for(bucket, key, opts)
-        tx = transport(opts)
 
-        commit_targets = begin_commit_targets(tx, endpoints, obj_rel)
-        tmp_dirs = ordered_tmp_dirs(commit_targets)
-        meta = build_delete_marker_meta(version_id, entry_opts)
+        with {:ok, endpoints} <- endpoints_for(bucket, key, opts) do
+          tx = transport(opts)
 
-        prepared = write_sidecars(tx, tmp_dirs, meta)
+          commit_targets = begin_commit_targets(tx, endpoints, obj_rel)
+          tmp_dirs = ordered_tmp_dirs(commit_targets)
+          meta = build_delete_marker_meta(version_id, entry_opts)
 
-        if prepared < c.write_quorum do
-          Logger.error("distributed put_delete_marker below write quorum (pre-commit)",
-            bucket: bucket,
-            key: key,
-            reason: "prepared=#{prepared} < write_quorum=#{c.write_quorum}"
-          )
+          prepared = write_sidecars(tx, tmp_dirs, meta)
 
-          cleanup_tmps(tx, commit_targets)
-          {:error, :write_quorum}
-        else
-          # 纯元数据提交声明（ShardServer.commit/3 :meta_only）：temp 只有 meta.json 无 part.0 →
-          # 跳过 part rename 只提交 meta.json（仍 fsync + 原子 rename + sync dir）。
-          ok_endpoints = commit_all(tx, commit_targets, Keyword.put(opts, :meta_only, true))
-
-          if ok_endpoints >= c.write_quorum do
-            gc_orphan_parts(tx, commit_targets)
-            :ok
-          else
-            Logger.error("distributed put_delete_marker below write quorum",
+          if prepared < c.write_quorum do
+            Logger.error("distributed put_delete_marker below write quorum (pre-commit)",
               bucket: bucket,
               key: key,
-              reason: "ok_endpoints=#{ok_endpoints} < write_quorum=#{c.write_quorum}"
+              reason: "prepared=#{prepared} < write_quorum=#{c.write_quorum}"
             )
 
             cleanup_tmps(tx, commit_targets)
             {:error, :write_quorum}
+          else
+            # 纯元数据提交声明（ShardServer.commit/3 :meta_only）：temp 只有 meta.json 无 part.0 →
+            # 跳过 part rename 只提交 meta.json（仍 fsync + 原子 rename + sync dir）。
+            ok_endpoints = commit_all(tx, commit_targets, Keyword.put(opts, :meta_only, true))
+
+            if ok_endpoints >= c.write_quorum do
+              gc_orphan_parts(tx, commit_targets)
+              :ok
+            else
+              Logger.error("distributed put_delete_marker below write quorum",
+                bucket: bucket,
+                key: key,
+                reason: "ok_endpoints=#{ok_endpoints} < write_quorum=#{c.write_quorum}"
+              )
+
+              cleanup_tmps(tx, commit_targets)
+              {:error, :write_quorum}
+            end
           end
         end
     end
@@ -936,26 +1014,26 @@ defmodule Maxio.Storage.Distributed do
         c = cfg(opts)
         tx = transport(opts)
 
-        confirmed =
-          bucket
-          |> endpoints_for(key, opts)
-          |> Enum.count(fn {node, drive} ->
-            dir = Path.join(drive, obj_rel)
-            _ = tx.delete_shard(node, dir)
-            version_deleted?(tx, node, dir)
-          end)
+        with {:ok, endpoints} <- endpoints_for(bucket, key, opts) do
+          confirmed =
+            Enum.count(endpoints, fn {node, drive} ->
+              dir = Path.join(drive, obj_rel)
+              _ = tx.delete_shard(node, dir)
+              version_deleted?(tx, node, dir)
+            end)
 
-        if confirmed >= c.write_quorum do
-          :ok
-        else
-          Logger.error("distributed delete_version below write quorum",
-            bucket: bucket,
-            key: key,
-            reason:
-              "confirmed=#{confirmed} < write_quorum=#{c.write_quorum} version_id=#{version_id}"
-          )
+          if confirmed >= c.write_quorum do
+            :ok
+          else
+            Logger.error("distributed delete_version below write quorum",
+              bucket: bucket,
+              key: key,
+              reason:
+                "confirmed=#{confirmed} < write_quorum=#{c.write_quorum} version_id=#{version_id}"
+            )
 
-          {:error, :write_quorum}
+            {:error, :write_quorum}
+          end
         end
     end
   end

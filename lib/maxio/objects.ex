@@ -89,6 +89,7 @@ defmodule Maxio.Objects do
           index_generation: Map.get(attrs, :generation, 0)
         }
         |> Map.merge(SystemHeaders.take(attrs))
+        |> Map.merge(placement_attrs(attrs))
 
       Repo.transaction(fn ->
         unset_latest(bucket.id, key)
@@ -113,6 +114,9 @@ defmodule Maxio.Objects do
                  :acl_grants,
                  :sse_algorithm,
                  :sse_envelope,
+                 :placement_set_id,
+                 :placement_pool_id,
+                 :placement_topology_hash,
                  :is_latest,
                  :is_delete_marker,
                  :synced_at,
@@ -289,7 +293,10 @@ defmodule Maxio.Objects do
           :acl_grants,
           :tags,
           :sse_algorithm,
-          :sse_envelope
+          :sse_envelope,
+          :placement_set_id,
+          :placement_pool_id,
+          :placement_topology_hash
         ])
         |> Map.merge(%{
           bucket_id: bucket.id,
@@ -328,6 +335,9 @@ defmodule Maxio.Objects do
                     :acl_grants,
                     :sse_algorithm,
                     :sse_envelope,
+                    :placement_set_id,
+                    :placement_pool_id,
+                    :placement_topology_hash,
                     :is_latest,
                     :is_delete_marker,
                     :synced_at,
@@ -384,23 +394,25 @@ defmodule Maxio.Objects do
   落盘，PG 索引须用同 version_id 保持盘/PG 一致）。Enabled 传新 ULID，Suspended 传 "null"
   （null marker 替换既有 null 版本，AWS 语义）。返回 {:ok, %{version_id}}。
   """
-  @spec insert_delete_marker_with_id(String.t(), String.t(), String.t()) ::
+  @spec insert_delete_marker_with_id(String.t(), String.t(), String.t(), map()) ::
           {:ok, %{version_id: String.t()}} | {:error, :no_such_bucket}
-  def insert_delete_marker_with_id(bucket_name, key, version_id) do
+  def insert_delete_marker_with_id(bucket_name, key, version_id, attrs \\ %{}) do
     with {:ok, bucket} <- bucket_or_error(bucket_name) do
-      base = %{
-        bucket_id: bucket.id,
-        bucket_name: bucket_name,
-        key: key,
-        size: 0,
-        etag: "",
-        version_id: version_id,
-        is_latest: true,
-        is_delete_marker: true,
-        # ROUTE B B5-1：写穿即视作同步；delete marker sidecar entry generation 恒 0（B5-0 既定）。
-        synced_at: DateTime.utc_now(),
-        index_generation: 0
-      }
+      base =
+        %{
+          bucket_id: bucket.id,
+          bucket_name: bucket_name,
+          key: key,
+          size: 0,
+          etag: "",
+          version_id: version_id,
+          is_latest: true,
+          is_delete_marker: true,
+          # ROUTE B B5-1：写穿即视作同步；delete marker sidecar entry generation 恒 0（B5-0 既定）。
+          synced_at: DateTime.utc_now(),
+          index_generation: 0
+        }
+        |> Map.merge(placement_attrs(attrs))
 
       Repo.transaction(fn ->
         unset_latest(bucket.id, key)
@@ -414,6 +426,9 @@ defmodule Maxio.Objects do
                [
                  :size,
                  :etag,
+                 :placement_set_id,
+                 :placement_pool_id,
+                 :placement_topology_hash,
                  :is_latest,
                  :is_delete_marker,
                  :synced_at,
@@ -438,9 +453,10 @@ defmodule Maxio.Objects do
   记 Log.error 而非让 DELETE 失败（去 PG 写路径 SPOF，铁律 3 绝不静默）。`:pg` 默认权威仍走
   insert_delete_marker_with_id/3 的致命语义。
   """
-  @spec insert_delete_marker_index(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
-  def insert_delete_marker_index(bucket_name, key, version_id) do
-    case insert_delete_marker_with_id(bucket_name, key, version_id) do
+  @spec insert_delete_marker_index(String.t(), String.t(), String.t(), map()) ::
+          :ok | {:error, term()}
+  def insert_delete_marker_index(bucket_name, key, version_id, attrs \\ %{}) do
+    case insert_delete_marker_with_id(bucket_name, key, version_id, attrs) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -579,6 +595,10 @@ defmodule Maxio.Objects do
   # sidecar 版本 entry 的 generation（缺失/非整数 → 0，与 Sidecar 排序键同兜底）。
   defp entry_generation(%{"generation" => g}) when is_integer(g), do: g
   defp entry_generation(_entry), do: 0
+
+  defp placement_attrs(attrs) do
+    Map.take(attrs, [:placement_set_id, :placement_pool_id, :placement_topology_hash])
+  end
 
   @doc """
   永久删除某特定版本行（DELETE ?versionId）。删后若被删的是当时的 latest，则把该 key 余下

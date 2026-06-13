@@ -45,6 +45,7 @@ defmodule Maxio.Cluster.RebalanceTest do
     assert report.objects == 3
     assert report.versions == 4
     assert report.delete_markers == 1
+    assert report.placement_fallbacks == 4
     assert report.bytes == 37
 
     per_set = Map.new(report.per_set, &{&1.set_id, &1})
@@ -53,12 +54,14 @@ defmodule Maxio.Cluster.RebalanceTest do
     assert per_set[0].objects == 2
     assert per_set[0].versions == 2
     assert per_set[0].delete_markers == 0
+    assert per_set[0].placement_fallbacks == 2
     assert per_set[0].bytes == 30
 
     refute Map.fetch!(per_set[1], :target?)
     assert per_set[1].objects == 1
     assert per_set[1].versions == 2
     assert per_set[1].delete_markers == 1
+    assert per_set[1].placement_fallbacks == 2
     assert per_set[1].bytes == 7
 
     assert report.decommission.set_id == 0
@@ -88,7 +91,45 @@ defmodule Maxio.Cluster.RebalanceTest do
     assert report.objects == 1
     assert report.versions == 1
     assert report.delete_markers == 0
+    assert report.placement_fallbacks == 1
     assert report.bytes == 20
+  end
+
+  test "planner prefers persisted placement before falling back to current router" do
+    topology = topology()
+    bucket = bucket_name("rebalance-placement")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+
+    key_hashes_to_zero = key_for_set(bucket, topology, 0, "hash-zero")
+    key_hashes_to_one = key_for_set(bucket, topology, 1, "hash-one")
+
+    {:ok, _} =
+      Objects.put_version_with_id(bucket, key_hashes_to_zero, "01", %{
+        size: 12,
+        etag: "e12",
+        placement_set_id: 1,
+        placement_topology_hash: "historical"
+      })
+
+    {:ok, _} =
+      Objects.put_version_with_id(bucket, key_hashes_to_one, "01", %{size: 5, etag: "e5"})
+
+    {:ok, report} =
+      Rebalance.plan(topology: topology, include_drive_stats: false, decommission_set: 1)
+
+    per_set = Map.new(report.per_set, &{&1.set_id, &1})
+
+    assert report.scanned == 2
+    assert report.placement_fallbacks == 1
+    assert per_set[0].objects == 0
+    assert per_set[0].bytes == 0
+    assert per_set[0].placement_fallbacks == 0
+    assert per_set[1].objects == 2
+    assert per_set[1].bytes == 17
+    assert per_set[1].placement_fallbacks == 1
+    assert report.decommission.objects == 2
+    assert report.decommission.bytes == 17
+    assert report.decommission.placement_fallbacks == 1
   end
 
   test "partial drive stats are surfaced without hiding inventory totals" do

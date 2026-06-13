@@ -76,13 +76,15 @@ defmodule Mix.Tasks.Maxio.Rebalance.Plan do
         "topology_sets=#{report.topology_sets} endpoints=#{report.endpoints} " <>
         "buckets=#{report.buckets} pages=#{report.pages} scanned=#{report.scanned} " <>
         "objects=#{report.objects} versions=#{report.versions} " <>
-        "delete_markers=#{report.delete_markers} bytes=#{report.bytes} " <>
+        "delete_markers=#{report.delete_markers} " <>
+        "placement_fallbacks=#{report.placement_fallbacks} bytes=#{report.bytes} " <>
         "drive_status=#{report.drive_stats.status} drive_ok=#{report.drive_stats.ok} " <>
         "drive_errors=#{report.drive_stats.errors} " <>
         "decommission_set=#{format_value(report.decommission_set)} " <>
         "decommission_objects=#{report.decommission.objects} " <>
         "decommission_versions=#{report.decommission.versions} " <>
         "decommission_delete_markers=#{report.decommission.delete_markers} " <>
+        "decommission_placement_fallbacks=#{report.decommission.placement_fallbacks} " <>
         "decommission_bytes=#{report.decommission.bytes}"
     )
 
@@ -93,7 +95,8 @@ defmodule Mix.Tasks.Maxio.Rebalance.Plan do
     IO.puts(
       "[maxio rebalance.set] set_id=#{set.set_id} target=#{Map.fetch!(set, :target?)} " <>
         "endpoints=#{set.endpoints} objects=#{set.objects} versions=#{set.versions} " <>
-        "delete_markers=#{set.delete_markers} bytes=#{set.bytes} " <>
+        "delete_markers=#{set.delete_markers} " <>
+        "placement_fallbacks=#{set.placement_fallbacks} bytes=#{set.bytes} " <>
         "drive_endpoints=#{set.drive_endpoints} drive_ok=#{set.drive_ok} " <>
         "drive_errors=#{set.drive_errors} " <>
         "drive_capacity_bytes=#{set.drive_capacity_bytes} " <>

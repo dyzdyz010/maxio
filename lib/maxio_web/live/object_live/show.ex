@@ -4,13 +4,14 @@ defmodule MaxioWeb.ObjectLive.Show do
   修改时间）+ 标签编辑（raw 文本 ↔ `[{k,v}]`，经 `Maxio.Tags.validate(_, :object)` 校验，
   `:invalid_tag` 显式 flash，绝不静默放行，铁律 3）+ 版本历史（`Objects.list_object_versions/2`，
   含 delete marker badge，per-version 流式下载经 `DownloadController` + 永久删除经
-  `Objects.delete_version/3`，删后 `stream(reset: true)` 重取以反映 promote_latest）。
+  `Objects.delete_version/3` + `Storage.delete/4`，删后 `stream(reset: true)` 重取以反映 promote_latest）。
   不存在的桶/对象 → `push_navigate` 回 browse（flash 不静默）。路由 `live "/buckets/:bucket/object/*key"`
   已在 M5-5 注册，本单元只「完整替换」占位实现，勿重复添加路由。
   """
   use MaxioWeb, :live_view
 
-  alias Maxio.{Buckets, Objects, Tags}
+  alias Maxio.{Buckets, Objects, Storage, Tags}
+  alias Maxio.Cluster.Placement
 
   @impl true
   def mount(%{"bucket" => bucket, "key" => key_segments}, _session, socket) do
@@ -174,8 +175,12 @@ defmodule MaxioWeb.ObjectLive.Show do
     bucket = socket.assigns.bucket
     key = socket.assigns.key
 
+    storage_opts = storage_opts_for_version(bucket, key, vid)
+
     case Objects.delete_version(bucket, key, vid) do
       {:ok, _} ->
+        _ = Storage.delete(bucket, key, vid, storage_opts)
+
         # 重取版本列表（promote_latest 可能改变其他行的 is_latest）+ 重取当前对象元数据。
         versions = versions_for(bucket, key)
 
@@ -196,6 +201,13 @@ defmodule MaxioWeb.ObjectLive.Show do
   end
 
   # ── 辅助 ──
+
+  defp storage_opts_for_version(bucket, key, version_id) do
+    case Objects.get_version(bucket, key, version_id) do
+      {:ok, obj} -> Placement.storage_opts(obj)
+      {:error, :not_found} -> []
+    end
+  end
 
   # 取该 (bucket, key) 的全部版本行（list_object_versions 以 prefix 查询，再精确过滤同名 key）。
   defp versions_for(bucket, key) do

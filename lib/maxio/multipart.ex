@@ -209,7 +209,7 @@ defmodule Maxio.Multipart do
         )
 
       case Maxio.Storage.put(upload.bucket_name, upload.key, version_id, cipher_stream, put_opts) do
-        {:ok, %{size: _stored_size}} ->
+        {:ok, %{size: _stored_size} = write_result} ->
           # part 字节清理 + 会话/分块元数据删除统一由调用方 handler 的 Multipart.abort/1 负责
           # （单一职责，不在此重复 abort_upload）。
           {:ok,
@@ -217,7 +217,10 @@ defmodule Maxio.Multipart do
              etag: s3_etag,
              size: visible_size,
              sse_envelope: sse_envelope,
-             version_id: version_id
+             version_id: version_id,
+             placement_set_id: Map.get(write_result, :placement_set_id),
+             placement_pool_id: Map.get(write_result, :placement_pool_id),
+             placement_topology_hash: Map.get(write_result, :placement_topology_hash)
            }}
 
         {:error, _} = err ->
@@ -246,10 +249,19 @@ defmodule Maxio.Multipart do
            part_numbers,
            assemble_opts
          ) do
-      {:ok, %{size: size}} ->
+      {:ok, %{size: size} = write_result} ->
         # part 字节清理 + 会话/分块元数据删除统一由调用方 handler 的 Multipart.abort/1 负责
         # （单一职责，不在此重复 abort_upload）。
-        {:ok, %{etag: s3_etag, size: size, sse_envelope: nil, version_id: version_id}}
+        {:ok,
+         %{
+           etag: s3_etag,
+           size: size,
+           sse_envelope: nil,
+           version_id: version_id,
+           placement_set_id: Map.get(write_result, :placement_set_id),
+           placement_pool_id: Map.get(write_result, :placement_pool_id),
+           placement_topology_hash: Map.get(write_result, :placement_topology_hash)
+         }}
 
       {:error, _} = err ->
         err

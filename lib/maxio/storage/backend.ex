@@ -55,11 +55,12 @@ defmodule Maxio.Storage.Backend do
               opts :: [{:object_meta, object_meta()} | {atom(), term()}]
             ) ::
               {:ok, put_result()} | {:error, term()}
-  @callback get(bucket(), key(), version_id :: String.t(), range()) ::
+  @callback get(bucket(), key(), version_id :: String.t(), range(), opts :: keyword()) ::
               {:ok, Enumerable.t()} | {:error, :enoent | term()}
-  @callback stat(bucket(), key(), version_id :: String.t()) ::
+  @callback stat(bucket(), key(), version_id :: String.t(), opts :: keyword()) ::
               {:ok, %{size: non_neg_integer()}} | {:error, :enoent}
-  @callback delete(bucket(), key(), version_id :: String.t()) :: :ok | {:error, term()}
+  @callback delete(bucket(), key(), version_id :: String.t(), opts :: keyword()) ::
+              :ok | {:error, term()}
   @callback put_bucket(bucket()) :: :ok | {:error, term()}
   @callback delete_bucket(bucket()) :: :ok | {:error, term()}
 

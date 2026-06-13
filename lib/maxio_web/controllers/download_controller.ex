@@ -7,6 +7,7 @@ defmodule MaxioWeb.DownloadController do
   use MaxioWeb, :controller
 
   alias Maxio.{Objects, Storage}
+  alias Maxio.Cluster.Placement
   alias Maxio.Objects.Object
 
   def show(conn, %{"bucket" => bucket, "key" => key_segments} = params) do
@@ -20,7 +21,9 @@ defmodule MaxioWeb.DownloadController do
 
     case fetch do
       {:ok, %Object{is_delete_marker: false} = object} ->
-        {:ok, stream} = Storage.get(bucket, key, object.version_id, nil)
+        {:ok, stream} =
+          Storage.get(bucket, key, object.version_id, nil, Placement.storage_opts(object))
+
         filename = Path.basename(key)
 
         conn

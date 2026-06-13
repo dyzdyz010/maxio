@@ -1,7 +1,43 @@
 defmodule MaxioWeb.ObjectLiveShowTest do
-  use MaxioWeb.ConnCase, async: true
+  use MaxioWeb.ConnCase, async: false
 
   import Phoenix.LiveViewTest
+
+  defmodule CapturingDeleteBackend do
+    @behaviour Maxio.Storage.Backend
+
+    defp capture_pid, do: Application.get_env(:maxio, :object_live_show_capture_pid)
+
+    @impl true
+    def put(b, k, v, c, o), do: Maxio.Storage.FS.put(b, k, v, c, o)
+    @impl true
+    def get(b, k, v, r, o), do: Maxio.Storage.FS.get(b, k, v, r, o)
+    @impl true
+    def stat(b, k, v, o), do: Maxio.Storage.FS.stat(b, k, v, o)
+
+    @impl true
+    def delete(b, k, v, o) do
+      if pid = capture_pid(), do: send(pid, {:delete, b, k, v, o})
+      Maxio.Storage.FS.delete(b, k, v, o)
+    end
+
+    @impl true
+    def put_bucket(b), do: Maxio.Storage.FS.put_bucket(b)
+    @impl true
+    def delete_bucket(b), do: Maxio.Storage.FS.delete_bucket(b)
+    @impl true
+    def put_part(b, k, u, n, c, o), do: Maxio.Storage.FS.put_part(b, k, u, n, c, o)
+    @impl true
+    def get_part_stream(b, k, u, n, o), do: Maxio.Storage.FS.get_part_stream(b, k, u, n, o)
+    @impl true
+    def assemble(b, k, u, ns, o), do: Maxio.Storage.FS.assemble(b, k, u, ns, o)
+    @impl true
+    def abort_upload(b, k, u, o), do: Maxio.Storage.FS.abort_upload(b, k, u, o)
+    @impl true
+    def put_delete_marker(b, k, v, eo, o), do: Maxio.Storage.FS.put_delete_marker(b, k, v, eo, o)
+    @impl true
+    def delete_version(b, k, v, o), do: Maxio.Storage.FS.delete_version(b, k, v, o)
+  end
 
   setup %{conn: conn} do
     {:ok, _b} = Maxio.Buckets.create("show-bucket", "arn:aws:iam:::root")
@@ -86,5 +122,46 @@ defmodule MaxioWeb.ObjectLiveShowTest do
 
     assert {:error, :not_found} =
              Maxio.Objects.get_version("del-bucket", "k.txt", v1.version_id)
+  end
+
+  test "删除版本时按对象持久化 placement 清理存储层", %{conn: conn} do
+    prev_backend = Application.get_env(:maxio, :storage_backend)
+    prev_capture_pid = Application.get_env(:maxio, :object_live_show_capture_pid)
+
+    Application.put_env(:maxio, :storage_backend, CapturingDeleteBackend)
+    Application.put_env(:maxio, :object_live_show_capture_pid, self())
+
+    on_exit(fn ->
+      Application.put_env(:maxio, :storage_backend, prev_backend)
+
+      if is_nil(prev_capture_pid) do
+        Application.delete_env(:maxio, :object_live_show_capture_pid)
+      else
+        Application.put_env(:maxio, :object_live_show_capture_pid, prev_capture_pid)
+      end
+    end)
+
+    {:ok, _b} = Maxio.Buckets.create("placed-show-bucket", "arn:aws:iam:::root")
+    version_id = Maxio.Versioning.VersionId.generate()
+
+    {:ok, _object} =
+      Maxio.Objects.put_version_with_id("placed-show-bucket", "k.txt", version_id, %{
+        size: 1,
+        etag: "a",
+        placement_set_id: 7,
+        placement_pool_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/buckets/placed-show-bucket/object/k.txt")
+
+    view
+    |> element(~s([phx-value-vid="#{version_id}"]))
+    |> render_click()
+
+    assert_receive {:delete, "placed-show-bucket", "k.txt", ^version_id, opts}
+    assert Keyword.fetch!(opts, :placement_set_id) == 7
+    assert Keyword.fetch!(opts, :placement_pool_id) == 0
+    assert Keyword.fetch!(opts, :placement_topology_hash) == "topo-a"
   end
 end

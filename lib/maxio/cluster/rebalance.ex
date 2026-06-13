@@ -9,7 +9,7 @@ defmodule Maxio.Cluster.Rebalance do
   """
 
   alias Maxio.{Buckets, Objects}
-  alias Maxio.Cluster.{DriveStats, Router, Topology}
+  alias Maxio.Cluster.{DriveStats, Placement, Topology}
   alias Maxio.S3.Log
 
   @default_page_size 500
@@ -21,6 +21,7 @@ defmodule Maxio.Cluster.Rebalance do
           objects: non_neg_integer(),
           versions: non_neg_integer(),
           delete_markers: non_neg_integer(),
+          placement_fallbacks: non_neg_integer(),
           bytes: non_neg_integer(),
           drive_endpoints: non_neg_integer(),
           drive_ok: non_neg_integer(),
@@ -42,6 +43,7 @@ defmodule Maxio.Cluster.Rebalance do
           objects: non_neg_integer(),
           versions: non_neg_integer(),
           delete_markers: non_neg_integer(),
+          placement_fallbacks: non_neg_integer(),
           bytes: non_neg_integer(),
           decommission_set: Topology.set_id() | nil,
           decommission: map(),
@@ -107,7 +109,7 @@ defmodule Maxio.Cluster.Rebalance do
 
     [
       view: view,
-      topology: topology_for_router(view),
+      placement_opts: placement_opts(view),
       set_ids: set_ids,
       current_only: current_only,
       scope: if(current_only, do: :current_only, else: :versions),
@@ -132,6 +134,7 @@ defmodule Maxio.Cluster.Rebalance do
            objects: 0,
            versions: 0,
            delete_markers: 0,
+           placement_fallbacks: 0,
            bytes: 0,
            drive_endpoints: 0,
            drive_ok: 0,
@@ -155,6 +158,7 @@ defmodule Maxio.Cluster.Rebalance do
       objects: 0,
       versions: 0,
       delete_markers: 0,
+      placement_fallbacks: 0,
       bytes: 0,
       decommission_set: Keyword.get(cfg, :decommission_set),
       decommission: empty_decommission(Keyword.get(cfg, :decommission_set)),
@@ -223,7 +227,9 @@ defmodule Maxio.Cluster.Rebalance do
   end
 
   defp account_object(bucket, object, cfg, report) do
-    set_id = Router.set_for(bucket, object.key, cfg[:topology])
+    placement = placement_for(bucket, object, cfg)
+    set_id = placement.set_id
+    placement_fallbacks = if placement.source == :persisted, do: 0, else: 1
     delete_marker? = object.is_delete_marker
     bytes = if delete_marker?, do: 0, else: non_negative_int(object.size)
     objects = if delete_marker?, do: 0, else: 1
@@ -234,6 +240,7 @@ defmodule Maxio.Cluster.Rebalance do
       objects: objects,
       versions: 1,
       delete_markers: delete_markers,
+      placement_fallbacks: placement_fallbacks,
       bytes: bytes
     }
 
@@ -241,6 +248,17 @@ defmodule Maxio.Cluster.Rebalance do
     |> add_totals(delta)
     |> update_set(set_id, delta)
     |> maybe_add_decommission(set_id, cfg[:decommission_set], delta)
+  end
+
+  defp placement_for(bucket, object, cfg) do
+    case Placement.resolve_object(bucket, object, cfg[:placement_opts]) do
+      {:ok, placement} ->
+        placement
+
+      {:error, {:unknown_set_id, _set_id, _set_ids}} ->
+        {:ok, placement} = Placement.resolve(bucket, object.key, cfg[:placement_opts])
+        %{placement | source: :router}
+    end
   end
 
   defp attach_drive_stats(report, cfg) do
@@ -321,6 +339,7 @@ defmodule Maxio.Cluster.Rebalance do
         objects: report.objects + delta.objects,
         versions: report.versions + delta.versions,
         delete_markers: report.delete_markers + delta.delete_markers,
+        placement_fallbacks: report.placement_fallbacks + delta.placement_fallbacks,
         bytes: report.bytes + delta.bytes
     }
   end
@@ -332,6 +351,7 @@ defmodule Maxio.Cluster.Rebalance do
         | objects: set.objects + delta.objects,
           versions: set.versions + delta.versions,
           delete_markers: set.delete_markers + delta.delete_markers,
+          placement_fallbacks: set.placement_fallbacks + delta.placement_fallbacks,
           bytes: set.bytes + delta.bytes
       }
     end)
@@ -354,6 +374,7 @@ defmodule Maxio.Cluster.Rebalance do
         | objects: decommission.objects + delta.objects,
           versions: decommission.versions + delta.versions,
           delete_markers: decommission.delete_markers + delta.delete_markers,
+          placement_fallbacks: decommission.placement_fallbacks + delta.placement_fallbacks,
           bytes: decommission.bytes + delta.bytes
       }
     end)
@@ -376,6 +397,7 @@ defmodule Maxio.Cluster.Rebalance do
       objects: 0,
       versions: 0,
       delete_markers: 0,
+      placement_fallbacks: 0,
       bytes: 0,
       decommission_set: Keyword.get(opts, :decommission_set),
       decommission: empty_decommission(Keyword.get(opts, :decommission_set)),
@@ -391,6 +413,7 @@ defmodule Maxio.Cluster.Rebalance do
       objects: 0,
       versions: 0,
       delete_markers: 0,
+      placement_fallbacks: 0,
       bytes: 0
     }
   end
@@ -428,8 +451,8 @@ defmodule Maxio.Cluster.Rebalance do
     end
   end
 
-  defp topology_for_router({:configured, nil}), do: nil
-  defp topology_for_router({:injected, topology}), do: topology
+  defp placement_opts({:configured, nil}), do: []
+  defp placement_opts({:injected, topology}), do: [topology: topology]
 
   defp all_set_ids({:configured, nil}), do: Topology.all_set_ids()
   defp all_set_ids({:injected, topology}), do: Topology.all_set_ids_from(topology)

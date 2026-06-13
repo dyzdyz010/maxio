@@ -13,6 +13,7 @@ defmodule Maxio.Lifecycle do
   alias Maxio.Buckets
   alias Maxio.Buckets.Bucket
   alias Maxio.BucketConfigs
+  alias Maxio.Cluster.Placement
   alias Maxio.Multipart
   alias Maxio.Multipart.Upload
   alias Maxio.Objects
@@ -374,14 +375,14 @@ defmodule Maxio.Lifecycle do
         put_delete_marker(bucket.name, object.key, "null", opts)
 
       _unversioned ->
-        hard_delete_object(bucket.name, object.key)
+        hard_delete_object(bucket.name, object)
     end
   end
 
-  defp hard_delete_object(bucket, key) do
-    case Maxio.Lock.with_object_lock({bucket, key}, fn ->
-           :ok = Objects.delete_metadata(bucket, key)
-           _ = Storage.delete(bucket, key, "null")
+  defp hard_delete_object(bucket, %Object{} = object) do
+    case Maxio.Lock.with_object_lock({bucket, object.key}, fn ->
+           :ok = Objects.delete_metadata(bucket, object.key)
+           _ = Storage.delete(bucket, object.key, "null", Placement.storage_opts(object))
            :ok
          end) do
       {:ok, :ok} -> :ok
@@ -403,7 +404,9 @@ defmodule Maxio.Lifecycle do
 
   defp put_delete_marker_sidecar(bucket, key, version_id) do
     with :ok <- Storage.put_delete_marker(bucket, key, version_id) do
-      case Objects.insert_delete_marker_index(bucket, key, version_id) do
+      placement_attrs = Placement.attrs_for_write(bucket, key)
+
+      case Objects.insert_delete_marker_index(bucket, key, version_id, placement_attrs) do
         :ok ->
           :ok
 
@@ -421,8 +424,11 @@ defmodule Maxio.Lifecycle do
   end
 
   defp put_delete_marker_pg(bucket, key, version_id) do
-    {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id)
-    if version_id == "null", do: _ = Storage.delete(bucket, key, "null")
+    old_null_opts = storage_opts_for_version(bucket, key, "null")
+    placement_attrs = Placement.attrs_for_write(bucket, key)
+
+    {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id, placement_attrs)
+    if version_id == "null", do: _ = Storage.delete(bucket, key, "null", old_null_opts)
     _ = Storage.put_delete_marker(bucket, key, version_id)
     :ok
   end
@@ -440,7 +446,13 @@ defmodule Maxio.Lifecycle do
   end
 
   defp delete_version_sidecar(bucket, key, version_id) do
-    with :ok <- Storage.delete_version(bucket, key, version_id) do
+    with :ok <-
+           Storage.delete_version(
+             bucket,
+             key,
+             version_id,
+             storage_opts_for_version(bucket, key, version_id)
+           ) do
       case Objects.delete_version_index(bucket, key, version_id) do
         :ok ->
           :ok
@@ -459,13 +471,22 @@ defmodule Maxio.Lifecycle do
   end
 
   defp delete_version_pg(bucket, key, version_id) do
+    storage_opts = storage_opts_for_version(bucket, key, version_id)
+
     case Objects.delete_version(bucket, key, version_id) do
       {:ok, _} ->
-        _ = Storage.delete(bucket, key, version_id)
+        _ = Storage.delete(bucket, key, version_id, storage_opts)
         :ok
 
       {:error, :not_found} ->
         :ok
+    end
+  end
+
+  defp storage_opts_for_version(bucket, key, version_id) do
+    case Objects.get_version(bucket, key, version_id) do
+      {:ok, object} -> Placement.storage_opts(object)
+      {:error, :not_found} -> []
     end
   end
 

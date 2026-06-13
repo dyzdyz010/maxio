@@ -5,6 +5,7 @@ defmodule Maxio.S3.Handlers.Object do
   """
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Storage}
+  alias Maxio.Cluster.Placement
   alias Maxio.Policy.ACL
 
   alias Maxio.S3.{
@@ -105,7 +106,7 @@ defmodule Maxio.S3.Handlers.Object do
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
         case Storage.put(bucket, key, version_id, chunks, object_meta: object_meta) do
-          {:ok, %{size: stored_size, etag: etag, sha256: sha256}} ->
+          {:ok, %{size: stored_size, etag: etag, sha256: sha256} = write_result} ->
             # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
             # SSE 加密对象：后端返回的 stored_size 是密文帧长度；S3 可见 size 用明文计数流统计。
             # x-amz-decoded-content-length 仍按明文 size 校验；x-amz-content-sha256 在 SSE 路径暂不复算
@@ -140,11 +141,13 @@ defmodule Maxio.S3.Handlers.Object do
                     sse_envelope: sse_envelope
                   }
                   |> Map.merge(system_headers)
+                  |> Map.merge(Placement.attrs_from_result(write_result))
 
                 commit_metadata(bucket, key, version_id, attrs)
               rescue
                 err ->
-                  _ = Storage.delete(bucket, key, version_id)
+                  _ =
+                    Storage.delete(bucket, key, version_id, Placement.storage_opts(write_result))
 
                   Log.warn("put object rolled back orphan bytes",
                     action: :put_object,
@@ -264,7 +267,15 @@ defmodule Maxio.S3.Handlers.Object do
                 # 对单区间 Range，先映射到覆盖该明文区间的完整密文帧 byte-range，再解密和裁剪首尾
                 # 明文帧；避免为了小范围读取/认证无关的后续密文帧。
                 {cipher_range, plain_slice} = sse_ranges(range, total)
-                {:ok, raw_stream} = Storage.get(bucket, key, object.version_id, cipher_range)
+
+                {:ok, raw_stream} =
+                  Storage.get(
+                    bucket,
+                    key,
+                    object.version_id,
+                    cipher_range,
+                    Placement.storage_opts(object)
+                  )
 
                 send_authenticated_sse_object!(
                   conn,
@@ -276,7 +287,15 @@ defmodule Maxio.S3.Handlers.Object do
                 )
 
               _ ->
-                {:ok, stream} = Storage.get(bucket, key, object.version_id, range_tuple(range))
+                {:ok, stream} =
+                  Storage.get(
+                    bucket,
+                    key,
+                    object.version_id,
+                    range_tuple(range),
+                    Placement.storage_opts(object)
+                  )
+
                 conn = maybe_put_version_id(conn, object.version_id)
                 send_object(conn, object, total, range, stream)
             end
@@ -457,8 +476,9 @@ defmodule Maxio.S3.Handlers.Object do
         # Unversioned：真删（删 null 行 + 字节）。B1-1：元数据 + 字节删除纳入同一对象锁，
         # 避免与并发同 key PUT 的提交 seam 交错（获锁失败 -> 503 RequestTimeout，铁律 3）。
         case Maxio.Lock.with_object_lock({bucket, key}, fn ->
+               storage_opts = storage_opts_for_current(bucket, key)
                :ok = Objects.delete_metadata(bucket, key)
-               _ = Storage.delete(bucket, key)
+               _ = Storage.delete(bucket, key, "null", storage_opts)
                :ok
              end) do
           {:ok, :ok} ->
@@ -590,8 +610,9 @@ defmodule Maxio.S3.Handlers.Object do
 
       true ->
         # 未版本化桶 → 硬删（删 null 行 + 字节）。缺失 key 也算成功（S3 语义）。
+        storage_opts = storage_opts_for_current(bucket, key)
         :ok = Objects.delete_metadata(bucket, key)
-        _ = Storage.delete(bucket, key)
+        _ = Storage.delete(bucket, key, "null", storage_opts)
         {:ok, %{key: key}}
     end
   end
@@ -741,6 +762,7 @@ defmodule Maxio.S3.Handlers.Object do
         self_copy?,
         src_bucket,
         src_key,
+        src_obj,
         src_obj.version_id,
         dest_bucket,
         dest_key
@@ -769,11 +791,11 @@ defmodule Maxio.S3.Handlers.Object do
           |> Map.merge(SystemHeaders.to_object_meta(system_headers))
 
         Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
-          {_stored_size, etag} =
+          {_stored_size, etag, write_result} =
             case Storage.put(dest_bucket, dest_key, dest_version_id, copy_stream,
                    object_meta: dest_object_meta
                  ) do
-              {:ok, %{size: size, etag: etag}} -> {size, etag}
+              {:ok, %{size: size, etag: etag} = write_result} -> {size, etag, write_result}
               {:error, reason} -> raise_storage_write_error(reason, dest_bucket, dest_key)
             end
 
@@ -800,7 +822,8 @@ defmodule Maxio.S3.Handlers.Object do
                 sse_algorithm: target_sse,
                 sse_envelope: target_sse_envelope
               }
-              |> Map.merge(system_headers),
+              |> Map.merge(system_headers)
+              |> Map.merge(Placement.attrs_from_result(write_result)),
               :copy_object
             )
 
@@ -871,14 +894,32 @@ defmodule Maxio.S3.Handlers.Object do
   # 非自拷贝：直接返回源对象「真实版本」流（锁外打开，目标写时消费）。
   # src_version_id 为源对象的真实版本路径（版本化源 ULID、未版本化源 "null"），绝不再硬编码 "null"
   # （否则版本化源读不到字节 → 静默产生空目标，铁律 5）。:tmp_key=nil 表示无临时副本需清理。
-  defp prepare_copy_source(false, src_bucket, src_key, src_version_id, _dest_bucket, _dest_key) do
-    {:ok, src_stream} = Storage.get(src_bucket, src_key, src_version_id, nil)
+  defp prepare_copy_source(
+         false,
+         src_bucket,
+         src_key,
+         src_obj,
+         src_version_id,
+         _dest_bucket,
+         _dest_key
+       ) do
+    {:ok, src_stream} =
+      Storage.get(src_bucket, src_key, src_version_id, nil, Placement.storage_opts(src_obj))
+
     %{stream: src_stream, dest_bucket: nil, tmp_key: nil}
   end
 
   # 自拷贝（src==dest）：锁外先把源「真实版本」流式写到唯一临时 key（避免目标写截断源），
   # 返回临时流供目标写消费。
-  defp prepare_copy_source(true, src_bucket, src_key, src_version_id, dest_bucket, dest_key) do
+  defp prepare_copy_source(
+         true,
+         src_bucket,
+         src_key,
+         src_obj,
+         src_version_id,
+         dest_bucket,
+         dest_key
+       ) do
     suffix = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
 
     # B5-4：临时 key 自身必须通过 key 守卫（1024 字节长度闸）——近上限 dest_key 直接整段做前缀
@@ -886,7 +927,9 @@ defmodule Maxio.S3.Handlers.Object do
     # 作归因可读性；唯一性由 16 hex 随机后缀保证；末段恒以 ".maxio-copytmp-<hex>" 结尾，
     # 绝不构成 `.`/`..` 段——tmp_key 恒为合法 key。
     tmp_key = String.slice(dest_key, 0, 64) <> ".maxio-copytmp-" <> suffix
-    {:ok, src_stream} = Storage.get(src_bucket, src_key, src_version_id, nil)
+
+    {:ok, src_stream} =
+      Storage.get(src_bucket, src_key, src_version_id, nil, Placement.storage_opts(src_obj))
 
     case Storage.put(dest_bucket, tmp_key, "null", src_stream) do
       {:ok, _tmp} ->
@@ -904,6 +947,20 @@ defmodule Maxio.S3.Handlers.Object do
   defp cleanup_copy_source(%{dest_bucket: dest_bucket, tmp_key: tmp_key}) do
     _ = Storage.delete(dest_bucket, tmp_key, "null")
     :ok
+  end
+
+  defp storage_opts_for_current(bucket, key) do
+    case Objects.get_metadata(bucket, key) do
+      {:ok, obj} -> Placement.storage_opts(obj)
+      {:error, :not_found} -> []
+    end
+  end
+
+  defp storage_opts_for_version(bucket, key, version_id) do
+    case Objects.get_version(bucket, key, version_id) do
+      {:ok, obj} -> Placement.storage_opts(obj)
+      {:error, :not_found} -> []
+    end
   end
 
   defp raise_storage_write_error(reason, bucket, key)
@@ -1020,8 +1077,9 @@ defmodule Maxio.S3.Handlers.Object do
   # 不可能存在任何版本）→ 视同不存在（幂等 204，对齐 AWS 删除不存在版本）。
   defp commit_version_delete_sidecar(bucket, key, version_id) do
     dm? = version_is_delete_marker?(bucket, key, version_id)
+    storage_opts = storage_opts_for_version(bucket, key, version_id)
 
-    case Storage.delete_version(bucket, key, version_id) do
+    case Storage.delete_version(bucket, key, version_id, storage_opts) do
       :ok ->
         case Objects.delete_version_index(bucket, key, version_id) do
           :ok ->
@@ -1050,9 +1108,11 @@ defmodule Maxio.S3.Handlers.Object do
   # :pg（默认）写权威：PG 删行权威先行（既有语义/状态码不变）；盘上字节删除 best-effort 但失败
   # 必 Log.warn 归因（绝不再静默丢弃结果，铁律 3）。
   defp commit_version_delete_pg(bucket, key, version_id) do
+    storage_opts = storage_opts_for_version(bucket, key, version_id)
+
     case Objects.delete_version(bucket, key, version_id) do
       {:ok, %{was_delete_marker: dm?}} ->
-        case Storage.delete(bucket, key, version_id) do
+        case Storage.delete(bucket, key, version_id, storage_opts) do
           :ok ->
             :ok
 
@@ -1095,7 +1155,9 @@ defmodule Maxio.S3.Handlers.Object do
   # 旧对象完好可读，重试收敛）；PG 索引 best-effort（盘上 marker 已权威耐久）。
   defp commit_delete_marker_sidecar(bucket, key, version_id) do
     with :ok <- Storage.put_delete_marker(bucket, key, version_id) do
-      case Objects.insert_delete_marker_index(bucket, key, version_id) do
+      placement_attrs = Placement.attrs_for_write(bucket, key)
+
+      case Objects.insert_delete_marker_index(bucket, key, version_id, placement_attrs) do
         :ok ->
           :ok
 
@@ -1117,10 +1179,13 @@ defmodule Maxio.S3.Handlers.Object do
   # 均 best-effort：后端 marker 写失败（FS 单盘 IO 错 / 纠删 quorum 不足，B6-1 起 FS 也实落
   # marker sidecar）不影响已权威提交的删除（盘上残留对 PG 读/列权威不可见），绝不让 :pg 路径因盘失败而失败。
   defp commit_delete_marker_pg(bucket, key, version_id, versioning) do
-    {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id)
+    old_null_opts = storage_opts_for_version(bucket, key, "null")
+    placement_attrs = Placement.attrs_for_write(bucket, key)
+
+    {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id, placement_attrs)
 
     # Suspended：null marker 替换既有 null 版本 → 清理被替换的 null 版本字节 + sidecar。
-    if versioning == "Suspended", do: _ = Storage.delete(bucket, key, "null")
+    if versioning == "Suspended", do: _ = Storage.delete(bucket, key, "null", old_null_opts)
     _ = Storage.put_delete_marker(bucket, key, version_id)
     :ok
   end
@@ -1187,6 +1252,9 @@ defmodule Maxio.S3.Handlers.Object do
       tags: Map.get(attrs, :tags, %{}),
       sse_algorithm: Map.get(attrs, :sse_algorithm),
       sse_envelope: Map.get(attrs, :sse_envelope),
+      placement_set_id: Map.get(attrs, :placement_set_id),
+      placement_pool_id: Map.get(attrs, :placement_pool_id),
+      placement_topology_hash: Map.get(attrs, :placement_topology_hash),
       is_latest: true,
       is_delete_marker: false,
       updated_at: DateTime.utc_now()

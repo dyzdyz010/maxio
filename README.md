@@ -361,7 +361,8 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 **node-local drive health long-window offline registry**、**software drive identity replacement detection**、
 **drive IO latency/throughput telemetry CLI**、**drive filesystem capacity stats CLI**、
 **operator-triggered fresh-drive heal workflow** 和
-**config-gated fresh-drive heal scheduler**，并新增 **read-only rebalance/decommission planning CLI**。
+**config-gated fresh-drive heal scheduler**，并新增 **read-only rebalance/decommission planning CLI**
+与 **object placement contract**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -415,11 +416,12 @@ M8-3a/b/c/d/e 已提供：
   注入。该信号是 filesystem capacity 观测，不是 queue depth、SMART、硬件身份、物理吞吐，也暂不参与
   对象路由、free-space placement 或 rebalance。
 - `Maxio.Cluster.Rebalance` / `mix maxio.rebalance.plan [--current-only] [--decommission-set <id>] [--page-size <n>] [--no-drive-stats] [--json]`：
-  对当前 topology 做只读规划取证，从 PG 对象元数据分页枚举对象/版本/delete marker，并按现有
-  `Router.set_for/3` 汇总每个 erasure set 的 logical bytes、版本数、delete marker 数与可选 drive
-  capacity/free-space。`--decommission-set` 仅估算目标 set 受影响对象范围；不移动数据、不改路由、
-  不实现 MinIO `mc admin rebalance/decommission` 状态机。该估算基于当前 topology，历史 topology
-  写入对象和物理 shard bytes 仍需后续迁移层处理。
+  对当前 topology 做只读规划取证，从 PG 对象元数据分页枚举对象/版本/delete marker。对象行有
+  `placement_set_id` 时优先按持久化真实落点汇总；旧行或未知落点回退到当前 `Router.set_for/3`，
+  并通过 `placement_fallbacks` 暴露估算风险。输出每个 erasure set 的 logical bytes、版本数、
+  delete marker 数与可选 drive capacity/free-space。`--decommission-set` 仅估算目标 set 受影响对象范围；
+  不移动数据、不改新写 placement、不实现 MinIO `mc admin rebalance/decommission` 状态机。物理 shard bytes
+  与真实迁移计划仍需后续迁移层处理。
 - `Maxio.Cluster.PressureAggregator`：监督树内缓存 peer node 的 `IOPressure.local_snapshot/0`，
   后台按 `config :maxio, :io_pressure` 刷新；scrubber/fresh-drive gate 只读本地计数 + 新鲜缓存，
   peer timeout/stale/down 均 fail-open，不在对象间同步 RPC。
@@ -478,5 +480,5 @@ M8 剩余：
   本节点/缓存 peer 的 S3 handler in-flight + ShardServer storage-op 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-combined`）、
   node-local ShardServer IO latency/throughput telemetry、filesystem capacity/free-space stats、node-local drive-offline 长窗口观测、software UUID same-path replacement detection，
   手动 `mix maxio.heal.fresh_drives` marker 消费、默认关闭的 fresh-drive heal scheduler，以及只读
-  `mix maxio.rebalance.plan` 当前 topology logical inventory；
+  `mix maxio.rebalance.plan` logical inventory（优先对象持久化 placement，旧行计 `placement_fallbacks`）；
   尚未接入 OS/设备级磁盘队列/硬件吞吐反馈、硬件/物理 replacement identity、free-space placement、decommission 或 rebalance 数据迁移。

@@ -6,6 +6,7 @@ defmodule Maxio.S3.Handlers.Multipart do
   """
   import Plug.Conn
   alias Maxio.{Buckets, Multipart, Objects, Storage}
+  alias Maxio.Cluster.Placement
   alias Maxio.Policy.ACL
 
   alias Maxio.S3.{
@@ -155,27 +156,35 @@ defmodule Maxio.S3.Handlers.Multipart do
         version_id = complete_version_id(bucket_record)
 
         case Multipart.complete(upload, requested, version_id: version_id) do
-          {:ok, %{etag: etag, size: size, sse_envelope: sse_envelope, version_id: version_id}} ->
+          {:ok,
+           %{etag: etag, size: size, sse_envelope: sse_envelope, version_id: version_id} =
+               complete_result} ->
             # ROUTE B B5-1：元数据提交按写权威分流（与 object.ex commit_metadata 同模式）。
             :ok =
-              commit_complete_metadata(bucket, key, version_id, %{
-                size: size,
-                etag: etag,
-                content_type: upload.content_type,
-                content_encoding: upload.content_encoding,
-                content_disposition: upload.content_disposition,
-                cache_control: upload.cache_control,
-                expires: upload.expires,
-                storage_class: upload.storage_class,
-                acl_canned: upload.acl_canned,
-                acl_grants: upload.acl_grants || ACL.empty_grants_doc(),
-                sse_algorithm: upload.sse_algorithm,
-                sse_envelope: sse_envelope,
-                # ROUTE B B4-6 fidelity：会话捕获的 user_metadata 也写入 PG 索引行，
-                # 消除已完成多段对象在 :pg(默认) 读路径下 metadata=%{} 的 D3-style 分裂——
-                # 与 sidecar 透传（assemble_object_meta.user_metadata）保持两路一致。
-                metadata: upload.metadata || %{}
-              })
+              commit_complete_metadata(
+                bucket,
+                key,
+                version_id,
+                %{
+                  size: size,
+                  etag: etag,
+                  content_type: upload.content_type,
+                  content_encoding: upload.content_encoding,
+                  content_disposition: upload.content_disposition,
+                  cache_control: upload.cache_control,
+                  expires: upload.expires,
+                  storage_class: upload.storage_class,
+                  acl_canned: upload.acl_canned,
+                  acl_grants: upload.acl_grants || ACL.empty_grants_doc(),
+                  sse_algorithm: upload.sse_algorithm,
+                  sse_envelope: sse_envelope,
+                  # ROUTE B B4-6 fidelity：会话捕获的 user_metadata 也写入 PG 索引行，
+                  # 消除已完成多段对象在 :pg(默认) 读路径下 metadata=%{} 的 D3-style 分裂——
+                  # 与 sidecar 透传（assemble_object_meta.user_metadata）保持两路一致。
+                  metadata: upload.metadata || %{}
+                }
+                |> Map.merge(Placement.attrs_from_result(complete_result))
+              )
 
             _ = Multipart.abort(upload)
             {:ok, {etag, size, upload.sse_algorithm, version_id}}

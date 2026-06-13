@@ -39,6 +39,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.PlanTest do
     assert output =~ "buckets=1"
     assert output =~ "objects=1"
     assert output =~ "versions=1"
+    assert output =~ "placement_fallbacks=1"
     assert output =~ "bytes=9"
     assert output =~ "drive_status=disabled"
     assert output =~ "[maxio rebalance.set] set_id=0"
@@ -64,6 +65,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.PlanTest do
     assert report["topology_sets"] == 2
     assert report["objects"] == 1
     assert report["versions"] == 1
+    assert report["placement_fallbacks"] == 1
     assert report["bytes"] == 5
     assert is_list(report["per_set"])
   end

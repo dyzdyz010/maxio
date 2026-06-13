@@ -27,7 +27,7 @@ defmodule Maxio.S3.InFlightTest.BlockingBackend do
     end
   end
 
-  def get(_bucket, _key, _version_id, _range) do
+  def get(_bucket, _key, _version_id, _range, _opts) do
     parent = Application.fetch_env!(:maxio, :in_flight_test_parent)
 
     stream =
@@ -52,7 +52,7 @@ defmodule Maxio.S3.InFlightTest.BlockingBackend do
     {:ok, stream}
   end
 
-  def delete(_bucket, _key, _version_id), do: :ok
+  def delete(_bucket, _key, _version_id, _opts), do: :ok
 end
 
 defmodule Maxio.S3.InFlightTest do
