@@ -251,6 +251,56 @@ defmodule Maxio.Objects do
     end
   end
 
+  @doc """
+  Atomically switch only the persisted placement columns for a version row.
+
+  The optimistic guard keeps the byte-visible identity stable: bucket/key/version,
+  old placement, etag, logical size, delete-marker flag and updated_at must still
+  match the caller's row. `updated_at` is intentionally preserved so S3
+  Last-Modified does not drift during decommission copy-pass.
+  """
+  @spec update_placement_if_current(Object.t(), map()) ::
+          {:ok, Object.t()} | {:error, :stale | :not_found}
+  def update_placement_if_current(%Object{} = object, %{placement_set_id: set_id} = attrs)
+      when is_integer(set_id) do
+    set_attrs = [
+      placement_set_id: set_id,
+      placement_pool_id: Map.get(attrs, :placement_pool_id),
+      placement_topology_hash: Map.get(attrs, :placement_topology_hash),
+      synced_at: Map.get(attrs, :synced_at, DateTime.utc_now()),
+      index_generation: Map.get(attrs, :index_generation, object.index_generation || 0)
+    ]
+
+    query =
+      Object
+      |> where([o], o.id == ^object.id)
+      |> where([o], o.bucket_id == ^object.bucket_id)
+      |> where([o], o.bucket_name == ^object.bucket_name)
+      |> where([o], o.key == ^object.key)
+      |> where([o], o.version_id == ^object.version_id)
+      |> where([o], o.etag == ^object.etag)
+      |> where([o], o.size == ^object.size)
+      |> where([o], o.is_delete_marker == ^object.is_delete_marker)
+      |> where([o], o.updated_at == ^object.updated_at)
+      |> where_expected(:placement_set_id, object.placement_set_id)
+      |> where_expected(:placement_pool_id, object.placement_pool_id)
+      |> where_expected(:placement_topology_hash, object.placement_topology_hash)
+
+    case Repo.update_all(query, set: set_attrs) do
+      {1, _} ->
+        Notify.broadcast(
+          {:object_metadata_changed, object.bucket_name, object.key, object.version_id}
+        )
+
+        get_version(object.bucket_name, object.key, object.version_id)
+
+      {0, _} ->
+        if Repo.get(Object, object.id), do: {:error, :stale}, else: {:error, :not_found}
+    end
+  end
+
+  def update_placement_if_current(%Object{}, _attrs), do: {:error, :stale}
+
   @doc "删除对象元数据（幂等：不存在也返回 :ok）。"
   @spec delete_metadata(String.t(), String.t()) :: :ok
   def delete_metadata(bucket_name, key) do
@@ -598,6 +648,14 @@ defmodule Maxio.Objects do
 
   defp placement_attrs(attrs) do
     Map.take(attrs, [:placement_set_id, :placement_pool_id, :placement_topology_hash])
+  end
+
+  defp where_expected(query, field, nil) do
+    where(query, [o], is_nil(field(o, ^field)))
+  end
+
+  defp where_expected(query, field, value) do
+    where(query, [o], field(o, ^field) == ^value)
   end
 
   @doc """

@@ -362,7 +362,8 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 **drive IO latency/throughput telemetry CLI**、**drive filesystem capacity stats CLI**、
 **operator-triggered fresh-drive heal workflow** 和
 **config-gated fresh-drive heal scheduler**，并新增 **read-only rebalance/decommission planning CLI**
-与 **object placement contract**，以及 **persistent rebalance/decommission job control plane**。
+与 **object placement contract**、**persistent rebalance/decommission job control plane**，
+以及 **restricted foreground decommission copy-pass runner**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -427,8 +428,13 @@ M8-3a/b/c/d/e 已提供：
   cursor/progress 初始字段与 `data_movement=false` / `data_movement_status=not_started`；DB partial unique index
   与 context 双层保证同一时间最多一个 active job。若计划里存在 `placement_fallbacks`，会拒绝创建 job，
   避免在无法确认真实落点时伪造可执行迁移计划；decommission job 也会拒绝 `--current-only`，必须盘点全版本
-  与 delete marker。当前只提供 planned/canceled 状态控制和 operator 可观测性，
-  不启动 worker、不移动 shard、不删除源 shard、不改变对象路由或 free-space placement。
+  与 delete marker。
+- `Maxio.Cluster.Rebalance.Runner` / `mix maxio.rebalance.run [JOB_ID|--job-id <uuid>] --destination-set <id> [--max-versions <n>] [--page-size <n>] [--dry-run] [--json]`：
+  受限前台 decommission copy-pass。runner 只处理 decommission job，要求 operator 显式指定目标 erasure set；
+  在 PG object placement 作为 read/list 权威时，逐版本/marker 把 `target_set_id` 上的对象写入
+  `destination_set_id`，目标写成功后用乐观条件更新对象 placement。`--max-versions` 可分批推进 cursor；
+  `--dry-run` 只返回计划报告，不修改 job。边界：不启动后台 worker、不删除源 shard、不做 source cleanup、
+  不改 topology/pool、不做 free-space placement；若 read/list authority 不是 PG 会 fail-closed。
 - `Maxio.Cluster.PressureAggregator`：监督树内缓存 peer node 的 `IOPressure.local_snapshot/0`，
   后台按 `config :maxio, :io_pressure` 刷新；scrubber/fresh-drive gate 只读本地计数 + 新鲜缓存，
   peer timeout/stale/down 均 fail-open，不在对象间同步 RPC。
@@ -488,5 +494,7 @@ M8 剩余：
   node-local ShardServer IO latency/throughput telemetry、filesystem capacity/free-space stats、node-local drive-offline 长窗口观测、software UUID same-path replacement detection，
   手动 `mix maxio.heal.fresh_drives` marker 消费、默认关闭的 fresh-drive heal scheduler，以及只读
   `mix maxio.rebalance.plan` logical inventory（优先对象持久化 placement，旧行计 `placement_fallbacks`）
-  和 `mix maxio.rebalance.start|status|cancel` 持久化 job 控制面；
-  尚未接入 OS/设备级磁盘队列/硬件吞吐反馈、硬件/物理 replacement identity、free-space placement、decommission 或 rebalance 数据迁移。
+  和 `mix maxio.rebalance.start|status|cancel` 持久化 job 控制面，以及受限前台
+  `mix maxio.rebalance.run` decommission copy-pass；
+  尚未接入 OS/设备级磁盘队列/硬件吞吐反馈、硬件/物理 replacement identity、source cleanup、free-space placement、
+  后台 worker、topology/pool mutation 或完整 decommission/rebalance workflow。

@@ -399,12 +399,13 @@ defmodule Maxio.Storage.Distributed do
   # entry 的 S3 可见 etag；单次 PUT 无此键（nil）→ migrate_v1 沿用 core etag。
   defp version_opts(version_id, opts) do
     om = Keyword.get(opts, :object_meta, %{})
-    modtime = System.os_time(:nanosecond)
+    modtime = Map.get(om, :modtime, System.os_time(:nanosecond))
 
     [
       version_id: version_id,
       data_dir: version_id,
       modtime: modtime,
+      generation: Map.get(om, :generation, 0),
       size: object_meta_value(om, :size),
       etag: Map.get(om, :etag),
       content_type: Map.get(om, :content_type, "binary/octet-stream"),

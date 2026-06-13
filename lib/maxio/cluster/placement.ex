@@ -78,6 +78,13 @@ defmodule Maxio.Cluster.Placement do
 
   @doc "Persistable placement attrs returned from a storage write result."
   @spec attrs_from_result(map() | term()) :: map()
+  def attrs_from_result(%{set_id: set_id} = result) do
+    %{}
+    |> maybe_put(:placement_set_id, set_id)
+    |> maybe_put(:placement_pool_id, Map.get(result, :pool_id))
+    |> maybe_put(:placement_topology_hash, Map.get(result, :topology_hash))
+  end
+
   def attrs_from_result(%{} = result) do
     %{}
     |> maybe_put(:placement_set_id, Map.get(result, :placement_set_id))

@@ -77,9 +77,11 @@ defmodule Mix.Tasks.Maxio.Rebalance.Status do
   end
 
   defp print_job(job) do
+    view = Jobs.to_view(job)
+
     IO.puts(
       "[maxio rebalance.status] job_id=#{job.id} kind=#{job.kind} status=#{job.status} " <>
-        "data_movement=false data_movement_status=#{job.data_movement_status} " <>
+        "data_movement=#{view.data_movement} data_movement_status=#{job.data_movement_status} " <>
         "target_set_id=#{format_value(job.target_set_id)} " <>
         "plan_status=#{job.plan_status} scanned=#{job.plan_scanned} bytes=#{job.plan_bytes} " <>
         "placement_fallbacks=#{job.plan_placement_fallbacks} progress_scanned=#{job.progress_scanned} " <>

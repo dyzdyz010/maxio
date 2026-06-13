@@ -108,8 +108,10 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
       kind: job.kind,
       status: job.status,
       data_movement_status: job.data_movement_status,
-      data_movement: false,
+      data_movement: data_movement?(job),
       target_set_id: job.target_set_id,
+      destination_set_id: job.destination_set_id,
+      source_cleanup_status: job.source_cleanup_status,
       current_only: job.current_only,
       include_drive_stats: job.include_drive_stats,
       page_size: job.page_size,
@@ -132,6 +134,89 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
       inserted_at: iso8601(job.inserted_at),
       updated_at: iso8601(job.updated_at)
     }
+  end
+
+  @doc "Mark a decommission job as running and bind its destination set."
+  @spec begin_data_movement(Job.t() | String.t(), non_neg_integer(), keyword()) ::
+          {:ok, Job.t()} | {:error, term()}
+  def begin_data_movement(job_or_id, destination_set_id, opts \\ [])
+
+  def begin_data_movement(job_or_id, destination_set_id, opts)
+      when is_integer(destination_set_id) do
+    with {:ok, job} <- fetch_job(job_or_id),
+         :ok <- ensure_destination_compatible(job, destination_set_id) do
+      attrs = %{
+        status: "running",
+        data_movement_status: "moving",
+        destination_set_id: destination_set_id,
+        source_cleanup_status: "not_started",
+        error_reason: nil
+      }
+
+      attrs = if job.started_at, do: attrs, else: Map.put(attrs, :started_at, now(opts))
+
+      guarded_begin_data_movement(job, attrs, destination_set_id)
+    end
+  end
+
+  def begin_data_movement(_job_or_id, destination_set_id, _opts),
+    do: {:error, {:invalid_destination_set_id, destination_set_id}}
+
+  @doc "Persist foreground runner counters and resume cursor."
+  @spec record_progress(Job.t() | String.t(), map(), map()) :: {:ok, Job.t()} | {:error, term()}
+  def record_progress(job_or_id, counters, cursor_attrs \\ %{}) do
+    with {:ok, job} <- fetch_job(job_or_id) do
+      attrs =
+        %{
+          progress_scanned: Map.get(counters, :scanned, job.progress_scanned),
+          progress_moved: Map.get(counters, :moved, job.progress_moved),
+          progress_skipped: Map.get(counters, :skipped, job.progress_skipped),
+          progress_errors: Map.get(counters, :errors, job.progress_errors)
+        }
+        |> Map.merge(
+          Map.take(cursor_attrs, [:cursor_bucket, :cursor_key_marker, :cursor_version_id_marker])
+        )
+
+      guarded_update_job(job, attrs, ["running"])
+    end
+  end
+
+  @doc "Finish a runner pass successfully and clear resume cursor."
+  @spec complete_data_movement(Job.t() | String.t(), keyword()) ::
+          {:ok, Job.t()} | {:error, term()}
+  def complete_data_movement(job_or_id, opts \\ []) do
+    with {:ok, job} <- fetch_job(job_or_id) do
+      guarded_update_job(
+        job,
+        %{
+          status: "complete",
+          data_movement_status: "complete",
+          cursor_bucket: nil,
+          cursor_key_marker: nil,
+          cursor_version_id_marker: nil,
+          finished_at: now(opts)
+        },
+        ["running"]
+      )
+    end
+  end
+
+  @doc "Mark a runner pass failed with a structured reason summary."
+  @spec fail_data_movement(Job.t() | String.t(), term(), keyword()) ::
+          {:ok, Job.t()} | {:error, term()}
+  def fail_data_movement(job_or_id, reason, opts \\ []) do
+    with {:ok, job} <- fetch_job(job_or_id) do
+      guarded_update_job(
+        job,
+        %{
+          status: "failed",
+          data_movement_status: "failed",
+          error_reason: inspect(reason),
+          finished_at: now(opts)
+        },
+        ["running"]
+      )
+    end
   end
 
   defp create(kind, opts) do
@@ -270,15 +355,19 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
   defp cancel_job(%Job{status: status} = job, opts) when status in @active_statuses do
     finished_at = now(opts)
 
-    job
-    |> Job.changeset(%{
-      status: "canceled",
-      data_movement_status: "canceled",
-      cancel_requested_at: finished_at,
-      finished_at: finished_at
-    })
-    |> Repo.update()
-    |> case do
+    job_result =
+      guarded_update_job(
+        job,
+        %{
+          status: "canceled",
+          data_movement_status: "canceled",
+          cancel_requested_at: finished_at,
+          finished_at: finished_at
+        },
+        @active_statuses
+      )
+
+    case job_result do
       {:ok, job} ->
         Log.info("rebalance job canceled",
           action: :rebalance_job_cancel,
@@ -287,12 +376,126 @@ defmodule Maxio.Cluster.Rebalance.Jobs do
 
         {:ok, job}
 
-      {:error, changeset} ->
-        {:error, changeset}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   defp cancel_job(%Job{} = job, _opts), do: {:error, {:not_cancelable, job.status}}
+
+  defp ensure_destination_compatible(
+         %Job{kind: "decommission", target_set_id: target},
+         destination
+       )
+       when target == destination,
+       do: {:error, :destination_matches_target}
+
+  defp ensure_destination_compatible(
+         %Job{kind: "decommission", destination_set_id: nil},
+         _destination
+       ),
+       do: :ok
+
+  defp ensure_destination_compatible(
+         %Job{kind: "decommission", destination_set_id: destination},
+         destination
+       ),
+       do: :ok
+
+  defp ensure_destination_compatible(
+         %Job{kind: "decommission", destination_set_id: existing},
+         destination
+       ),
+       do: {:error, {:destination_mismatch, existing, destination}}
+
+  defp ensure_destination_compatible(%Job{kind: kind}, _destination),
+    do: {:error, {:unsupported_job_kind, kind}}
+
+  defp fetch_job(%Job{} = job), do: {:ok, job}
+  defp fetch_job(id) when is_binary(id), do: get(id)
+  defp fetch_job(value), do: {:error, {:invalid_job, value}}
+
+  defp guarded_update_job(%Job{} = job, attrs, allowed_statuses) do
+    changeset = Job.changeset(job, attrs)
+
+    if changeset.valid? do
+      changes =
+        changeset.changes
+        |> Map.put(:updated_at, DateTime.utc_now())
+        |> Enum.into([])
+
+      case Repo.update_all(
+             from(j in Job, where: j.id == ^job.id and j.status in ^allowed_statuses),
+             set: changes
+           ) do
+        {1, _rows} ->
+          get(job.id)
+
+        {0, _rows} ->
+          case get(job.id) do
+            {:ok, %Job{} = stale} -> {:error, {:stale_job_status, stale.status}}
+            {:error, reason} -> {:error, reason}
+          end
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp guarded_begin_data_movement(%Job{} = job, attrs, destination_set_id) do
+    changeset = Job.changeset(job, attrs)
+
+    if changeset.valid? do
+      changes =
+        changeset.changes
+        |> Map.put(:updated_at, DateTime.utc_now())
+        |> Enum.into([])
+
+      query =
+        from(j in Job,
+          where:
+            j.id == ^job.id and j.kind == "decommission" and
+              j.status in ^["planned", "running"] and
+              j.target_set_id != ^destination_set_id and
+              (is_nil(j.destination_set_id) or j.destination_set_id == ^destination_set_id)
+        )
+
+      case Repo.update_all(query, set: changes) do
+        {1, _rows} ->
+          get(job.id)
+
+        {0, _rows} ->
+          explain_begin_conflict(job.id, destination_set_id)
+      end
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp explain_begin_conflict(job_id, destination_set_id) do
+    case get(job_id) do
+      {:ok, %Job{} = current} ->
+        case ensure_destination_compatible(current, destination_set_id) do
+          :ok ->
+            if current.status in ["planned", "running"],
+              do: {:error, :stale_job},
+              else: {:error, {:stale_job_status, current.status}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp data_movement?(%Job{} = job) do
+    job.data_movement_status in ["moving", "complete", "failed"] or
+      not is_nil(job.destination_set_id) or
+      (job.progress_scanned || 0) > 0 or
+      (job.progress_moved || 0) > 0
+  end
 
   defp maybe_where(query, _field, nil), do: query
 

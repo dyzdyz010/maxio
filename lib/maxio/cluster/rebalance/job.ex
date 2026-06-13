@@ -12,6 +12,8 @@ defmodule Maxio.Cluster.Rebalance.Job do
     field :status, :string, default: "planned"
     field :data_movement_status, :string, default: "not_started"
     field :target_set_id, :integer
+    field :destination_set_id, :integer
+    field :source_cleanup_status, :string, default: "not_started"
     field :current_only, :boolean, default: false
     field :include_drive_stats, :boolean, default: true
     field :page_size, :integer, default: 500
@@ -39,11 +41,13 @@ defmodule Maxio.Cluster.Rebalance.Job do
   @kinds ~w(rebalance decommission)
   @statuses ~w(planned running cancel_requested complete failed canceled)
   @data_movement_statuses ~w(not_started moving paused complete failed canceled)
+  @source_cleanup_statuses ~w(not_started skipped complete failed)
 
   @required [
     :kind,
     :status,
     :data_movement_status,
+    :source_cleanup_status,
     :current_only,
     :include_drive_stats,
     :page_size,
@@ -61,6 +65,7 @@ defmodule Maxio.Cluster.Rebalance.Job do
 
   @optional [
     :target_set_id,
+    :destination_set_id,
     :cursor_bucket,
     :cursor_key_marker,
     :cursor_version_id_marker,
@@ -78,7 +83,9 @@ defmodule Maxio.Cluster.Rebalance.Job do
     |> validate_inclusion(:kind, @kinds)
     |> validate_inclusion(:status, @statuses)
     |> validate_inclusion(:data_movement_status, @data_movement_statuses)
+    |> validate_inclusion(:source_cleanup_status, @source_cleanup_statuses)
     |> validate_number(:page_size, greater_than: 0)
+    |> validate_number(:destination_set_id, greater_than_or_equal_to: 0)
     |> validate_number(:plan_scanned, greater_than_or_equal_to: 0)
     |> validate_number(:plan_bytes, greater_than_or_equal_to: 0)
     |> validate_number(:plan_placement_fallbacks, greater_than_or_equal_to: 0)

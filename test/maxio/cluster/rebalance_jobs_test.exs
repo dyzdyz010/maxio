@@ -101,6 +101,86 @@ defmodule Maxio.Cluster.RebalanceJobsTest do
     refute next_job.id == job.id
   end
 
+  test "movement state transitions do not overwrite canceled or terminal jobs" do
+    topology = topology()
+    bucket = bucket_name("movement-guard-job")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "null", %{
+        size: 3,
+        etag: "e3",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    assert {:ok, job} = Jobs.start_decommission(0, topology: topology, include_drive_stats: false)
+    assert Jobs.to_view(job).data_movement == false
+
+    assert {:ok, running} = Jobs.begin_data_movement(job.id, 1)
+    assert running.status == "running"
+    assert Jobs.to_view(running).data_movement == true
+
+    assert {:ok, canceled} = Jobs.cancel(running.id)
+    assert canceled.status == "canceled"
+
+    assert {:error, {:stale_job_status, "canceled"}} =
+             Jobs.record_progress(canceled.id, %{scanned: 1, moved: 1, skipped: 0, errors: 0})
+
+    assert {:error, {:stale_job_status, "canceled"}} =
+             Jobs.complete_data_movement(canceled.id)
+
+    assert {:error, {:stale_job_status, "canceled"}} =
+             Jobs.fail_data_movement(canceled.id, :late_error)
+
+    assert {:ok, unchanged} = Jobs.get(canceled.id)
+    assert unchanged.status == "canceled"
+    assert unchanged.progress_scanned == 0
+    refute is_nil(unchanged.finished_at)
+
+    assert {:ok, terminal_job} =
+             Jobs.start_decommission(0, topology: topology, include_drive_stats: false)
+
+    assert {:ok, terminal_running} = Jobs.begin_data_movement(terminal_job.id, 1)
+    assert {:ok, complete} = Jobs.complete_data_movement(terminal_running.id)
+    assert complete.status == "complete"
+
+    assert {:error, {:stale_job_status, "complete"}} =
+             Jobs.begin_data_movement(complete.id, 1)
+
+    assert {:ok, still_complete} = Jobs.get(complete.id)
+    assert still_complete.status == "complete"
+  end
+
+  test "begin_data_movement cannot rebind destination from a stale job snapshot" do
+    topology = topology()
+    bucket = bucket_name("movement-destination-guard-job")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "null", %{
+        size: 3,
+        etag: "e3",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    assert {:ok, job} = Jobs.start_decommission(0, topology: topology, include_drive_stats: false)
+    stale_snapshot = job
+
+    assert {:ok, running} = Jobs.begin_data_movement(job, 1)
+    assert running.destination_set_id == 1
+
+    assert {:error, {:destination_mismatch, 1, 2}} =
+             Jobs.begin_data_movement(stale_snapshot, 2)
+
+    assert {:ok, unchanged} = Jobs.get(job.id)
+    assert unchanged.status == "running"
+    assert unchanged.destination_set_id == 1
+  end
+
   test "start fails loudly when plan has placement fallbacks" do
     topology = topology()
     bucket = bucket_name("fallback-job")
