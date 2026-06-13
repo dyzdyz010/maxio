@@ -130,7 +130,9 @@ defmodule Maxio.Storage.FS do
       data_shards: 1,
       parity_shards: 0,
       block_size: @chunk_size,
-      sets: %{0 => %{id: 0, endpoints: [{Node.self(), data_dir(opts)}]}},
+      pools: %{0 => %{id: 0, set_ids: [0]}},
+      pool_ids: [0],
+      sets: %{0 => %{id: 0, pool_id: 0, endpoints: [{Node.self(), data_dir(opts)}]}},
       set_ids: [0]
     }
   end

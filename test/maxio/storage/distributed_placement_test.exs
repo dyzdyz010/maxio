@@ -39,6 +39,7 @@ defmodule Maxio.Storage.DistributedPlacementTest do
 
     assert {:ok, result} = Distributed.put(bucket, key, "null", [body], opts)
     assert result.placement_set_id == 1
+    assert result.placement_pool_id == 0
 
     assert {:error, :enoent} =
              Distributed.get(bucket, key, "null", nil, topology: topology, transport: InProcess)

@@ -32,7 +32,7 @@ defmodule Maxio.Cluster.Placement do
             {:ok,
              %{
                set_id: set_id,
-               pool_id: Keyword.get(opts, :placement_pool_id),
+               pool_id: Keyword.get(opts, :placement_pool_id) || pool_id_for_set(set_id, view),
                topology_hash: topology_hash(view),
                source: :override
              }}
@@ -155,6 +155,11 @@ defmodule Maxio.Cluster.Placement do
       data_shards: Map.get(topology, :data_shards),
       parity_shards: Map.get(topology, :parity_shards),
       block_size: Map.get(topology, :block_size),
+      pool_ids: Topology.pool_ids_from(topology),
+      pools:
+        Map.new(Topology.pool_ids_from(topology), fn pool_id ->
+          {pool_id, Topology.set_ids_for_pool_from(topology, pool_id)}
+        end),
       set_ids: Topology.all_set_ids_from(topology)
     }
 
@@ -165,10 +170,12 @@ defmodule Maxio.Cluster.Placement do
   defp resolve_routed(_bucket, _key, {:configured, nil}), do: {:ok, no_topology()}
 
   defp resolve_routed(bucket, key, {:injected, topology} = view) do
+    set_id = Router.set_for(bucket, key, topology)
+
     {:ok,
      %{
-       set_id: Router.set_for(bucket, key, topology),
-       pool_id: nil,
+       set_id: set_id,
+       pool_id: Topology.pool_id_for_set_from(topology, set_id),
        topology_hash: topology_hash(view),
        source: :router
      }}
@@ -188,7 +195,7 @@ defmodule Maxio.Cluster.Placement do
           :decommission_redirect
         end
 
-      {:ok, %{placement | set_id: set_id, source: source}}
+      {:ok, %{placement | set_id: set_id, pool_id: pool_id_for_set(set_id, view), source: source}}
     end
   end
 
@@ -210,15 +217,26 @@ defmodule Maxio.Cluster.Placement do
 
   defp current_topology! do
     set_ids = Topology.all_set_ids()
+    pool_ids = Topology.pool_ids()
 
     %{
       data_shards: Keyword.fetch!(Topology.ec_params(), :data_shards),
       parity_shards: Keyword.fetch!(Topology.ec_params(), :parity_shards),
       block_size: Keyword.fetch!(Topology.ec_params(), :block_size),
+      pool_ids: pool_ids,
+      pools:
+        Map.new(pool_ids, fn pool_id ->
+          {pool_id, %{id: pool_id, set_ids: Topology.set_ids_for_pool(pool_id)}}
+        end),
       set_ids: set_ids,
       sets:
         Map.new(set_ids, fn set_id ->
-          {set_id, %{id: set_id, endpoints: Topology.endpoints(set_id)}}
+          {set_id,
+           %{
+             id: set_id,
+             pool_id: Topology.pool_id_for_set(set_id),
+             endpoints: Topology.endpoints(set_id)
+           }}
         end)
     }
   end
@@ -234,6 +252,11 @@ defmodule Maxio.Cluster.Placement do
       {:error, {:unknown_set_id, set_id, set_ids}}
     end
   end
+
+  defp pool_id_for_set(_set_id, {:configured, nil}), do: nil
+
+  defp pool_id_for_set(set_id, {:injected, topology}),
+    do: Topology.pool_id_for_set_from(topology, set_id)
 
   defp normalize_set_id(nil), do: nil
   defp normalize_set_id(set_id) when is_integer(set_id), do: set_id

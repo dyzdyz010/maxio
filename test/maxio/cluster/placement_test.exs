@@ -35,8 +35,21 @@ defmodule Maxio.Cluster.PlacementTest do
 
     assert {:ok, placement} = Placement.resolve_object(bucket, object, topology: topology)
     assert placement.set_id == 1
+    assert placement.pool_id == 0
     assert placement.source == :router
     assert is_binary(placement.topology_hash)
+  end
+
+  test "resolve_write includes routed pool id for new writes" do
+    topology = multi_pool_topology()
+    bucket = "placement-pool-id"
+    key = key_for_set(bucket, topology, 2)
+
+    assert {:ok, placement} = Placement.resolve_write(bucket, key, topology: topology)
+    assert placement.set_id == 2
+    assert placement.pool_id == 7
+
+    assert Placement.attrs_for_write(bucket, key, topology: topology).placement_pool_id == 7
   end
 
   test "resolve_write applies decommission route while resolve_object fallback stays read-routed" do
@@ -54,6 +67,18 @@ defmodule Maxio.Cluster.PlacementTest do
     assert {:ok, read_placement} = Placement.resolve_object(bucket, object, opts)
     assert read_placement.set_id == 0
     assert read_placement.source == :router
+  end
+
+  test "resolve_write updates pool id when decommission route crosses pools" do
+    topology = multi_pool_topology()
+    bucket = "placement-cross-pool-freeze"
+    key = key_for_set(bucket, topology, 0)
+    opts = [topology: topology, decommission_write_routes: %{0 => 2}]
+
+    assert {:ok, placement} = Placement.resolve_write(bucket, key, opts)
+    assert placement.set_id == 2
+    assert placement.pool_id == 7
+    assert placement.source == :decommission_redirect
   end
 
   test "resolve_write preserves explicit placement override for internal movement callers" do
@@ -91,6 +116,25 @@ defmodule Maxio.Cluster.PlacementTest do
       block_size: 1024,
       allow_colocated_endpoints: true,
       pools: [%{id: 0, sets: [%{id: 0, endpoints: endpoints0}, %{id: 1, endpoints: endpoints1}]}]
+    )
+  end
+
+  defp multi_pool_topology do
+    base = Path.join(System.tmp_dir!(), "maxio_placement_multi_pool_test")
+
+    endpoints0 = for i <- 0..1, do: {Node.self(), Path.join(base, "s0d#{i}")}
+    endpoints1 = for i <- 0..1, do: {Node.self(), Path.join(base, "s1d#{i}")}
+    endpoints2 = for i <- 0..1, do: {Node.self(), Path.join(base, "s2d#{i}")}
+
+    Topology.parse_and_validate!(
+      data_shards: 1,
+      parity_shards: 1,
+      block_size: 1024,
+      allow_colocated_endpoints: true,
+      pools: [
+        %{id: 0, sets: [%{id: 0, endpoints: endpoints0}, %{id: 1, endpoints: endpoints1}]},
+        %{id: 7, sets: [%{id: 2, endpoints: endpoints2}]}
+      ]
     )
   end
 

@@ -27,6 +27,65 @@ defmodule Maxio.Cluster.TopologyTest do
     assert Topology.ec_params_from(t) == [data_shards: 4, parity_shards: 2, block_size: 1024]
   end
 
+  test "保留 pool 元数据和部署顺序" do
+    mk = fn id ->
+      eps = for i <- 0..2, do: {:"maxio@n#{i}", "/data/s#{id}d#{i}"}
+      %{id: id, endpoints: eps}
+    end
+
+    t =
+      Topology.parse_and_validate!(
+        data_shards: 2,
+        parity_shards: 1,
+        block_size: 1024,
+        pools: [
+          %{id: 7, sets: [mk.(10), mk.(2)]},
+          %{id: 4, sets: [mk.(3)]}
+        ]
+      )
+
+    assert Topology.pool_ids_from(t) == [7, 4]
+    assert Topology.all_set_ids_from(t) == [10, 2, 3]
+    assert Topology.set_ids_for_pool_from(t, 7) == [10, 2]
+    assert Topology.set_ids_for_pool_from(t, 4) == [3]
+    assert Topology.pool_id_for_set_from(t, 10) == 7
+    assert Topology.pool_id_for_set_from(t, 3) == 4
+  end
+
+  test "legacy topology maps default to pool 0" do
+    legacy = %{
+      data_shards: 1,
+      parity_shards: 0,
+      block_size: 1024,
+      sets: %{0 => %{id: 0, endpoints: [{Node.self(), "/data"}]}},
+      set_ids: [0]
+    }
+
+    assert Topology.pool_ids_from(legacy) == [0]
+    assert Topology.set_ids_for_pool_from(legacy, 0) == [0]
+    assert Topology.pool_id_for_set_from(legacy, 0) == 0
+  end
+
+  test "partial pool metadata fails fast instead of using legacy fallback" do
+    legacy = %{
+      data_shards: 1,
+      parity_shards: 0,
+      block_size: 1024,
+      sets: %{0 => %{id: 0, pool_id: 7, endpoints: [{Node.self(), "/data"}]}},
+      set_ids: [0]
+    }
+
+    assert_raise ArgumentError, ~r/pool metadata incomplete/, fn ->
+      Topology.pool_ids_from(legacy)
+    end
+
+    partial = Map.put(legacy, :pool_ids, [7])
+
+    assert_raise ArgumentError, ~r/pool metadata incomplete/, fn ->
+      Topology.set_ids_for_pool_from(partial, 7)
+    end
+  end
+
   test "endpoints 数 != K+M -> raise" do
     bad = put_in(cfg(1, 4, 2), [:pools], [%{id: 0, sets: [%{id: 0, endpoints: [{:n, "/d"}]}]}])
     assert_raise ArgumentError, ~r/endpoints/, fn -> Topology.parse_and_validate!(bad) end
@@ -50,6 +109,13 @@ defmodule Maxio.Cluster.TopologyTest do
       ]
 
     assert_raise ArgumentError, ~r/重复 set id/, fn -> Topology.parse_and_validate!(bad) end
+  end
+
+  test "重复 pool id -> raise" do
+    pool = %{id: 0, sets: []}
+    bad = [data_shards: 4, parity_shards: 2, block_size: 1024, pools: [pool, pool]]
+
+    assert_raise ArgumentError, ~r/重复 pool id/, fn -> Topology.parse_and_validate!(bad) end
   end
 
   test "空 set（无 erasure set）-> raise" do

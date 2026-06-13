@@ -10,12 +10,15 @@ defmodule Maxio.Cluster.Topology do
   use GenServer
 
   @type set_id :: non_neg_integer()
+  @type pool_id :: non_neg_integer()
   @type endpoint :: {node(), String.t()}
   @type t :: %{
           data_shards: pos_integer(),
           parity_shards: pos_integer(),
           block_size: pos_integer(),
-          sets: %{set_id() => %{id: set_id(), endpoints: [endpoint()]}},
+          pools: %{pool_id() => %{id: pool_id(), set_ids: [set_id()]}},
+          pool_ids: [pool_id()],
+          sets: %{set_id() => %{id: set_id(), pool_id: pool_id(), endpoints: [endpoint()]}},
           set_ids: [set_id()]
         }
 
@@ -51,6 +54,18 @@ defmodule Maxio.Cluster.Topology do
   @spec all_set_ids() :: [set_id()]
   def all_set_ids, do: get().set_ids
 
+  @doc "所有 pool_id（按部署配置顺序）。"
+  @spec pool_ids() :: [pool_id()]
+  def pool_ids, do: pool_ids_from(get())
+
+  @doc "某 pool 下的 set_id 列表（按部署配置顺序）。"
+  @spec set_ids_for_pool(pool_id()) :: [set_id()]
+  def set_ids_for_pool(pool_id), do: set_ids_for_pool_from(get(), pool_id)
+
+  @doc "某 set 所属 pool_id。"
+  @spec pool_id_for_set(set_id()) :: pool_id()
+  def pool_id_for_set(set_id), do: pool_id_for_set_from(get(), set_id)
+
   @doc "某 set 的 N 个有序 {node,drive} 端点（索引 i = 分片 i）。"
   @spec endpoints(set_id()) :: [endpoint()]
   def endpoints(set_id), do: endpoints_from(get(), set_id)
@@ -67,6 +82,45 @@ defmodule Maxio.Cluster.Topology do
 
   @spec all_set_ids_from(t()) :: [set_id()]
   def all_set_ids_from(%{set_ids: ids}), do: ids
+
+  @spec pool_ids_from(t() | map()) :: [pool_id()]
+  def pool_ids_from(%{} = topology) do
+    cond do
+      complete_pool_metadata?(topology) -> Map.fetch!(topology, :pool_ids)
+      legacy_pool_metadata?(topology) -> legacy_pool_ids(topology)
+      true -> raise_incomplete_pool_metadata!()
+    end
+  end
+
+  @spec set_ids_for_pool_from(t() | map(), pool_id()) :: [set_id()]
+  def set_ids_for_pool_from(%{} = topology, pool_id) do
+    cond do
+      complete_pool_metadata?(topology) ->
+        topology |> Map.fetch!(:pools) |> Map.fetch!(pool_id) |> Map.fetch!(:set_ids)
+
+      legacy_pool_metadata?(topology) and pool_id == 0 ->
+        Map.fetch!(topology, :set_ids)
+
+      legacy_pool_metadata?(topology) ->
+        raise KeyError,
+          key: pool_id,
+          term: %{0 => %{id: 0, set_ids: Map.fetch!(topology, :set_ids)}}
+
+      true ->
+        raise_incomplete_pool_metadata!()
+    end
+  end
+
+  @spec pool_id_for_set_from(t() | map(), set_id()) :: pool_id()
+  def pool_id_for_set_from(%{} = topology, set_id) do
+    set = topology |> Map.fetch!(:sets) |> Map.fetch!(set_id)
+
+    cond do
+      complete_pool_metadata?(topology) -> Map.fetch!(set, :pool_id)
+      legacy_pool_metadata?(topology) -> 0
+      true -> raise_incomplete_pool_metadata!()
+    end
+  end
 
   @spec endpoints_from(t(), set_id()) :: [endpoint()]
   def endpoints_from(%{sets: sets}, set_id), do: Map.fetch!(sets, set_id).endpoints
@@ -120,26 +174,43 @@ defmodule Maxio.Cluster.Topology do
         :ok
     end
 
-    {sets, ids} =
+    {sets, set_ids, pools, pool_ids} =
       cfg
       |> Keyword.fetch!(:pools)
-      |> Enum.flat_map(& &1.sets)
-      |> Enum.reduce({%{}, []}, fn s, {acc, ids} ->
-        if length(s.endpoints) != n do
-          raise ArgumentError,
-                "topology: set #{s.id} 有 #{length(s.endpoints)} 个 endpoints != K+M=#{n}"
+      |> Enum.reduce({%{}, [], %{}, []}, fn pool,
+                                            {sets_acc, set_ids_acc, pools_acc, pool_ids_acc} ->
+        pool_id = pool.id
+
+        if Map.has_key?(pools_acc, pool_id) do
+          raise ArgumentError, "topology: 重复 pool id #{pool_id}"
         end
 
-        if Map.has_key?(acc, s.id) do
-          raise ArgumentError, "topology: 重复 set id #{s.id}"
-        end
+        {sets_acc, pool_set_ids, set_ids_acc} =
+          Enum.reduce(pool.sets, {sets_acc, [], set_ids_acc}, fn s,
+                                                                 {set_acc, pool_set_ids, ids_acc} ->
+            if length(s.endpoints) != n do
+              raise ArgumentError,
+                    "topology: set #{s.id} 有 #{length(s.endpoints)} 个 endpoints != K+M=#{n}"
+            end
 
-        validate_distinct_nodes!(s, allow_colocated)
+            if Map.has_key?(set_acc, s.id) do
+              raise ArgumentError, "topology: 重复 set id #{s.id}"
+            end
 
-        {Map.put(acc, s.id, %{id: s.id, endpoints: s.endpoints}), [s.id | ids]}
+            validate_distinct_nodes!(s, allow_colocated)
+
+            set = %{id: s.id, pool_id: pool_id, endpoints: s.endpoints}
+
+            {Map.put(set_acc, s.id, set), [s.id | pool_set_ids], [s.id | ids_acc]}
+          end)
+
+        pool_set_ids = Enum.reverse(pool_set_ids)
+        pool = %{id: pool_id, set_ids: pool_set_ids}
+
+        {sets_acc, set_ids_acc, Map.put(pools_acc, pool_id, pool), [pool_id | pool_ids_acc]}
       end)
 
-    if ids == [] do
+    if set_ids == [] do
       raise ArgumentError, "topology: 至少需一个 erasure set"
     end
 
@@ -147,8 +218,10 @@ defmodule Maxio.Cluster.Topology do
       data_shards: k,
       parity_shards: m,
       block_size: bs,
+      pools: pools,
+      pool_ids: Enum.reverse(pool_ids),
       sets: sets,
-      set_ids: Enum.sort(ids)
+      set_ids: Enum.reverse(set_ids)
     }
   end
 
@@ -168,5 +241,28 @@ defmodule Maxio.Cluster.Topology do
     end
 
     :ok
+  end
+
+  defp complete_pool_metadata?(%{} = topology) do
+    Map.has_key?(topology, :pool_ids) and Map.has_key?(topology, :pools) and
+      topology
+      |> Map.get(:sets, %{})
+      |> Enum.all?(fn {_set_id, set} -> is_map(set) and Map.has_key?(set, :pool_id) end)
+  end
+
+  defp legacy_pool_metadata?(%{} = topology) do
+    not Map.has_key?(topology, :pool_ids) and not Map.has_key?(topology, :pools) and
+      topology
+      |> Map.get(:sets, %{})
+      |> Enum.all?(fn {_set_id, set} -> is_map(set) and not Map.has_key?(set, :pool_id) end)
+  end
+
+  defp legacy_pool_ids(%{set_ids: []}), do: []
+  defp legacy_pool_ids(%{set_ids: _ids}), do: [0]
+
+  defp raise_incomplete_pool_metadata! do
+    raise ArgumentError,
+          "topology: pool metadata incomplete; expected pool_ids+pools+set.pool_id " <>
+            "or a legacy topology with none of those fields"
   end
 end
