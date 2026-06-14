@@ -11,6 +11,7 @@ defmodule Maxio.S3.Handlers.Multipart do
 
   alias Maxio.S3.{
     BodyReader,
+    Checksum,
     CopySource,
     Error,
     Log,
@@ -118,6 +119,7 @@ defmodule Maxio.S3.Handlers.Multipart do
     part_number = parse_part_number!(Map.fetch!(conn.query_params, "partNumber"))
 
     upload = upload_or_raise(bucket, key, upload_id)
+    :ok = Checksum.reject_upload_part_headers!(conn)
 
     case header(conn, "x-amz-copy-source") do
       nil -> upload_part_body(conn, bucket, key, upload_id, part_number, upload)

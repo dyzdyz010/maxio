@@ -12,6 +12,7 @@ defmodule Maxio.S3.Handlers.Object do
     BodyReader,
     Conditional,
     CopySource,
+    Checksum,
     Error,
     Log,
     PublicAccessBlock,
@@ -53,7 +54,10 @@ defmodule Maxio.S3.Handlers.Object do
     acl_input = acl_from_headers!(conn)
     :ok = PublicAccessBlock.reject_public_acl_write!(bucket, acl_input)
     payload_mode = conn.assigns.payload_mode
-    chunks = BodyReader.stream(conn, payload_mode)
+    checksum = Checksum.from_conn!(conn)
+
+    {chunks, get_checksum, discard_checksum} =
+      conn |> BodyReader.stream(payload_mode) |> Checksum.wrap_stream(checksum)
 
     # 版本字节路径对齐：先按桶 versioning 算 version_id（Enabled→新 ULID，否则 "null"），
     # 字节流式写入该 version_id 路径；落库用同一 version_id（铁律 4：不缓冲重写）。
@@ -107,69 +111,87 @@ defmodule Maxio.S3.Handlers.Object do
     # version_id/SSE/tags 等纯计算/读保持锁外；获锁失败 -> {:error,:locked} -> 503 RequestTimeout（铁律 3）。
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
-        case Storage.put(bucket, key, version_id, chunks, object_meta: object_meta) do
-          {:ok, %{size: stored_size, etag: etag, sha256: sha256} = write_result} ->
-            # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
-            # SSE 加密对象：后端返回的 stored_size 是密文帧长度；S3 可见 size 用明文计数流统计。
-            # x-amz-decoded-content-length 仍按明文 size 校验；x-amz-content-sha256 在 SSE 路径暂不复算
-            # 明文 SHA（SigV4/chunked 已在 BodyReader 层验签，后续再补明文 checksum 取证任务）。
-            #
-            # 传输完整性（decoded-length / content-sha256）失败在两条权威分支下都**致命 + 回滚孤儿**
-            # （这是 digest/签名失配，与 PG 无关，铁律 3 绝不静默接受）；仅 PG 索引写在
-            # authoritative_source(:write)==:sidecar 时降为 best-effort（见下）。
-            size = if sse_requested == "AES256", do: visible_size.(), else: stored_size
+        try do
+          case Storage.put(bucket, key, version_id, chunks, object_meta: object_meta) do
+            {:ok, %{size: stored_size, etag: etag, sha256: sha256} = write_result} ->
+              # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
+              # SSE 加密对象：后端返回的 stored_size 是密文帧长度；S3 可见 size 用明文计数流统计。
+              # x-amz-decoded-content-length 仍按明文 size 校验；x-amz-content-sha256 在 SSE 路径暂不复算
+              # 明文 SHA（SigV4/chunked 已在 BodyReader 层验签，后续再补明文 checksum 取证任务）。
+              #
+              # 传输完整性（decoded-length / content-sha256）失败在两条权威分支下都**致命 + 回滚孤儿**
+              # （这是 digest/签名失配，与 PG 无关，铁律 3 绝不静默接受）；仅 PG 索引写在
+              # authoritative_source(:write)==:sidecar 时降为 best-effort（见下）。
+              size = if sse_requested == "AES256", do: visible_size.(), else: stored_size
 
-            obj =
-              try do
-                :ok = verify_decoded_length!(conn, payload_mode, size)
+              {obj, checksum} =
+                try do
+                  checksum = get_checksum.()
+                  :ok = checksum.verify!.()
+                  :ok = verify_decoded_length!(conn, payload_mode, size)
 
-                unless sse_requested do
-                  :ok = verify_content_sha256!(conn, payload_mode, sha256)
+                  unless sse_requested do
+                    :ok = verify_content_sha256!(conn, payload_mode, sha256)
+                  end
+
+                  attrs =
+                    %{
+                      size: size,
+                      etag: etag,
+                      content_type: content_type,
+                      storage_class: storage_class,
+                      acl_canned: acl_input.canned,
+                      acl_grants: acl_input.grants_doc,
+                      # ROUTE B B4-6 D3：user metadata 也写入 PG 索引（键 :metadata，与 CopyObject 的
+                      # metadata: meta_map 对齐），消除 :pg(默认) 与 :sidecar 两路读 user metadata 的分裂。
+                      metadata: user_metadata,
+                      tags: tags_map,
+                      sse_algorithm: sse_requested,
+                      sse_envelope: sse_envelope
+                    }
+                    |> Map.merge(system_headers)
+                    |> Map.merge(Placement.attrs_from_result(write_result))
+
+                  {commit_metadata(bucket, key, version_id, attrs), checksum}
+                rescue
+                  err ->
+                    _ =
+                      Storage.delete(
+                        bucket,
+                        key,
+                        version_id,
+                        Placement.storage_opts(write_result)
+                      )
+
+                    Log.warn("put object rolled back orphan bytes",
+                      action: :put_object,
+                      bucket: bucket,
+                      key: key,
+                      reason: :incomplete_body
+                    )
+
+                    reraise(err, __STACKTRACE__)
                 end
 
-                attrs =
-                  %{
-                    size: size,
-                    etag: etag,
-                    content_type: content_type,
-                    storage_class: storage_class,
-                    acl_canned: acl_input.canned,
-                    acl_grants: acl_input.grants_doc,
-                    # ROUTE B B4-6 D3：user metadata 也写入 PG 索引（键 :metadata，与 CopyObject 的
-                    # metadata: meta_map 对齐），消除 :pg(默认) 与 :sidecar 两路读 user metadata 的分裂。
-                    metadata: user_metadata,
-                    tags: tags_map,
-                    sse_algorithm: sse_requested,
-                    sse_envelope: sse_envelope
-                  }
-                  |> Map.merge(system_headers)
-                  |> Map.merge(Placement.attrs_from_result(write_result))
+              {:ok, {size, etag, obj, checksum}}
 
-                commit_metadata(bucket, key, version_id, attrs)
-              rescue
-                err ->
-                  _ =
-                    Storage.delete(bucket, key, version_id, Placement.storage_opts(write_result))
-
-                  Log.warn("put object rolled back orphan bytes",
-                    action: :put_object,
-                    bucket: bucket,
-                    key: key,
-                    reason: :incomplete_body
-                  )
-
-                  reraise(err, __STACKTRACE__)
-              end
-
-            {:ok, {size, etag, obj}}
-
-          {:error, reason} ->
-            {:error, reason}
+            {:error, reason} ->
+              discard_checksum.()
+              {:error, reason}
+          end
+        rescue
+          err ->
+            discard_checksum.()
+            reraise(err, __STACKTRACE__)
+        catch
+          kind, reason ->
+            discard_checksum.()
+            :erlang.raise(kind, reason, __STACKTRACE__)
         end
       end)
 
     case commit_result do
-      {:ok, {:ok, {size, etag, obj}}} ->
+      {:ok, {:ok, {size, etag, obj, checksum}}} ->
         Log.info("put object",
           action: :put_object,
           bucket: bucket,
@@ -181,6 +203,7 @@ defmodule Maxio.S3.Handlers.Object do
         conn
         |> maybe_put_version_id(obj.version_id)
         |> SSE.put_response_header(sse_requested)
+        |> Checksum.put_response_headers(checksum)
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
 
