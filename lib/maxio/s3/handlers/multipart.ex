@@ -11,6 +11,7 @@ defmodule Maxio.S3.Handlers.Multipart do
 
   alias Maxio.S3.{
     BodyReader,
+    CopySource,
     Error,
     Log,
     PublicAccessBlock,
@@ -24,6 +25,7 @@ defmodule Maxio.S3.Handlers.Multipart do
 
   alias Maxio.S3.Views.{
     InitiateMultipartUpload,
+    CopyPartResult,
     CompleteMultipartUpload,
     ListParts,
     ListMultipartUploads
@@ -32,6 +34,7 @@ defmodule Maxio.S3.Handlers.Multipart do
   @owner_id "maxio"
   @owner_display "maxio"
   @complete_xml_limit 1_048_576
+  @min_part_copy_range_source_size 5_242_880
 
   @spec create_multipart_upload(Plug.Conn.t()) :: Plug.Conn.t()
   def create_multipart_upload(conn) do
@@ -115,6 +118,14 @@ defmodule Maxio.S3.Handlers.Multipart do
     part_number = parse_part_number!(Map.fetch!(conn.query_params, "partNumber"))
 
     upload = upload_or_raise(bucket, key, upload_id)
+
+    case header(conn, "x-amz-copy-source") do
+      nil -> upload_part_body(conn, bucket, key, upload_id, part_number, upload)
+      raw -> upload_part_copy(conn, bucket, key, upload_id, part_number, upload, raw)
+    end
+  end
+
+  defp upload_part_body(conn, bucket, key, upload_id, part_number, upload) do
     chunks = BodyReader.stream(conn, conn.assigns.payload_mode)
 
     case Storage.put_part(
@@ -143,6 +154,70 @@ defmodule Maxio.S3.Handlers.Multipart do
         # B5-3 R4 backstop：入口守卫部署前遗留的在途会话（点段 key）打到后端路径层
         # （FS object_path）结构化拒绝 → 400 XMinioInvalidObjectName，绝不塌缩 500（铁律 3）。
         # 新会话已被 create_multipart_upload 入口守卫拦截，此分支仅兜历史在途上传。
+        raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
+
+      {:error, reason} when reason in [:write_quorum, :rename_busy] ->
+        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+
+      {:error, reason} ->
+        raise upload_part_error(reason, bucket, key)
+    end
+  end
+
+  defp upload_part_copy(conn, bucket, key, upload_id, part_number, upload, copy_source_header) do
+    source = CopySource.parse!(copy_source_header)
+    :ok = validate_object_key!(source.bucket, source.key)
+    :ok = CopySource.validate_version_id!(source)
+    SSE.reject_copy_source_customer_headers!(conn.req_headers)
+
+    src_obj = copy_source_or_raise(source)
+    reject_copy_source_marker!(source, src_obj)
+
+    case CopySource.conditional_result(conn, src_obj) do
+      :proceed ->
+        :ok
+
+      {:error, :precondition_failed} ->
+        raise Error.new(:precondition_failed, resource: "/#{source.bucket}/#{source.key}")
+    end
+
+    range = CopySource.parse_range!(header(conn, "x-amz-copy-source-range"), src_obj.size)
+    reject_small_range_copy!(range, source, src_obj)
+    chunks = copy_part_source_stream!(source, src_obj, range)
+
+    case Storage.put_part(
+           bucket,
+           key,
+           upload_id,
+           part_number,
+           chunks,
+           Placement.upload_storage_opts(upload)
+         ) do
+      {:ok, %{size: size, etag: etag}} ->
+        {:ok, part} = Multipart.put_part(upload, part_number, %{etag: etag, size: size})
+
+        Log.info("upload part copy",
+          action: :upload_part_copy,
+          bucket: bucket,
+          key: key,
+          src_bucket: source.bucket,
+          src_key: source.key,
+          size: size
+        )
+
+        body =
+          CopyPartResult.render(%{
+            etag: etag,
+            last_modified: part.updated_at
+          })
+
+        conn
+        |> put_resp_content_type("application/xml")
+        |> maybe_put_copy_source_version_id(src_obj.version_id)
+        |> SSE.put_response_header(upload.sse_algorithm)
+        |> send_resp(200, body)
+
+      {:error, :invalid_key} ->
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       {:error, reason} when reason in [:write_quorum, :rename_busy] ->
@@ -427,6 +502,129 @@ defmodule Maxio.S3.Handlers.Multipart do
       {:error, :not_found} -> raise Error.new(:no_such_upload, resource: "/#{bucket}/#{key}")
     end
   end
+
+  defp copy_source_or_raise(%{bucket: bucket, key: key, version_id: version_id}) do
+    _ = ensure_bucket!(bucket)
+
+    case Maxio.ObjectMeta.get(bucket, key, version_id, []) do
+      %Objects.Object{} = object ->
+        object
+
+      {:error, :not_found} ->
+        raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+
+      {:error, :read_quorum} ->
+        Log.warn("upload part copy source unavailable: sidecar read_quorum unmet",
+          action: :upload_part_copy,
+          bucket: bucket,
+          key: key,
+          reason: :read_quorum
+        )
+
+        raise Error.new(:slow_down_read, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  defp reject_copy_source_marker!(%{version_id: nil, bucket: bucket, key: key}, %{
+         is_delete_marker: true
+       }) do
+    raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+  end
+
+  defp reject_copy_source_marker!(%{bucket: bucket, key: key}, %{is_delete_marker: true}) do
+    raise Error.new(:invalid_argument,
+            message: "Cannot copy a delete marker version",
+            resource: "/#{bucket}/#{key}"
+          )
+  end
+
+  defp reject_copy_source_marker!(_source, _src_obj), do: :ok
+
+  defp reject_small_range_copy!(nil, _source, _src_obj), do: :ok
+
+  defp reject_small_range_copy!(_range, %{bucket: bucket, key: key}, %{size: size})
+       when size <= @min_part_copy_range_source_size do
+    raise Error.new(:invalid_request,
+            message:
+              "Cannot specify x-amz-copy-source-range for source objects smaller than 5 MB",
+            resource: "/#{bucket}/#{key}"
+          )
+  end
+
+  defp reject_small_range_copy!(_range, _source, _src_obj), do: :ok
+
+  defp copy_part_source_stream!(source, src_obj, range) do
+    case src_obj.sse_algorithm do
+      nil ->
+        {:ok, stream} =
+          Storage.get(
+            source.bucket,
+            source.key,
+            src_obj.version_id,
+            range,
+            Placement.storage_opts(src_obj)
+          )
+
+        stream
+
+      "AES256" ->
+        {:ok, raw_stream} =
+          Storage.get(
+            source.bucket,
+            source.key,
+            src_obj.version_id,
+            nil,
+            Placement.storage_opts(src_obj)
+          )
+
+        raw_stream
+        |> Maxio.Crypto.SSE.unwrap_stream(src_obj.sse_envelope)
+        |> trim_stream(range)
+
+      alg ->
+        raise Error.new(:not_implemented,
+                message: "UploadPartCopy for #{alg} source objects not implemented"
+              )
+    end
+  end
+
+  defp trim_stream(stream, nil), do: stream
+
+  defp trim_stream(stream, {first, last}) do
+    Stream.transform(stream, {first, last - first + 1}, fn chunk, {skip, remaining} ->
+      cond do
+        remaining <= 0 ->
+          {:halt, {0, 0}}
+
+        true ->
+          chunk
+          |> IO.iodata_to_binary()
+          |> slice_chunk(skip, remaining)
+      end
+    end)
+  end
+
+  defp slice_chunk(chunk, skip, remaining) when skip >= byte_size(chunk),
+    do: {[], {skip - byte_size(chunk), remaining}}
+
+  defp slice_chunk(chunk, skip, remaining) when skip > 0 do
+    <<_skipped::binary-size(^skip), rest::binary>> = chunk
+    emit_slice(rest, remaining)
+  end
+
+  defp slice_chunk(chunk, 0, remaining), do: emit_slice(chunk, remaining)
+
+  defp emit_slice(chunk, remaining) do
+    emit_size = min(byte_size(chunk), remaining)
+    <<emit::binary-size(^emit_size), _tail::binary>> = chunk
+    {[emit], {0, remaining - emit_size}}
+  end
+
+  defp maybe_put_copy_source_version_id(conn, nil), do: conn
+  defp maybe_put_copy_source_version_id(conn, "null"), do: conn
+
+  defp maybe_put_copy_source_version_id(conn, version_id),
+    do: put_resp_header(conn, "x-amz-copy-source-version-id", version_id)
 
   # CompleteMultipartUpload 的小 XML 整读（带上限，铁律 4）。
   defp read_small_body!(conn) do

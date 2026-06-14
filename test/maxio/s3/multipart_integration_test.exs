@@ -33,6 +33,36 @@ defmodule Maxio.S3.MultipartIntegrationTest do
     id
   end
 
+  defp copy_part_etag(xml) do
+    [_, rest] = String.split(xml, "<ETag>")
+    [etag, _] = String.split(rest, "</ETag>")
+    String.replace(etag, "&quot;", "\"")
+  end
+
+  defp initiate_upload(bucket, key, conn_fun \\ &SigV4Request.signed_conn/3) do
+    init =
+      conn_fun.(:post, "/#{bucket}/#{key}", query: %{"uploads" => ""})
+      |> call()
+
+    assert init.status == 200
+    upload_id(init.resp_body)
+  end
+
+  defp complete_upload(bucket, key, upload_id, etags, conn_fun \\ &SigV4Request.signed_conn/3) do
+    parts =
+      etags
+      |> Enum.with_index(1)
+      |> Enum.map(fn {etag, part_number} ->
+        "<Part><PartNumber>#{part_number}</PartNumber><ETag>#{etag}</ETag></Part>"
+      end)
+
+    complete_xml =
+      IO.iodata_to_binary(["<CompleteMultipartUpload>", parts, "</CompleteMultipartUpload>"])
+
+    conn_fun.(:post, "/#{bucket}/#{key}", query: %{"uploadId" => upload_id}, body: complete_xml)
+    |> call()
+  end
+
   defp enable_versioning(bucket) do
     body = ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
 
@@ -141,6 +171,165 @@ defmodule Maxio.S3.MultipartIntegrationTest do
 
     assert {:ok, null_row} = Maxio.Objects.get_version("mpbk", "big.bin", "null")
     assert null_row.is_latest == true
+  end
+
+  test "UploadPartCopy copies a full source object as the part body" do
+    bucket = "mpcopyfull"
+    source_body = "server side multipart copy source"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    SigV4Request.signed_conn(:put, "/#{bucket}/src.txt", body: source_body) |> call()
+    uid = initiate_upload(bucket, "dst.txt")
+
+    copy =
+      SigV4Request.signed_conn(:put, "/#{bucket}/dst.txt",
+        query: %{"partNumber" => "1", "uploadId" => uid},
+        headers: [{"x-amz-copy-source", "/#{bucket}/src.txt"}]
+      )
+      |> call()
+
+    assert copy.status == 200
+    assert copy.resp_body =~ "<CopyPartResult"
+    etag = copy_part_etag(copy.resp_body)
+
+    complete = complete_upload(bucket, "dst.txt", uid, [etag])
+    assert complete.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/#{bucket}/dst.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == source_body
+  end
+
+  test "UploadPartCopy preserves encoded question marks in the source key" do
+    bucket = "mpcopyqmark"
+    source_body = "source key contains a question mark"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    SigV4Request.signed_conn(:put, "/#{bucket}/a%3Fb.txt", body: source_body) |> call()
+    uid = initiate_upload(bucket, "dst.txt")
+
+    copy =
+      SigV4Request.signed_conn(:put, "/#{bucket}/dst.txt",
+        query: %{"partNumber" => "1", "uploadId" => uid},
+        headers: [{"x-amz-copy-source", "/#{bucket}/a%3Fb.txt"}]
+      )
+      |> call()
+
+    assert copy.status == 200
+    etag = copy_part_etag(copy.resp_body)
+    assert complete_upload(bucket, "dst.txt", uid, [etag]).status == 200
+
+    get = SigV4Request.signed_conn(:get, "/#{bucket}/dst.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == source_body
+  end
+
+  test "UploadPartCopy source If-Modified-Since failure returns PreconditionFailed" do
+    bucket = "mpcopyims"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    SigV4Request.signed_conn(:put, "/#{bucket}/src.txt", body: "conditional source") |> call()
+    uid = initiate_upload(bucket, "dst.txt")
+
+    copy =
+      SigV4Request.signed_conn(:put, "/#{bucket}/dst.txt",
+        query: %{"partNumber" => "1", "uploadId" => uid},
+        headers: [
+          {"x-amz-copy-source", "/#{bucket}/src.txt"},
+          {"x-amz-copy-source-if-modified-since", "Wed, 30 Nov 2099 00:00:00 GMT"}
+        ]
+      )
+      |> call()
+
+    assert copy.status == 412
+    assert copy.resp_body =~ "<Code>PreconditionFailed</Code>"
+  end
+
+  test "UploadPartCopy copies the requested byte range from a large source object" do
+    bucket = "mpcopyrange"
+    prefix = String.duplicate("a", 5_242_880)
+    source_body = prefix <> "RANGE-OK" <> String.duplicate("z", 16)
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    SigV4Request.signed_conn(:put, "/#{bucket}/src.bin", body: source_body) |> call()
+    uid = initiate_upload(bucket, "dst.bin")
+
+    first = byte_size(prefix)
+    last = first + byte_size("RANGE-OK") - 1
+
+    copy =
+      SigV4Request.signed_conn(:put, "/#{bucket}/dst.bin",
+        query: %{"partNumber" => "1", "uploadId" => uid},
+        headers: [
+          {"x-amz-copy-source", "/#{bucket}/src.bin"},
+          {"x-amz-copy-source-range", "bytes=#{first}-#{last}"}
+        ]
+      )
+      |> call()
+
+    assert copy.status == 200
+    etag = copy_part_etag(copy.resp_body)
+    assert complete_upload(bucket, "dst.bin", uid, [etag]).status == 200
+
+    get = SigV4Request.signed_conn(:get, "/#{bucket}/dst.bin") |> call()
+    assert get.status == 200
+    assert get.resp_body == "RANGE-OK"
+  end
+
+  test "UploadPartCopy can copy a specific source version and echoes its version id" do
+    bucket = "mpcopyversion"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    assert enable_versioning(bucket).status == 200
+
+    put1 = SigV4Request.signed_conn(:put, "/#{bucket}/src.txt", body: "old-version") |> call()
+    assert [vid1] = get_resp_header(put1, "x-amz-version-id")
+
+    put2 = SigV4Request.signed_conn(:put, "/#{bucket}/src.txt", body: "new-version") |> call()
+    assert [_vid2] = get_resp_header(put2, "x-amz-version-id")
+
+    uid = initiate_upload(bucket, "dst.txt")
+
+    copy =
+      SigV4Request.signed_conn(:put, "/#{bucket}/dst.txt",
+        query: %{"partNumber" => "1", "uploadId" => uid},
+        headers: [{"x-amz-copy-source", "/#{bucket}/src.txt?versionId=#{vid1}"}]
+      )
+      |> call()
+
+    assert copy.status == 200
+    assert get_resp_header(copy, "x-amz-copy-source-version-id") == [vid1]
+    etag = copy_part_etag(copy.resp_body)
+    assert complete_upload(bucket, "dst.txt", uid, [etag]).status == 200
+
+    get = SigV4Request.signed_conn(:get, "/#{bucket}/dst.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "old-version"
+  end
+
+  test "UploadPartCopy requires source read permission in addition to target write permission" do
+    bucket = "mpcopyauth"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    SigV4Request.signed_conn(:put, "/#{bucket}/src.txt", body: "private source") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::#{bucket}/dst.txt"}]})
+
+    SigV4Request.signed_conn(:put, "/#{bucket}", query: %{"policy" => ""}, body: policy)
+    |> call()
+
+    uid = initiate_upload(bucket, "dst.txt")
+
+    copy =
+      SigV4Request.anon_conn(:put, "/#{bucket}/dst.txt",
+        query: %{"partNumber" => "1", "uploadId" => uid},
+        headers: [{"x-amz-copy-source", "/#{bucket}/src.txt"}]
+      )
+      |> call()
+
+    assert copy.status == 403
+    assert copy.resp_body =~ "<Code>AccessDenied</Code>"
   end
 
   test "CompleteMultipartUpload 在 Enabled 桶中创建独立对象版本并回 x-amz-version-id" do

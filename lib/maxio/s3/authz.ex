@@ -14,12 +14,12 @@ defmodule Maxio.S3.Authz do
   owner? 判定（单租户）：principal.type == :root，或 principal 的 arn == 资源所属桶 owner。
 
   绝不缓冲对象 body（铁律 4）：本关卡只读 conn 元信息（assigns/headers/query），不 read_body。
-  CopyObject（:put_object 且带 x-amz-copy-source）：额外对源对象做一次 s3:GetObject 授权。
+  CopyObject/UploadPartCopy（带 x-amz-copy-source）：额外对源对象做一次 s3:GetObject 授权。
   """
   import Plug.Conn
   alias Maxio.{Buckets, ObjectMeta, Objects, Tags}
   alias Maxio.Policy.{ACL, ActionMap, Arn, Evaluator, RequestContext, Store}
-  alias Maxio.S3.{Error, Log, PublicAccessBlock}
+  alias Maxio.S3.{CopySource, Error, Log, PublicAccessBlock}
 
   @max_keys_limit 1000
 
@@ -117,7 +117,7 @@ defmodule Maxio.S3.Authz do
           conditions
         )
 
-        # CopyObject 二次检查：源对象 s3:GetObject（铁律 5，对齐官方 CopyObject 双检查）。
+        # CopyObject/UploadPartCopy 二次检查：源对象 s3:GetObject（铁律 5，对齐官方 copy source 双检查）。
         maybe_authorize_copy_source(conn, action, principal, authenticated?, conditions)
         :ok
 
@@ -708,14 +708,15 @@ defmodule Maxio.S3.Authz do
       end)
   end
 
-  # ── CopyObject 源对象二次检查 ──
-  defp maybe_authorize_copy_source(conn, :put_object, principal, authenticated?, conditions) do
+  # ── CopyObject / UploadPartCopy 源对象二次检查 ──
+  defp maybe_authorize_copy_source(conn, action, principal, authenticated?, conditions)
+       when action in [:put_object, :upload_part] do
     case conn |> get_req_header("x-amz-copy-source") |> List.first() do
       nil ->
         :ok
 
       raw ->
-        {src_bucket, src_key, src_version_id} = parse_copy_source(raw)
+        %{bucket: src_bucket, key: src_key, version_id: src_version_id} = CopySource.parse!(raw)
         resource = Arn.object_arn(src_bucket, src_key)
 
         statements =
@@ -751,7 +752,13 @@ defmodule Maxio.S3.Authz do
             )
 
           {:deny, reason} ->
-            deny(conn, :copy_object_source, copy_source_action(src_version_id), resource, reason)
+            deny(
+              conn,
+              copy_source_denied_action(action),
+              copy_source_action(src_version_id),
+              resource,
+              reason
+            )
         end
     end
   end
@@ -761,27 +768,8 @@ defmodule Maxio.S3.Authz do
   defp copy_source_action(nil), do: "s3:GetObject"
   defp copy_source_action(_version_id), do: "s3:GetObjectVersion"
 
-  defp parse_copy_source(raw) do
-    decoded = URI.decode(raw)
-    trimmed = String.replace_prefix(decoded, "/", "")
-
-    {path, version_id} =
-      case String.split(trimmed, "?", parts: 2) do
-        [p] ->
-          {p, nil}
-
-        [p, q] ->
-          {p, q |> URI.decode_query() |> Map.get("versionId") |> normalize_copy_version_id()}
-      end
-
-    case String.split(path, "/", parts: 2) do
-      [b, k] when k != "" -> {b, k, version_id}
-      _ -> {"", "", nil}
-    end
-  end
-
-  defp normalize_copy_version_id(""), do: nil
-  defp normalize_copy_version_id(version_id), do: version_id
+  defp copy_source_denied_action(:upload_part), do: :upload_part_copy_source
+  defp copy_source_denied_action(_action), do: :copy_object_source
 
   defp copy_source_conn(nil), do: nil
   defp copy_source_conn(version_id), do: %{query_params: %{"versionId" => version_id}}

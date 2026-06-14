@@ -37,6 +37,22 @@ defmodule Maxio.S3.CopyObjectVersionTest do
     |> call()
   end
 
+  test "CopyObject preserves encoded question marks in the source key" do
+    SigV4Request.signed_conn(:put, "/cpqmark") |> call()
+    SigV4Request.signed_conn(:put, "/cpqmark/a%3Fb.txt", body: "encoded question") |> call()
+
+    cp =
+      SigV4Request.signed_conn(:put, "/cpqmark/dst.txt",
+        headers: [{"x-amz-copy-source", "/cpqmark/a%3Fb.txt"}]
+      )
+      |> call()
+
+    assert cp.status == 200
+    g = SigV4Request.signed_conn(:get, "/cpqmark/dst.txt") |> call()
+    assert g.status == 200
+    assert g.resp_body == "encoded question"
+  end
+
   test "复制版本化源的当前版本 → 目标字节等于源最新版本（不再是 0 字节）" do
     SigV4Request.signed_conn(:put, "/cpv1") |> call()
     assert enable_versioning("cpv1").status == 200

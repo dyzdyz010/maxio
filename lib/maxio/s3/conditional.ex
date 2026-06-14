@@ -71,17 +71,30 @@ defmodule Maxio.S3.Conditional do
   end
 
   defp step4(if_mod, lm, method) do
-    if method in ["GET", "HEAD"] do
-      case parse_http_date(if_mod) do
-        {:ok, since} ->
-          # 未修改（lm <= since）→ 304
-          if DateTime.compare(lm, since) == :gt, do: :proceed, else: {:respond, 304}
+    cond do
+      method in ["GET", "HEAD"] ->
+        case parse_http_date(if_mod) do
+          {:ok, since} ->
+            # 未修改（lm <= since）→ 304
+            if DateTime.compare(lm, since) == :gt, do: :proceed, else: {:respond, 304}
 
-        :none ->
-          :proceed
-      end
-    else
-      :proceed
+          :none ->
+            :proceed
+        end
+
+      method == "COPY" ->
+        case parse_http_date(if_mod) do
+          {:ok, since} ->
+            if DateTime.compare(lm, since) == :gt,
+              do: :proceed,
+              else: {:error, :precondition_failed}
+
+          :none ->
+            :proceed
+        end
+
+      true ->
+        :proceed
     end
   end
 

@@ -11,6 +11,7 @@ defmodule Maxio.S3.Handlers.Object do
   alias Maxio.S3.{
     BodyReader,
     Conditional,
+    CopySource,
     Error,
     Log,
     PublicAccessBlock,
@@ -1471,30 +1472,8 @@ defmodule Maxio.S3.Handlers.Object do
   # （URL 编码）。返回 {bucket, key, version_id | nil}：默认标识源的当前版本，?versionId= 选特定版本
   # （对齐 AWS CopyObject，铁律 5）。
   defp parse_copy_source!(raw) do
-    decoded = URI.decode(raw)
-    trimmed = String.replace_prefix(decoded, "/", "")
-
-    {path, version_id} =
-      case String.split(trimmed, "?", parts: 2) do
-        [p] -> {p, nil}
-        [p, q] -> {p, copy_source_version_id(q)}
-      end
-
-    case String.split(path, "/", parts: 2) do
-      [bucket, key] when key != "" -> {bucket, key, version_id}
-      _ -> raise Error.new(:invalid_argument, message: "Invalid x-amz-copy-source")
-    end
-  end
-
-  # 从 copy-source 查询串提取 versionId（无/空 → nil）。
-  defp copy_source_version_id(query) do
-    query
-    |> URI.decode_query()
-    |> Map.get("versionId")
-    |> case do
-      v when is_binary(v) and v != "" -> v
-      _ -> nil
-    end
+    %{bucket: bucket, key: key, version_id: version_id} = CopySource.parse!(raw)
+    {bucket, key, version_id}
   end
 
   # 源条件头（x-amz-copy-source-if-*）→ 复用 Conditional，先映射成标准头名再对源对象求值。
