@@ -7,17 +7,19 @@ defmodule Maxio.Cluster.Transport do
 
   约定：drive_obj_dir = Path.join(drive, obj_rel)，由后端用 Topology 端点的 drive +
   Maxio.Cluster.Paths.object_rel/3 组装后传入；node 决定调哪个节点。
-  节点宕机/超时/远端异常：get_shard -> nil（交 EC 重建）；put_shard/put_sidecar -> {:error, :unavailable}。
+  节点宕机/超时/远端异常：get_shard -> nil（交 EC 重建）；get_sidecar/put_shard/put_sidecar ->
+  {:error, :unavailable}。
   """
   @callback put_shard(node(), String.t(), non_neg_integer(), binary(), pos_integer()) ::
               :ok | {:error, term()}
   @callback get_shard(node(), String.t(), non_neg_integer(), pos_integer()) :: binary() | nil
   @callback put_sidecar(node(), String.t(), map()) :: :ok | {:error, term()}
-  @callback get_sidecar(node(), String.t()) :: {:ok, map()} | {:error, :enoent}
+  @callback get_sidecar(node(), String.t()) :: {:ok, map()} | {:error, term()}
   @callback stat_shard(node(), String.t()) :: {:ok, non_neg_integer()} | {:error, :enoent}
   @callback stat_shard_info(node(), String.t()) ::
               {:ok, %{size: non_neg_integer(), mtime_ms: integer()}} | {:error, :enoent}
   @callback delete_shard(node(), String.t()) :: :ok
+  @callback move_shard(node(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   @callback delete_part_file(node(), String.t()) :: :ok | {:error, term()}
   @callback quarantine_layout_roots(node(), String.t(), [String.t()], String.t(), map()) ::
               {:ok, map()} | {:error, term()}
@@ -84,7 +86,7 @@ defmodule Maxio.Cluster.Transport.Erpc do
 
   @impl true
   def get_sidecar(node, dir) do
-    call(node, :get_sidecar, [dir], fn -> {:error, :enoent} end)
+    call(node, :get_sidecar, [dir], fn -> {:error, :unavailable} end)
   end
 
   @impl true
@@ -100,6 +102,13 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def delete_shard(node, dir) do
     call(node, :delete_shard, [dir], fn -> :ok end)
+  end
+
+  @impl true
+  def move_shard(node, source_dir, destination_dir, opts \\ []) do
+    call(node, :move_shard, [source_dir, destination_dir, opts], fn ->
+      {:error, :unavailable}
+    end)
   end
 
   @impl true

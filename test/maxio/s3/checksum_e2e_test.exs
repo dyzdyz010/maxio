@@ -173,8 +173,10 @@ defmodule Maxio.S3.ChecksumE2ETest do
     assert mismatch.resp_body =~ "<Code>BadDigest</Code>"
   end
 
-  test "UploadPart checksum headers fail closed until part rollback is supported" do
+  test "UploadPart validates x-amz-checksum-sha256 and echoes the checksum header" do
     SigV4Request.signed_conn(:put, "/ckmp") |> call()
+    body = "part bytes"
+    checksum = hash_b64(:sha256, body)
 
     init =
       SigV4Request.signed_conn(:post, "/ckmp/object.bin", query: %{"uploads" => ""})
@@ -186,13 +188,63 @@ defmodule Maxio.S3.ChecksumE2ETest do
     part =
       SigV4Request.signed_conn(:put, "/ckmp/object.bin",
         query: %{"partNumber" => "1", "uploadId" => upload_id},
-        body: "part bytes",
-        headers: [{"x-amz-checksum-sha256", hash_b64(:sha256, "part bytes")}]
+        body: body,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", checksum}
+        ]
       )
       |> call()
 
-    assert part.status == 501
-    assert part.resp_body =~ "<Code>NotImplemented</Code>"
+    assert part.status == 200
+    assert get_resp_header(part, "x-amz-checksum-sha256") == [checksum]
+    [etag] = get_resp_header(part, "etag")
+
+    complete = complete_multipart_upload("ckmp", "object.bin", upload_id, [etag])
+    assert complete.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/ckmp/object.bin") |> call()
+    assert get.status == 200
+    assert get.resp_body == body
+  end
+
+  test "UploadPart BadDigest does not overwrite an existing part" do
+    SigV4Request.signed_conn(:put, "/ckmprollback") |> call()
+
+    init =
+      SigV4Request.signed_conn(:post, "/ckmprollback/object.bin", query: %{"uploads" => ""})
+      |> call()
+
+    assert init.status == 200
+    upload_id = upload_id(init.resp_body)
+
+    old =
+      SigV4Request.signed_conn(:put, "/ckmprollback/object.bin",
+        query: %{"partNumber" => "1", "uploadId" => upload_id},
+        body: "OLD"
+      )
+      |> call()
+
+    assert old.status == 200
+    [old_etag] = get_resp_header(old, "etag")
+
+    bad =
+      SigV4Request.signed_conn(:put, "/ckmprollback/object.bin",
+        query: %{"partNumber" => "1", "uploadId" => upload_id},
+        body: "NEW",
+        headers: [{"x-amz-checksum-sha256", hash_b64(:sha256, "different")}]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "<Code>BadDigest</Code>"
+
+    complete = complete_multipart_upload("ckmprollback", "object.bin", upload_id, [old_etag])
+    assert complete.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/ckmprollback/object.bin") |> call()
+    assert get.status == 200
+    assert get.resp_body == "OLD"
   end
 
   test "UploadPartCopy checksum headers fail closed before copying source bytes" do
@@ -218,6 +270,30 @@ defmodule Maxio.S3.ChecksumE2ETest do
 
     assert part.status == 501
     assert part.resp_body =~ "<Code>NotImplemented</Code>"
+
+    list =
+      SigV4Request.signed_conn(:get, "/ckmpcopy/object.bin", query: %{"uploadId" => upload_id})
+      |> call()
+
+    assert list.status == 200
+    refute list.resp_body =~ "<PartNumber>1</PartNumber>"
+  end
+
+  defp complete_multipart_upload(bucket, key, upload_id, etags) do
+    parts =
+      etags
+      |> Enum.with_index(1)
+      |> Enum.map(fn {etag, part_number} ->
+        "<Part><PartNumber>#{part_number}</PartNumber><ETag>#{etag}</ETag></Part>"
+      end)
+
+    body = IO.iodata_to_binary(["<CompleteMultipartUpload>", parts, "</CompleteMultipartUpload>"])
+
+    SigV4Request.signed_conn(:post, "/#{bucket}/#{key}",
+      query: %{"uploadId" => upload_id},
+      body: body
+    )
+    |> call()
   end
 
   defp upload_id(xml) do

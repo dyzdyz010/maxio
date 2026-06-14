@@ -71,18 +71,18 @@ defmodule Maxio.S3.Checksum do
     }
   end
 
-  @doc "UploadPart checksum validation is not implemented yet; fail closed."
+  @doc "Rejects checksum headers on UploadPartCopy until copy checksum validation is implemented."
   @spec reject_upload_part_headers!(Plug.Conn.t()) :: :ok
   def reject_upload_part_headers!(conn) do
     cond do
       checksum_headers?(conn.req_headers) ->
         raise Error.new(:not_implemented,
-                message: "UploadPart checksum validation is not implemented"
+                message: "UploadPartCopy checksum validation is not implemented"
               )
 
       trailer_checksum?(conn.req_headers) ->
         raise Error.new(:not_implemented,
-                message: "UploadPart checksum trailers are not implemented"
+                message: "UploadPartCopy checksum trailers are not implemented"
               )
 
       true ->

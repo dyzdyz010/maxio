@@ -78,6 +78,29 @@ defmodule Maxio.Test.StorageConformance do
         assert {:error, :enoent} = @backend.get_part_stream("b", "big", "u1", 1, o)
         assert :ok = @backend.abort_upload("b", "big", "u1", o)
       end
+
+      test "parts: before_part_commit failure does not replace existing part", ctx do
+        o = opts(ctx)
+        :ok = @backend.put_bucket("b", o)
+        {:ok, old} = @backend.put_part("b", "big", "u-precommit", 1, ["OLD"], o)
+
+        hook_opts =
+          Keyword.put(o, :before_part_commit, fn part ->
+            assert part.size == 3
+            assert part.etag == :crypto.hash(:md5, "NEW") |> Base.encode16(case: :lower)
+            raise "reject part"
+          end)
+
+        assert_raise RuntimeError, "reject part", fn ->
+          @backend.put_part("b", "big", "u-precommit", 1, ["NEW"], hook_opts)
+        end
+
+        {:ok, stream} = @backend.get_part_stream("b", "big", "u-precommit", 1, o)
+        assert IO.iodata_to_binary(Enum.to_list(stream)) == "OLD"
+
+        {:ok, %{size: 3}} = @backend.assemble("b", "big", "u-precommit", [1], o)
+        assert old.etag == :crypto.hash(:md5, "OLD") |> Base.encode16(case: :lower)
+      end
     end
   end
 end

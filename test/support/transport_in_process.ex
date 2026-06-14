@@ -152,7 +152,7 @@ defmodule Maxio.Cluster.Transport.InProcess do
 
   @impl true
   def get_sidecar(node, dir) do
-    if down?(node, dir), do: {:error, :enoent}, else: ShardServer.get_sidecar(dir)
+    if down?(node, dir), do: {:error, :unavailable}, else: ShardServer.get_sidecar(dir)
   end
 
   @impl true
@@ -168,6 +168,13 @@ defmodule Maxio.Cluster.Transport.InProcess do
   @impl true
   def delete_shard(node, dir) do
     if down?(node, dir), do: :ok, else: ShardServer.delete_shard(dir)
+  end
+
+  @impl true
+  def move_shard(node, source_dir, destination_dir, opts \\ []) do
+    if down?(node, source_dir) or down?(node, destination_dir),
+      do: {:error, :unavailable},
+      else: ShardServer.move_shard(source_dir, destination_dir, opts)
   end
 
   @impl true

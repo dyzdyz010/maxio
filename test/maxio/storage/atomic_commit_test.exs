@@ -230,6 +230,31 @@ defmodule Maxio.Storage.AtomicCommitTest do
     end)
   end
 
+  test "EC put_part commit quorum failure restores the old part", %{root: root} do
+    drives = for i <- 0..5, do: Path.join(root, "d#{i}")
+    Enum.each(drives, &File.mkdir_p!/1)
+    opts = [drives: drives, data_shards: 4, parity_shards: 2, block_size: 16]
+    :ok = ErasureCoded.put_bucket("b", opts)
+
+    {:ok, _old} = ErasureCoded.put_part("b", "big", "u-replace", 1, ["OLD"], opts)
+    {agent, rename_fun} = fail_after_real_renames(6)
+    on_exit(fn -> stop_agent(agent) end)
+
+    assert {:error, :write_quorum} =
+             ErasureCoded.put_part(
+               "b",
+               "big",
+               "u-replace",
+               1,
+               ["NEW"],
+               Keyword.put(opts, :rename_fun, rename_fun)
+             )
+
+    {:ok, stream} = ErasureCoded.get_part_stream("b", "big", "u-replace", 1, opts)
+    assert IO.iodata_to_binary(Enum.to_list(stream)) == "OLD"
+    assert_tmp_roots_empty(drives)
+  end
+
   # ── Distributed 后端：部分端点 down -> write_quorum 未达 -> temp 清理 + {:error,:write_quorum} ──
 
   test "Distributed put below write_quorum cleans temp and returns {:error, :write_quorum}", %{
@@ -276,6 +301,140 @@ defmodule Maxio.Storage.AtomicCommitTest do
     end)
   end
 
+  test "Distributed put_part commit quorum failure restores the old part", %{root: root} do
+    InProcess.setup!()
+
+    endpoints =
+      for i <- 0..5 do
+        {:"maxio@dn#{div(i, 2)}", Path.join(root, "dn#{div(i, 2)}_d#{rem(i, 2)}")}
+      end
+
+    topology =
+      Topology.parse_and_validate!(
+        data_shards: 4,
+        parity_shards: 2,
+        block_size: 16,
+        allow_colocated_endpoints: true,
+        pools: [%{id: 0, sets: [%{id: 0, endpoints: endpoints}]}]
+      )
+
+    opts = [topology: topology, transport: InProcess]
+    :ok = Distributed.put_bucket("b", opts)
+    {:ok, _old} = Distributed.put_part("b", "big", "u-replace", 1, ["OLD"], opts)
+
+    failed_drives =
+      endpoints
+      |> Enum.drop(3)
+      |> Enum.map(fn {_node, drive} -> drive end)
+
+    assert {:error, :write_quorum} =
+             Distributed.put_part(
+               "b",
+               "big",
+               "u-replace",
+               1,
+               ["NEW"],
+               Keyword.put(opts, :rename_fun, fail_renames_on_drives(failed_drives))
+             )
+
+    {:ok, stream} = Distributed.get_part_stream("b", "big", "u-replace", 1, opts)
+    assert IO.iodata_to_binary(Enum.to_list(stream)) == "OLD"
+
+    endpoints
+    |> Enum.map(fn {_node, drive} -> drive end)
+    |> assert_tmp_roots_empty()
+  end
+
+  test "Distributed put_part aborts when an existing part endpoint cannot be backed up", %{
+    root: root
+  } do
+    InProcess.setup!()
+
+    endpoints =
+      for i <- 0..5 do
+        {:"maxio@dn#{div(i, 2)}", Path.join(root, "dn#{div(i, 2)}_d#{rem(i, 2)}")}
+      end
+
+    topology =
+      Topology.parse_and_validate!(
+        data_shards: 4,
+        parity_shards: 2,
+        block_size: 16,
+        allow_colocated_endpoints: true,
+        pools: [%{id: 0, sets: [%{id: 0, endpoints: endpoints}]}]
+      )
+
+    opts = [topology: topology, transport: InProcess]
+    :ok = Distributed.put_bucket("b", opts)
+    {:ok, _old} = Distributed.put_part("b", "big", "u-backup-down", 1, ["OLD"], opts)
+
+    {down_node, down_drive} = List.last(endpoints)
+    InProcess.set_drive_down(down_node, down_drive)
+
+    assert {:error, :write_quorum} =
+             Distributed.put_part("b", "big", "u-backup-down", 1, ["NEW"], opts)
+
+    InProcess.set_drive_up(down_node, down_drive)
+
+    {:ok, stream} = Distributed.get_part_stream("b", "big", "u-backup-down", 1, opts)
+    assert IO.iodata_to_binary(Enum.to_list(stream)) == "OLD"
+
+    endpoints
+    |> Enum.map(fn {_node, drive} -> drive end)
+    |> assert_tmp_roots_empty()
+  end
+
+  test "Distributed put_part quorum success cleans failed endpoint old finals", %{root: root} do
+    InProcess.setup!()
+
+    endpoints =
+      for i <- 0..5 do
+        {:"maxio@dn#{div(i, 2)}", Path.join(root, "dn#{div(i, 2)}_d#{rem(i, 2)}")}
+      end
+
+    topology =
+      Topology.parse_and_validate!(
+        data_shards: 4,
+        parity_shards: 2,
+        block_size: 16,
+        allow_colocated_endpoints: true,
+        pools: [%{id: 0, sets: [%{id: 0, endpoints: endpoints}]}]
+      )
+
+    opts = [topology: topology, transport: InProcess]
+    :ok = Distributed.put_bucket("b", opts)
+    {:ok, old} = Distributed.put_part("b", "big", "u-partial-success", 1, ["OLD"], opts)
+
+    failed_drives =
+      endpoints
+      |> Enum.drop(4)
+      |> Enum.map(fn {_node, drive} -> drive end)
+
+    assert {:ok, _new} =
+             Distributed.put_part(
+               "b",
+               "big",
+               "u-partial-success",
+               1,
+               ["NEW"],
+               Keyword.put(opts, :rename_fun, fail_renames_on_drives(failed_drives))
+             )
+
+    {:ok, stream} = Distributed.get_part_stream("b", "big", "u-partial-success", 1, opts)
+    assert IO.iodata_to_binary(Enum.to_list(stream)) == "NEW"
+
+    part_rel = Maxio.Cluster.Paths.part_rel("b", "u-partial-success", 1)
+
+    Enum.each(endpoints, fn {_node, drive} ->
+      meta_path = Path.join([drive, part_rel, "meta.json"])
+      if File.exists?(meta_path), do: refute(File.read!(meta_path) =~ old.etag)
+    end)
+
+    endpoints
+    |> Enum.map(fn {_node, drive} -> drive end)
+    |> assert_tmp_roots_empty()
+  end
+
   defp attach_fsync_counter do
     {:ok, agent} = Agent.start_link(fn -> [] end)
     ref = "fsync-#{System.unique_integer([:positive])}"
@@ -290,5 +449,58 @@ defmodule Maxio.Storage.AtomicCommitTest do
     )
 
     {agent, ref}
+  end
+
+  defp fail_after_real_renames(allowed) do
+    {:ok, agent} = Agent.start(fn -> 0 end)
+
+    rename_fun = fn src, dst ->
+      Agent.get_and_update(agent, fn count ->
+        next = count + 1
+
+        result =
+          if next <= allowed do
+            :file.rename(String.to_charlist(src), String.to_charlist(dst))
+          else
+            {:error, :erofs}
+          end
+
+        {result, next}
+      end)
+    end
+
+    {agent, rename_fun}
+  end
+
+  defp stop_agent(agent) do
+    Agent.stop(agent)
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp fail_renames_on_drives(drives) do
+    drives = Enum.map(drives, &normalize_path/1)
+
+    fn src, dst ->
+      if Enum.any?(drives, &path_within?(dst, &1)) do
+        {:error, :erofs}
+      else
+        :file.rename(String.to_charlist(src), String.to_charlist(dst))
+      end
+    end
+  end
+
+  defp path_within?(path, root) do
+    path = normalize_path(path)
+    path == root or String.starts_with?(path, root <> "/")
+  end
+
+  defp normalize_path(path), do: path |> Path.expand() |> String.replace("\\", "/")
+
+  defp assert_tmp_roots_empty(drives) do
+    Enum.each(drives, fn drive ->
+      tmp_root = Path.join(drive, ".tmp")
+      assert not File.dir?(tmp_root) or File.ls!(tmp_root) == []
+    end)
   end
 end

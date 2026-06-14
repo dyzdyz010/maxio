@@ -27,11 +27,27 @@ defmodule Maxio.Cluster.TransportInProcessTest do
     assert InProcess.get_shard(:maxio@n1, dir, 0, 256) == s
   end
 
-  test "sidecar 在宕机端点回 :enoent", %{base: base} do
+  test "sidecar 在宕机端点回 :unavailable", %{base: base} do
     dir = Path.join(base, "n2_d0/b/k")
     :ok = InProcess.put_sidecar(:maxio@n2, dir, %{"size" => 1})
     InProcess.set_down(:maxio@n2)
-    assert {:error, :enoent} = InProcess.get_sidecar(:maxio@n2, dir)
+    assert {:error, :unavailable} = InProcess.get_sidecar(:maxio@n2, dir)
+  end
+
+  test "move_shard moves directories and reports unavailable drives", %{base: base} do
+    node = :maxio@n2
+    drive = Path.join(base, "n2_d1")
+    source = Path.join(drive, "b/k")
+    destination = Path.join(drive, ".tmp/backup")
+
+    :ok = InProcess.put_sidecar(node, source, %{"size" => 1})
+    assert :ok = InProcess.move_shard(node, source, destination)
+    assert {:error, :enoent} = InProcess.get_sidecar(node, source)
+    assert {:ok, %{"size" => 1}} = InProcess.get_sidecar(node, destination)
+    assert {:error, :enoent} = InProcess.move_shard(node, source, destination)
+
+    InProcess.set_drive_down(node, drive)
+    assert {:error, :unavailable} = InProcess.move_shard(node, destination, source)
   end
 
   test "drive-level outage leaves sibling drives on the same node reachable", %{base: base} do

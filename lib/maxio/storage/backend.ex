@@ -70,7 +70,21 @@ defmodule Maxio.Storage.Backend do
   @type part_number :: pos_integer()
   @type part_put_result :: %{size: non_neg_integer(), etag: String.t(), md5_raw: binary()}
 
-  @doc "流式写入一个 part 的字节，返回该 part 的 size、MD5 hex etag（无引号）与 16 字节原始 MD5。"
+  @doc """
+  Streams one multipart-upload part and returns size, unquoted MD5 hex ETag,
+  and the raw 16-byte MD5.
+
+  Backends may receive `opts[:before_part_commit]` as a precommit hook. When
+  present, the backend must write the new part into a temp/staged location,
+  compute `%{size, etag, md5_raw}`, call the hook with that result, then commit
+  the final part only if the hook succeeds. A hook may return a map, which is
+  merged into the successful result.
+
+  If the hook raises, backends must clean the staged bytes and must not replace
+  an existing final part. This keeps checksum failures and other precommit
+  validation failures fail-closed. Final commit failures keep each backend's
+  normal write-quorum error semantics.
+  """
   @callback put_part(
               bucket(),
               key(),

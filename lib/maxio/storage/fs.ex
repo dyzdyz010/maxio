@@ -269,28 +269,59 @@ defmodule Maxio.Storage.FS do
   end
 
   defp do_put_part(bucket, key, upload_id, part_number, chunks, opts) do
-    with {:ok, _obj} <- object_path(bucket, key, "null", opts) do
-      path = part_path(bucket, upload_id, part_number, opts)
-      File.mkdir_p!(Path.dirname(path))
-      {:ok, fd} = File.open(path, [:write, :binary, :raw])
+    with {:ok, _obj} <- object_path(bucket, key, "null", opts),
+         {:ok, tmp_dir} <- ShardServer.begin_tmp(data_dir(opts)) do
+      final_path = part_path(bucket, upload_id, part_number, opts)
+      tmp_path = Path.join(tmp_dir, @part_file)
 
       try do
-        ctx0 = :crypto.hash_init(:md5)
+        result = write_part_file!(tmp_path, chunks)
+        extra = run_before_part_commit!(opts, result)
 
-        {ctx, size} =
-          Enum.reduce(chunks, {ctx0, 0}, fn chunk, {ctx, acc} ->
-            :ok = IO.binwrite(fd, chunk)
-            {:crypto.hash_update(ctx, chunk), acc + byte_size(chunk)}
-          end)
-
-        md5_raw = :crypto.hash_final(ctx)
-        etag = Base.encode16(md5_raw, case: :lower)
-        {:ok, %{size: size, etag: etag, md5_raw: md5_raw}}
+        case ShardServer.commit_file(tmp_path, final_path, commit_opts(opts)) do
+          :ok -> {:ok, Map.merge(result, extra)}
+          {:error, reason} -> {:error, reason}
+        end
       after
-        File.close(fd)
+        _ = File.rm_rf(tmp_dir)
       end
     end
   end
+
+  defp write_part_file!(path, chunks) do
+    {:ok, fd} = File.open(path, [:write, :binary, :raw])
+
+    try do
+      ctx0 = :crypto.hash_init(:md5)
+
+      {ctx, size} =
+        Enum.reduce(chunks, {ctx0, 0}, fn chunk, {ctx, acc} ->
+          :ok = IO.binwrite(fd, chunk)
+          {:crypto.hash_update(ctx, chunk), acc + byte_size(chunk)}
+        end)
+
+      md5_raw = :crypto.hash_final(ctx)
+
+      %{
+        size: size,
+        etag: Base.encode16(md5_raw, case: :lower),
+        md5_raw: md5_raw
+      }
+    after
+      File.close(fd)
+    end
+  end
+
+  defp run_before_part_commit!(opts, result) do
+    case Keyword.get(opts, :before_part_commit) do
+      nil -> %{}
+      fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
+      fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())
+    end
+  end
+
+  defp normalize_part_commit_extra(nil), do: %{}
+  defp normalize_part_commit_extra(extra) when is_map(extra), do: extra
 
   defp do_get_part_stream(bucket, key, upload_id, part_number, opts) do
     with {:ok, _obj} <- object_path(bucket, key, "null", opts) do

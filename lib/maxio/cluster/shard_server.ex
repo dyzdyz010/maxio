@@ -258,6 +258,19 @@ defmodule Maxio.Cluster.ShardServer do
     end)
   end
 
+  @doc "Move a shard directory on the same node/drive. Missing source is reported explicitly."
+  @spec move_shard(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def move_shard(source_dir, destination_dir, opts \\ []) do
+    DriveIO.track(:write, fn ->
+      rename_fun = rename_fun(opts)
+
+      with {:ok, _} <- File.rm_rf(destination_dir),
+           :ok <- File.mkdir_p(Path.dirname(destination_dir)) do
+        rename_atomic(rename_fun, source_dir, destination_dir)
+      end
+    end)
+  end
+
   @doc "只删除该 drive 上对象目录里的 part.0，保留 meta.json 与子目录。幂等。"
   @spec delete_part_file(String.t()) :: :ok | {:error, term()}
   def delete_part_file(drive_obj_dir) do

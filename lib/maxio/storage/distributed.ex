@@ -172,7 +172,7 @@ defmodule Maxio.Storage.Distributed do
 
   # ── 原子提交编排（B1-2）──
   # 每端点 begin_tmp（drive_root = endpoint drive，与 final 同卷保证 rename 原子）；返回保序的
-  # %{node, final_dir, tmp_dir}（begin_tmp 失败 -> tmp_dir=nil，写时跳过、commit 不计入 quorum）。
+  # %{node, drive, final_dir, tmp_dir}（begin_tmp 失败 -> tmp_dir=nil，写时跳过、commit 不计入 quorum）。
   defp begin_commit_targets(tx, endpoints, obj_rel) do
     Enum.map(endpoints, fn {node, drive} ->
       final_dir = Path.join(drive, obj_rel)
@@ -183,7 +183,7 @@ defmodule Maxio.Storage.Distributed do
           {:error, _} -> nil
         end
 
-      %{node: node, final_dir: final_dir, tmp_dir: tmp_dir}
+      %{node: node, drive: drive, final_dir: final_dir, tmp_dir: tmp_dir}
     end)
   end
 
@@ -196,23 +196,38 @@ defmodule Maxio.Storage.Distributed do
   # :meta_only 仅 do_put_delete_marker 注入（纯元数据提交声明，B5-0）；do_put/assemble 不注入 →
   # 缺省 false → 缺 part.0 仍立即失败（绝不静默把「忘写数据」当成功提交）。
   defp commit_all(tx, targets, opts) do
-    commit_opts = Keyword.take(opts, [:fsync, :meta_only])
+    commit_all_results(tx, targets, opts)
+    |> Enum.count(fn {_target, ok?} -> ok? end)
+  end
+
+  defp commit_all_results(tx, targets, opts) do
+    commit_opts = Keyword.take(opts, [:fsync, :meta_only, :rename_fun])
 
     targets
-    |> Enum.filter(& &1.tmp_dir)
     |> Task.async_stream(
-      fn %{node: node, tmp_dir: tmp, final_dir: final} ->
-        case tx.commit_object(node, tmp, final, commit_opts) do
-          :ok -> :ok
-          _ -> :error
-        end
+      fn
+        %{tmp_dir: nil} ->
+          false
+
+        %{node: node, tmp_dir: tmp, final_dir: final} ->
+          try do
+            case tx.commit_object(node, tmp, final, commit_opts) do
+              :ok -> true
+              _ -> false
+            end
+          rescue
+            _ -> false
+          catch
+            _kind, _reason -> false
+          end
       end,
       timeout: :infinity,
       max_concurrency: max(length(targets), 1)
     )
-    |> Enum.count(fn
-      {:ok, :ok} -> true
-      _ -> false
+    |> Enum.zip(targets)
+    |> Enum.map(fn
+      {{:ok, ok?}, target} -> {target, ok?}
+      {{:exit, _reason}, target} -> {target, false}
     end)
   end
 
@@ -712,34 +727,61 @@ defmodule Maxio.Storage.Distributed do
     c = cfg(opts)
 
     with {:ok, endpoints} <- endpoints_for_upload_write(bucket, upload_id, opts) do
-      dirs = endpoint_dirs(endpoints, part_rel)
       tx = transport(opts)
-      n = Config.total(c)
+      commit_targets = begin_commit_targets(tx, endpoints, part_rel)
+      tmp_dirs = ordered_tmp_dirs(commit_targets)
 
-      acc0 = %{
-        md5: :crypto.hash_init(:md5),
-        sha: nil,
-        size: 0,
-        shard_len: nil,
-        block_hashes: List.duplicate([], n),
-        buffer: <<>>,
-        block_index: 0,
-        dirs: dirs,
-        tx: tx
-      }
+      try do
+        n = Config.total(c)
 
-      acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed_part(c, acc, chunk) end)
-      acc = flush_final(c, acc)
+        acc0 = %{
+          md5: :crypto.hash_init(:md5),
+          sha: nil,
+          size: 0,
+          shard_len: nil,
+          block_hashes: List.duplicate([], n),
+          buffer: <<>>,
+          block_index: 0,
+          dirs: tmp_dirs,
+          tx: tx
+        }
 
-      md5_raw = :crypto.hash_final(acc.md5)
-      etag = Base.encode16(md5_raw, case: :lower)
-      shard_len = acc.shard_len || 0
+        acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed_part(c, acc, chunk) end)
+        acc = flush_final(c, acc)
 
-      meta =
-        build_part_meta(c, acc.size, etag, shard_len, Enum.map(acc.block_hashes, &Enum.reverse/1))
+        md5_raw = :crypto.hash_final(acc.md5)
+        etag = Base.encode16(md5_raw, case: :lower)
+        shard_len = acc.shard_len || 0
 
-      _ = write_sidecars(tx, dirs, meta)
-      {:ok, %{size: acc.size, etag: etag, md5_raw: md5_raw}}
+        meta =
+          build_part_meta(
+            c,
+            acc.size,
+            etag,
+            shard_len,
+            Enum.map(acc.block_hashes, &Enum.reverse/1)
+          )
+
+        result = %{size: acc.size, etag: etag, md5_raw: md5_raw}
+        extra = run_before_part_commit!(opts, result)
+        _ = write_sidecars(tx, tmp_dirs, meta)
+
+        case commit_part_replace(tx, commit_targets, c.write_quorum, opts) do
+          :ok ->
+            {:ok, Map.merge(result, extra)}
+
+          {:error, :write_quorum} ->
+            {:error, :write_quorum}
+        end
+      rescue
+        err ->
+          cleanup_tmps(tx, commit_targets)
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          cleanup_tmps(tx, commit_targets)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
     end
   end
 
@@ -777,6 +819,17 @@ defmodule Maxio.Storage.Distributed do
       "shards" => shards
     }
   end
+
+  defp run_before_part_commit!(opts, result) do
+    case Keyword.get(opts, :before_part_commit) do
+      nil -> %{}
+      fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
+      fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())
+    end
+  end
+
+  defp normalize_part_commit_extra(nil), do: %{}
+  defp normalize_part_commit_extra(extra) when is_map(extra), do: extra
 
   defp do_get_part_stream(bucket, _key, upload_id, part_number, opts) do
     part_rel = Paths.part_rel(bucket, upload_id, part_number)
@@ -1010,6 +1063,116 @@ defmodule Maxio.Storage.Distributed do
     targets
     |> Enum.filter(& &1.tmp_dir)
     |> Enum.each(fn %{node: node, tmp_dir: tmp} -> tx.delete_shard(node, tmp) end)
+  end
+
+  defp commit_part_replace(tx, targets, write_quorum, opts) do
+    case backup_existing_targets(tx, targets) do
+      {:ok, backups} ->
+        commit_part_replace_with_backups(tx, targets, backups, write_quorum, opts)
+
+      {:error, :write_quorum} ->
+        cleanup_tmps(tx, targets)
+        {:error, :write_quorum}
+    end
+  end
+
+  defp commit_part_replace_with_backups(tx, targets, backups, write_quorum, opts) do
+    try do
+      results = commit_all_results(tx, targets, opts)
+      ok_endpoints = Enum.count(results, fn {_target, ok?} -> ok? end)
+
+      if ok_endpoints >= write_quorum do
+        cleanup_failed_part_finals(tx, results)
+        cleanup_tmps(tx, targets)
+        cleanup_backups(tx, backups)
+        :ok
+      else
+        restore_part_backups(tx, targets, backups)
+        {:error, :write_quorum}
+      end
+    rescue
+      err ->
+        restore_part_backups(tx, targets, backups)
+        reraise(err, __STACKTRACE__)
+    catch
+      kind, reason ->
+        restore_part_backups(tx, targets, backups)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp cleanup_failed_part_finals(tx, results) do
+    Enum.each(results, fn
+      {_target, true} -> :ok
+      {%{node: node, final_dir: final}, false} -> tx.delete_shard(node, final)
+      {_target, false} -> :ok
+    end)
+  end
+
+  defp backup_existing_targets(tx, targets) do
+    do_backup_existing_targets(tx, targets, [])
+  end
+
+  defp do_backup_existing_targets(_tx, [], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp do_backup_existing_targets(tx, [target | rest], acc) do
+    case backup_existing_target(tx, target) do
+      {:ok, entry} ->
+        do_backup_existing_targets(tx, rest, [entry | acc])
+
+      {:error, _reason} ->
+        restore_part_backups(tx, [], Enum.reverse(acc))
+        {:error, :write_quorum}
+    end
+  end
+
+  defp backup_existing_target(tx, %{node: node, drive: drive, final_dir: final}) do
+    case tx.get_sidecar(node, final) do
+      {:ok, _meta} ->
+        with {:ok, backup} <- tx.begin_tmp(node, drive) do
+          case tx.move_shard(node, final, backup, []) do
+            :ok ->
+              {:ok, %{node: node, final_dir: final, backup_dir: backup}}
+
+            {:error, :enoent} ->
+              tx.delete_shard(node, backup)
+              {:ok, %{node: node, final_dir: final, backup_dir: nil}}
+
+            {:error, reason} ->
+              tx.delete_shard(node, backup)
+              {:error, reason}
+          end
+        end
+
+      {:error, :enoent} ->
+        {:ok, %{node: node, final_dir: final, backup_dir: nil}}
+
+      {:error, _reason} ->
+        {:error, :write_quorum}
+    end
+  end
+
+  defp cleanup_backups(tx, backups) do
+    Enum.each(backups, fn
+      %{backup_dir: nil} -> :ok
+      %{node: node, backup_dir: backup} -> tx.delete_shard(node, backup)
+    end)
+  end
+
+  defp restore_part_backups(tx, targets, backups) do
+    cleanup_tmps(tx, targets)
+
+    targets
+    |> Enum.filter(& &1.tmp_dir)
+    |> Enum.each(fn %{node: node, final_dir: final} -> tx.delete_shard(node, final) end)
+
+    Enum.each(backups, fn
+      %{backup_dir: nil} ->
+        :ok
+
+      %{node: node, final_dir: final, backup_dir: backup} ->
+        _ = tx.move_shard(node, backup, final, [])
+    end)
   end
 
   # B5-3 R2：marker quorum 成功后 best-effort GC 各端点 final 里被替换 null 版本的孤儿 part.0

@@ -90,23 +90,30 @@ defmodule Maxio.Storage.ErasureCoded do
 
   defp do_put_part(bucket, _key, upload_id, part_number, chunks, opts) do
     cfg = Config.load!(opts)
-    dirs = part_dirs(bucket, upload_id, part_number, cfg)
-    Enum.each(dirs, &File.mkdir_p!/1)
-    fds = Enum.map(dirs, fn dir -> open_write!(Path.join(dir, @part_file)) end)
+    final_dirs = part_dirs(bucket, upload_id, part_number, cfg)
+    commit_pairs = Enum.zip(cfg.drives, final_dirs)
+    tmps = begin_tmp_dirs!(cfg.drives)
 
     try do
-      acc0 = %{
-        md5: :crypto.hash_init(:md5),
-        sha: nil,
-        size: 0,
-        shard_len: nil,
-        block_hashes: List.duplicate([], Config.total(cfg)),
-        buffer: <<>>,
-        fds: fds
-      }
+      fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
 
-      acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed_part(cfg, acc, chunk) end)
-      acc = flush_final(cfg, acc)
+      acc =
+        try do
+          acc0 = %{
+            md5: :crypto.hash_init(:md5),
+            sha: nil,
+            size: 0,
+            shard_len: nil,
+            block_hashes: List.duplicate([], Config.total(cfg)),
+            buffer: <<>>,
+            fds: fds
+          }
+
+          acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed_part(cfg, acc, chunk) end)
+          flush_final(cfg, acc)
+        after
+          Enum.each(fds, &File.close/1)
+        end
 
       md5_raw = :crypto.hash_final(acc.md5)
       etag = Base.encode16(md5_raw, case: :lower)
@@ -121,10 +128,25 @@ defmodule Maxio.Storage.ErasureCoded do
           Enum.map(acc.block_hashes, &Enum.reverse/1)
         )
 
-      _ = write_sidecars(dirs, meta)
-      {:ok, %{size: acc.size, etag: etag, md5_raw: md5_raw}}
-    after
-      Enum.each(fds, &File.close/1)
+      result = %{size: acc.size, etag: etag, md5_raw: md5_raw}
+      extra = run_before_part_commit!(opts, result)
+      write_tmp_sidecars(tmps, meta)
+
+      case commit_part_replace(tmps, commit_pairs, cfg.write_quorum, opts) do
+        :ok ->
+          {:ok, Map.merge(result, extra)}
+
+        {:error, :write_quorum} ->
+          {:error, :write_quorum}
+      end
+    rescue
+      err ->
+        cleanup_tmps(tmps)
+        reraise(err, __STACKTRACE__)
+    catch
+      kind, reason ->
+        cleanup_tmps(tmps)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
   end
 
@@ -200,7 +222,9 @@ defmodule Maxio.Storage.ErasureCoded do
 
     with {:ok, commit_pairs} <- commit_pairs(bucket, key, version_id, cfg) do
       # B1-2 原子提交：组装对象同样先写各盘 temp obj-dir，commit 数据先于元数据原子 rename 到 final。
-      tmps = Enum.map(commit_pairs, fn {drive_root, _final} -> begin_tmp!(drive_root) end)
+      tmps =
+        commit_pairs |> Enum.map(fn {drive_root, _final} -> drive_root end) |> begin_tmp_dirs!()
+
       fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
 
       acc =
@@ -280,7 +304,9 @@ defmodule Maxio.Storage.ErasureCoded do
     cfg = Config.load!(opts)
 
     with {:ok, commit_pairs} <- commit_pairs(bucket, key, version_id, cfg) do
-      tmps = Enum.map(commit_pairs, fn {drive_root, _final} -> begin_tmp!(drive_root) end)
+      tmps =
+        commit_pairs |> Enum.map(fn {drive_root, _final} -> drive_root end) |> begin_tmp_dirs!()
+
       meta = build_delete_marker_meta(version_id, entry_opts)
 
       write_tmp_sidecars(tmps, meta)
@@ -339,10 +365,18 @@ defmodule Maxio.Storage.ErasureCoded do
     end
   end
 
-  # 在某盘 drive_root 下建同卷 temp obj-dir（与 final 同卷 -> rename 原子）。
-  defp begin_tmp!(drive_root) do
-    {:ok, tmp} = ShardServer.begin_tmp(drive_root)
-    tmp
+  defp begin_tmp_dirs!(drive_roots) do
+    Enum.reduce(drive_roots, [], fn drive_root, acc ->
+      case ShardServer.begin_tmp(drive_root) do
+        {:ok, tmp} ->
+          [tmp | acc]
+
+        {:error, reason} ->
+          cleanup_tmps(acc)
+          raise "failed to create shard temp dir: #{inspect(reason)}"
+      end
+    end)
+    |> Enum.reverse()
   end
 
   # sidecar 写各盘 temp obj-dir（与 part.0 同 temp，一并 commit）。
@@ -355,14 +389,19 @@ defmodule Maxio.Storage.ErasureCoded do
   # :meta_only 仅 do_put_delete_marker 注入（纯元数据提交声明，B5-0）；do_put/assemble 不注入 →
   # 缺省 false → 缺 part.0 仍立即失败（绝不静默把「忘写数据」当成功提交）。
   defp commit_drives(tmps, commit_pairs, opts) do
-    commit_opts = Keyword.take(opts, [:fsync, :meta_only])
+    commit_drives_results(tmps, commit_pairs, opts)
+    |> Enum.count(fn {_commit_pair, ok?} -> ok? end)
+  end
+
+  defp commit_drives_results(tmps, commit_pairs, opts) do
+    commit_opts = Keyword.take(opts, [:fsync, :meta_only, :rename_fun])
 
     tmps
     |> Enum.zip(commit_pairs)
-    |> Enum.reduce(0, fn {tmp, {_drive_root, final_dir}}, ok ->
+    |> Enum.map(fn {tmp, {_drive_root, final_dir} = commit_pair} ->
       case ShardServer.commit(tmp, final_dir, commit_opts) do
-        :ok -> ok + 1
-        {:error, _} -> ok
+        :ok -> {commit_pair, true}
+        {:error, _} -> {commit_pair, false}
       end
     end)
   end
@@ -373,7 +412,115 @@ defmodule Maxio.Storage.ErasureCoded do
     Enum.each(commit_pairs, fn {_drive_root, final_dir} -> File.rm_rf(final_dir) end)
   end
 
+  defp commit_part_replace(tmps, commit_pairs, write_quorum, opts) do
+    backups = backup_existing_shards!(commit_pairs)
+
+    try do
+      results = commit_drives_results(tmps, commit_pairs, opts)
+      ok_drives = Enum.count(results, fn {_commit_pair, ok?} -> ok? end)
+
+      if ok_drives >= write_quorum do
+        cleanup_failed_part_finals(results)
+        cleanup_tmps(tmps)
+        cleanup_backups(backups)
+        :ok
+      else
+        restore_part_backups(tmps, commit_pairs, backups)
+        {:error, :write_quorum}
+      end
+    rescue
+      err ->
+        restore_part_backups(tmps, commit_pairs, backups)
+        reraise(err, __STACKTRACE__)
+    catch
+      kind, reason ->
+        restore_part_backups(tmps, commit_pairs, backups)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp cleanup_failed_part_finals(results) do
+    Enum.each(results, fn
+      {_commit_pair, true} -> :ok
+      {{_drive_root, final_dir}, false} -> File.rm_rf(final_dir)
+    end)
+  end
+
+  defp backup_existing_shards!(commit_pairs) do
+    do_backup_existing_shards!(commit_pairs, [])
+  end
+
+  defp do_backup_existing_shards!([], acc), do: Enum.reverse(acc)
+
+  defp do_backup_existing_shards!([{drive_root, final_dir} | rest], acc) do
+    case backup_existing_shard(drive_root, final_dir) do
+      {:ok, entry} ->
+        do_backup_existing_shards!(rest, [entry | acc])
+
+      {:error, reason} ->
+        restore_part_backups([], [], Enum.reverse(acc))
+        raise "failed to backup shard before replacement commit: #{inspect(reason)}"
+    end
+  end
+
+  defp backup_existing_shard(drive_root, final_dir) do
+    if File.exists?(final_dir) do
+      with {:ok, backup} <- ShardServer.begin_tmp(drive_root) do
+        case ShardServer.move_shard(final_dir, backup, []) do
+          :ok ->
+            {:ok, {drive_root, final_dir, backup}}
+
+          {:error, :enoent} ->
+            File.rm_rf(backup)
+            {:ok, {drive_root, final_dir, nil}}
+
+          {:error, reason} ->
+            File.rm_rf(backup)
+            {:error, reason}
+        end
+      end
+    else
+      {:ok, {drive_root, final_dir, nil}}
+    end
+  end
+
+  defp cleanup_backups(backups) do
+    Enum.each(backups, fn
+      {_drive_root, _final_dir, nil} -> :ok
+      {_drive_root, _final_dir, backup} -> File.rm_rf(backup)
+    end)
+  end
+
+  defp restore_part_backups(tmps, commit_pairs, backups) do
+    cleanup_tmps(tmps)
+
+    Enum.each(commit_pairs, fn {_drive_root, final_dir} ->
+      File.rm_rf(final_dir)
+    end)
+
+    Enum.each(backups, fn
+      {_drive_root, _final_dir, nil} ->
+        :ok
+
+      {_drive_root, final_dir, backup} ->
+        _ = ShardServer.move_shard(backup, final_dir, [])
+    end)
+  end
+
   # ── PUT：逐块流式编码 ──
+
+  defp cleanup_tmps(tmps), do: Enum.each(tmps, &File.rm_rf/1)
+
+  defp run_before_part_commit!(opts, result) do
+    case Keyword.get(opts, :before_part_commit) do
+      nil -> %{}
+      fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
+      fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())
+    end
+  end
+
+  defp normalize_part_commit_extra(nil), do: %{}
+  defp normalize_part_commit_extra(extra) when is_map(extra), do: extra
 
   defp do_put(bucket, key, version_id, chunks, opts) do
     cfg = Config.load!(opts)
@@ -381,7 +528,9 @@ defmodule Maxio.Storage.ErasureCoded do
     with {:ok, commit_pairs} <- commit_pairs(bucket, key, version_id, cfg) do
       # B1-2 原子提交：各盘先建同卷 temp obj-dir，逐块流式写 temp 的 part.0，流尾 sidecar 写 temp，
       # 最后各盘 commit（数据先于元数据原子 rename 到 final），成功盘数 >= write_quorum 才 {:ok}。
-      tmps = Enum.map(commit_pairs, fn {drive_root, _final} -> begin_tmp!(drive_root) end)
+      tmps =
+        commit_pairs |> Enum.map(fn {drive_root, _final} -> drive_root end) |> begin_tmp_dirs!()
+
       fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
 
       acc =
@@ -562,17 +711,6 @@ defmodule Maxio.Storage.ErasureCoded do
       fun when is_function(fun, 0) -> fun.()
       value -> value
     end
-  end
-
-  defp write_sidecars(dirs, meta) do
-    bin = Meta.encode(meta)
-
-    Enum.reduce(dirs, 0, fn dir, ok ->
-      case File.write(Path.join(dir, @meta_file), bin) do
-        :ok -> ok + 1
-        {:error, _} -> ok
-      end
-    end)
   end
 
   # ROUTE B B5-0：纯 delete-marker maxio/2 sidecar（无 part.0 字节、无 ec/shards 耐久 core——delete

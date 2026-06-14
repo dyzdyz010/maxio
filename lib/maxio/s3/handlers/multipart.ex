@@ -119,7 +119,6 @@ defmodule Maxio.S3.Handlers.Multipart do
     part_number = parse_part_number!(Map.fetch!(conn.query_params, "partNumber"))
 
     upload = upload_or_raise(bucket, key, upload_id)
-    :ok = Checksum.reject_upload_part_headers!(conn)
 
     case header(conn, "x-amz-copy-source") do
       nil -> upload_part_body(conn, bucket, key, upload_id, part_number, upload)
@@ -128,18 +127,37 @@ defmodule Maxio.S3.Handlers.Multipart do
   end
 
   defp upload_part_body(conn, bucket, key, upload_id, part_number, upload) do
-    chunks = BodyReader.stream(conn, conn.assigns.payload_mode)
+    checksum = Checksum.from_conn!(conn)
 
-    case Storage.put_part(
-           bucket,
-           key,
-           upload_id,
-           part_number,
-           chunks,
-           Placement.upload_storage_opts(upload)
-         ) do
-      {:ok, %{size: size, etag: etag}} ->
+    {chunks, get_checksum, discard_checksum} =
+      conn |> BodyReader.stream(conn.assigns.payload_mode) |> Checksum.wrap_stream(checksum)
+
+    opts =
+      upload
+      |> Placement.upload_storage_opts()
+      |> Keyword.put(:before_part_commit, fn _part ->
+        checksum = get_checksum.()
+        :ok = checksum.verify!.()
+        %{checksum: checksum}
+      end)
+
+    put_result =
+      try do
+        Storage.put_part(bucket, key, upload_id, part_number, chunks, opts)
+      rescue
+        err ->
+          discard_checksum.()
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          discard_checksum.()
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    case put_result do
+      {:ok, %{size: size, etag: etag} = part_result} ->
         {:ok, _} = Multipart.put_part(upload, part_number, %{etag: etag, size: size})
+        checksum = Map.get(part_result, :checksum, checksum)
 
         Log.info("upload part",
           action: :upload_part,
@@ -149,24 +167,31 @@ defmodule Maxio.S3.Handlers.Multipart do
         )
 
         conn
+        |> Checksum.put_response_headers(checksum)
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
 
       {:error, :invalid_key} ->
+        discard_checksum.()
+
         # B5-3 R4 backstop：入口守卫部署前遗留的在途会话（点段 key）打到后端路径层
         # （FS object_path）结构化拒绝 → 400 XMinioInvalidObjectName，绝不塌缩 500（铁律 3）。
         # 新会话已被 create_multipart_upload 入口守卫拦截，此分支仅兜历史在途上传。
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       {:error, reason} when reason in [:write_quorum, :rename_busy] ->
+        discard_checksum.()
         raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
 
       {:error, reason} ->
+        discard_checksum.()
         raise upload_part_error(reason, bucket, key)
     end
   end
 
   defp upload_part_copy(conn, bucket, key, upload_id, part_number, upload, copy_source_header) do
+    :ok = Checksum.reject_upload_part_headers!(conn)
+
     source = CopySource.parse!(copy_source_header)
     :ok = validate_object_key!(source.bucket, source.key)
     :ok = CopySource.validate_version_id!(source)
