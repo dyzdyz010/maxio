@@ -83,12 +83,40 @@ defmodule Mix.Tasks.Maxio.Rebalance.Status do
       "[maxio rebalance.status] job_id=#{job.id} kind=#{job.kind} status=#{job.status} " <>
         "data_movement=#{view.data_movement} data_movement_status=#{job.data_movement_status} " <>
         "target_set_id=#{format_value(job.target_set_id)} " <>
+        "destination_set_id=#{format_value(job.destination_set_id)} " <>
         "plan_status=#{job.plan_status} scanned=#{job.plan_scanned} bytes=#{job.plan_bytes} " <>
         "placement_fallbacks=#{job.plan_placement_fallbacks} progress_scanned=#{job.progress_scanned} " <>
-        "progress_moved=#{job.progress_moved} progress_errors=#{job.progress_errors}"
+        "progress_moved=#{job.progress_moved} progress_errors=#{job.progress_errors} " <>
+        "source_cleanup_status=#{job.source_cleanup_status} " <>
+        "rebalance_closure_status=#{job.rebalance_closure_status} " <>
+        "rebalance_closure_topology_hash=#{format_value(job.rebalance_closure_topology_hash)} " <>
+        "rebalance_closure_blockers=#{inspect(job.rebalance_closure_blockers)} " <>
+        "topology_removal_status=#{job.topology_removal_status} " <>
+        "topology_removal_scope=#{job.topology_removal_scope} " <>
+        "target_endpoint_manifest=#{target_endpoint_count(job.topology_removal_target_endpoints)} " <>
+        "removed_pool_ids=#{inspect(job.topology_removal_removed_pool_ids)} " <>
+        "physical_removal_status=#{job.physical_removal_status} " <>
+        "physical_removal_scope=#{job.physical_removal_scope} " <>
+        "physical_removal_quarantine_id=#{format_value(job.physical_removal_quarantine_id)} " <>
+        "physical_removal_roots_quarantined=#{job.physical_removal_roots_quarantined} " <>
+        "physical_removal_errors=#{job.physical_removal_errors} " <>
+        "physical_removal_purge_status=#{job.physical_removal_purge_status} " <>
+        "physical_removal_purge_scope=#{job.physical_removal_purge_scope} " <>
+        "physical_removal_purge_roots_deleted=#{job.physical_removal_purge_roots_deleted} " <>
+        "physical_removal_purge_bytes_deleted=#{job.physical_removal_purge_bytes_deleted} " <>
+        "physical_removal_purge_errors=#{job.physical_removal_purge_errors}"
     )
   end
 
   defp format_value(nil), do: "nil"
   defp format_value(value), do: to_string(value)
+
+  defp target_endpoint_count(%{} = manifest) do
+    manifest
+    |> Map.get("endpoints", Map.get(manifest, :endpoints, []))
+    |> List.wrap()
+    |> length()
+  end
+
+  defp target_endpoint_count(_manifest), do: 0
 end

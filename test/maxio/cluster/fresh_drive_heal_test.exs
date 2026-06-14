@@ -8,6 +8,8 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
     DriveIdentity,
     FreshDriveHeal,
     Paths,
+    Placement,
+    Router,
     Topology,
     Transport.InProcess
   }
@@ -95,6 +97,76 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
 
     {:ok, stream} = Distributed.get(bucket, key, "null", nil, opts)
     assert IO.iodata_to_binary(Enum.to_list(stream)) == body
+  end
+
+  test "fresh-drive heal uses persisted placement instead of current router" do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "maxio_fresh_drive_placement_#{System.unique_integer([:positive])}"
+      )
+
+    endpoints0 = for i <- 0..3, do: {Node.self(), Path.join(base, "s0d#{i}")}
+    endpoints1 = for i <- 0..3, do: {Node.self(), Path.join(base, "s1d#{i}")}
+    Enum.each(endpoints0 ++ endpoints1, fn {_node, drive} -> File.mkdir_p!(drive) end)
+
+    topology =
+      Topology.parse_and_validate!(
+        data_shards: 2,
+        parity_shards: 2,
+        block_size: 1024,
+        allow_colocated_endpoints: true,
+        pools: [
+          %{id: 0, sets: [%{id: 0, endpoints: endpoints0}, %{id: 1, endpoints: endpoints1}]}
+        ]
+      )
+
+    try do
+      bucket = bucket_name("fresh-placement")
+      key = key_for_set(bucket, topology, 1, "routes-to-one")
+      body = :crypto.strong_rand_bytes(1536)
+      opts = [topology: topology, transport: InProcess]
+      source_opts = Keyword.put(opts, :placement_set_id, 0)
+      {node, drive} = hd(endpoints0)
+
+      {:ok, _bucket} = Buckets.create(bucket, @owner)
+      :ok = Distributed.put_bucket(bucket, opts)
+
+      InProcess.set_drive_down(node, drive)
+      assert %{offline: 1} = probe(%{topology: topology}, 0)
+
+      {:ok, write_result} = Distributed.put(bucket, key, "null", [body], source_opts)
+
+      put_index!(
+        bucket,
+        key,
+        "null",
+        write_result.size,
+        write_result.etag,
+        Placement.attrs_from_result(write_result)
+      )
+
+      missing_part = part_path(drive, bucket, key, "null")
+      refute File.exists?(missing_part)
+
+      InProcess.set_drive_up(node, drive)
+      assert %{heal_required: 1} = probe(%{topology: topology}, 1)
+
+      assert {:ok, report} =
+               FreshDriveHeal.run_once(topology: topology, transport: InProcess)
+
+      assert report.status == :ok
+      assert report.scanned == 1
+      assert report.drives_cleared == 1
+      assert File.exists?(missing_part)
+      refute DriveHealth.heal_required?({node, drive})
+
+      {:ok, stream} = Distributed.get(bucket, key, "null", nil, source_opts)
+      assert IO.iodata_to_binary(Enum.to_list(stream)) == body
+    after
+      DriveHealth.reset()
+      File.rm_rf(base)
+    end
   end
 
   test "dry-run reports targets without healing or clearing", ctx do
@@ -395,15 +467,28 @@ defmodule Maxio.Cluster.FreshDriveHealTest do
 
   defp dist_opts(ctx), do: [topology: ctx.topology, transport: InProcess]
 
-  defp put_index!(bucket, key, version_id, size, etag) do
+  defp put_index!(bucket, key, version_id, size, etag, attrs \\ %{}) do
     {:ok, object} =
-      Objects.put_version_with_id(bucket, key, version_id, %{
-        size: size,
-        etag: etag,
-        content_type: "application/octet-stream"
-      })
+      Objects.put_version_with_id(
+        bucket,
+        key,
+        version_id,
+        %{
+          size: size,
+          etag: etag,
+          content_type: "application/octet-stream"
+        }
+        |> Map.merge(attrs)
+      )
 
     object
+  end
+
+  defp key_for_set(bucket, topology, set_id, prefix) do
+    Enum.find_value(0..10_000, fn i ->
+      key = "#{prefix}-#{set_id}-#{i}.bin"
+      if Router.set_for(bucket, key, topology) == set_id, do: key
+    end) || flunk("could not find key for set #{inspect(set_id)}")
   end
 
   defp part_path(drive, bucket, key, version_id),

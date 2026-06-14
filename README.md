@@ -27,6 +27,7 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **版本 ID**：ULID（26 字符 Crockford base32，时间有序、URL-safe）；无版本写入用保留串 `null`（既是存储值也是 `x-amz-version-id` 回显值）。
 - **对象多版本模型**：`objects` 表每 `(bucket, key, version_id)` 一行。`Enabled` 下 PutObject 生成新 ULID 并置为当前版本；`Suspended`/`Unversioned` 用 `null` 版本就地覆盖。
 - **Delete marker**：`Enabled` 下无 `versionId` 的 DELETE 插入删除标记（无字节的特殊版本行）。当前版本为删除标记时 GET/HEAD 返回 `404 + x-amz-delete-marker: true`；`?versionId` 指向删除标记返回 `405 + x-amz-delete-marker: true`。`?versionId` 的 DELETE 永久删除该版本（删除当前版本时自动提升下一个最新版本）。
+- **MFA Delete**：`MfaDelete` 状态可解析/存储/回显；启用/禁用 MFA Delete、在 MFA Delete 桶中改变 versioning 状态、`DELETE ?versionId`、`Suspended` 桶中会替换 `null` 版本的无 `versionId` 删除、以及含 `<VersionId>` 或会替换 `null` 版本条目的 `DeleteObjects` 都要求 root principal、HTTPS 且已签名的 `x-amz-mfa`，并通过 `config :maxio, :mfa_delete_verifier` 配置的 verifier。未配置 verifier 时受保护操作 fail-closed。`DeleteObjects` 缺/错 MFA 为整请求失败；`Enabled` 桶普通无 `versionId` DELETE 只插入独立 delete marker，不要求 MFA。
 - **ListObjectVersions**（`?versions`）：Version 与 DeleteMarker 元素交错、按 `key` 升序 + 版本 newest-first、二维分页（`key-marker` + `version-id-marker`）、`delimiter`/`CommonPrefixes`。
 - **响应头**：`x-amz-version-id`（仅非 `null` 时）、`x-amz-delete-marker`（仅为真时）。
 - **ListObjectsV2** 仍只返回「当前版本且非删除标记」的对象。
@@ -57,6 +58,17 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **Principal 内联策略**：`principal_policies/1` 不再恒空；`principal_policies` 表按 `principal_arn + policy_name` 存储 identity-based policy，并与 bucket policy / ACL 一起交给同一个 Evaluator。显式 Deny 仍优先于任意 Allow。
 - **Principal 语义**：identity policy 绑定在 principal 上，JSON 内不允许 `Principal`；绑定关系隐式提供当前 principal。bucket policy 仍要求显式 `Principal`。
 - **CLI**：`mix maxio.iam.put_policy --principal ARN --name NAME --file policy.json`、`mix maxio.iam.list_policies --principal ARN`、`mix maxio.iam.delete_policy --principal ARN --name NAME`。
+
+### STS session credentials（续作已支持）
+
+- **本地临时凭据**：`Maxio.STS.issue_session/1` 基于活跃长期 access key 签发 `ASIA...` 临时 access key、secret key 与 session token；数据库只保存 `session_token_sha256`，secret/token 仅在签发响应中出现一次。
+- **SigV4 鉴权**：header auth 支持已签名的 `x-amz-security-token`，presigned URL 支持 `X-Amz-Security-Token` query 参数；临时 key 缺 token、错 token、过期或撤销均 fail-closed，长期 key 携带 stale token 返回 `InvalidToken`。
+- **GetSessionToken Query API**：`GET /?Action=GetSessionToken&Version=2011-06-15&DurationSeconds=N` 与 POST `application/x-www-form-urlencoded` form 均已支持；请求必须用长期凭据按 SigV4 `sts` service scope 签名，返回 STS XML `<GetSessionTokenResponse>`，临时凭据可继续签 S3 请求但不能递归调用 `GetSessionToken`。可选 `SerialNumber`/`TokenCode` 会通过本地 TOTP verifier 两阶段校验并消费，成功 session 在后续 S3 授权上下文暴露 `aws:MultiFactorAuthPresent=true`。
+- **GetCallerIdentity Query API**：`GET/POST Action=GetCallerIdentity` 已支持；请求必须有效签名且 SigV4 credential scope service 为 `sts`，但不评估 IAM allow/deny policy、不签发新凭据、不落库。长期凭据、`GetSessionToken` 临时凭据与 `AssumeRole` role session 均可调用；响应返回 `UserId`、`Account`、`Arn`。`Account` 来自 `config :maxio, :sts, account_id: ...`（运行时 `MAXIO_ACCOUNT_ID` 可覆盖，默认 `000000000000`）；当前仍沿用 maxio 单账户 ARN/`UserId` 折中，完整 AWS account-id / unique-id / role-id 体系随多租户 IAM 扩展收敛。
+- **AssumeRole Query API**：新增 IAM role 存储与 trust policy 解析；`GET/POST Action=AssumeRole` 支持 `RoleArn`、`RoleSessionName`、`DurationSeconds` 与 `Tags.member.N.Key/Value` session tags，按角色信任策略评估 `sts:AssumeRole`，返回 `<AssumeRoleResponse>` 临时凭据。该临时凭据以 role ARN 作为 S3 授权 principal，可通过现有 `principal_policies` 绑定角色权限；session tags 会大小写不敏感覆盖同名 role tags，并在后续 S3 授权上下文暴露为 `aws:PrincipalTag/*`。`GetSessionToken` 临时凭据与 assumed-role 临时凭据均可调用 `AssumeRole`；role chaining 的 `DurationSeconds` 上限按 AWS 语义收紧为 3600 秒。
+- **AssumeRole trust context**：`ExternalId`、`SourceIdentity`、`SerialNumber`/`TokenCode` MFA 与 session tag 上下文已参与 trust policy 条件求值（`sts:ExternalId`、`sts:SourceIdentity`、`aws:SourceIdentity`、`aws:MultiFactorAuthPresent`、`aws:RequestTag/*`、`aws:TagKeys`、`aws:ResourceTag/*`）。设置或继承 SourceIdentity 时，目标 role trust policy 必须同时允许 `sts:AssumeRole` 与 `sts:SetSourceIdentity`，且非 root 调用方 identity policy 也必须允许对目标 role 执行 `sts:SetSourceIdentity`；传入 session tags 时，目标 role trust policy 必须同时允许 `sts:AssumeRole` 与 `sts:TagSession`。SourceIdentity 会随会话持久化并在 S3 授权上下文暴露为 `aws:SourceIdentity`；role chaining 会继承既有 SourceIdentity 且拒绝改写。MFA 成功会持久化审计布尔态与 serial SHA256，不保存 raw serial 或 token code。按 AWS 语义，`AssumeRole` 得到的临时凭据后续访问 S3 时不暴露 `aws:MultiFactorAuthPresent`；该键只用于本次 role trust policy 判断。当前 MFA 路径复用本地 root/IAM user TOTP 设备管理。
+- **CLI**：`mix maxio.sts.issue_session --access-key AKIA... [--duration-seconds N] [--json]`、`mix maxio.sts.list_sessions [--json]`、`mix maxio.sts.revoke_session --access-key ASIA...`。list/revoke 不输出 secret、token 或 token hash。
+- **仍 defer**：WebIdentity、session policy、`TransitiveTagKeys`/链式 session tag 传播、跨账户/account-principal 场景下的 STS caller `sts:AssumeRole` identity-policy side 授权、ProvidedContexts、AWS IAM MFA device API surface、硬件 MFA、Console UI 与 secret at-rest 加密统一治理。
 
 ### IAM condition operators（续作已支持）
 
@@ -102,14 +114,14 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 ### M4 显式 defer 清单（汇总；文档化，绝不静默）
 
 1. **Lifecycle Transition / NoncurrentVersionTransition 执行**：当前版本过期、非当前版本过期、仅存 delete marker 清理、旧 MPU 中止可由 `mix maxio.lifecycle.run` 或 `config :maxio, :lifecycle_scheduler, enabled: true` 后台周期执行；Transition / NoncurrentVersionTransition 仍 no-op 并显式暴露。
-2. **MFA Delete**：`MfaDelete` 状态解析/存储/回显（仅曾配置时回 `<MfaDelete>`），但不强制 MFA 校验（无设备），`x-amz-mfa` 头不验证。
+2. **MFA Delete 设备管理 / 非 HTTP 入口**：S3 HTTP API 已强制 MFA Delete，并在未配置 verifier 时 fail-closed；受保护操作必须 root principal，且 `x-amz-mfa` 必须被 SigV4 `SignedHeaders` 覆盖。已提供 DB-backed root/IAM user TOTP 设备管理、加密 seed 信封、pending→active 激活、CLI 注册/验证/停用/列举与 TOTP step 防重放；MFA Delete verifier 仍只接受 root principal，生产环境必须配置 `MAXIO_MFA_SECRET_KEY`。仍 defer：硬件 MFA/硬件 serial 管理、AWS IAM MFA device API、轮换编排 UI，以及 Console 等非 HTTP operator 路径的 MFA 交互语义。Lifecycle runner 对 MFA Delete 桶会跳过会永久删除版本的动作并计数，不绕过 header verifier。
 3. **SSE-C / SSE-KMS / DSSE-KMS**：仅 SSE-S3（AES256）；其余 → `501 NotImplemented`。`BucketKeyEnabled` no-op。
 4. **SSE 密钥管理简化**：单一静态主密钥，无轮转/HSM/KMS。
 5. **SSE 对象 + Range / 大对象逐帧流式解密**：Range 降级为完整对象；整对象解密后返回。
 6. **Multipart 完成对象版本化（2026-06-12 已收敛）**：CompleteMultipartUpload 在 Enabled 桶生成独立 ULID `version_id`，字节、sidecar、PG/索引与 `x-amz-version-id` 响应头使用同一版本；Suspended/Unversioned 仍写 `null` 版本。
 7. **对象级逐版本独立 tag set**：tag 挂在版本行（`?tagging&versionId` 已支持指定版本）；`s3:*VersionTagging` 按同名非 version 权限评估（单租户）。
 8. **lifecycle `Transition` / `NoncurrentVersionTransition` 执行**：仅存储/校验/回放；runner 计 unsupported，不做静默转储。
-9. **沿用 M3 剩余 defer**：跨账户/多租户、更广泛 AWS 全局上下文键、STS/session token、email grantee、checksum trailer 重算、secret at-rest 加密。
+9. **沿用 M3 剩余 defer**：跨账户/多租户、更广泛 AWS 全局上下文键、AssumeRole WebIdentity/session policy/`TransitiveTagKeys` 链式 session tag 传播、跨账户/account-principal 场景下的 STS caller `sts:AssumeRole` identity-policy side 授权、email grantee、checksum trailer 重算、secret at-rest 加密。
 
 ## Console（M5，LiveView 管理控制台）
 
@@ -318,9 +330,10 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
 
 ### M7 显式 defer 清单（文档化，绝不静默假装实现）
 
-1. **Rebalance / Decommission / online pool 扩容**：添加/退役 pool、跨 pool 迁移、free-space 加权放置
-   （MinIO `mc admin rebalance`/`decommission`）。M7 单 pool（多 pool 两级路由 + 加权新写 + 迁移 = defer）；
-   set 数 per pool 不可变。
+1. **Rebalance / Decommission / online pool 扩容**：添加/退役 pool、跨 pool 迁移
+   （MinIO `mc admin rebalance`/`decommission`）。M8 已补 pool metadata、opt-in free-space 加权新写
+   与受限旧对象 rebalance copy-pass/source cleanup；topology/pool mutation、pool removal
+   与 set 数 per pool 在线扩缩仍 defer。
 2. **完整 dsync 锁语义**：M8-1 已把 `:global.trans` MVP 升级为 `LockServer` + quorum lease，
    支持 acquire/release/refresh/force_unlock、read/write 锁区分、owner-death 与 TTL sweep。
    仍 defer：Raft 线性化锁、fencing token、split-brain 下陈旧写硬拒绝。
@@ -337,8 +350,9 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
    S3 handler in-flight + ShardServer storage-op 自适应对象间暂停、cached peer pressure aggregation、
    node-local drive health 长窗口离线观测、persistent software drive identity replacement detection、
    operator-triggered fresh-drive heal pass、默认关闭的 marker-based 自动 fresh-drive heal scheduler，以及
-   read-only rebalance/decommission planning telemetry；
-   仍 defer：OS/设备级 drive queue/吞吐采样、硬件/物理 drive identity 与完整 replacement/rebalance/decommission workflow。
+   read-only rebalance/decommission planning telemetry、OS/设备级 drive queue/latency/吞吐 pressure telemetry；
+   仍 defer：硬件/物理 drive identity 与完整 replacement/rebalance workflow；decommission 主路径已有只读 workflow closure 取证，
+   rebalance 现有只读 copy/cleanup/placement closure auditor 与 opt-in closure verifier。
 5. **多 parity / storage class**：单一 (K,M)；`x-amz-storage-class` → 不同 EC = defer（沿用 M6）。
 6. **parity upgrade on degraded write**：写未达 write_quorum 即 `{:error, :write_quorum}`（绝不静默）；
    MinIO 的「写时临时提高 effective parity」= defer。
@@ -347,7 +361,7 @@ mix maxio.heal.cluster <bucket> <key> [version_id]   # heal 单对象（version_
 8. **failure-domain 感知的自动 set 形成**：M7 拓扑由 config **手工**指定每 set 的 N 个 `{node, drive}`。
    MinIO 的 ellipsis 展开 + node-interleaving + GCD set sizing 自动形成 = defer（手工 config 即可达同等放置）。
 9. **沿用 M0–M6 全部既有 defer**（lifecycle Transition/NoncurrentVersionTransition、SSE 大对象逐帧流式 GET、
-   IAM managed-policy/group/role/session 扩展、MFA Delete 强制、跨账户多租户、条件高级扩展、inline 小对象等）。
+   IAM managed-policy/group/role/session 扩展、Console operator MFA 交互语义、跨账户多租户、条件高级扩展、inline 小对象等）。
 
 **设计保证**：M7 在 M6 同一 RS 核心**之外**加 routing/locking/topology/transport 层，**不重写
 encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分片 → EC 重建或结构化 raise，
@@ -359,12 +373,21 @@ encode/decode/heal 引擎**；所有节点宕机/超时/quorum-loss → nil 分�
 **M8-3a/b/c/d/e PG metadata-driven scrubber/auto-heal + optional index reconcile pre-pass + orphan shard evidence/cleanup**
 与 **M8-4 integration evidence + peer lock harness**，并补入 **node-local S3 + storage-op adaptive scrubber pacing**、
 **node-local drive health long-window offline registry**、**software drive identity replacement detection**、
-**drive IO latency/throughput telemetry CLI**、**drive filesystem capacity stats CLI**、
+**drive IO latency/throughput telemetry CLI**、**OS/device-level drive IO pressure telemetry CLI**、**drive filesystem capacity stats CLI**、
 **operator-triggered fresh-drive heal workflow** 和
 **config-gated fresh-drive heal scheduler**，并新增 **read-only rebalance/decommission planning CLI**
 与 **object placement contract**、**persistent rebalance/decommission job control plane**、
-**restricted foreground decommission copy-pass runner**、**rebalance runner singleton lock + monotonic progress**
-以及 **guarded decommission source-shard cleanup**。
+**restricted foreground decommission/rebalance copy-pass runner**、**rebalance runner singleton lock + monotonic progress**
+以及 **guarded decommission/rebalance source-shard cleanup**、**decommission write-routing freeze / MPU placement contract**、
+**config-gated decommission/rebalance scheduler**、**free-space decommission destination selection**、
+**pool free-space weighted new-write placement**、**topology removal preflight CLI**、**topology removal plan artifact CLI**、
+**runtime-local topology removal apply CLI**、**cluster runtime topology convergence apply CLI**
+和 **DB-backed deployment topology revision persistence CLI**、**deployment topology removal verification CLI**、
+**physical removal manifest / read-only preflight CLI**、**operator-gated physical layout quarantine CLI**、
+**retention-gated physical quarantine purge CLI**、**read-only decommission workflow/pool-retired auditor CLI**、
+**read-only rebalance workflow/placement closure auditor CLI**、**rebalance closure verifier CLI**、
+**read-only drive hardware evidence CLI**、**physical-removal hardware evidence audit flag** 与
+**persistent scheduler run ledger / backoff / alert CLI** 与 **scheduler cluster-cadence evidence v1**。
 `Maxio.Cluster.LockServer` 作为每节点本地 lease table，
 `Maxio.Cluster.Lock` 在多个节点上获取同一 token，达到 quorum 后才运行调用方临界区。它保留
 `with_lock/2,3` 与 `quorum_with_lock/2,3` 返回形态，因此 S3 handler 和存储后端调用面不变。
@@ -397,7 +420,7 @@ M8-3a/b/c/d/e 已提供：
 - `Maxio.Cluster.Scrubber`：默认随监督树启动但不调度；`config :maxio, :scrubber, enabled: true`
   后按 `interval_ms` 周期运行。周期轮按 `sample_inverse` 做确定性 1/N 深度 heal 检查，
   `mix maxio.scan` / `run_once` 默认仍为全量取证。
-- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--no-adaptive-io] [--io-load-source s3-in-flight|storage-ops|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-combined] [--max-live-requests N] [--io-pause-ms MS] [--io-max-pause-ms MS] [--drive-offline-after-ms MS] [--reconcile-index]`：
+- `mix maxio.scan [--bucket <name>] [--versions] [--no-throttle] [--max-objects-per-sec N] [--object-burst N] [--sleep-between-batches-ms MS] [--no-adaptive-io] [--io-load-source s3-in-flight|storage-ops|drive-device-io|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-drive-device-io|cluster-combined] [--max-live-requests N] [--io-pause-ms MS] [--io-max-pause-ms MS] [--drive-offline-after-ms MS] [--reconcile-index]`：
   一次性扫描入口，输出
   buckets/scanned/damaged/healed/unrecoverable/missing/skipped/sampled_out/index_status/index_scanned/index_upserted/index_gc/index_skipped/index_divergent/index_orphan_shards/index_orphan_bytes/index_orphan_cleaned/index_orphan_cleaned_bytes/drive_sets/drive_endpoints/drive_online/drive_suspect/drive_offline/drive_heal_required/drive_identity_replacements/drive_identity_heal_required/drive_identity_errors/objects/bytes。
   `--reconcile-index` 会先调用既有 `Maxio.Storage.Scanner` 做 disk/peer sidecar → PG 派生索引收敛，
@@ -415,8 +438,36 @@ M8-3a/b/c/d/e 已提供：
   经 `Transport.drive_stats/3` 主动探测当前 topology 的 drive root，输出每个 endpoint 的 filesystem
   capacity/free/used、used_percent、mount_root、source 与 precision，并汇总总量和最小 free-space；
   默认 provider 使用 OTP `os_mon`/`disksup`，测试和特殊部署可经 `config :maxio, :drive_stats, provider: fun/1`
-  注入。该信号是 filesystem capacity 观测，不是 queue depth、SMART、硬件身份、物理吞吐，也暂不参与
-  对象路由、free-space placement 或 rebalance。
+  注入。该信号是 filesystem capacity 观测，不是 queue depth、SMART、硬件身份、物理吞吐。默认不改变对象路由；
+  显式启用 pool write policy 时会作为新写 pool 加权落点输入。
+- `Maxio.Cluster.DriveDeviceIO` / `mix maxio.drive.device_io [--summary-only] [--drive <path>] [--cached] [--reset]`：
+  监督树内维护 fail-open cache，按当前 topology 只采样本节点 drive root；Linux 默认 provider 读取 `/proc/self/mountinfo`
+  与 `/proc/diskstats`，把 queue depth、busy%、吞吐、ops/s、平均 latency 或原始 diskstats delta 归一化为
+  `pressure`，并把 `drive-device-io` / `cluster-drive-device-io` 纳入 scrubber/fresh-drive adaptive gate。
+- `Maxio.Cluster.DriveHardwareEvidence` / `mix maxio.drive.hardware_evidence [--summary-only] [--drive <path>] [--json] [--show-raw] [--smart] [--smartctl-path <path>] [--smart-timeout-ms <ms>] [--smart-nocheck never|sleep|standby|idle]`：
+  只读采集 topology endpoint 或单个 drive root 的 mount/device/sysfs 证据；Linux 默认 provider 读取
+  `/proc/self/mountinfo` 与 `/sys/dev/block/<major>:<minor>`，输出 mount root/source、fs type、major:minor、
+  block/parent device、rotational/model 与 serial/WWID hash。raw serial/WWID 默认不打印，必须显式
+  `--show-raw`；每条输出都标记 `destructive_gate=false`。`--smart` 显式开启后会在 endpoint owner node
+  上有界执行 `smartctl -j -a -n <mode>`（默认 `standby`，`never` 时省略 `-n`），只抽取 SMART allowlist
+  子证据（health/support、power-on/temperature、ATA/NVMe 常见计数、raw SMART identity 的 hash）；
+  smartctl 缺失、权限不足、timeout、invalid JSON 或非零 exit 都只进入 `smart.status/error/exit_status`，
+  base sample 仍保持只读证据语义，且不会 dump 原始 smartctl JSON。raw SMART serial/WWN/EUI64/NGUID 也默认
+  只输出 hash，`--show-raw` 只放行这些明确身份字段，不放行完整 JSON。
+  该信号不写 `cluster_drive_identities`，
+  不触发 heal/rebalance，不作为 physical remove/purge 安全闸；CLI 不启动完整 app/supervision tree，
+  config topology 直接解析，DB topology 仅启动 Repo 做只读 active revision 读取。
+  非 Linux、provider 错误/异常、无 topology、stale cache 均返回 0，不影响 S3 路由、quorum、写入或对象迁移；
+  SMART passed 也不是硬盘健康保证、secure erase 证明、admission control 或真实物理身份判断。
+- `Maxio.Cluster.Placement.PoolWritePolicy`：默认关闭（`config :maxio, :pool_write_policy, mode: :hash`），
+  保持 M7 全局 set hash。设置 `mode: :weighted_free_space` 或
+  `MAXIO_POOL_WRITE_POLICY=weighted_free_space` 后，普通新写先按健康 pool 的 filesystem free bytes 做确定性加权选择，
+  再在该 pool 的 set 列表内按对象名 hash 选择 set；显式 `placement_set_id` 仍优先，读/删/旧对象仍使用
+  持久化 placement。candidate pool 若 endpoint telemetry 缺失或 endpoint error 会 fail-closed；
+  超过高水位（默认 `max_used_percent_x100: 9900`，可用 `MAXIO_POOL_WRITE_MAX_USED_PERCENT_X100` 覆盖）
+  或无可用空间的 pool 会被跳过，直到无可写 pool 时返回结构化错误。当前未内建后台 telemetry cache；
+  未传 `drive_stats` 快照时会现场采样，因此仍保持 opt-in。该策略只影响新对象落点，不迁移旧对象、
+  不改 topology、不删除 pool。
 - `Maxio.Cluster.Rebalance` / `mix maxio.rebalance.plan [--current-only] [--decommission-set <id>] [--page-size <n>] [--no-drive-stats] [--json]`：
   对当前 topology 做只读规划取证，从 PG 对象元数据分页枚举对象/版本/delete marker。对象行有
   `placement_set_id` 时优先按持久化真实落点汇总；旧行或未知落点回退到当前 `Router.set_for/3`，
@@ -427,24 +478,158 @@ M8-3a/b/c/d/e 已提供：
 - `Maxio.Cluster.Rebalance.Jobs` / `mix maxio.rebalance.start|status|cancel`：
   持久化 rebalance/decommission 运维 job 控制面。`start` 会保存当时的 planner 快照、job kind/target set、
   cursor/progress 初始字段与 `data_movement=false` / `data_movement_status=not_started`；DB partial unique index
-  与 context 双层保证同一时间最多一个 active job。若计划里存在 `placement_fallbacks`，会拒绝创建 job，
+  与 context 双层保证同一时间最多一个 active job；job creation 与 runtime-local topology apply 共享同一个
+  runtime-topology quorum lock，避免在 set removal apply 期间按旧 runtime topology 生成新计划。若计划里存在 `placement_fallbacks`，会拒绝创建 job，
   避免在无法确认真实落点时伪造可执行迁移计划；decommission job 也会拒绝 `--current-only`，必须盘点全版本
   与 delete marker。
-- `Maxio.Cluster.Rebalance.Runner` / `mix maxio.rebalance.run [JOB_ID|--job-id <uuid>] --destination-set <id> [--max-versions <n>] [--page-size <n>] [--dry-run] [--json]`：
-  受限前台 decommission copy-pass。runner 只处理 decommission job，要求 operator 显式指定目标 erasure set；
-  在 PG object placement 作为 read/list 权威时，逐版本/marker 把 `target_set_id` 上的对象写入
-  `destination_set_id`，目标写成功后用乐观条件更新对象 placement。`--max-versions` 可分批推进 cursor；
+- `Maxio.Cluster.Rebalance.Runner` / `mix maxio.rebalance.run [JOB_ID|--job-id <uuid>] [--destination-set <id>|--auto-destination] [--max-versions <n>] [--page-size <n>] [--dry-run] [--json]`：
+  受限前台 copy-pass。decommission job 要求 operator 显式指定目标 erasure set 或启用 `--auto-destination`；
+  rebalance job 不接受固定 destination，而是逐对象按当前 topology/router 计算目标 set，仅迁移持久化 placement
+  与当前路由不一致的版本/delete marker。在 PG object placement 作为 read/list 权威时，目标写成功后用乐观条件更新对象 placement。
+  `--max-versions` 可分批推进 cursor；rebalance 对已在目标 set 的行计为 skipped 并推进 cursor；
   非 dry-run 会先获取 job 级 quorum lock，锁内重新读取 job 并重新校验；progress/cursor 只单调前进，
-  stale runner 不能回退计数或 cursor。`--dry-run` 只返回计划报告，不修改 job。边界：不启动后台 worker、不删除源 shard、不做 source cleanup、
-  不改 topology/pool、不做 free-space placement；若 read/list authority 不是 PG 会 fail-closed。
+  stale runner 不能回退计数或 cursor。`--dry-run` 只返回计划报告，不修改 job。边界：runner 本身不启动后台 worker；
+  source cleanup 走单独 guarded cleanup；不改 topology/pool、不做 pool removal；
+  rebalance 使用 current router 而非 write-routing/pool free-space policy；若 read/list authority 不是 PG 会 fail-closed。
 - `Maxio.Cluster.Rebalance.SourceCleanup` / `mix maxio.rebalance.cleanup [JOB_ID|--job-id <uuid>] [--max-versions <n>] [--page-size <n>] [--dry-run] [--json]`：
-  受限前台 source-shard cleanup。cleanup 只处理 `data_movement_status=complete` 的 decommission job；
-  非 dry-run 复用同一个 job-level quorum lock，并在对象锁内重新读取 PG row。只有当前
-  `placement_set_id == destination_set_id` 的同一 `bucket/key/version_id`，才会通过
-  `Storage.delete_version/4` 对旧 `target_set_id` 执行 quorum 删除；PG placement 仍是 target 时 fail-closed，
-  placement 缺失或非 destination 时跳过。`--max-versions` 使用独立 cleanup cursor/progress resume；
-  `--dry-run` 不删 shard、不改 job。边界：这是已迁移版本的旧副本清理，不是 pool removal；
-  不冻结新写、不证明 target set 已空、不改 topology/pool、不做 free-space placement。
+  受限 source-shard cleanup。cleanup 只处理 `data_movement_status=complete` 的 decommission/rebalance job；
+  非 dry-run 复用同一个 job-level quorum lock，并在对象锁内重新读取 PG row。decommission 仅在当前
+  `placement_set_id == destination_set_id` 时，对旧 `target_set_id` 执行 quorum 删除；PG placement 仍是 target
+  会 fail-closed。rebalance 保留 PG-authoritative `placement_set_id`，对当前 topology 中其它 set 的同版本副本执行
+  quorum 删除；cleanup activation 会在 runtime-topology quorum lock 内重新读取 job 并重跑 topology/set 校验，避免与
+  runtime-local topology apply 交错。缺失或未知 PG placement 会 fail-closed。`--max-versions` 使用独立 cleanup cursor/progress resume；
+  `--dry-run` 不删 shard、不改 job。边界：这是已迁移版本的旧副本清理，不是 orphan scanner 或 pool removal；
+  不冻结新写、不证明 pool/set 物理为空、不改 topology/pool、不做 free-space placement。
+- `Maxio.Cluster.Rebalance.TopologyMutation` / `mix maxio.rebalance.preflight_removal [JOB_ID|--job-id <uuid>] [--json]` /
+  `mix maxio.rebalance.plan_removal [JOB_ID|--job-id <uuid>] [--json]` /
+  `mix maxio.rebalance.apply_removal [JOB_ID|--job-id <uuid>] --yes [--expected-current-topology-hash <sha256>] [--json]` /
+  `mix maxio.rebalance.apply_removal_cluster [JOB_ID|--job-id <uuid>] --yes [--expected-current-topology-hash <sha256>] [--nodes <node1,node2>] [--json]` /
+  `mix maxio.rebalance.persist_removal_deployment [JOB_ID|--job-id <uuid>] --runtime-node <node> --expected-proposed-topology-hash <sha256> --yes [--json]` /
+  `mix maxio.rebalance.verify_removal_deployment [JOB_ID|--job-id <uuid>] [--json]` /
+  `mix maxio.rebalance.physical_removal_preflight [JOB_ID|--job-id <uuid>] [--hardware-evidence] [--json]` /
+  `mix maxio.rebalance.physical_remove [JOB_ID|--job-id <uuid>] --confirm-job-id <same uuid> [--hardware-evidence] [--json]` /
+  `mix maxio.rebalance.physical_purge_preflight [JOB_ID|--job-id <uuid>] [--retention-hours N] [--json]` /
+  `mix maxio.rebalance.physical_purge [JOB_ID|--job-id <uuid>] --confirm-job-id <same uuid> --confirm-quarantine-id <id> [--retention-hours N] [--json]` /
+  `mix maxio.rebalance.workflow [JOB_ID|--job-id <uuid>] [--json]` /
+  `mix maxio.rebalance.verify_closure [JOB_ID|--job-id <uuid>] [--audit-page-size N] [--json]`：
+  `preflight_removal` 是只读 topology removal preflight。它要求 decommission job 已完成 copy-pass 与 source cleanup，确认无其它 active
+  rebalance/decommission job、PG 中无 target-set placement row、无缺失/未知 placement row、active MPU 无 target/missing/unknown placement row，
+  target set 全 endpoint 可达，且 target set 盘上所有 bucket root、`.versions`、`.uploads` 不再有 `meta.json`/`part.0`
+  残留；bucket `.keep` marker 会单独计数但不阻塞。任何条件不满足都返回 blocked + blockers/examples。
+  `plan_removal` 仅在 preflight ready 后生成 proposed topology config、before/after topology hash、removed set/pool 列表；
+  topology hash 使用包含 EC 参数、pool/set 顺序与有序 `{node, drive}` endpoints 的 full fingerprint；
+  若 target set 所在 pool 变空，proposed config 会同时移除该 pool。`apply_removal` 必须显式 `--yes`，会在 global runtime-topology
+  quorum lock 内重新跑 preflight，可用 `--expected-current-topology-hash` 绑定 operator 已审阅的 plan artifact，先在 job row
+  记录 `topology_removal_status/scope/hash/applied_at` 审计字段、拓扑移除前的 target endpoint manifest 与
+  removed pool ids；非空 manifest 必须与 `current_topology_hash` 对应拓扑里的目标 set endpoint 清单逐项一致，再把
+  proposed topology 安装到当前 BEAM runtime；
+  若 audit 已记录且 before/after topology hash 与当前 plan 一致，重复执行会继续完成 runtime install，用于恢复 audit 后、
+  runtime install 前的 lease-loss/进程中断窗口。`apply_removal_cluster` 是显式集群 runtime apply：同样不改 deployment
+  config，但会把 proposed topology 安装到选定/推导的 BEAM runtime 节点；显式 `--nodes` 只会增加探测节点，
+  不能省略 removal plan 捕获的原始 current topology node roster（包括 removed-set-only 节点）；远端节点先执行、本节点最后执行，
+  任一节点 unreachable/hash mismatch 都返回结构化 partial report 且不记录 cluster convergence 审计。成功后记录
+  `topology_removal_cluster_status/hash/nodes/verified_at`。随后 operator 可运行 `persist_removal_deployment`，
+  必须传入已审阅的 `--expected-proposed-topology-hash`；该命令在同一 topology mutation lock 内确认 runtime/cluster
+  已收敛、PG/MPU placement guard 仍干净后，把当前 runtime proposed topology 写入 `cluster_topology_revisions`
+  的 active DB 版本。`config :maxio, :topology_source, :config` 仍是默认启动来源；设置
+  `MAXIO_TOPOLOGY_SOURCE=db` 后，启动会从 active DB revision 加载拓扑，若缺失、无效或 hash 不匹配则 fail-closed，
+  不静默回退旧 config。`verify_removal_deployment` 会按 `:topology_source` 选择部署事实来源：`:db` 必须读取 active DB revision，
+  `:config` 只读取 `config :maxio, Maxio.Cluster.Topology`，避免 DB revision 已写入但重启仍加载旧 config 时过早退休 write-routing。
+  它确认 target set 已不在部署拓扑、deployment topology hash 等于 apply 记录的 proposed hash，要求 cluster convergence
+  审计已存在，并 live-check 审计 node roster、当前 mesh/部署拓扑/显式节点的 runtime topology hash 均已收敛到 proposed hash；
+  审计节点当前不可见会以 `:missing_expected_node` fail-closed。随后重新检查 PG/MPU 中无 target/missing/unknown placement；
+  通过后记录 `topology_removal_deployment_status=verified`，此时 decommission write-routing 才会退休。
+  `physical_removal_preflight` 只能在 deployment verification 之后使用，且只读取 apply 阶段持久化的 target endpoint
+  manifest 定位已从当前 topology 删除的 drive root，不从当前 topology 反推。它会重新检查 job complete、data movement/source
+  cleanup complete、cluster runtime convergence、deployment verified、无 active job、manifest 有效、endpoint 可达与物理残留为空；
+  unknown node atom 会 fail-closed。结果输出 `removable`/blockers/examples，`physical_removal=false`，绝不删除文件、不改
+  scheduler、不做物理 pool removal。可选 `--hardware-evidence` 只对 stored manifest endpoints 追加 sanitized drive
+  hardware evidence（serial/WWID 仅保留 hash），输出 `drive_hardware_evidence_gate=false`，不改变 `removable`/blockers。
+  `physical_remove` 只能在同一 ready gate 后显式运行，且必须传入匹配的 `--confirm-job-id`。它在 runtime topology
+  mutation lock 内重跑 physical preflight，把 manifest hash 与 job/quarantine id 绑定，然后经 `Transport.quarantine_layout_roots/5`
+  对每个 stored endpoint 做可恢复隔离：只移动 PG 已知 bucket root、`.versions`、`.uploads` 到
+  `<drive>/.maxio-removal-quarantine/<quarantine_id>/...`，并写 `<drive>/.maxio-physical-removal.json` marker。
+  若带 `--hardware-evidence`，同一锁内 preflight 的 sanitized evidence snapshot 会写入 job `physical_removal_results`，
+  但不会写入每个 drive 的 `.maxio-physical-removal.json` marker，也不会作为 destructive gate。
+  它会阻塞 unknown top-level directory、layout root 内 unexpected file、drive/root/source/destination symlink 与 unsafe path；
+  成功后记录 `physical_removal_status=quarantined`、manifest hash、quarantine id、endpoint results 与计数，重复执行幂等返回
+  `already_quarantined`。边界：不 hard delete、不清空 quarantine、不移动整个 drive root、不触碰 `.tmp`，不接 scheduler，
+  不提供 secure erase、SMART/hardware identity 或实际物理 pool removal。
+  `physical_purge_preflight` 是只读 hard-delete safety gate：要求 job 已 quarantined、deployment/removal 证据仍有效、
+  endpoint reachable、source layout 未重新出现、quarantine marker 匹配、purge tree 内无 symlink/unsupported path，
+  且 `physical_removal_completed_at + retention-hours` 已到达。`physical_purge` 必须同时确认 job id 与 quarantine id，
+  并在同一个 runtime topology mutation lock 内先验证所有 endpoint，再删除每个
+  `<drive>/.maxio-removal-quarantine/<quarantine_id>`，最后写 `<drive>/.maxio-physical-purge.json`。
+  它只删除 quarantine root，不删除 drive root、不删除 physical-removal marker、不改 topology/deployment、不接 scheduler；
+  保留期默认 168 小时，可由 operator 显式传 `--retention-hours`。
+  `rebalance.workflow` 是只读 workflow auditor：从 job audit、runtime topology 与当前 deployment topology（config 或 DB active revision）
+  计算 phase / next_action / destructive_next_action / set_retired / pool_retired。decommission job 只有当 target set 和 removed pool ids
+  同时从 runtime 与 deployment topology 消失，且 job 已完成 physical quarantine purge，才报告 retired。rebalance job 会按
+  copy_pass → source_cleanup → rebalance_closure 汇报；closure 阶段只读扫描 PG object placement，对比当前 Router set，
+  并统计 missing/unknown/stale placement、routing mismatch 与 active MPU placement/hash 风险，干净时报告 `rebalance_complete?=true`。
+  blocked closure 的 `next_action` 是 operator-facing 映射：job/closure 失败先指向
+  `mix maxio.rebalance.status --job-id <job-id> --json`；权威源或 runtime topology 不可用时指向只读
+  `rebalance.workflow` 重查；存在其它 active job 时指向该 active job 的 workflow；placement/MPU blocker 指向
+  `mix maxio.rebalance.verify_closure --job-id <job-id> --json`（operator 先按 examples 修复或完成/abort 受影响 MPU 后再复核）；
+  纯 routing mismatch 才指向 `mix maxio.rebalance.start --json` 创建新的普通 rebalance 计划。它不执行 copy/cleanup、
+  不自动改 PG placement/hash、不自动 abort MPU、不做 topology apply、deployment persistence、physical remove 或 purge。
+  `rebalance.verify_closure` 复用同一 live audit，在 job runner lock 与 runtime topology read lock 下把一次 point-in-time
+  closure 证据写回 `cluster_rebalance_jobs.rebalance_closure_*`；干净时标记 `verified`，有 placement/MPU blocker 时标记
+  `blocked` 且可在 operator 修复后重试。它不是 read-only（会写审计字段），但仍不移动数据、不删除 shard、不改 topology、不隔离/清理物理 root。
+  `Maxio.Cluster.Rebalance.Scheduler` 可在 `auto_runtime_topology: true`、`auto_deployment_topology: true`
+  且 `:topology_source == :db` 时调用 `TopologyMutation.apply_removal_cluster/2`，为已完成 source cleanup 的
+  decommission job 执行同一套 cluster runtime convergence apply；该阶段会剥离 `topology`、`nodes`、`node_apply_fun`、
+  stale expected hash、runtime/deployment topology override 与 raw `lock_opts`，避免 scheduler 用测试级 override
+  伪造 topology mutation。cluster convergence audit 记录后，scheduler 再调用 `TopologyMutation.finalize_removal_deployment/2`，
+  在同一个 runtime topology lock 内完成 DB persistence + deployment verification；该最终阶段同样不接受 low-level
+  runtime/deployment topology override，expected proposed hash 始终来自 job audit。边界：两个自动阶段默认关闭，不删 shard、
+  不删除物理 pool、不提供 Raft/all-or-nothing consensus。`auto_rebalance_closure: true` 是单独 opt-in，只会为已完成
+  copy/source cleanup 的 rebalance job 调用 `Closure.verify_once/2` 记录 placement closure audit，不触发 decommission topology
+  或 physical 阶段。
+- `Maxio.Cluster.Rebalance.Scheduler`：默认随监督树启动但不调度；`config :maxio, :rebalance_scheduler, enabled: true`
+  后按 `interval_ms` 在 cluster singleton lock 下选择下一个 runnable job。planned/running 的 rebalance/decommission
+  copy-pass 优先调用同一个 `Runner.run_once/2`；copy 完成且无其它 active job 阻挡时，才调用
+  `SourceCleanup.cleanup_once/2` 推进 source cleanup。scheduler 的 destination 配置只作用于 decommission；
+  rebalance job 会剥离 `destination_set_id`/`destination_sets`/`auto_destination`，继续逐对象按 current router 选目标。
+  `auto_runtime_topology: true` 只有在 `auto_deployment_topology: true` 且 `:topology_source == :db` 时才会为
+  已完成 source cleanup 的 decommission job 复用 `TopologyMutation.apply_removal_cluster/2`，记录 cluster runtime convergence
+  审计；随后 `auto_deployment_topology: true` 会复用 `TopologyMutation.finalize_removal_deployment/2` 把 converged runtime
+  topology 写入 active DB revision 并完成 deployment verification/write-routing retirement。两个自动阶段默认关闭，
+  且不做物理 pool removal。`auto_rebalance_closure: true` 默认关闭；开启后只会写 rebalance closure audit evidence。
+- `Maxio.Cluster.SchedulerRuns` / `mix maxio.scheduler.status [--scheduler fresh_drive_heal|rebalance] [--runs N] [--state-only] [--cadence] [--since-minutes N] [--expected-interval-ms N] [--stale-after-ms N] [--json]`：
+  为 fresh-drive heal scheduler 与 rebalance scheduler 增加持久化 run ledger / state row。每次手动 `run_now/1`
+  或后台 scheduled pass 都会追加 `cluster_scheduler_runs` 取证，并 upsert `cluster_scheduler_states`
+  的 effective health、连续失败、退避截止与告警状态；`no_runnable_job` 归类为 idle，`lock_unavailable` 与 backoff skip
+  归类为 skipped，不计入 destructive failure，且已有 effective state 时只写入独立 skipped run evidence，不覆盖上一条有效
+  ok/blocked/failed/backoff 状态。达到 `config :maxio, :scheduler_ledger, failure_threshold: N`
+  后，自动 scheduled pass 会在 `backoff_ms` 窗口内跳过 runner；手动 `run_now/1` 仍可用于 operator 修复与取证。
+  `--cadence` 为只读 scheduled-only 健康观察器：manual `run_now/1` 不会被当成后台心跳，`lock_unavailable` 与 backoff
+  等 skipped scheduled run 只计入证据窗口但不能让 health 变绿；alert/backoff/blocked/failed 优先于“最近有 run”。cadence 输出会列出
+  scheduled/effective/healthy/skipped node 集合、lock loser node/count 与 last effective scheduled node，且忽略 `finished_at > now`
+  的未来 run，便于长跑后判断哪些节点实际参与、哪些只是 singleton lock loser。本地 cadence 测试覆盖 fresh-drive 与 rebalance 两个 scheduler 同轮竞争只允许一个 runner 进入；`MAXIO_RUN_PEER_LOCK=1`
+  时可运行 `scheduler_peer_cadence_test` 通过真实 `:peer` LockServer 取证。alert sink 失败只注记本次 run summary 的 `alert_emit_error`，不会让 scheduler 崩溃。该 ledger 不启用 scheduler、不移动数据、
+  不清理 shard、不改 topology、不触发 physical remove/purge。rebalance closure blocked report 的 `next_action` 会进入 ledger summary，
+  并继续走 summary redaction / byte bound。
+  `mix maxio.scheduler.evidence [--scheduler fresh_drive_heal|rebalance] [--from <iso8601> --until <iso8601> | --since-minutes N] [--expected-nodes node_a,node_b] [--min-effective-nodes N] [--require-lock-loser] [--require-rollups] [--fail-on-attention] [--json]`
+  可把长跑后的 cadence/node/lock-loser/blocked next_action/rollup 覆盖情况汇总成只读 gate artifact；它只启动 Repo 读取 ledger，
+  不 `app.start`、不启动 scheduler、不运行 runner、不写 DB。evidence window 使用 `[from, until)` 半开语义，与 rollup/retention 对齐；
+  expected node 缺席、effective node 不足、要求 lock-loser 却缺证据、或 `--require-rollups` 缺 scheduled rollup 时都会 fail-closed；
+  `--fail-on-attention` 会把 blocked/failed run warnings 也变成非零退出，供长跑演练使用。
+  `docs/superpowers/runbooks/m8_scheduler_live_rehearsal.md` 记录真实多节点演练步骤；`scripts/m8_scheduler_live_rehearsal.exs`
+  只包装 evidence gate 并写归档 JSON，不启动 scheduler 或执行修复。
+  `mix maxio.scheduler.rollup --from <iso8601> --until <iso8601> [--scheduler fresh_drive_heal|rebalance] [--trigger manual|scheduled] [--window-minutes N]`
+  可把已关闭窗口写入 `cluster_scheduler_run_rollups` durable audit；`mix maxio.scheduler.status --rollups`
+  只读查看。`mix maxio.scheduler.prune --scheduler <name> --trigger manual|scheduled --from <iso8601> --until <iso8601> --window-minutes N --dry-run`
+  只做 prune preflight；真实删除必须追加 `--confirm-prune --confirm-scheduler <same> --confirm-trigger <same>`。
+  `--confirm-from <same> --confirm-until <same> --confirm-window-minutes <same>`。
+  prune 只删除 count/source digest/source max updated_at 与 durable rollup 完全一致的 raw run id 集合；任一窗口缺 rollup、
+  digest 不一致、仍处于 open/current window、或命中 `cluster_scheduler_states.last_run_id` / latest scheduled/effective/healthy
+  等保护 run 时，整次 range fail-closed 且不做 partial delete。`record`、实际 `rollup` 与 prune 共享 scheduler+trigger
+  级 transaction advisory lock；已 prune 的窗口禁止被 rollup 重算覆盖，也拒绝 late raw run 写入。
+  `mix maxio.scheduler.retention --scheduler <name> --trigger manual|scheduled --retain-days N --window-minutes N --dry-run`
+  可按保留期生成默认关闭的旧 ledger 明细清理计划；真实执行必须追加 `--enable-retention --confirm-retention`
+  以及匹配的 scheduler/trigger/retain-days/window-minutes/cutoff 确认。retention 不自动创建 rollup、不删除 rollup rows、
+  不接后台 timer；缺 rollup 或 prune 复核失败时 fail-closed。
 - `Maxio.Cluster.PressureAggregator`：监督树内缓存 peer node 的 `IOPressure.local_snapshot/0`，
   后台按 `config :maxio, :io_pressure` 刷新；scrubber/fresh-drive gate 只读本地计数 + 新鲜缓存，
   peer timeout/stale/down 均 fail-open，不在对象间同步 RPC。
@@ -464,14 +649,46 @@ M8-3a/b/c/d/e 已提供：
   `--probe` 会按当前 topology 主动探测并持久化观察结果，默认会为可达的本机或远端 endpoint 创建缺失的
   `.maxio-drive-identity.json`；`--probe --no-create-missing` 用于只取证缺失 marker，`--marker-file <name>`
   可临时指定 marker 文件名。
+- `mix maxio.drive.hardware_evidence [--summary-only] [--drive <path>] [--json] [--show-raw] [--smart]`：
+  读取只读硬件/设备证据并默认隐藏 raw serial/WWID。它与 `maxio.drive.identities` 分离，不持久化、
+  不参与 same-path replacement detection，也不作为任何 destructive operation 的自动判定。`--smart`
+  仅增加默认关闭的 SMART allowlist 子证据，失败 fail-open，默认不暴露 raw SMART identity 或完整 smartctl JSON。
 - `Maxio.Cluster.FreshDriveHeal` / `mix maxio.heal.fresh_drives`：显式运维入口，枚举 PG inventory
-  中落到 affected erasure set 的对象/版本（默认含 delete marker），复用 `Maxio.Cluster.Heal` 修复缺失 shard
+  中落到 affected erasure set 的对象/版本（默认含 delete marker；优先对象持久化 placement，旧行回退 router），复用 `Maxio.Cluster.Heal` 修复缺失 shard
   或 marker sidecar；仅在完整、非 bucket 限定、非 current-only、非 dry-run 且无 missing/skipped/unrecoverable/error 的 pass
   后清除 `DriveHealth.heal_required?`。`--dry-run`、`--bucket`、`--max-objects`、`--current-only` 都不会清 marker。
+  `--rebalance-if-needed` 会在同一 CLI 输出中记录 post-heal rebalance enqueue evidence；`--rebalance-advance-steps N`
+  会 opt-in 通过普通 rebalance scheduler 对同一个新建 rebalance job 做有界 copy/source-cleanup 步进；`--rebalance-verify-closure`
+  会把默认步数设为 3 并开启 rebalance closure verifier。
 - `Maxio.Cluster.FreshDriveHeal.Scheduler`：默认随监督树启动但不调度；`config :maxio, :fresh_drive_heal_scheduler, enabled: true`
   后按 `interval_ms` 在 cluster singleton lock 下自动调用同一个 `FreshDriveHeal.run_once/1` workflow。
   默认 `probe_drive_health: true` 会先刷新 topology drive probes；`run_now/1` 可经 IEx/测试手动触发。
-  这是 marker-based heal automation，不是硬件/物理 replacement identity、持久化 job queue、decommission 或 rebalance。
+  `auto_rebalance_after_heal: true` 默认关闭；显式开启后，只有 clean 且清除 marker 的 pass 才通过
+  `Rebalance.Jobs.start_rebalance_if_needed/1` 创建普通 durable rebalance job，且仅在 PG placement 与当前 router 存在
+  routing mismatch 时创建，placement fallback / active job 仍 fail-closed 或记录 skip。`auto_advance_rebalance_after_heal: true`
+  默认也关闭；显式开启后只对本轮创建的同一个普通 rebalance job 调 `Rebalance.Scheduler.run_steps/1`，受
+  `rebalance_advance_max_steps` 限制，并可通过 `rebalance_advance_opts: [auto_rebalance_closure: true]` 记录 closure
+  evidence。这不是硬件/物理 replacement identity、decommission、topology mutation 或 destructive automation。
+- `Maxio.Cluster.Replacement.Workflow` / `mix maxio.replacement.workflow`：replacement runbook/auditor 入口。
+  默认只读输出 `DriveHealth` heal-required 摘要、latest rebalance workflow evidence 与下一条安全命令；
+  `--probe` 才刷新 drive probes，`--heal` 才调用 fresh-drive scheduler bridge。`--rebalance-if-needed`、`--advance-steps N`
+  与 `--verify-closure` 只在同一次显式 `--heal` run 中生效，并复用上面已有的 rebalance enqueue / same-job bounded drain /
+  closure verifier；`--verify-closure` 未给步数时默认 3 步。该入口不接受任意 job_id advance，不执行 decommission、
+  topology mutation、deployment finalization、physical remove 或 purge。`--fail-on-blocked` 会先输出 JSON/text，再把
+  `status=blocked|failed` 变成非零退出；`mix run --no-start scripts/m8_replacement_live_rehearsal.exs -- ...`
+  会把该 workflow 输出归档为 replacement rehearsal JSON，并额外要求 `blockers=[]` 且 `next_action=none` 才通过；
+  默认 `--dry-run` 不通过 live gate，除非显式 `--allow-dry-run-success` 作为非 live 证据归档。该 CLI 使用最小 runtime
+  启动，不调用 `app.start`，避免 operator 环境中已启用的后台 scheduler 在演练子进程里并发运行。
+- `Maxio.Cluster.Replacement.AutomationProfile` / `mix maxio.replacement.automation_status [--fail-on-blocked] [--fail-on-attention] [--json] [--require-scheduler-evidence ...]`：
+  只读检查生产 replacement 自动化配置是否形成完整链路：fresh-drive heal scheduler 探测 replacement marker、clean heal 后 enqueue durable
+  rebalance、rebalance scheduler 推进 copy/source cleanup、closure verifier 记录 placement closure、两个 scheduler 都有 ledger 取证。
+  默认配置会报告 blocked；只有显式启用 fresh-drive scheduler、`auto_rebalance_after_heal`、rebalance scheduler、`auto_source_cleanup`、
+  `auto_rebalance_closure` 与 scheduler ledger 后才报告 ready。该 gate 不调用 `app.start`、不启动 scheduler、不运行 heal/rebalance、
+  默认不读写 DB、不改 topology/deployment、不触碰 physical layout；显式 `--require-scheduler-evidence` 时仅启动 Repo 读取已有
+  scheduler ledger，并复用 `mix maxio.scheduler.evidence` 的 scheduled-only 语义（`--since-minutes`、`--expected-interval-ms`、
+  `--stale-after-ms`、`--expected-nodes`、`--min-effective-nodes`、`--require-lock-loser`）确认 fresh-drive/rebalance 后台自动化近期有证据。
+  `replacement.workflow` 的默认 audit 会附带该 profile 作为生产化缺口提示，但不会把配置或 scheduler evidence 未 ready 当成一次
+  replacement 操作失败。
 - 对象来源为 `Maxio.Objects` 的有界分页；FS 后端只刷新 `Maxio.Cluster.Scrubber.Usage` 快照，
   `ErasureCoded`/`Distributed` 后端按 erasure set 通过 `Maxio.Cluster.Lock.quorum_with_lock/3`
   获取 heartbeat-backed 短租约后调用 `Maxio.Storage.Erasure.Heal` 或 `Maxio.Cluster.Heal`。
@@ -498,14 +715,53 @@ M8-4 已提供：
 
 M8 剩余：
 
-- 完整 MinIO data-scanner parity：OS/设备级 drive queue/吞吐反馈、硬件/物理 drive identity 与完整 replacement/rebalance/decommission workflow。
+- 完整 MinIO data-scanner parity：硬件/物理 drive identity 已有只读 evidence CLI，physical removal preflight/remove
+  已可 opt-in 绑定 sanitized hardware evidence 审计快照；replacement runbook/auditor CLI 已能默认只读审计并显式串起
+  fresh-drive heal、rebalance enqueue、same-job bounded drain 与 closure verifier，并可通过
+  `scripts/m8_replacement_live_rehearsal.exs` 归档严格 artifact gate，并可用 `mix maxio.replacement.automation_status` 检查生产自动化配置链路是否 ready；
+  生产级全自动策略仍待续作。decommission 主路径已有只读 workflow/pool-retired
+  auditor 与非空端到端取证，rebalance 已有只读 placement closure auditor 与 opt-in 持久化 closure verifier。
   当前已有保守 token-bucket object pacing（`max_objects_per_sec` + `object_burst`，允许 burst 后限制下一次对象扫描开始），
-  本节点/缓存 peer 的 S3 handler in-flight + ShardServer storage-op 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-combined`）、
-  node-local ShardServer IO latency/throughput telemetry、filesystem capacity/free-space stats、node-local drive-offline 长窗口观测、software UUID same-path replacement detection，
-  手动 `mix maxio.heal.fresh_drives` marker 消费、默认关闭的 fresh-drive heal scheduler，以及只读
-  `mix maxio.rebalance.plan` logical inventory（优先对象持久化 placement，旧行计 `placement_fallbacks`）
+  本节点/缓存 peer 的 S3 handler in-flight + ShardServer storage-op + OS/device-level drive pressure 自适应对象间暂停（`--io-load-source s3-in-flight|storage-ops|drive-device-io|combined|cluster-s3-in-flight|cluster-storage-ops|cluster-drive-device-io|cluster-combined`）、
+  node-local ShardServer IO latency/throughput telemetry、Linux `/proc/diskstats` fail-open drive pressure telemetry、filesystem capacity/free-space stats、node-local drive-offline 长窗口观测、software UUID same-path replacement detection，
+  手动 `mix maxio.heal.fresh_drives` marker 消费、默认关闭的 fresh-drive heal scheduler（可 opt-in 在 clean marker-clearing pass
+  后 enqueue 普通 rebalance job，并可对该 job 做 bounded same-job copy/cleanup/closure drain），以及只读
+  `mix maxio.replacement.workflow` runbook/auditor（默认只读，显式 flags 才 probe/heal/enqueue/advance/closure），以及只读
+  `mix maxio.rebalance.plan` logical inventory（优先对象持久化 placement，旧行计 `placement_fallbacks`，并统计
+  `routing_mismatches`）
   和 `mix maxio.rebalance.start|status|cancel` 持久化 job 控制面，以及受限前台
-  `mix maxio.rebalance.run` decommission copy-pass（job-level singleton lock + monotonic progress/cursor）
-  与 `mix maxio.rebalance.cleanup` guarded source-shard cleanup；
-  尚未接入 OS/设备级磁盘队列/硬件吞吐反馈、硬件/物理 replacement identity、free-space placement、
-  后台 worker、topology/pool mutation 或完整 decommission/rebalance workflow。
+  `mix maxio.rebalance.run` decommission/rebalance copy-pass（job-level singleton lock + monotonic progress/cursor）
+  与 `mix maxio.rebalance.cleanup` guarded decommission/rebalance source-shard cleanup，并有默认关闭的
+  `Maxio.Cluster.Rebalance.Scheduler` 后台推进 copy/cleanup，并有只读
+  `mix maxio.rebalance.preflight_removal` / `mix maxio.rebalance.plan_removal` 生成移除前安全证据与 proposed topology artifact，
+  显式 `mix maxio.rebalance.apply_removal --yes` 把 proposed topology 安装到当前 BEAM runtime，
+  `mix maxio.rebalance.apply_removal_cluster --yes` 证明原始 topology 参与节点均完成 cluster runtime convergence，
+  `mix maxio.rebalance.persist_removal_deployment --runtime-node <node> --expected-proposed-topology-hash <sha256> --yes` 把收敛后的 proposed topology
+  持久化为 active DB deployment revision，以及 `mix maxio.rebalance.verify_removal_deployment` 核验并退休 write-routing；
+  也可通过默认关闭的 `rebalance_scheduler.auto_runtime_topology` + `auto_deployment_topology` 在 DB topology source
+  下自动执行 cluster runtime apply 与最后的 single-lock finalization gate；deployment verified 后可运行
+  `mix maxio.rebalance.physical_removal_preflight --hardware-evidence` 取得只读物理移除 + sanitized hardware evidence，
+  或显式运行 `mix maxio.rebalance.physical_remove --confirm-job-id <job-id> --hardware-evidence` 把 Maxio layout roots 隔离到
+  `.maxio-removal-quarantine/<id>` 并写 physical-removal marker；保留期满足后可运行
+  `mix maxio.rebalance.physical_purge --confirm-job-id <job-id> --confirm-quarantine-id <id>` 删除对应 quarantine root
+  并写 physical-purge marker；`mix maxio.rebalance.workflow --job-id <job-id>` 可只读确认非空 decommission 主路径已达到
+  set/pool retired audit closure，也可确认 rebalance job 已完成 copy、source cleanup 与 PG/router placement closure；
+  `mix maxio.rebalance.verify_closure --job-id <job-id>` 可把 rebalance closure 的点-in-time 证据写回 job row；
+  `mix maxio.scheduler.status --cadence` 可查看 fresh-drive/rebalance scheduler 的持久化 run ledger、effective health、连续失败、退避窗口、告警状态、scheduled-only overdue 健康与 node 参与度/lock loser 证据；
+  `mix maxio.scheduler.evidence --fail-on-attention` 可把长跑窗口变成机器可判定的只读 gate artifact（expected nodes、min effective nodes、lock-loser、blocked next_action、可选 rollup 覆盖），
+  不启动完整 app、不写 ledger；`mix run --no-start scripts/m8_scheduler_live_rehearsal.exs -- ...`
+  可把该 gate 输出归档为 rehearsal JSON；
+  `mix run --no-start scripts/m8_replacement_live_rehearsal.exs -- --heal --rebalance-if-needed --advance-steps N --verify-closure`
+  可把 replacement/rebalance operator 闭环归档为严格 JSON artifact，只有 workflow 无 blockers 且无剩余 next_action 才通过；显式追加
+  `--require-scheduler-evidence` 与 `--scheduler-evidence-*` 参数时，还会 shell out 到
+  `mix maxio.scheduler.evidence --json --fail-on-attention`，把 scheduled-only scheduler evidence、exit status 与 gate 结果打包进同一 artifact，
+  由 `bundle_gate` 决定最终退出；`gate` 仍只表示本次 replacement workflow，不把 scheduler 健康混入一次手动修复结论。
+  `mix maxio.scheduler.rollup --from <iso8601> --until <iso8601> [--window-minutes N]` 可显式把已关闭的 run ledger 窗口聚合进
+  `cluster_scheduler_run_rollups`，`mix maxio.scheduler.status --rollups` 只读查看这些聚合窗口；`mix maxio.scheduler.prune --dry-run`
+  可复核某个 scheduler+trigger+窗口 range 是否可删，真实 prune 需显式确认 scheduler/trigger/from/until/window。prune 只在 durable rollup 与 raw rows
+  count/source digest/source max updated_at 完全一致、且不命中 state/cadence 保护 run 时删除 exact ids；它不改变 scheduler
+  state/cadence/backoff/alert，任一窗口不满足条件则整次 range fail-closed。`mix maxio.scheduler.retention --dry-run`
+  可按 retain-days/cutoff 规划旧 raw run 清理；真实 retention 仍需显式 enable/confirm，并复用同一 verified prune 内核，
+  不自动补 rollup、不启用后台清理。
+  已有默认关闭的 SMART allowlist 子证据；尚未接入硬件 service time/物理吞吐或物理 replacement identity、secure erase、
+  真实硬件拔盘证明，或 replacement/rebalance 的生产级全自动策略与更多活体端到端取证。

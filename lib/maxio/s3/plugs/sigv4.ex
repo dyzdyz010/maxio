@@ -62,6 +62,8 @@ defmodule Maxio.S3.Plugs.SigV4 do
             |> assign(:principal, principal)
             |> assign(:auth_type, signed_request.auth_type)
             |> assign(:payload_mode, signed_request.payload_mode)
+            |> assign(:sigv4_signed_headers, signed_request.signed_headers)
+            |> assign(:sigv4_signed_request, signed_request)
             |> assign(:sigv4_context, sig_context)
 
           {:error, %Error{} = err} ->
@@ -93,6 +95,9 @@ defmodule Maxio.S3.Plugs.SigV4 do
   end
 
   defp build_material(conn, sr) do
+    {session_token, session_token_source, session_token_error} = extract_session_token(conn, sr)
+    sr = %{sr | session_token: session_token, session_token_source: session_token_source}
+
     payload_hash =
       case sr.auth_type do
         :presigned -> "UNSIGNED-PAYLOAD"
@@ -106,9 +111,54 @@ defmodule Maxio.S3.Plugs.SigV4 do
       query: signing_query(conn, sr),
       headers: req_headers_lower(conn),
       payload_hash: payload_hash,
-      now: now(conn)
+      now: now(conn),
+      session_token: session_token,
+      session_token_source: session_token_source,
+      session_token_error: session_token_error
     }
   end
+
+  defp extract_session_token(conn, %{auth_type: :header}) do
+    header_token = header(conn, "x-amz-security-token")
+    query_token = Map.get(conn.query_params || %{}, "X-Amz-Security-Token")
+
+    cond do
+      present?(header_token) and present?(query_token) ->
+        {nil, nil, :invalid_request}
+
+      present?(query_token) ->
+        {nil, nil, :invalid_request}
+
+      present?(header_token) ->
+        {header_token, :header, nil}
+
+      true ->
+        {nil, nil, nil}
+    end
+  end
+
+  defp extract_session_token(conn, %{auth_type: :presigned}) do
+    header_token = header(conn, "x-amz-security-token")
+    query_token = Map.get(conn.query_params || %{}, "X-Amz-Security-Token")
+
+    cond do
+      present?(header_token) and present?(query_token) ->
+        {nil, nil, :invalid_request}
+
+      present?(header_token) ->
+        {nil, nil, :invalid_request}
+
+      present?(query_token) ->
+        {query_token, :query, nil}
+
+      true ->
+        {nil, nil, nil}
+    end
+  end
+
+  defp present?(nil), do: false
+  defp present?(""), do: false
+  defp present?(_value), do: true
 
   # 已 URL 解码的真实路径（Canonical 内部再做 S3 单次编码）。
   # 必须取自**原始 request_path**（保留尾/连续/前导斜杠），绝不用 conn.path_info——

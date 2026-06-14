@@ -24,7 +24,7 @@ defmodule Mix.Tasks.Maxio.Scan do
   """
   use Mix.Task
 
-  @io_load_sources ~w(s3-in-flight storage-ops combined cluster-s3-in-flight cluster-storage-ops cluster-combined)
+  @io_load_sources ~w(s3-in-flight storage-ops combined drive-device-io cluster-s3-in-flight cluster-storage-ops cluster-combined cluster-drive-device-io)
   @io_load_source_usage Enum.join(@io_load_sources, "|")
 
   @impl true

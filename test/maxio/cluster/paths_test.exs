@@ -33,6 +33,7 @@ defmodule Maxio.Cluster.PathsTest do
       "a/.versions/b",
       "a/.uploads/b",
       "a/.tmp/b",
+      "a/.maxio-removal-quarantine/b",
       "dir/",
       "a/b/",
       "a//b",
@@ -69,7 +70,8 @@ defmodule Maxio.Cluster.PathsTest do
 
     test "编码段永不等于盘上布局名/内部目录名（结构化无碰撞，对齐 MinIO 结构避碰）" do
       for key <- @tricky_keys,
-          layout <- ["meta.json", "part.0", ".versions", ".uploads", ".tmp"] do
+          layout <-
+            ["meta.json", "part.0", ".versions", ".uploads", ".tmp", ".maxio-removal-quarantine"] do
         {:ok, rel} = Paths.encode_key(key)
 
         refute layout in String.split(rel, "/"),
@@ -96,7 +98,14 @@ defmodule Maxio.Cluster.PathsTest do
 
   describe "validate_key（API 层守卫 = 仅 S3/MinIO 都拒的形态）" do
     test "保留布局名段是普通合法 key（MinIO/AWS 均接受）" do
-      for key <- ["a/meta.json/b", "part.0", ".versions/x", ".uploads/x", "a/.tmp/b"] do
+      for key <- [
+            "a/meta.json/b",
+            "part.0",
+            ".versions/x",
+            ".uploads/x",
+            "a/.tmp/b",
+            "a/.maxio-removal-quarantine/b"
+          ] do
         assert :ok = Paths.validate_key(key), "#{key} must be a valid key"
       end
     end

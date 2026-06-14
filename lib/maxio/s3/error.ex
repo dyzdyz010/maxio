@@ -36,6 +36,8 @@ defmodule Maxio.S3.Error do
     invalid_access_key_id:
       {"InvalidAccessKeyId", 403,
        "The AWS access key ID that you provided does not exist in our records."},
+    invalid_token: {"InvalidToken", 400, "The provided token is malformed or otherwise invalid."},
+    expired_token: {"ExpiredToken", 400, "The provided token has expired."},
     request_time_too_skewed:
       {"RequestTimeTooSkewed", 403,
        "The difference between the request time and the server's time is too large."},

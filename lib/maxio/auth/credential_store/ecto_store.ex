@@ -1,30 +1,34 @@
 defmodule Maxio.Auth.CredentialStore.EctoStore do
   @moduledoc """
-  Postgres 凭据后端（铁律 1：实现既有 CredentialStore behaviour，换后端不动鉴权逻辑）。
-  get_secret 按 access_key_id 查 active 密钥，返回 %{secret_key, principal}；
-  principal map 形态与 MemoryStore 对齐（%{type, access_key, arn}）。inactive/缺失 → :error。
+  Postgres credential backend.
+
+  Long-term access keys live in `access_keys`; temporary STS session credentials
+  live in `sts_sessions` and require a matching session token.
   """
   @behaviour Maxio.Auth.CredentialStore
 
   import Ecto.Query
+
+  alias Maxio.Auth.SessionToken
+  alias Maxio.IAM.{AccessKey, STSSession}
+  alias Maxio.Policy.Statement
   alias Maxio.Repo
-  alias Maxio.IAM.AccessKey
 
   @impl true
-  def get_secret(access_key) do
+  def get_secret(access_key), do: get_secret(access_key, [])
+
+  @impl true
+  def get_secret(access_key, opts) do
     case Repo.get_by(AccessKey, access_key_id: access_key, status: "active") do
       nil ->
-        :error
+        get_session_secret(access_key, opts)
 
       %AccessKey{} = row ->
-        principal = %{
-          type: String.to_existing_atom(row.type),
-          access_key: row.access_key_id,
-          arn: row.principal_arn,
-          tags: row.tags || %{}
-        }
-
-        {:ok, %{secret_key: row.secret_key, principal: principal}}
+        if session_token?(Keyword.get(opts, :session_token)) do
+          {:error, :invalid_token}
+        else
+          {:ok, %{secret_key: row.secret_key, principal: access_key_principal(row)}}
+        end
     end
   end
 
@@ -70,18 +74,114 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
     |> Enum.map(fn a ->
       %{
         access_key: a.access_key_id,
-        principal: %{
-          type: String.to_existing_atom(a.type),
-          access_key: a.access_key_id,
-          arn: a.principal_arn,
-          tags: a.tags || %{}
-        }
+        principal: access_key_principal(a)
       }
     end)
   end
 
   @impl true
   def invalidate(_scope), do: :ok
+
+  defp get_session_secret(access_key, opts) do
+    now = Keyword.get(opts, :now) || DateTime.utc_now()
+
+    case Repo.get_by(STSSession, access_key_id: access_key) do
+      nil ->
+        :error
+
+      %STSSession{status: status} when status != "active" ->
+        {:error, :invalid_token}
+
+      %STSSession{} = row ->
+        cond do
+          expired?(row.expires_at, now) ->
+            {:error, :expired_token}
+
+          not session_token?(Keyword.get(opts, :session_token)) ->
+            {:error, :missing_session_token}
+
+          not SessionToken.verify(Keyword.get(opts, :session_token), row.session_token_sha256) ->
+            {:error, :invalid_token}
+
+          true ->
+            {:ok, %{secret_key: row.secret_key, principal: session_principal(row)}}
+        end
+    end
+  end
+
+  defp access_key_principal(%AccessKey{} = row) do
+    %{
+      type: principal_type(row.type),
+      access_key: row.access_key_id,
+      arn: row.principal_arn,
+      tags: row.tags || %{}
+    }
+  end
+
+  defp session_principal(%STSSession{principal_type: "assumed_role"} = row) do
+    %{
+      type: :assumed_role,
+      access_key: row.access_key_id,
+      arn: row.principal_arn,
+      tags: row.tags || %{},
+      transitive_tag_keys: row.transitive_tag_keys || [],
+      session_policy: row.session_policy,
+      session_policy_statements: session_policy_statements(row.session_policy),
+      source_identity: row.source_identity,
+      mfa_authenticated: row.mfa_authenticated,
+      mfa_serial_hash: row.mfa_serial_hash,
+      credential_type: :session,
+      session_name: row.session_name,
+      session_access_key: row.access_key_id,
+      session_expires_at: row.expires_at,
+      issuer_access_key: row.issuer_access_key_id
+    }
+  end
+
+  defp session_principal(%STSSession{} = row) do
+    %{
+      type: principal_type(row.principal_type),
+      access_key: row.issuer_access_key_id,
+      arn: row.principal_arn,
+      tags: row.tags || %{},
+      transitive_tag_keys: row.transitive_tag_keys || [],
+      session_policy: row.session_policy,
+      session_policy_statements: session_policy_statements(row.session_policy),
+      source_identity: row.source_identity,
+      mfa_authenticated: row.mfa_authenticated,
+      mfa_serial_hash: row.mfa_serial_hash,
+      credential_type: :session,
+      session_name: row.session_name,
+      session_access_key: row.access_key_id,
+      session_expires_at: row.expires_at,
+      issuer_access_key: row.issuer_access_key_id
+    }
+  end
+
+  defp expired?(expires_at, now), do: DateTime.compare(expires_at, now) != :gt
+
+  defp session_token?(nil), do: false
+  defp session_token?(""), do: false
+  defp session_token?(_token), do: true
+
+  defp principal_type("root"), do: :root
+  defp principal_type("iam_user"), do: :iam_user
+  defp principal_type("assumed_role"), do: :assumed_role
+  defp principal_type(_other), do: :unknown
+
+  defp session_policy_statements(nil), do: []
+
+  defp session_policy_statements(%{} = document) do
+    document
+    |> Jason.encode!()
+    |> Statement.parse_identity_policy()
+    |> case do
+      {:ok, statements} -> statements
+      {:error, _reason} -> :invalid
+    end
+  end
+
+  defp session_policy_statements(_document), do: :invalid
 
   defp normalize_tags(tags) when is_map(tags) do
     Map.new(tags, fn {key, value} -> {to_string(key), tag_value(value)} end)

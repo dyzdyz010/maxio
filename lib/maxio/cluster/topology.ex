@@ -16,6 +16,7 @@ defmodule Maxio.Cluster.Topology do
           data_shards: pos_integer(),
           parity_shards: pos_integer(),
           block_size: pos_integer(),
+          allow_colocated_endpoints: boolean(),
           pools: %{pool_id() => %{id: pool_id(), set_ids: [set_id()]}},
           pool_ids: [pool_id()],
           sets: %{set_id() => %{id: set_id(), pool_id: pool_id(), endpoints: [endpoint()]}},
@@ -23,13 +24,26 @@ defmodule Maxio.Cluster.Topology do
         }
 
   @pt_key {__MODULE__, :topology}
+  @runtime_mutation_lock_resource {:rebalance_topology_apply_removal, :runtime_topology}
 
   def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
   @impl true
   def init(:ok) do
+    :persistent_term.erase(@pt_key)
+
+    case topology_source() do
+      :config -> init_from_config()
+      :db -> init_from_db()
+      other -> {:stop, {:invalid_topology_source, other}}
+    end
+  end
+
+  defp init_from_config do
     case Application.get_env(:maxio, __MODULE__) do
       nil ->
+        {:ok, :no_topology}
+
         # 无拓扑配置（单节点 dev / FS 后端 / test）—— 不解析、不存 pt，门面读时回 :no_topology。
         {:ok, :no_topology}
 
@@ -49,6 +63,36 @@ defmodule Maxio.Cluster.Topology do
   """
   @spec configured?() :: boolean()
   def configured?, do: :persistent_term.get(@pt_key, :no_topology) != :no_topology
+
+  @doc "Return the parsed current runtime topology, or `{:error, :no_topology}`."
+  @spec current() :: {:ok, t()} | {:error, :no_topology}
+  def current do
+    case :persistent_term.get(@pt_key, :no_topology) do
+      :no_topology -> {:error, :no_topology}
+      topology -> {:ok, topology}
+    end
+  end
+
+  defp init_from_db do
+    case Maxio.Cluster.TopologyStore.active_topology() do
+      {:ok, topology} ->
+        :persistent_term.put(@pt_key, topology)
+        {:ok, topology}
+
+      {:error, reason} ->
+        {:stop, {:db_topology_unavailable, reason}}
+    end
+  end
+
+  defp topology_source do
+    case Application.get_env(:maxio, :topology_source, :config) do
+      :config -> :config
+      "config" -> :config
+      :db -> :db
+      "db" -> :db
+      other -> other
+    end
+  end
 
   @doc "所有 set_id（按 pool 顺序 + set 顺序展平）的全局有序列表。路由 mod 用其长度。"
   @spec all_set_ids() :: [set_id()]
@@ -74,6 +118,10 @@ defmodule Maxio.Cluster.Topology do
   @spec ec_params() :: keyword()
   def ec_params, do: ec_params_from(get())
 
+  @doc "是否显式允许同一 set 内 endpoint 位于同一 node。"
+  @spec allow_colocated_endpoints?() :: boolean()
+  def allow_colocated_endpoints?, do: allow_colocated_endpoints_from(get())
+
   @doc "本节点在某 set 中负责的本地 drive 列表（端点 node == Node.self()）。"
   @spec local_drives_for_set(set_id()) :: [String.t()]
   def local_drives_for_set(set_id), do: local_drives_from(get(), set_id, Node.self())
@@ -82,6 +130,39 @@ defmodule Maxio.Cluster.Topology do
 
   @spec all_set_ids_from(t()) :: [set_id()]
   def all_set_ids_from(%{set_ids: ids}), do: ids
+
+  @doc "Return a read-only snapshot of the current runtime topology on this BEAM node."
+  @spec runtime_snapshot() :: map()
+  def runtime_snapshot do
+    case :persistent_term.get(@pt_key, :no_topology) do
+      :no_topology ->
+        %{
+          node: Node.self(),
+          runtime_status: :no_topology,
+          topology_hash: nil,
+          set_ids: [],
+          pool_ids: []
+        }
+
+      topology ->
+        %{
+          node: Node.self(),
+          runtime_status: :configured,
+          topology_hash: fingerprint(topology),
+          set_ids: all_set_ids_from(topology),
+          pool_ids: pool_ids_from(topology)
+        }
+    end
+  end
+
+  @doc "Return the current runtime topology hash, or `{:error, :no_topology}`."
+  @spec runtime_hash() :: {:ok, String.t()} | {:error, :no_topology}
+  def runtime_hash do
+    case runtime_snapshot() do
+      %{runtime_status: :configured, topology_hash: hash} -> {:ok, hash}
+      %{runtime_status: :no_topology} -> {:error, :no_topology}
+    end
+  end
 
   @spec pool_ids_from(t() | map()) :: [pool_id()]
   def pool_ids_from(%{} = topology) do
@@ -129,9 +210,126 @@ defmodule Maxio.Cluster.Topology do
   def ec_params_from(%{data_shards: k, parity_shards: m, block_size: bs}),
     do: [data_shards: k, parity_shards: m, block_size: bs]
 
+  @spec allow_colocated_endpoints_from(t() | map()) :: boolean()
+  def allow_colocated_endpoints_from(%{} = topology) do
+    Map.get(topology, :allow_colocated_endpoints, false) or colocated_endpoints?(topology)
+  end
+
   @spec local_drives_from(t(), set_id(), node()) :: [String.t()]
   def local_drives_from(t, set_id, node) do
     for {^node, drive} <- endpoints_from(t, set_id), do: drive
+  end
+
+  @doc """
+  Build the parsed topology that would result from removing one erasure set.
+
+  This is a pure helper for operator planning. It does not mutate runtime
+  topology, deployment config, job state, or storage data.
+  """
+  @spec remove_set_from(t(), set_id()) :: {:ok, t()} | {:error, term()}
+  def remove_set_from(%{} = topology, set_id) when is_integer(set_id) do
+    set_ids = all_set_ids_from(topology)
+
+    cond do
+      set_id not in set_ids ->
+        {:error, {:unknown_set_id, set_id, set_ids}}
+
+      length(set_ids) == 1 ->
+        {:error, :would_remove_last_set}
+
+      true ->
+        candidate = do_remove_set(topology, set_id)
+        validate_topology_shape!(candidate)
+        {:ok, candidate}
+    end
+  end
+
+  def remove_set_from(_topology, set_id), do: {:error, {:invalid_set_id, set_id}}
+
+  @doc """
+  Install a parsed topology into the current BEAM runtime.
+
+  This is a runtime-only operation for explicit operator workflows. It does not
+  rewrite deployment config and does not persist across process restart unless
+  the deployment config is updated separately.
+  """
+  @spec install_runtime!(t()) :: t()
+  def install_runtime!(%{} = topology) do
+    validate_topology_shape!(topology)
+    :persistent_term.put(@pt_key, topology)
+    topology
+  end
+
+  @doc """
+  Install a parsed topology into runtime only if the current runtime hash matches.
+
+  If the node is already at the proposed hash this returns an idempotent
+  `:already_applied` result. This helper is intentionally runtime-only and never
+  writes deployment config.
+  """
+  @spec install_runtime_if_hash(t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def install_runtime_if_hash(%{} = topology, expected_current_hash)
+      when is_binary(expected_current_hash) do
+    validate_topology_shape!(topology)
+    proposed_hash = fingerprint(topology)
+
+    case runtime_hash() do
+      {:ok, ^proposed_hash} ->
+        {:ok, Map.put(runtime_snapshot(), :apply_status, :already_applied)}
+
+      {:ok, ^expected_current_hash} ->
+        install_runtime!(topology)
+        {:ok, Map.put(runtime_snapshot(), :apply_status, :applied)}
+
+      {:ok, actual_hash} ->
+        {:error, {:runtime_topology_hash_mismatch, expected_current_hash, actual_hash}}
+
+      {:error, :no_topology} ->
+        {:error, :no_topology}
+    end
+  end
+
+  @doc """
+  Shared quorum-lock resource for runtime topology mutation fences.
+
+  Rebalance/decommission job creation and explicit runtime topology apply must
+  share this resource so no job can be planned against a topology while another
+  operator workflow removes a set from the current runtime.
+  """
+  @spec runtime_mutation_lock_resource() :: term()
+  def runtime_mutation_lock_resource, do: @runtime_mutation_lock_resource
+
+  @doc """
+  Convert a parsed topology to the operator-facing config keyword shape.
+  """
+  @spec to_config(t()) :: keyword()
+  def to_config(%{} = topology) do
+    base = [
+      data_shards: Map.fetch!(topology, :data_shards),
+      parity_shards: Map.fetch!(topology, :parity_shards),
+      block_size: Map.fetch!(topology, :block_size)
+    ]
+
+    base =
+      if allow_colocated_endpoints_from(topology) do
+        base ++ [allow_colocated_endpoints: true]
+      else
+        base
+      end
+
+    base ++
+      [
+        pools:
+          Enum.map(pool_ids_from(topology), fn pool_id ->
+            %{
+              id: pool_id,
+              sets:
+                Enum.map(set_ids_for_pool_from(topology, pool_id), fn set_id ->
+                  %{id: set_id, endpoints: endpoints_from(topology, set_id)}
+                end)
+            }
+          end)
+      ]
   end
 
   defp get do
@@ -145,6 +343,38 @@ defmodule Maxio.Cluster.Topology do
         parsed
     end
   end
+
+  @doc """
+  Stable full-topology fingerprint used for runtime/deployment convergence proofs.
+
+  This intentionally includes the ordered endpoint `{node, drive}` material for
+  every set. Placement set IDs alone are not enough to prove that two runtimes
+  would address the same shards.
+  """
+  @spec fingerprint(t() | map()) :: String.t()
+  def fingerprint(topology) when is_map(topology) do
+    material = [
+      {:data_shards, Map.get(topology, :data_shards)},
+      {:parity_shards, Map.get(topology, :parity_shards)},
+      {:block_size, Map.get(topology, :block_size)},
+      {:allow_colocated_endpoints, allow_colocated_endpoints_from(topology)},
+      {:pool_ids, pool_ids_from(topology)},
+      {:set_ids, all_set_ids_from(topology)},
+      {:pools,
+       Enum.map(pool_ids_from(topology), fn pool_id ->
+         {pool_id,
+          Enum.map(set_ids_for_pool_from(topology, pool_id), fn set_id ->
+            {set_id, Enum.map(endpoints_from(topology, set_id), &fingerprint_endpoint/1)}
+          end)}
+       end)}
+    ]
+
+    :crypto.hash(:sha256, :erlang.term_to_binary(material))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp fingerprint_endpoint({node, drive}) when is_atom(node) and is_binary(drive),
+    do: {Atom.to_string(node), drive}
 
   @doc """
   解析+校验拓扑 config。返回 parsed struct。非法 raise ArgumentError（铁律 3）。
@@ -218,6 +448,7 @@ defmodule Maxio.Cluster.Topology do
       data_shards: k,
       parity_shards: m,
       block_size: bs,
+      allow_colocated_endpoints: allow_colocated,
       pools: pools,
       pool_ids: Enum.reverse(pool_ids),
       sets: sets,
@@ -260,9 +491,93 @@ defmodule Maxio.Cluster.Topology do
   defp legacy_pool_ids(%{set_ids: []}), do: []
   defp legacy_pool_ids(%{set_ids: _ids}), do: [0]
 
+  defp colocated_endpoints?(%{} = topology) do
+    Enum.any?(all_set_ids_from(topology), fn set_id ->
+      nodes = Enum.map(endpoints_from(topology, set_id), fn {node, _drive} -> node end)
+      length(nodes) != length(Enum.uniq(nodes))
+    end)
+  end
+
   defp raise_incomplete_pool_metadata! do
     raise ArgumentError,
           "topology: pool metadata incomplete; expected pool_ids+pools+set.pool_id " <>
             "or a legacy topology with none of those fields"
+  end
+
+  defp do_remove_set(topology, set_id) do
+    pool_id = pool_id_for_set_from(topology, set_id)
+    set_ids = Enum.reject(all_set_ids_from(topology), &(&1 == set_id))
+    sets = topology |> Map.fetch!(:sets) |> Map.delete(set_id)
+    pools = Map.fetch!(topology, :pools)
+    pool_ids = pool_ids_from(topology)
+    pool = Map.fetch!(pools, pool_id)
+    pool_set_ids = Enum.reject(Map.fetch!(pool, :set_ids), &(&1 == set_id))
+
+    {pool_ids, pools} =
+      if pool_set_ids == [] do
+        {Enum.reject(pool_ids, &(&1 == pool_id)), Map.delete(pools, pool_id)}
+      else
+        pool = %{pool | set_ids: pool_set_ids}
+        {pool_ids, Map.put(pools, pool_id, pool)}
+      end
+
+    %{
+      topology
+      | pool_ids: pool_ids,
+        pools: pools,
+        set_ids: set_ids,
+        sets: sets
+    }
+  end
+
+  defp validate_topology_shape!(%{} = topology) do
+    k = Map.fetch!(topology, :data_shards)
+    m = Map.fetch!(topology, :parity_shards)
+    n = k + m
+    set_ids = all_set_ids_from(topology)
+    pool_ids = pool_ids_from(topology)
+
+    cond do
+      set_ids == [] ->
+        raise ArgumentError, "topology: runtime topology must contain at least one erasure set"
+
+      pool_ids == [] ->
+        raise ArgumentError, "topology: runtime topology must contain at least one pool"
+
+      true ->
+        :ok
+    end
+
+    set_id_set = MapSet.new(set_ids)
+
+    Enum.each(pool_ids, fn pool_id ->
+      pool_set_ids = set_ids_for_pool_from(topology, pool_id)
+
+      if pool_set_ids == [] do
+        raise ArgumentError, "topology: pool #{pool_id} has no erasure sets"
+      end
+
+      Enum.each(pool_set_ids, fn set_id ->
+        unless MapSet.member?(set_id_set, set_id) do
+          raise ArgumentError, "topology: pool #{pool_id} references unknown set #{set_id}"
+        end
+      end)
+    end)
+
+    Enum.each(set_ids, fn set_id ->
+      endpoints = endpoints_from(topology, set_id)
+
+      if length(endpoints) != n do
+        raise ArgumentError, "topology: set #{set_id} endpoints != K+M=#{n}"
+      end
+
+      pool_id = pool_id_for_set_from(topology, set_id)
+
+      unless pool_id in pool_ids and set_id in set_ids_for_pool_from(topology, pool_id) do
+        raise ArgumentError, "topology: set #{set_id} has inconsistent pool metadata"
+      end
+    end)
+
+    :ok
   end
 end

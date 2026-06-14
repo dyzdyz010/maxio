@@ -175,6 +175,54 @@ defmodule Maxio.LifecycleTest do
     assert latest.resp_body == "v4"
   end
 
+  test "MFA Delete bucket skips NoncurrentVersionExpiration permanent deletes" do
+    SigV4Request.signed_conn(:put, "/lcmfanoncur") |> call()
+    :ok = Maxio.Buckets.put_versioning("lcmfanoncur", "Enabled", "Enabled")
+
+    v1 = put_object_version!("lcmfanoncur", "doc.txt", "v1")
+    _v2 = put_object_version!("lcmfanoncur", "doc.txt", "v2")
+
+    touch_version("lcmfanoncur", "doc.txt", v1, DateTime.add(@now, -10 * 86_400, :second))
+    touch_latest("lcmfanoncur", "doc.txt", DateTime.add(@now, -1 * 86_400, :second))
+
+    :ok =
+      BucketConfigs.put("lcmfanoncur", :lifecycle, [
+        rule(%{"filter_prefix" => "", "noncurrent_days" => 1})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.noncurrent_versions_expired == 0
+    assert summary.mfa_delete_protected_actions_skipped == 1
+    assert summary.errors == []
+    assert_version_status("lcmfanoncur", "doc.txt", v1, 200)
+  end
+
+  test "MFA Delete suspended bucket skips current Expiration that would replace null version" do
+    SigV4Request.signed_conn(:put, "/lcmfasuspexp") |> call()
+    :ok = Maxio.Buckets.put_versioning("lcmfasuspexp", "Suspended", "Enabled")
+
+    put = SigV4Request.signed_conn(:put, "/lcmfasuspexp/doc.txt", body: "null-live") |> call()
+    assert put.status == 200
+
+    touch_latest("lcmfasuspexp", "doc.txt", @old)
+
+    :ok =
+      BucketConfigs.put("lcmfasuspexp", :lifecycle, [
+        rule(%{"filter_prefix" => "", "expiration_days" => 1})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.objects_expired == 0
+    assert summary.mfa_delete_protected_actions_skipped == 1
+    assert summary.errors == []
+
+    current = SigV4Request.signed_conn(:get, "/lcmfasuspexp/doc.txt") |> call()
+    assert current.status == 200
+    assert current.resp_body == "null-live"
+  end
+
   test "NoncurrentVersionTransition is counted unsupported and never deletes versions" do
     SigV4Request.signed_conn(:put, "/lcnct") |> call()
     :ok = Maxio.Buckets.put_versioning("lcnct", "Enabled", nil)
@@ -293,6 +341,28 @@ defmodule Maxio.LifecycleTest do
     assert summary.delete_markers_removed == 1
     assert summary.errors == []
     assert {:error, :not_found} = Objects.get_metadata("lceodm", "ghost.txt")
+  end
+
+  test "MFA Delete bucket skips ExpiredObjectDeleteMarker cleanup" do
+    SigV4Request.signed_conn(:put, "/lcmfamarker") |> call()
+    :ok = Maxio.Buckets.put_versioning("lcmfamarker", "Enabled", "Enabled")
+
+    delete = SigV4Request.signed_conn(:delete, "/lcmfamarker/ghost.txt") |> call()
+    assert delete.status == 204
+    {:ok, marker} = Objects.get_metadata("lcmfamarker", "ghost.txt")
+    assert marker.is_delete_marker
+
+    :ok =
+      BucketConfigs.put("lcmfamarker", :lifecycle, [
+        rule(%{"expired_object_delete_marker" => true})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.delete_markers_removed == 0
+    assert summary.mfa_delete_protected_actions_skipped == 1
+    assert summary.errors == []
+    assert {:ok, _marker} = Objects.get_metadata("lcmfamarker", "ghost.txt")
   end
 
   test "AbortIncompleteMultipartUpload removes old pending upload sessions" do

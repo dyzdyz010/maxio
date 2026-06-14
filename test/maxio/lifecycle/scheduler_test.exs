@@ -73,6 +73,7 @@ defmodule Maxio.Lifecycle.SchedulerTest do
         noncurrent_versions_expired: 0,
         delete_markers_removed: 0,
         multipart_uploads_aborted: 0,
+        mfa_delete_protected_actions_skipped: 0,
         unsupported_rules: 0,
         errors: []
       },

@@ -25,7 +25,9 @@ defmodule Maxio.Auth.SigV4.SignedRequest do
     :amz_date,
     :auth_type,
     :payload_mode,
-    :expires
+    :expires,
+    :session_token,
+    :session_token_source
   ]
 
   @type t :: %__MODULE__{
@@ -38,6 +40,8 @@ defmodule Maxio.Auth.SigV4.SignedRequest do
           amz_date: String.t(),
           auth_type: :header | :presigned,
           payload_mode: :single | :unsigned | :streaming,
-          expires: pos_integer() | nil
+          expires: pos_integer() | nil,
+          session_token: String.t() | nil,
+          session_token_source: :header | :query | nil
         }
 end

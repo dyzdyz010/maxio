@@ -30,6 +30,33 @@ defmodule Maxio.Policy.StoreOptionalCallbacksTest do
 
       assert :ok = Store.delete_principal_policy("arn:aws:iam:::user/legacy", "policy")
       assert [] = Store.list_principal_policies("arn:aws:iam:::user/legacy")
+
+      assert {:error, :not_supported} =
+               Store.put_managed_session_policy("arn:aws:iam:::policy/legacy", "{}")
+
+      assert {:error, :not_supported} =
+               Store.create_managed_session_policy("arn:aws:iam:::policy/legacy", "{}")
+
+      assert {:error, :not_supported} =
+               Store.managed_session_policy("arn:aws:iam:::policy/legacy")
+
+      assert :ok = Store.delete_managed_session_policy("arn:aws:iam:::policy/legacy")
+      assert [] = Store.list_managed_session_policies()
+
+      assert {:error, :not_supported} =
+               Store.attach_role_managed_policy(
+                 "arn:aws:iam:::role/legacy",
+                 "arn:aws:iam:::policy/legacy"
+               )
+
+      assert :ok =
+               Store.detach_role_managed_policy(
+                 "arn:aws:iam:::role/legacy",
+                 "arn:aws:iam:::policy/legacy"
+               )
+
+      assert [] = Store.list_attached_role_managed_policies("arn:aws:iam:::role/legacy")
+      refute Store.managed_session_policy_attached?("arn:aws:iam:::policy/legacy")
     after
       Application.put_env(:maxio, :policy_store, previous_store)
     end

@@ -109,7 +109,7 @@ defmodule Mix.Tasks.Maxio.ScanTest do
           "0",
           "--no-adaptive-io",
           "--io-load-source",
-          "cluster-combined",
+          "cluster-drive-device-io",
           "--max-live-requests",
           "2",
           "--io-pause-ms",

@@ -77,6 +77,33 @@ defmodule Maxio.Cluster.RebalanceWriteRoutingTest do
     assert routes[0] == 1
   end
 
+  test "deployment verification retires completed decommission write route" do
+    insert_route!(7, 1,
+      status: "complete",
+      data_movement_status: "complete",
+      source_cleanup_status: "complete",
+      topology_removal_status: "runtime_local_applied",
+      topology_removal_scope: "runtime_local",
+      topology_removal_proposed_hash: "proposed-7"
+    )
+
+    insert_route!(8, 1,
+      status: "complete",
+      data_movement_status: "complete",
+      source_cleanup_status: "complete",
+      topology_removal_status: "runtime_local_applied",
+      topology_removal_scope: "runtime_local",
+      topology_removal_proposed_hash: "proposed-8",
+      topology_removal_deployment_status: "verified",
+      topology_removal_deployment_hash: "proposed-8",
+      topology_removal_deployment_verified_at: DateTime.utc_now()
+    )
+
+    assert {:ok, routes} = WriteRouting.active_routes()
+    assert routes[7] == 1
+    refute Map.has_key?(routes, 8)
+  end
+
   test "Distributed.put reroutes ordinary writes while explicit placement remains authoritative",
        %{
          topology: topology
@@ -306,7 +333,7 @@ defmodule Maxio.Cluster.RebalanceWriteRoutingTest do
       started_at: DateTime.utc_now()
     }
 
-    %Job{} |> Job.changeset(base) |> Repo.insert!()
+    %Job{} |> Job.changeset(Map.merge(base, Map.new(attrs))) |> Repo.insert!()
   end
 
   defp topology(base, set_count) do

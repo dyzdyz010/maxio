@@ -13,5 +13,6 @@ defmodule Maxio.S3.Endpoint do
   plug Maxio.S3.Plugs.AddressStyle
   plug Maxio.S3.Plugs.Cors
   plug Maxio.S3.Plugs.SigV4
+  plug Maxio.STS.QueryPlug
   plug Maxio.S3.Plugs.Dispatch
 end

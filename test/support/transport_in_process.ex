@@ -51,6 +51,10 @@ defmodule Maxio.Cluster.Transport.InProcess do
   @doc "Fail delete_part_file for one drive while keeping probes online."
   def set_delete_part_file_down(node, drive), do: set_op_down(:delete_part_file, node, drive)
 
+  @doc "Fail purge_quarantine_root for one drive while keeping preflight online."
+  def set_purge_quarantine_root_down(node, drive),
+    do: set_op_down(:purge_quarantine_root, node, drive)
+
   defp set_op_down(op, node, drive),
     do: :ets.insert(@table, {{:op, op, node, normalize_path(drive)}, true})
 
@@ -107,14 +111,22 @@ defmodule Maxio.Cluster.Transport.InProcess do
         s3 + storage
       )
 
+    drive_device_io =
+      non_negative_int(
+        Map.get(snapshot, :drive_device_io) || Map.get(snapshot, "drive_device_io"),
+        0
+      )
+
     %{
       s3_in_flight: s3,
       storage_ops: storage,
-      combined: combined
+      combined: combined,
+      drive_device_io: drive_device_io
     }
   end
 
-  defp normalize_pressure_snapshot(_snapshot), do: %{s3_in_flight: 0, storage_ops: 0, combined: 0}
+  defp normalize_pressure_snapshot(_snapshot),
+    do: %{s3_in_flight: 0, storage_ops: 0, combined: 0, drive_device_io: 0}
 
   defp non_negative_int(n, _default) when is_integer(n) and n >= 0, do: n
   defp non_negative_int(_n, default), do: default
@@ -166,6 +178,28 @@ defmodule Maxio.Cluster.Transport.InProcess do
   end
 
   @impl true
+  def quarantine_layout_roots(node, drive_root, bucket_names, quarantine_id, marker) do
+    if down?(node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.quarantine_layout_roots(drive_root, bucket_names, quarantine_id, marker)
+  end
+
+  @impl true
+  def purge_quarantine_root(node, drive_root, quarantine_id, expected_marker) do
+    if down?(node, drive_root) or op_down?(:purge_quarantine_root, node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.purge_quarantine_root(drive_root, quarantine_id, expected_marker)
+  end
+
+  @impl true
+  def preflight_quarantine_purge_root(node, drive_root, quarantine_id, expected_marker) do
+    if down?(node, drive_root),
+      do: {:error, :unavailable},
+      else:
+        ShardServer.preflight_quarantine_purge_root(drive_root, quarantine_id, expected_marker)
+  end
+
+  @impl true
   def heal_shard(node, dir, block_map, shard_len, meta) do
     if down?(node, dir) or op_down?(:heal_shard, node, dir),
       do: {:ok, 0},
@@ -205,6 +239,13 @@ defmodule Maxio.Cluster.Transport.InProcess do
     if down?(node, drive_root),
       do: {:error, :unavailable},
       else: ShardServer.probe_drive_identity(drive_root, opts)
+  end
+
+  @impl true
+  def drive_hardware_evidence(node, drive_root, opts \\ []) do
+    if down?(node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.drive_hardware_evidence(drive_root, opts)
   end
 
   @impl true

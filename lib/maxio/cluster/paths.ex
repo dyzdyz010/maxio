@@ -39,7 +39,14 @@ defmodule Maxio.Cluster.Paths do
 
   # 盘上布局保留名：与编码后的用户段必须不相交（ShardServer @meta_file/@part_file、
   # 内部根 .versions/.uploads/.tmp、list_dir 的跳过名单同源）。仅精确匹配（part.1 等不在内）。
-  @layout_reserved ["meta.json", "part.0", ".versions", ".uploads", ".tmp"]
+  @layout_reserved [
+    "meta.json",
+    "part.0",
+    ".versions",
+    ".uploads",
+    ".tmp",
+    ".maxio-removal-quarantine"
+  ]
 
   # 编码标记。互不为后缀（decode 按 @dir_suffix → @esc_suffix → @empty_seg 顺序判定无歧义）。
   @esc_suffix "__MXESC__"

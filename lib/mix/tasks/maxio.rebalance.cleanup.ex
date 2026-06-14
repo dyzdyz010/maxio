@@ -1,15 +1,19 @@
 defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
-  @shortdoc "Clean old source-set replicas for a decommission job"
+  @shortdoc "Clean old source-set replicas for a rebalance/decommission job"
   @moduledoc """
-  Run a guarded foreground source cleanup pass for a decommission job.
+  Run a guarded foreground source cleanup pass for a rebalance/decommission job.
 
       mix maxio.rebalance.cleanup --job-id <uuid>
       mix maxio.rebalance.cleanup <uuid> --max-versions 500
       mix maxio.rebalance.cleanup --dry-run --json
 
   The command only deletes old source-set copies for versions whose PG placement
-  already points at the job destination set. It does not delete object metadata,
-  mutate topology, remove a pool, or choose destinations automatically.
+  already points at the authoritative set. Decommission jobs delete the old
+  target-set copy after placement moves to the destination set; rebalance jobs
+  delete configured non-authoritative set copies while keeping the PG placement
+  set. Cleanup activation revalidates under the runtime-topology mutation lock.
+  It does not delete object metadata, mutate topology, remove a pool, or choose
+  destinations automatically.
   """
   use Mix.Task
 
@@ -64,9 +68,9 @@ defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
   defp resolve_job_id(job_id) when is_binary(job_id), do: {:ok, job_id}
 
   defp resolve_job_id(nil) do
-    case Jobs.latest(kind: "decommission") do
-      nil -> {:error, :not_found}
-      job -> {:ok, job.id}
+    case Jobs.next_runnable_source_cleanup() do
+      {:ok, job} -> {:ok, job.id}
+      {:error, :not_found} -> {:error, :not_found}
     end
   end
 
@@ -76,6 +80,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
     else
       IO.puts(
         "[maxio rebalance.cleanup] job_id=#{report.job_id} status=#{report.status} " <>
+          "kind=#{report.job_kind} " <>
           "source_cleanup_status=#{report.source_cleanup_status} " <>
           "target_set_id=#{report.target_set_id} destination_set_id=#{report.destination_set_id} " <>
           "dry_run=#{report.dry_run} scanned=#{report.scanned} deleted=#{report.deleted} " <>
@@ -85,7 +90,9 @@ defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
     end
   end
 
-  defp error_message(:not_found), do: "no decommission job found"
+  defp error_message(:not_found),
+    do: "no cleanup-ready rebalance/decommission job found"
+
   defp error_message(:missing_destination_set_id), do: "job has no destination_set_id"
   defp error_message(:missing_target_set_id), do: "job has no target_set_id"
 
@@ -95,10 +102,13 @@ defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
   defp error_message(:no_topology),
     do: "cannot run source cleanup without configured topology"
 
-  defp error_message(:canceled), do: "decommission job is canceled"
+  defp error_message(:canceled), do: "rebalance/decommission job is canceled"
 
   defp error_message(:runner_locked),
-    do: "decommission job runner is already active for this job"
+    do: "rebalance/decommission job runner is already active for this job"
+
+  defp error_message(:topology_mutation_locked),
+    do: "source cleanup cannot start while runtime topology mutation is locked"
 
   defp error_message(:source_cleanup_complete),
     do: "source cleanup is already complete for this job"
@@ -110,7 +120,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
     do: "source cleanup requires data_movement_status=complete, got #{inspect(status)}"
 
   defp error_message({:unsupported_job_kind, kind}),
-    do: "rebalance.cleanup only supports decommission jobs, got kind=#{inspect(kind)}"
+    do: "rebalance.cleanup only supports rebalance/decommission jobs, got kind=#{inspect(kind)}"
 
   defp error_message({:unsupported_authoritative_source, kind, source}) do
     "rebalance.cleanup requires authoritative_source(:#{kind}) == :pg, got #{inspect(source)}"
@@ -123,6 +133,13 @@ defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
   defp error_message({:unknown_target_set_id, set_id, set_ids}) do
     "job target_set_id=#{inspect(set_id)} is not in configured set ids: #{inspect(set_ids)}"
   end
+
+  defp error_message({:unknown_placement_set_id, set_ids}) do
+    "one or more object versions point outside configured set ids: #{inspect(set_ids)}"
+  end
+
+  defp error_message(:missing_persisted_placement),
+    do: "one or more object versions lack persisted placement"
 
   defp error_message({:active_job_exists, job}) do
     "cannot start source cleanup while another active job exists: #{job.id}"
@@ -138,6 +155,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Cleanup do
     end
   end
 
+  defp json_ready(nil), do: nil
   defp json_ready(value) when is_boolean(value), do: value
   defp json_ready(value) when is_atom(value), do: Atom.to_string(value)
   defp json_ready(value) when is_list(value), do: Enum.map(value, &json_ready/1)

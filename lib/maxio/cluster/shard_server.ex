@@ -31,12 +31,15 @@ defmodule Maxio.Cluster.ShardServer do
   """
   use GenServer
 
-  alias Maxio.Cluster.{DriveIO, DriveIdentity, DriveStats}
+  alias Maxio.Cluster.{DriveHardwareEvidence, DriveIO, DriveIdentity, DriveStats}
   alias Maxio.Storage.Erasure.Meta
 
   @part_file "part.0"
   @meta_file "meta.json"
   @tmp_root ".tmp"
+  @quarantine_root ".maxio-removal-quarantine"
+  @physical_removal_marker ".maxio-physical-removal.json"
+  @physical_purge_marker ".maxio-physical-purge.json"
   @rename_retries 5
 
   def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
@@ -134,7 +137,7 @@ defmodule Maxio.Cluster.ShardServer do
   end
 
   # 走盘 LIST 须跳过的内部前缀（ROUTE B P3）：.versions（版本树）/.uploads（multipart parts）/.tmp（原子提交临时区）。
-  @internal_prefixes [".versions", ".uploads", ".tmp"]
+  @internal_prefixes [".versions", ".uploads", ".tmp", @quarantine_root]
 
   @doc """
   读单层目录 drive_dir 下的条目（ROUTE B P3 drive-walk LIST 原语，本机；被 :erpc 寻址，无 node 首参）。
@@ -208,6 +211,12 @@ defmodule Maxio.Cluster.ShardServer do
     DriveIO.track(:probe, fn -> DriveIdentity.probe_drive_root(drive_root, opts) end)
   end
 
+  @doc "Return read-only hardware/device evidence for a configured drive root."
+  @spec drive_hardware_evidence(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def drive_hardware_evidence(drive_root, opts \\ []) do
+    DriveIO.track(:metadata, fn -> DriveHardwareEvidence.local(drive_root, opts) end)
+  end
+
   @doc "Return OS-backed filesystem capacity stats for a configured drive root."
   @spec drive_stats(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def drive_stats(drive_root, opts \\ []) do
@@ -257,6 +266,103 @@ defmodule Maxio.Cluster.ShardServer do
         :ok -> :ok
         {:error, :enoent} -> :ok
         {:error, reason} -> {:error, reason}
+      end
+    end)
+  end
+
+  @doc """
+  Move Maxio-owned layout roots under one drive into a same-drive quarantine.
+
+  This is strict and operator-facing: unlike `delete_shard/1`, failures are
+  returned to the caller. The function never moves the drive root itself, never
+  accepts arbitrary relative paths, rejects symlink roots, and blocks unknown
+  top-level directories so a misconfigured shared filesystem path is not
+  accidentally rearranged.
+  """
+  @spec quarantine_layout_roots(String.t(), [String.t()], String.t(), map()) ::
+          {:ok, map()} | {:error, term()}
+  def quarantine_layout_roots(drive_root, bucket_names, quarantine_id, marker \\ %{}) do
+    DriveIO.track(:delete, fn ->
+      with :ok <- validate_drive_root_for_quarantine(drive_root),
+           {:ok, known_buckets} <- normalize_quarantine_buckets(bucket_names),
+           :ok <- validate_quarantine_id(quarantine_id),
+           :ok <- reject_unknown_top_level_roots(drive_root, known_buckets),
+           {:ok, roots} <- move_layout_roots(drive_root, known_buckets, quarantine_id),
+           {:ok, marker_path} <-
+             write_physical_removal_marker(drive_root, quarantine_id, marker, roots) do
+        {:ok,
+         %{
+           quarantine_id: quarantine_id,
+           quarantine_root: Path.join([drive_root, @quarantine_root, quarantine_id]),
+           marker_path: marker_path,
+           marker_written: true,
+           roots: roots
+         }}
+      end
+    end)
+  end
+
+  @doc """
+  Hard-delete one previously quarantined Maxio layout root.
+
+  This is quarantine-specific and strict: it only removes
+  `<drive>/.maxio-removal-quarantine/<quarantine_id>`, requires the physical
+  removal marker to match the expected job/quarantine/manifest, rejects symlink
+  roots and symlinks inside the quarantine tree, and writes a purge marker
+  outside the deleted tree for retry/idempotency audit.
+  """
+  @spec purge_quarantine_root(String.t(), String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def purge_quarantine_root(drive_root, quarantine_id, expected_marker) do
+    DriveIO.track(:delete, fn ->
+      with :ok <- validate_expected_purge_marker(expected_marker),
+           {:ok, preflight} <-
+             preflight_quarantine_purge_root(drive_root, quarantine_id, expected_marker),
+           quarantine_root <- preflight.quarantine_root,
+           {:ok, summary} <-
+             purge_existing_quarantine_root(
+               drive_root,
+               quarantine_root,
+               quarantine_id,
+               expected_marker
+             ),
+           {:ok, marker_path} <-
+             write_physical_purge_marker(drive_root, quarantine_id, expected_marker, "purged") do
+        {:ok,
+         Map.merge(summary, %{
+           quarantine_id: quarantine_id,
+           quarantine_root: quarantine_root,
+           marker_path: marker_path,
+           marker_written: true
+         })}
+      end
+    end)
+  end
+
+  @doc "Validate a quarantine root can be hard-deleted without mutating it."
+  @spec preflight_quarantine_purge_root(String.t(), String.t(), map()) ::
+          {:ok, map()} | {:error, term()}
+  def preflight_quarantine_purge_root(drive_root, quarantine_id, expected_marker) do
+    DriveIO.track(:metadata, fn ->
+      with :ok <- validate_expected_purge_marker(expected_marker),
+           :ok <- validate_drive_root_for_quarantine(drive_root),
+           :ok <- validate_quarantine_id(quarantine_id),
+           quarantine_root <- Path.join([drive_root, @quarantine_root, quarantine_id]),
+           :ok <- ensure_strict_child(drive_root, quarantine_root),
+           :ok <- ensure_no_symlink_ancestors(drive_root, quarantine_root),
+           :ok <-
+             ensure_physical_removal_marker_matches(drive_root, quarantine_id, expected_marker),
+           {:ok, summary} <-
+             summarize_existing_quarantine_for_purge(
+               drive_root,
+               quarantine_root,
+               quarantine_id,
+               expected_marker
+             ) do
+        {:ok,
+         Map.merge(summary, %{
+           quarantine_id: quarantine_id,
+           quarantine_root: quarantine_root
+         })}
       end
     end)
   end
@@ -399,6 +505,630 @@ defmodule Maxio.Cluster.ShardServer do
       bytes: bytes
     )
   end
+
+  defp validate_drive_root_for_quarantine(drive_root) when is_binary(drive_root) do
+    expanded = Path.expand(drive_root)
+
+    cond do
+      Path.dirname(expanded) == expanded ->
+        {:error, {:unsafe_drive_root, drive_root}}
+
+      length(Path.split(expanded)) < 2 ->
+        {:error, {:unsafe_drive_root, drive_root}}
+
+      true ->
+        case File.lstat(drive_root) do
+          {:ok, %File.Stat{type: :directory}} -> :ok
+          {:ok, %File.Stat{type: :symlink}} -> {:error, {:symlink_drive_root, drive_root}}
+          {:ok, _stat} -> {:error, {:not_directory, drive_root}}
+          {:error, :enoent} -> {:error, :unavailable}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp validate_drive_root_for_quarantine(drive_root),
+    do: {:error, {:invalid_drive_root, drive_root}}
+
+  defp normalize_quarantine_buckets(bucket_names) when is_list(bucket_names) do
+    Enum.reduce_while(bucket_names, {:ok, []}, fn bucket, {:ok, acc} ->
+      if safe_direct_child_name?(bucket) and bucket not in @internal_prefixes do
+        {:cont, {:ok, [bucket | acc]}}
+      else
+        {:halt, {:error, {:invalid_bucket_root, bucket}}}
+      end
+    end)
+    |> case do
+      {:ok, buckets} -> {:ok, buckets |> Enum.uniq() |> Enum.sort()}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp normalize_quarantine_buckets(bucket_names),
+    do: {:error, {:invalid_bucket_roots, bucket_names}}
+
+  defp validate_quarantine_id(quarantine_id) do
+    if safe_direct_child_name?(quarantine_id) do
+      :ok
+    else
+      {:error, {:invalid_quarantine_id, quarantine_id}}
+    end
+  end
+
+  defp safe_direct_child_name?(name) when is_binary(name) do
+    name not in ["", ".", ".."] and
+      not String.contains?(name, ["/", "\\"]) and
+      Path.basename(name) == name
+  end
+
+  defp safe_direct_child_name?(_name), do: false
+
+  defp reject_unknown_top_level_roots(drive_root, known_buckets) do
+    case top_level_directories(drive_root) do
+      {:ok, dirs} ->
+        known = MapSet.new(known_buckets ++ @internal_prefixes)
+
+        unknown =
+          dirs
+          |> Enum.reject(&MapSet.member?(known, &1))
+          |> Enum.sort()
+
+        if unknown == [] do
+          :ok
+        else
+          {:error, {:unknown_top_level_roots, unknown}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp top_level_directories(drive_root) do
+    case File.ls(drive_root) do
+      {:ok, names} ->
+        Enum.reduce_while(names, {:ok, []}, fn name, {:ok, acc} ->
+          path = Path.join(drive_root, name)
+
+          case File.lstat(path) do
+            {:ok, %File.Stat{type: :directory}} ->
+              {:cont, {:ok, [name | acc]}}
+
+            {:ok, %File.Stat{type: :symlink}} ->
+              {:halt, {:error, {:symlink_top_level_root, name}}}
+
+            {:ok, _stat} ->
+              {:cont, {:ok, acc}}
+
+            {:error, reason} ->
+              {:halt, {:error, {:top_level_root_stat_failed, name, reason}}}
+          end
+        end)
+        |> case do
+          {:ok, dirs} -> {:ok, Enum.sort(dirs)}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp move_layout_roots(drive_root, buckets, quarantine_id) do
+    roots =
+      Enum.map(buckets, &{:bucket, &1}) ++
+        [{:internal, ".versions"}, {:internal, ".uploads"}]
+
+    Enum.reduce_while(roots, {:ok, []}, fn root, {:ok, acc} ->
+      case move_layout_root(drive_root, root, quarantine_id) do
+        {:ok, nil} -> {:cont, {:ok, acc}}
+        {:ok, result} -> {:cont, {:ok, [result | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, moved} -> {:ok, Enum.reverse(moved)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp move_layout_root(drive_root, {:bucket, bucket}, quarantine_id) do
+    source = Path.join(drive_root, bucket)
+    destination = Path.join([drive_root, @quarantine_root, quarantine_id, "buckets", bucket])
+    move_direct_child_root(drive_root, source, destination, "bucket", bucket)
+  end
+
+  defp move_layout_root(drive_root, {:internal, ".versions"}, quarantine_id) do
+    source = Path.join(drive_root, ".versions")
+    destination = Path.join([drive_root, @quarantine_root, quarantine_id, ".versions"])
+    move_direct_child_root(drive_root, source, destination, "versions", ".versions")
+  end
+
+  defp move_layout_root(drive_root, {:internal, ".uploads"}, quarantine_id) do
+    source = Path.join(drive_root, ".uploads")
+    destination = Path.join([drive_root, @quarantine_root, quarantine_id, ".uploads"])
+    move_direct_child_root(drive_root, source, destination, "uploads", ".uploads")
+  end
+
+  defp move_direct_child_root(drive_root, source, destination, layout, name) do
+    with :ok <- ensure_strict_child(drive_root, source),
+         :ok <- ensure_strict_child(drive_root, destination),
+         :ok <- ensure_no_symlink_ancestors(drive_root, destination) do
+      case File.lstat(source) do
+        {:ok, %File.Stat{type: :directory}} ->
+          move_existing_root(source, destination, layout, name)
+
+        {:ok, %File.Stat{type: :symlink}} ->
+          {:error, {:symlink_layout_root, name}}
+
+        {:ok, _stat} ->
+          {:error, {:not_directory, name}}
+
+        {:error, :enoent} ->
+          already_quarantined_or_missing(destination, layout, name)
+
+        {:error, reason} ->
+          {:error, {:layout_root_stat_failed, name, reason}}
+      end
+    end
+  end
+
+  defp move_existing_root(source, destination, layout, name) do
+    case quarantine_destination_available?(destination, name) do
+      :ok ->
+        with :ok <- ensure_quarantine_tree_clean(source, layout),
+             :ok <- File.mkdir_p(Path.dirname(destination)),
+             :ok <- ensure_no_symlink_ancestors(Path.dirname(source), destination),
+             :ok <- File.rename(source, destination) do
+          {:ok,
+           %{
+             layout: layout,
+             name: name,
+             source: source,
+             quarantine_path: destination,
+             status: "quarantined"
+           }}
+        else
+          {:error, {reason, _layout, _rel}} = error
+          when reason in [
+                 :unsafe_layout_file,
+                 :symlink_layout_path,
+                 :unsupported_layout_path_type,
+                 :layout_tree_stat_failed,
+                 :layout_tree_list_failed,
+                 :symlink_layout_ancestor
+               ] ->
+            error
+
+          {:error, reason} ->
+            {:error, {:quarantine_rename_failed, name, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp quarantine_destination_available?(destination, name) do
+    case File.lstat(destination) do
+      {:ok, %File.Stat{type: :symlink}} -> {:error, {:symlink_quarantine_destination, name}}
+      {:ok, _stat} -> {:error, {:quarantine_destination_exists, name}}
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:quarantine_destination_stat_failed, name, reason}}
+    end
+  end
+
+  defp already_quarantined_or_missing(destination, layout, name) do
+    case File.lstat(destination) do
+      {:ok, %File.Stat{type: :directory}} ->
+        {:ok, already_quarantined_result(destination, layout, name)}
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        {:error, {:symlink_quarantine_destination, name}}
+
+      {:ok, _stat} ->
+        {:error, {:invalid_quarantine_destination, name}}
+
+      {:error, :enoent} ->
+        {:ok, nil}
+
+      {:error, reason} ->
+        {:error, {:quarantine_destination_stat_failed, name, reason}}
+    end
+  end
+
+  defp ensure_quarantine_tree_clean(root, layout), do: do_quarantine_tree_clean(root, layout, [])
+
+  defp do_quarantine_tree_clean(dir, layout, rel) do
+    case File.ls(dir) do
+      {:ok, names} ->
+        Enum.reduce_while(names, :ok, fn name, :ok ->
+          child = Path.join(dir, name)
+          child_rel = rel ++ [name]
+
+          case File.lstat(child) do
+            {:ok, %File.Stat{type: :directory}} ->
+              case do_quarantine_tree_clean(child, layout, child_rel) do
+                :ok -> {:cont, :ok}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+
+            {:ok, %File.Stat{type: :regular}} ->
+              case validate_quarantine_file(layout, child_rel) do
+                :ok -> {:cont, :ok}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+
+            {:ok, %File.Stat{type: :symlink}} ->
+              {:halt, {:error, {:symlink_layout_path, layout, rel_path(child_rel)}}}
+
+            {:ok, %File.Stat{type: type}} ->
+              {:halt,
+               {:error, {:unsupported_layout_path_type, layout, rel_path(child_rel), type}}}
+
+            {:error, reason} ->
+              {:halt, {:error, {:layout_tree_stat_failed, layout, rel_path(child_rel), reason}}}
+          end
+        end)
+
+      {:error, reason} ->
+        {:error, {:layout_tree_list_failed, layout, rel_path(rel), reason}}
+    end
+  end
+
+  defp validate_quarantine_file("bucket", [".keep", @meta_file]), do: :ok
+
+  defp validate_quarantine_file(layout, rel),
+    do: {:error, {:unsafe_layout_file, layout, rel_path(rel)}}
+
+  defp rel_path([]), do: "."
+  defp rel_path(rel), do: Path.join(rel)
+
+  defp already_quarantined_result(destination, layout, name) do
+    %{
+      layout: layout,
+      name: name,
+      source: nil,
+      quarantine_path: destination,
+      status: "already_quarantined"
+    }
+  end
+
+  defp write_physical_removal_marker(drive_root, quarantine_id, marker, roots) do
+    marker_path = Path.join(drive_root, @physical_removal_marker)
+
+    with :ok <- ensure_strict_child(drive_root, marker_path),
+         :ok <- ensure_no_symlink_ancestors(drive_root, marker_path),
+         :ok <- reject_symlink(marker_path),
+         :ok <- File.mkdir_p(Path.join([drive_root, @quarantine_root, quarantine_id])),
+         :ok <-
+           ensure_no_symlink_ancestors(
+             drive_root,
+             Path.join([drive_root, @quarantine_root, quarantine_id])
+           ),
+         :ok <-
+           File.write(
+             marker_path,
+             Jason.encode!(
+               Map.merge(json_ready(marker), %{
+                 "quarantine_id" => quarantine_id,
+                 "quarantine_root" => Path.join([drive_root, @quarantine_root, quarantine_id]),
+                 "roots" => json_ready(roots),
+                 "written_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+               })
+             )
+           ) do
+      {:ok, marker_path}
+    else
+      {:error, reason} -> {:error, {:marker_write_failed, reason}}
+    end
+  end
+
+  defp ensure_physical_removal_marker_matches(drive_root, quarantine_id, expected_marker) do
+    marker_path = Path.join(drive_root, @physical_removal_marker)
+
+    with :ok <- ensure_strict_child(drive_root, marker_path),
+         :ok <- ensure_no_symlink_ancestors(drive_root, marker_path),
+         :ok <- reject_symlink(marker_path),
+         {:ok, marker} <- read_json_marker(marker_path),
+         :ok <- ensure_marker_field(marker, "quarantine_id", quarantine_id),
+         :ok <- ensure_marker_field(marker, "job_id", Map.get(expected_marker, "job_id")),
+         :ok <-
+           ensure_marker_field(marker, "manifest_hash", Map.get(expected_marker, "manifest_hash")) do
+      :ok
+    else
+      {:error, reason} -> {:error, {:physical_removal_marker_mismatch, reason}}
+    end
+  end
+
+  defp purge_existing_quarantine_root(drive_root, quarantine_root, quarantine_id, expected_marker) do
+    case File.lstat(quarantine_root) do
+      {:ok, %File.Stat{type: :directory}} ->
+        with {:ok, _started_marker_path} <-
+               write_physical_purge_marker(drive_root, quarantine_id, expected_marker, "purging"),
+             {:ok, summary} <- summarize_purge_tree(quarantine_root),
+             {:ok, _deleted_paths} <- remove_quarantine_tree(quarantine_root),
+             {:error, :enoent} <- File.lstat(quarantine_root) do
+          {:ok, Map.put(summary, :status, "purged")}
+        else
+          {:ok, _stat} -> {:error, {:quarantine_purge_failed, :still_exists}}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        {:error, {:symlink_quarantine_root, quarantine_root}}
+
+      {:ok, _stat} ->
+        {:error, {:invalid_quarantine_root, quarantine_root}}
+
+      {:error, :enoent} ->
+        with :ok <-
+               ensure_physical_purge_marker_matches(drive_root, quarantine_id, expected_marker) do
+          {:ok,
+           %{
+             status: "already_purged",
+             roots_deleted: 0,
+             files_deleted: 0,
+             dirs_deleted: 0,
+             bytes_deleted: 0
+           }}
+        end
+
+      {:error, reason} ->
+        {:error, {:quarantine_root_stat_failed, reason}}
+    end
+  end
+
+  defp summarize_existing_quarantine_for_purge(
+         drive_root,
+         quarantine_root,
+         quarantine_id,
+         expected_marker
+       ) do
+    case File.lstat(quarantine_root) do
+      {:ok, %File.Stat{type: :directory}} ->
+        with {:ok, summary} <- summarize_purge_tree(quarantine_root) do
+          {:ok, Map.put(summary, :status, "ready")}
+        end
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        {:error, {:symlink_quarantine_root, quarantine_root}}
+
+      {:ok, _stat} ->
+        {:error, {:invalid_quarantine_root, quarantine_root}}
+
+      {:error, :enoent} ->
+        with :ok <-
+               ensure_physical_purge_marker_matches(drive_root, quarantine_id, expected_marker) do
+          {:ok,
+           %{
+             status: "already_purged",
+             roots_deleted: 0,
+             files_deleted: 0,
+             dirs_deleted: 0,
+             bytes_deleted: 0
+           }}
+        end
+
+      {:error, reason} ->
+        {:error, {:quarantine_root_stat_failed, reason}}
+    end
+  end
+
+  defp summarize_purge_tree(root), do: do_summarize_purge_tree(root, root)
+
+  defp do_summarize_purge_tree(root, path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        with {:ok, names} <- File.ls(path) do
+          Enum.reduce_while(
+            names,
+            {:ok, %{files_deleted: 0, dirs_deleted: 1, bytes_deleted: 0}},
+            fn name, {:ok, acc} ->
+              child = Path.join(path, name)
+
+              case do_summarize_purge_tree(root, child) do
+                {:ok, summary} -> {:cont, {:ok, merge_purge_summary(acc, summary)}}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+            end
+          )
+          |> case do
+            {:ok, summary} ->
+              {:ok, Map.put(summary, :roots_deleted, if(path == root, do: 1, else: 0))}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        else
+          {:error, reason} -> {:error, {:purge_tree_list_failed, relative_to(root, path), reason}}
+        end
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        {:ok, %{roots_deleted: 0, files_deleted: 1, dirs_deleted: 0, bytes_deleted: size}}
+
+      {:ok, %File.Stat{type: :symlink}} ->
+        {:error, {:symlink_purge_path, relative_to(root, path)}}
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:unsupported_purge_path_type, relative_to(root, path), type}}
+
+      {:error, reason} ->
+        {:error, {:purge_tree_stat_failed, relative_to(root, path), reason}}
+    end
+  end
+
+  defp merge_purge_summary(left, right) do
+    %{
+      roots_deleted: Map.get(left, :roots_deleted, 0) + Map.get(right, :roots_deleted, 0),
+      files_deleted: Map.get(left, :files_deleted, 0) + Map.get(right, :files_deleted, 0),
+      dirs_deleted: Map.get(left, :dirs_deleted, 0) + Map.get(right, :dirs_deleted, 0),
+      bytes_deleted: Map.get(left, :bytes_deleted, 0) + Map.get(right, :bytes_deleted, 0)
+    }
+  end
+
+  defp remove_quarantine_tree(quarantine_root) do
+    case File.rm_rf(quarantine_root) do
+      {:ok, paths} ->
+        {:ok, paths}
+
+      {:error, reason, file} ->
+        {:error, {:quarantine_rm_rf_failed, relative_to(quarantine_root, file), reason}}
+    end
+  end
+
+  defp write_physical_purge_marker(drive_root, quarantine_id, marker, status) do
+    marker_path = Path.join(drive_root, @physical_purge_marker)
+
+    payload =
+      marker
+      |> json_ready()
+      |> Map.merge(%{
+        "quarantine_id" => quarantine_id,
+        "status" => status,
+        "written_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+      })
+
+    with :ok <- ensure_strict_child(drive_root, marker_path),
+         :ok <- ensure_no_symlink_ancestors(drive_root, marker_path),
+         :ok <- reject_symlink(marker_path),
+         :ok <- File.write(marker_path, Jason.encode!(payload)) do
+      {:ok, marker_path}
+    else
+      {:error, reason} -> {:error, {:purge_marker_write_failed, reason}}
+    end
+  end
+
+  defp read_json_marker(path) do
+    with {:ok, body} <- File.read(path),
+         {:ok, decoded} <- Jason.decode(body),
+         true <- is_map(decoded) do
+      {:ok, decoded}
+    else
+      false -> {:error, :invalid_marker_json}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_physical_purge_marker_matches(drive_root, quarantine_id, expected_marker) do
+    marker_path = Path.join(drive_root, @physical_purge_marker)
+
+    with :ok <- ensure_strict_child(drive_root, marker_path),
+         :ok <- ensure_no_symlink_ancestors(drive_root, marker_path),
+         :ok <- reject_symlink(marker_path),
+         {:ok, marker} <- read_json_marker(marker_path),
+         :ok <- ensure_marker_field(marker, "quarantine_id", quarantine_id),
+         :ok <- ensure_marker_field(marker, "job_id", Map.get(expected_marker, "job_id")),
+         :ok <-
+           ensure_marker_field(marker, "manifest_hash", Map.get(expected_marker, "manifest_hash")),
+         :ok <- ensure_marker_field(marker, "status", "purged") do
+      :ok
+    else
+      {:error, reason} -> {:error, {:physical_purge_marker_mismatch, reason}}
+    end
+  end
+
+  defp ensure_marker_field(_marker, _key, nil), do: :ok
+
+  defp ensure_marker_field(marker, key, expected) do
+    case Map.get(marker, key) do
+      ^expected -> :ok
+      actual -> {:error, {:marker_field_mismatch, key, expected, actual}}
+    end
+  end
+
+  defp validate_expected_purge_marker(%{} = marker) do
+    cond do
+      not is_binary(Map.get(marker, "job_id")) or Map.get(marker, "job_id") == "" ->
+        {:error, :missing_expected_purge_job_id}
+
+      not is_binary(Map.get(marker, "manifest_hash")) or Map.get(marker, "manifest_hash") == "" ->
+        {:error, :missing_expected_purge_manifest_hash}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_expected_purge_marker(_marker), do: {:error, :invalid_expected_purge_marker}
+
+  defp ensure_strict_child(drive_root, path) do
+    root_parts = drive_root |> Path.expand() |> Path.split()
+    path_parts = path |> Path.expand() |> Path.split()
+
+    if length(path_parts) > length(root_parts) and
+         Enum.take(path_parts, length(root_parts)) == root_parts do
+      :ok
+    else
+      {:error, {:unsafe_layout_path, path}}
+    end
+  end
+
+  defp ensure_no_symlink_ancestors(drive_root, path) do
+    root = Path.expand(drive_root)
+    expanded = Path.expand(path)
+    root_parts = Path.split(root)
+    path_parts = Path.split(expanded)
+    parent_parts = Enum.take(path_parts, max(length(path_parts) - 1, 0))
+
+    ancestor_parts =
+      length(root_parts)..length(parent_parts)
+      |> Enum.map(&Enum.take(parent_parts, &1))
+      |> Enum.reject(&(&1 == []))
+
+    Enum.reduce_while(ancestor_parts, :ok, fn parts, :ok ->
+      ancestor = Path.join(parts)
+
+      case File.lstat(ancestor) do
+        {:ok, %File.Stat{type: :directory}} ->
+          {:cont, :ok}
+
+        {:ok, %File.Stat{type: :symlink}} ->
+          {:halt,
+           {:error, {:symlink_layout_ancestor, "destination", relative_to(root, ancestor)}}}
+
+        {:ok, %File.Stat{type: type}} ->
+          {:halt,
+           {:error,
+            {:unsupported_layout_path_type, "destination", relative_to(root, ancestor), type}}}
+
+        {:error, :enoent} ->
+          {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt,
+           {:error,
+            {:layout_tree_stat_failed, "destination", relative_to(root, ancestor), reason}}}
+      end
+    end)
+  end
+
+  defp relative_to(root, path) do
+    root_parts = root |> Path.expand() |> Path.split()
+    path_parts = path |> Path.expand() |> Path.split()
+
+    path_parts
+    |> Enum.drop(length(root_parts))
+    |> rel_path()
+  end
+
+  defp reject_symlink(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} -> {:error, {:symlink_path, path}}
+      {:ok, _stat} -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:path_stat_failed, path, reason}}
+    end
+  end
+
+  defp json_ready(value) when is_atom(value), do: Atom.to_string(value)
+  defp json_ready(value) when is_list(value), do: Enum.map(value, &json_ready/1)
+
+  defp json_ready(%{} = value) do
+    Map.new(value, fn {key, item} -> {to_string(key), json_ready(item)} end)
+  end
+
+  defp json_ready(value), do: value
 
   defp do_begin_tmp(drive_root) do
     tmp = Path.join([drive_root, @tmp_root, uuid()])

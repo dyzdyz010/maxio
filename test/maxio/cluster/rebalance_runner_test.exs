@@ -124,6 +124,92 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
     assert complete.source_cleanup_status == "not_started"
   end
 
+  test "run_once rebalances mismatched object versions and delete markers to router set", ctx do
+    bucket = bucket_name("rebalance-runner-dynamic")
+    opts = dist_opts(ctx)
+    source_opts = Keyword.put(opts, :placement_set_id, 0)
+    destination_opts = Keyword.put(opts, :placement_set_id, 1)
+    key = key_for_set(bucket, ctx.topology, 1, "rebalance")
+    marker_key = key_for_set(bucket, ctx.topology, 1, "rebalance-deleted")
+    body = "rebalance-copy-pass-body"
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    :ok = Distributed.put_bucket(bucket, opts)
+
+    assert {:ok, write_result} =
+             Distributed.put(bucket, key, "v1", [body],
+               object_meta: %{content_type: "text/plain", user_metadata: %{"m" => "v"}},
+               topology: ctx.topology,
+               transport: InProcess,
+               placement_set_id: 0
+             )
+
+    {:ok, object} =
+      Objects.put_version_with_id(
+        bucket,
+        key,
+        "v1",
+        %{
+          size: byte_size(body),
+          etag: write_result.etag,
+          content_type: "text/plain",
+          metadata: %{"m" => "v"}
+        }
+        |> Map.merge(Placement.attrs_from_result(write_result))
+      )
+
+    assert :ok = Distributed.put_delete_marker(bucket, marker_key, "dm1", [], source_opts)
+    marker_attrs = Placement.attrs_for_write(bucket, marker_key, source_opts)
+
+    {:ok, _marker} =
+      Objects.insert_delete_marker_with_id(
+        bucket,
+        marker_key,
+        "dm1",
+        marker_attrs
+      )
+
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {:ok, report} =
+             Runner.run_once(job.id,
+               topology: ctx.topology,
+               transport: InProcess,
+               page_size: 1
+             )
+
+    assert report.status == :ok
+    assert report.job_kind == "rebalance"
+    assert is_nil(report.target_set_id)
+    assert is_nil(report.destination_set_id)
+    assert report.scanned == 2
+    assert report.moved == 2
+    assert report.skipped == 0
+    assert report.source_cleanup == false
+    assert report.topology_mutation == false
+
+    assert {:ok, moved_object} = Objects.get_version(bucket, key, "v1")
+    assert moved_object.placement_set_id == 1
+    assert moved_object.updated_at == object.updated_at
+
+    assert {:ok, destination_stream} = Distributed.get(bucket, key, "v1", nil, destination_opts)
+    assert IO.iodata_to_binary(Enum.to_list(destination_stream)) == body
+
+    assert {:ok, source_stream} = Distributed.get(bucket, key, "v1", nil, source_opts)
+    assert IO.iodata_to_binary(Enum.to_list(source_stream)) == body
+
+    assert {:ok, moved_marker} = Objects.get_version(bucket, marker_key, "dm1")
+    assert moved_marker.placement_set_id == 1
+    assert delete_marker_sidecar?(ctx.topology, marker_key, bucket, "dm1", 1)
+    assert delete_marker_sidecar?(ctx.topology, marker_key, bucket, "dm1", 0)
+
+    assert {:ok, complete} = Jobs.get(job.id)
+    assert complete.status == "complete"
+    assert complete.data_movement_status == "complete"
+    assert complete.source_cleanup_status == "not_started"
+    assert is_nil(complete.destination_set_id)
+  end
+
   test "max_versions leaves job running and next pass resumes from cursor", ctx do
     bucket = bucket_name("rebalance-partial")
     opts = dist_opts(ctx)
@@ -174,6 +260,53 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
     assert complete.status == :ok
     assert complete.scanned == 2
     assert complete.moved == 2
+    assert {:ok, finished} = Jobs.get(job.id)
+    assert finished.status == "complete"
+    assert is_nil(finished.cursor_bucket)
+  end
+
+  test "rebalance max_versions advances cursor across already-correct rows", ctx do
+    bucket = bucket_name("rebalance-resume-skips")
+    opts = dist_opts(ctx)
+    set0_opts = Keyword.put(opts, :placement_set_id, 0)
+    key_skip = key_for_set(bucket, ctx.topology, 0, "a-skip")
+    key_move = key_for_set(bucket, ctx.topology, 1, "z-move")
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    :ok = Distributed.put_bucket(bucket, opts)
+    {:ok, _skip} = put_object_version!(bucket, key_skip, "v1", "already-correct", set0_opts)
+    {:ok, _move} = put_object_version!(bucket, key_move, "v1", "needs-rebalance", set0_opts)
+
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {:ok, partial} =
+             Runner.run_once(job.id,
+               topology: ctx.topology,
+               transport: InProcess,
+               max_versions: 1
+             )
+
+    assert partial.status == :partial
+    assert partial.scanned == 1
+    assert partial.moved == 0
+    assert partial.skipped == 1
+
+    assert {:ok, running} = Jobs.get(job.id)
+    assert running.status == "running"
+    assert running.cursor_bucket == bucket
+    assert running.cursor_key_marker == key_skip
+
+    assert {:ok, complete} =
+             Runner.run_once(job.id, topology: ctx.topology, transport: InProcess)
+
+    assert complete.status == :ok
+    assert complete.scanned == 2
+    assert complete.moved == 1
+    assert complete.skipped == 1
+
+    assert {:ok, moved} = Objects.get_version(bucket, key_move, "v1")
+    assert moved.placement_set_id == 1
+
     assert {:ok, finished} = Jobs.get(job.id)
     assert finished.status == "complete"
     assert is_nil(finished.cursor_bucket)
@@ -240,6 +373,59 @@ defmodule Maxio.Cluster.RebalanceRunnerTest do
                topology: ctx.topology,
                authoritative_source: [read: :pg, list: :sidecar]
              )
+  end
+
+  test "rebalance runner refuses sidecar read authority", ctx do
+    bucket = bucket_name("rebalance-authority")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, ctx.topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 1,
+        etag: "e1",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {:error, {:unsupported_authoritative_source, :read, :sidecar}} =
+             Runner.run_once(job.id,
+               topology: ctx.topology,
+               authoritative_source: [read: :sidecar, list: :pg]
+             )
+  end
+
+  test "rebalance fails closed when a row lacks persisted placement", ctx do
+    bucket = bucket_name("rebalance-missing-placement")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+    key = key_for_set(bucket, ctx.topology, 0)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 1,
+        etag: "e1"
+      })
+
+    assert {:ok, report} =
+             Runner.run_once(job.id, topology: ctx.topology, transport: InProcess)
+
+    assert report.status == :failed
+    assert report.errors == 1
+
+    assert {:ok, failed} = Jobs.get(job.id)
+    assert failed.status == "failed"
+    assert failed.data_movement_status == "failed"
+    assert failed.error_reason =~ "rebalance_run_failed"
+  end
+
+  test "source cleanup waits for completed rebalance data movement", ctx do
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {:error, {:data_movement_not_complete, "not_started"}} =
+             Jobs.begin_source_cleanup(job.id)
   end
 
   test "runner validates destination set boundaries before copying", ctx do

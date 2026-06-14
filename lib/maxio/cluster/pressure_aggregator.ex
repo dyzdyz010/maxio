@@ -20,7 +20,8 @@ defmodule Maxio.Cluster.PressureAggregator do
   @type snapshot :: %{
           s3_in_flight: non_neg_integer(),
           storage_ops: non_neg_integer(),
-          combined: non_neg_integer()
+          combined: non_neg_integer(),
+          drive_device_io: non_neg_integer()
         }
 
   @doc false
@@ -209,14 +210,22 @@ defmodule Maxio.Cluster.PressureAggregator do
         s3 + storage
       )
 
+    drive_device_io =
+      non_negative_int(
+        Map.get(snapshot, :drive_device_io) || Map.get(snapshot, "drive_device_io"),
+        0
+      )
+
     %{
       s3_in_flight: s3,
       storage_ops: storage,
-      combined: combined
+      combined: combined,
+      drive_device_io: drive_device_io
     }
   end
 
-  defp normalize_snapshot(_snapshot), do: %{s3_in_flight: 0, storage_ops: 0, combined: 0}
+  defp normalize_snapshot(_snapshot),
+    do: %{s3_in_flight: 0, storage_ops: 0, combined: 0, drive_device_io: 0}
 
   defp peer_nodes(opts, state) do
     opts

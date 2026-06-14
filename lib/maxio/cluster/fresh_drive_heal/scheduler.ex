@@ -9,7 +9,8 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
 
   use GenServer
 
-  alias Maxio.Cluster.{DriveHealth, FreshDriveHeal, Lock, Topology}
+  alias Maxio.Cluster.{DriveHealth, FreshDriveHeal, Lock, SchedulerRuns, Topology}
+  alias Maxio.Cluster.Rebalance.Jobs
   alias Maxio.S3.Log
 
   @lock_resource {:fresh_drive_heal_scheduler, :run}
@@ -41,6 +42,31 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
     :drive_offline_after_ms,
     :drive_health_now_fun,
     :drive_health_now_ms
+  ]
+
+  @rebalance_start_keys [
+    :topology,
+    :page_size,
+    :include_drive_stats,
+    :drive_stats_fun,
+    :topology_lock_opts,
+    :lock_opts
+  ]
+
+  @rebalance_advance_keys [
+    :topology,
+    :transport,
+    :page_size,
+    :max_versions,
+    :authoritative_source,
+    :audit_page_size,
+    :auto_source_cleanup,
+    :auto_rebalance_closure,
+    :lock_nodes,
+    :lock_ttl_ms,
+    :lock_timeout_ms,
+    :lock_heartbeat_ms,
+    :runner_lock_opts
   ]
 
   @doc false
@@ -101,7 +127,7 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
 
   @impl true
   def handle_call({:run_now, opts}, _from, state) do
-    {result, state} = run_cycle(state, opts)
+    {result, state} = run_cycle(state, opts, :manual)
     {:reply, result, state}
   end
 
@@ -118,22 +144,93 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
 
   @impl true
   def handle_info(:run, %{enabled: true} = state) do
-    {_result, state} = run_cycle(%{state | timer_ref: nil}, [])
+    {_result, state} = run_cycle(%{state | timer_ref: nil}, [], :scheduled)
     {:noreply, schedule(state, state.interval_ms)}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  defp run_cycle(state, opts) do
+  defp run_cycle(state, opts, trigger) do
     cfg = config(Keyword.merge(state.base_opts, opts))
-    result = locked_run(cfg)
+    started_at = ledger_now(cfg)
+
+    result =
+      case maybe_skip_for_backoff(cfg, trigger, started_at) do
+        :run -> locked_run(cfg)
+        {:skip, reason} -> {:error, reason}
+      end
+
+    finished_at = ledger_now(cfg)
+    record_scheduler_run(cfg, trigger, started_at, finished_at, result)
+
     {result, record_result(state, result)}
+  end
+
+  defp maybe_skip_for_backoff(_cfg, :manual, _now), do: :run
+
+  defp maybe_skip_for_backoff(cfg, :scheduled, now) do
+    ledger_opts = cfg[:scheduler_ledger]
+
+    if Keyword.get(ledger_opts, :enabled, true) do
+      scheduler = Keyword.fetch!(ledger_opts, :scheduler)
+
+      case SchedulerRuns.backoff_active?(scheduler, Keyword.put(ledger_opts, :now, now)) do
+        {:ok, nil} ->
+          :run
+
+        {:ok, state} ->
+          {:skip, {:backoff_active, DateTime.to_iso8601(state.backoff_until)}}
+
+        {:error, reason} ->
+          Log.warn("fresh-drive heal scheduler ledger backoff check failed",
+            action: :fresh_drive_heal_scheduler,
+            reason: inspect(reason)
+          )
+
+          :run
+      end
+    else
+      :run
+    end
+  end
+
+  defp record_scheduler_run(cfg, trigger, started_at, finished_at, result) do
+    ledger_opts = cfg[:scheduler_ledger]
+
+    if Keyword.get(ledger_opts, :enabled, true) do
+      scheduler = Keyword.fetch!(ledger_opts, :scheduler)
+
+      case SchedulerRuns.record(scheduler, trigger, started_at, finished_at, result, ledger_opts) do
+        {:ok, _recorded} ->
+          :ok
+
+        {:error, :scheduler_ledger_disabled} ->
+          :ok
+
+        {:error, reason} ->
+          Log.warn("fresh-drive heal scheduler ledger record failed",
+            action: :fresh_drive_heal_scheduler,
+            reason: inspect(reason)
+          )
+      end
+    else
+      :ok
+    end
+  end
+
+  defp ledger_now(cfg) do
+    case Keyword.get(cfg[:scheduler_ledger], :now_fun) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> DateTime.utc_now()
+    end
+  rescue
+    _ -> DateTime.utc_now()
   end
 
   defp locked_run(cfg) do
     case Lock.quorum_with_lock(@lock_resource, fn -> do_run(cfg) end, lock_opts(cfg)) do
       {:ok, {:ok, report}} ->
-        {:ok, report}
+        {:ok, maybe_advance_rebalance(report, cfg)}
 
       {:ok, {:error, reason}} ->
         {:error, reason}
@@ -170,9 +267,163 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
     end
 
     case cfg[:runner].(cfg[:run_opts]) do
-      {:ok, report} -> {:ok, report}
+      {:ok, report} -> {:ok, maybe_enqueue_rebalance(report, cfg)}
       other -> {:error, {:bad_runner_result, other}}
     end
+  end
+
+  defp maybe_enqueue_rebalance(report, cfg) do
+    if cfg[:auto_rebalance_after_heal] do
+      maybe_enqueue_rebalance_enabled(report, cfg)
+    else
+      report
+    end
+  end
+
+  defp maybe_enqueue_rebalance_enabled(%{status: :ok, drives_cleared: cleared} = report, cfg)
+       when is_integer(cleared) and cleared > 0 do
+    case cfg[:rebalance_starter].(rebalance_start_opts(cfg)) do
+      {:ok, {:created, job}} ->
+        Log.info("fresh-drive heal scheduler enqueued rebalance job",
+          action: :fresh_drive_heal_scheduler,
+          reason: "job_id=#{job.id} drives_cleared=#{cleared}"
+        )
+
+        put_rebalance_enqueue(report, %{
+          status: :created,
+          job_id: job.id,
+          kind: job.kind,
+          plan_scanned: job.plan_scanned,
+          plan_routing_mismatches: get_in(job.plan, ["routing_mismatches"]) || 0
+        })
+
+      {:ok, :not_needed} ->
+        Log.info("fresh-drive heal scheduler skipped rebalance enqueue",
+          action: :fresh_drive_heal_scheduler,
+          reason: "rebalance_not_needed drives_cleared=#{cleared}"
+        )
+
+        put_rebalance_enqueue(report, %{status: :not_needed, reason: :rebalance_not_needed})
+
+      {:error, {:active_job_exists, job}} ->
+        Log.warn("fresh-drive heal scheduler skipped rebalance enqueue",
+          action: :fresh_drive_heal_scheduler,
+          reason: "active_job_exists job_id=#{job.id} kind=#{job.kind} status=#{job.status}"
+        )
+
+        put_rebalance_enqueue(report, %{
+          status: :skipped,
+          reason: :active_job_exists,
+          job_id: job.id,
+          kind: job.kind,
+          job_status: job.status
+        })
+
+      {:error, reason} ->
+        Log.error("fresh-drive heal scheduler rebalance enqueue failed",
+          action: :fresh_drive_heal_scheduler,
+          reason: inspect(reason)
+        )
+
+        put_rebalance_enqueue(report, %{status: :failed, reason: inspect(reason)})
+
+      other ->
+        Log.error("fresh-drive heal scheduler rebalance starter returned bad result",
+          action: :fresh_drive_heal_scheduler,
+          reason: inspect(other)
+        )
+
+        put_rebalance_enqueue(report, %{
+          status: :failed,
+          reason: inspect({:bad_rebalance_starter_result, other})
+        })
+    end
+  end
+
+  defp maybe_enqueue_rebalance_enabled(report, _cfg) do
+    put_rebalance_enqueue(report, %{
+      status: :not_eligible,
+      reason: Map.get(report, :status),
+      drives_cleared: Map.get(report, :drives_cleared, 0)
+    })
+  end
+
+  defp put_rebalance_enqueue(report, enqueue), do: Map.put(report, :rebalance_enqueue, enqueue)
+
+  defp rebalance_start_opts(cfg) do
+    Keyword.put_new(cfg[:rebalance_start_opts], :topology_lock_opts, lock_opts(cfg))
+  end
+
+  defp maybe_advance_rebalance(report, cfg) do
+    if cfg[:auto_advance_rebalance_after_heal] do
+      maybe_advance_rebalance_enabled(report, cfg)
+    else
+      report
+    end
+  end
+
+  defp maybe_advance_rebalance_enabled(
+         %{rebalance_enqueue: %{status: :created, job_id: job_id}} = report,
+         cfg
+       )
+       when is_binary(job_id) do
+    opts = rebalance_advancer_opts_for_job(cfg, job_id)
+
+    case cfg[:rebalance_advancer].(opts) do
+      {:ok, advance} when is_map(advance) ->
+        Log.info("fresh-drive heal scheduler advanced rebalance job",
+          action: :fresh_drive_heal_scheduler,
+          reason:
+            "job_id=#{job_id} status=#{Map.get(advance, :status)} steps=#{Map.get(advance, :steps)}"
+        )
+
+        put_rebalance_advance(report, normalize_rebalance_advance(advance))
+
+      {:error, reason} ->
+        Log.error("fresh-drive heal scheduler rebalance advance failed",
+          action: :fresh_drive_heal_scheduler,
+          reason: "job_id=#{job_id} reason=#{inspect(reason)}"
+        )
+
+        put_rebalance_advance(report, %{status: :failed, job_id: job_id, reason: inspect(reason)})
+
+      other ->
+        Log.error("fresh-drive heal scheduler rebalance advancer returned bad result",
+          action: :fresh_drive_heal_scheduler,
+          reason: "job_id=#{job_id} result=#{inspect(other)}"
+        )
+
+        put_rebalance_advance(report, %{
+          status: :failed,
+          job_id: job_id,
+          reason: inspect({:bad_rebalance_advancer_result, other})
+        })
+    end
+  end
+
+  defp maybe_advance_rebalance_enabled(report, _cfg) do
+    enqueue = Map.get(report, :rebalance_enqueue)
+
+    put_rebalance_advance(report, %{
+      status: :not_eligible,
+      reason: rebalance_advance_skip_reason(enqueue)
+    })
+  end
+
+  defp put_rebalance_advance(report, advance), do: Map.put(report, :rebalance_advance, advance)
+
+  defp normalize_rebalance_advance(%{} = advance) do
+    Map.take(advance, [:status, :job_id, :steps, :phases, :terminal_phase, :blockers, :reason])
+  end
+
+  defp rebalance_advance_skip_reason(%{status: status}), do: {:rebalance_enqueue, status}
+  defp rebalance_advance_skip_reason(_enqueue), do: :rebalance_not_enqueued
+
+  defp rebalance_advancer_opts_for_job(cfg, job_id) do
+    cfg[:rebalance_advance_opts]
+    |> Keyword.put(:job_id, job_id)
+    |> Keyword.put(:max_steps, cfg[:rebalance_advance_max_steps])
+    |> Keyword.put_new(:lock_nodes, lock_nodes(cfg))
   end
 
   defp record_result(state, {:ok, report}) do
@@ -205,6 +456,27 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
         ),
       probe_drive_health:
         Keyword.get(opts, :probe_drive_health, Keyword.get(cfg, :probe_drive_health, true)),
+      auto_rebalance_after_heal:
+        Keyword.get(
+          opts,
+          :auto_rebalance_after_heal,
+          Keyword.get(cfg, :auto_rebalance_after_heal, false)
+        ),
+      auto_advance_rebalance_after_heal:
+        Keyword.get(
+          opts,
+          :auto_advance_rebalance_after_heal,
+          Keyword.get(cfg, :auto_advance_rebalance_after_heal, false)
+        ),
+      rebalance_advance_max_steps:
+        positive_int(
+          Keyword.get(
+            opts,
+            :rebalance_advance_max_steps,
+            Keyword.get(cfg, :rebalance_advance_max_steps, 2)
+          ),
+          2
+        ),
       lock_nodes: Keyword.get(opts, :lock_nodes, Keyword.get(cfg, :lock_nodes)),
       lock_ttl_ms: Keyword.get(opts, :lock_ttl_ms, Keyword.get(cfg, :lock_ttl_ms, 60_000)),
       lock_timeout_ms:
@@ -212,9 +484,37 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
       lock_heartbeat_ms:
         Keyword.get(opts, :lock_heartbeat_ms, Keyword.get(cfg, :lock_heartbeat_ms)),
       run_opts: run_opts(opts, cfg),
+      rebalance_start_opts: rebalance_start_opts(opts, cfg),
+      rebalance_advance_opts: rebalance_advance_opts(opts, cfg),
       runner: runner(opts, cfg),
-      probe_fun: probe_fun(opts, cfg)
+      rebalance_starter: rebalance_starter(opts, cfg),
+      rebalance_advancer: rebalance_advancer(opts, cfg),
+      probe_fun: probe_fun(opts, cfg),
+      scheduler_ledger: scheduler_ledger_opts(opts, cfg, "fresh_drive_heal")
     ]
+  end
+
+  defp scheduler_ledger_opts(opts, cfg, scheduler) do
+    app_cfg = Application.get_env(:maxio, :scheduler_ledger, [])
+    scheduler_cfg = Keyword.get(cfg, :scheduler_ledger, [])
+    opts_cfg = Keyword.get(opts, :scheduler_ledger, [])
+
+    enabled =
+      Keyword.get(
+        opts,
+        :ledger_enabled,
+        Keyword.get(
+          opts_cfg,
+          :enabled,
+          Keyword.get(scheduler_cfg, :enabled, Keyword.get(app_cfg, :enabled, true))
+        )
+      )
+
+    app_cfg
+    |> Keyword.merge(scheduler_cfg)
+    |> Keyword.merge(opts_cfg)
+    |> Keyword.put(:scheduler, scheduler)
+    |> Keyword.put(:enabled, enabled)
   end
 
   defp run_opts(opts, cfg) do
@@ -225,10 +525,44 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
     |> Keyword.put_new(:scan_versions, true)
   end
 
+  defp rebalance_start_opts(opts, cfg) do
+    cfg
+    |> Keyword.get(:rebalance_start_opts, [])
+    |> Keyword.merge(Keyword.get(opts, :rebalance_start_opts, []))
+    |> Keyword.merge(Keyword.take(opts, @rebalance_start_keys))
+    |> Keyword.merge(Keyword.take(run_opts(opts, cfg), [:topology, :page_size]))
+    |> Keyword.put_new(:requested_by, "fresh_drive_heal_scheduler")
+  end
+
+  defp rebalance_advance_opts(opts, cfg) do
+    cfg
+    |> Keyword.get(:rebalance_advance_opts, [])
+    |> Keyword.merge(Keyword.get(opts, :rebalance_advance_opts, []))
+    |> Keyword.merge(Keyword.take(opts, @rebalance_advance_keys))
+    |> Keyword.merge(Keyword.take(run_opts(opts, cfg), [:topology, :transport, :page_size]))
+    |> Keyword.put_new(:auto_source_cleanup, true)
+    |> Keyword.put(:auto_runtime_topology, false)
+    |> Keyword.put(:auto_deployment_topology, false)
+  end
+
   defp runner(opts, cfg) do
     case Keyword.get(opts, :runner, Keyword.get(cfg, :runner)) do
       fun when is_function(fun, 1) -> fun
       _ -> &FreshDriveHeal.run_once/1
+    end
+  end
+
+  defp rebalance_starter(opts, cfg) do
+    case Keyword.get(opts, :rebalance_starter, Keyword.get(cfg, :rebalance_starter)) do
+      fun when is_function(fun, 1) -> fun
+      _ -> &Jobs.start_rebalance_if_needed/1
+    end
+  end
+
+  defp rebalance_advancer(opts, cfg) do
+    case Keyword.get(opts, :rebalance_advancer, Keyword.get(cfg, :rebalance_advancer)) do
+      fun when is_function(fun, 1) -> fun
+      _ -> &Maxio.Cluster.Rebalance.Scheduler.run_steps/1
     end
   end
 

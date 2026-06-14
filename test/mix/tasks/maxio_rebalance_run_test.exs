@@ -57,6 +57,65 @@ defmodule Mix.Tasks.Maxio.RebalanceRunTest do
     assert is_nil(unchanged.destination_set_id)
   end
 
+  test "dry-run prints rebalance copy-pass report without destination flag" do
+    topology = topology()
+    :persistent_term.put(@topology_key, topology)
+
+    bucket = bucket_name("rebalance-run-cli-dynamic")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, topology, 1)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 5,
+        etag: "e5",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, job} = Jobs.start_rebalance(include_drive_stats: false)
+
+    output =
+      capture_io(fn ->
+        Run.run(["--job-id", job.id, "--dry-run"])
+      end)
+
+    assert output =~ "[maxio rebalance.run]"
+    assert output =~ "kind=rebalance"
+    assert output =~ "status=dry_run"
+    assert output =~ "moved=1"
+    assert output =~ "source_cleanup=false"
+    assert output =~ "topology_mutation=false"
+
+    assert {:ok, unchanged} = Jobs.get(job.id)
+    assert unchanged.status == "planned"
+    assert unchanged.progress_scanned == 0
+    assert is_nil(unchanged.destination_set_id)
+  end
+
+  test "rebalance run rejects decommission-only destination flags" do
+    topology = topology()
+    :persistent_term.put(@topology_key, topology)
+
+    bucket = bucket_name("rebalance-run-cli-dynamic-dest")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    key = key_for_set(bucket, topology, 1)
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 5,
+        etag: "e5",
+        placement_set_id: 0,
+        placement_topology_hash: "topo-a"
+      })
+
+    {:ok, job} = Jobs.start_rebalance(include_drive_stats: false)
+
+    assert_raise Mix.Error, ~r/per-object destinations/, fn ->
+      Run.run(["--job-id", job.id, "--destination-set", "1", "--dry-run"])
+    end
+  end
+
   test "dry-run can choose destination from free space telemetry" do
     topology = topology()
     :persistent_term.put(@topology_key, topology)

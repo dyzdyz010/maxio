@@ -62,6 +62,87 @@ defmodule Maxio.Policy.StoreTest do
     assert [] = Store.principal_policies(%{type: :iam_user, arn: principal_arn})
   end
 
+  test "managed session policy registry create, put, list, get, and delete" do
+    policy_arn = "arn:aws:iam:::policy/session-read"
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::identity/*"}})
+
+    put_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::identity/*"}})
+
+    assert :ok = Store.create_managed_session_policy(policy_arn, policy)
+    assert {:error, :already_exists} = Store.create_managed_session_policy(policy_arn, put_policy)
+
+    assert {:error, :already_exists} =
+             Store.create_managed_session_policy(String.upcase(policy_arn), put_policy)
+
+    assert Enum.any?(Store.list_managed_session_policies(), &(&1.policy_arn == policy_arn))
+
+    assert {:ok, json} = Store.managed_session_policy(policy_arn)
+    assert {:ok, decoded} = Jason.decode(json)
+    assert get_in(decoded, ["Statement", "Action"]) == "s3:GetObject"
+
+    assert :ok = Store.put_managed_session_policy(policy_arn, put_policy)
+    assert {:ok, put_json} = Store.managed_session_policy(policy_arn)
+    assert {:ok, put_decoded} = Jason.decode(put_json)
+    assert get_in(put_decoded, ["Statement", "Action"]) == "s3:PutObject"
+
+    assert :ok = Store.delete_managed_session_policy(policy_arn)
+    assert {:error, :not_found} = Store.managed_session_policy(policy_arn)
+    assert {:error, :not_found} = Store.managed_session_policy("arn:aws:iam:::policy/missing")
+  end
+
+  test "role attached managed policies participate in role principal policies" do
+    role_arn = "arn:aws:iam:::role/store-attached-role"
+    policy_arn = "arn:aws:iam:::policy/store-attached-read"
+    unattached_policy_arn = "arn:aws:iam:::policy/store-unattached-write"
+
+    trust_policy = %{
+      "Version" => "2012-10-17",
+      "Statement" => %{
+        "Effect" => "Allow",
+        "Principal" => %{"AWS" => "arn:aws:iam:::root"},
+        "Action" => "sts:AssumeRole"
+      }
+    }
+
+    {:ok, _role} =
+      Maxio.IAM.create_role(
+        role_name: "store-attached-role",
+        trust_policy: trust_policy
+      )
+
+    read_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::attached/*"}})
+
+    write_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::attached/*"}})
+
+    assert :ok = Store.create_managed_session_policy(policy_arn, read_policy)
+    assert :ok = Store.create_managed_session_policy(unattached_policy_arn, write_policy)
+
+    assert :ok = Store.attach_role_managed_policy(role_arn, policy_arn)
+
+    assert [%Maxio.Policy.Statement{actions: ["s3:GetObject"]}] =
+             Store.principal_policies(%{arn: role_arn})
+
+    assert [
+             %{
+               role_arn: ^role_arn,
+               policy_arn: ^policy_arn,
+               document: %{"Statement" => %{"Action" => "s3:GetObject"}}
+             }
+           ] = Store.list_attached_role_managed_policies(role_arn)
+
+    assert Store.managed_session_policy_attached?(policy_arn)
+    refute Store.managed_session_policy_attached?(unattached_policy_arn)
+    assert {:error, :policy_attached} = Store.delete_managed_session_policy(policy_arn)
+
+    assert :ok = Store.detach_role_managed_policy(role_arn, policy_arn)
+    assert [] = Store.principal_policies(%{arn: role_arn})
+  end
+
   test "principal identity policy rejects explicit Principal" do
     bad =
       ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::identity/*"}})
@@ -88,5 +169,9 @@ defmodule Maxio.Policy.StoreTest do
 
     assert :ok = Store.delete_principal_policy(principal_arn, "list")
     assert_receive {:principal_policy_changed, ^principal_arn}
+
+    managed_policy_arn = "arn:aws:iam:::policy/notify-session-boundary"
+    assert :ok = Store.put_managed_session_policy(managed_policy_arn, identity_policy)
+    assert_receive {:managed_session_policy_changed, ^managed_policy_arn}
   end
 end

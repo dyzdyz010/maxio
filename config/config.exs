@@ -46,7 +46,22 @@ config :tailwind,
 # Configure Elixir's Logger
 config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id, :bucket, :key, :action, :auth_type, :reason, :code, :status]
+  metadata: [
+    :request_id,
+    :bucket,
+    :key,
+    :action,
+    :auth_type,
+    :reason,
+    :code,
+    :status,
+    :principal_arn,
+    :mfa_serial_hash,
+    :mfa_device_status,
+    :mfa_outcome,
+    :mfa_reason,
+    :mfa_window_offset
+  ]
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
@@ -64,6 +79,10 @@ config :maxio, :s3,
   data_dir: Path.expand("../priv/s3_data", __DIR__),
   root_user: "minioadmin",
   root_password: "minioadmin"
+
+# Local single-account identity used by STS GetCallerIdentity. Full multi-account
+# IAM/account-id semantics remain a later IAM expansion.
+config :maxio, :sts, account_id: "000000000000"
 
 # 独立 S3 Endpoint（Bandit child）监听配置。
 # prod/默认 9000（对齐 MinIO）；dev 因 Windows 9000–9099 保留段改用 9900（见 dev.exs）；
@@ -96,9 +115,21 @@ config :maxio, :erasure,
 config :maxio, :storage_backend, Maxio.Storage.FS
 config :maxio, :credential_store, Maxio.Auth.CredentialStore.EctoStore
 config :maxio, :policy_store, Maxio.Policy.Store.EctoStore
+config :maxio, :mfa_delete_verifier, Maxio.IAM.MFADeleteVerifier
+
+# Local MFA TOTP seed envelope key. Dev/test uses a fixed 32B key; production
+# must provide MAXIO_MFA_SECRET_KEY in runtime.exs so encrypted seeds are not
+# recoverable from repository defaults.
+if config_env() in [:dev, :test] do
+  config :maxio, :mfa, secret_key: "bWF4aW8tbWZhLWRlbGV0ZS1tYXN0ZXIta2V5LTMyYiE="
+end
 
 # M7 分片传输实现（prod = :erpc 到每节点 ShardServer；test 经 opts[:transport] 覆盖为 InProcess）。
 config :maxio, :shard_transport, Maxio.Cluster.Transport.Erpc
+
+# Deployment topology source. The default reads `config :maxio, Maxio.Cluster.Topology`.
+# Operators may switch to :db after persisting a validated active topology revision.
+config :maxio, :topology_source, :config
 
 # ROUTE B B1-2 耐久性：写路径 temp-then-rename 提交时是否 fsync（part.0 文件 + final 目录）。
 # 默认 true（prod 掉电不丢已确认写；fsync-before-quorum 让 write_quorum 不是耐久谎言）；
@@ -150,15 +181,57 @@ config :maxio, :drive_identity,
 # disksup and remains read-only. Tests may inject `provider: fun/1`.
 config :maxio, :drive_stats, provider: nil
 
+# M8 drive hardware evidence telemetry. Read-only; hashes raw serial/WWID by
+# default and never gates healing, quorum, placement, or physical deletion.
+config :maxio, :drive_hardware_evidence, provider: nil
+
+# M8 pool-level write placement. Default :hash preserves the stable M7 object
+# hash route. Operators may opt into :weighted_free_space for MinIO-style
+# server-pool expansion behavior: choose a healthy pool weighted by free bytes,
+# then hash within that pool's set list. Existing object reads still use
+# persisted placement; this does not migrate old data or mutate topology.
+config :maxio, :pool_write_policy,
+  mode: :hash,
+  max_used_percent_x100: 9_900,
+  exclude_pool_ids: []
+
+# M8 scheduler run ledger. Enabled only as an audit sidecar around scheduler
+# passes; it does not enable any scheduler or execute heal/rebalance work by
+# itself. Automatic scheduled passes enter backoff after repeated blocked/failed
+# results, while manual run_now remains available for operator recovery.
+config :maxio, :scheduler_ledger,
+  enabled: true,
+  failure_threshold: 3,
+  backoff_ms: 300_000,
+  max_summary_bytes: 16_384,
+  alert_sink: nil
+
+# M8 scheduler run ledger retention. Default-off operator policy for pruning old
+# raw run rows only after durable rollups already exist and still verify.
+config :maxio, :scheduler_ledger_retention,
+  enabled: false,
+  retain_days: nil,
+  window_minutes: 60,
+  max_windows: 8_784
+
 # M8 fresh-drive heal scheduler. Disabled by default; when enabled it automates
-# only the existing DriveHealth.heal_required? marker workflow. It does not track
-# physical drive identity or perform rebalance/decommission.
+# only the existing DriveHealth.heal_required? marker workflow. The optional
+# auto_rebalance_after_heal bridge only enqueues a durable rebalance job after a
+# clean marker-clearing pass; the optional auto_advance_rebalance_after_heal drain
+# reuses the normal rebalance scheduler for a bounded number of same-job
+# copy/cleanup/closure steps. It does not perform decommission, topology mutation,
+# physical removal, or physical drive actions.
 config :maxio, :fresh_drive_heal_scheduler,
   enabled: false,
   interval_ms: 86_400_000,
   initial_delay_ms: 60_000,
   probe_drive_health: true,
+  auto_rebalance_after_heal: false,
+  auto_advance_rebalance_after_heal: false,
+  rebalance_advance_max_steps: 2,
   run_opts: [],
+  rebalance_start_opts: [],
+  rebalance_advance_opts: [],
   lock_ttl_ms: 60_000,
   lock_timeout_ms: 3_000
 
@@ -166,13 +239,20 @@ config :maxio, :fresh_drive_heal_scheduler,
 # existing decommission copy-pass and guarded source cleanup primitives. Operators
 # must still create jobs. If no destination set is explicitly configured, the
 # scheduler asks the runner to choose one from DriveStats free-space telemetry.
-# It does not mutate topology or remove pools from deployment config.
+# Cluster runtime topology apply and DB-backed deployment topology
+# persistence/verification are additional explicit opt-ins. Runtime apply only
+# runs when both auto_runtime_topology and auto_deployment_topology are enabled
+# with :topology_source == :db. Rebalance closure audit recording is a separate
+# explicit opt-in. None of these paths removes physical pools.
 config :maxio, :rebalance_scheduler,
   enabled: false,
   interval_ms: 300_000,
   initial_delay_ms: 60_000,
   auto_source_cleanup: true,
   auto_destination: true,
+  auto_runtime_topology: false,
+  auto_deployment_topology: false,
+  auto_rebalance_closure: false,
   destination_sets: %{},
   run_opts: [],
   lock_ttl_ms: 60_000,

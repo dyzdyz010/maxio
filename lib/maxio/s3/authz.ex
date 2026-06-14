@@ -73,8 +73,11 @@ defmodule Maxio.S3.Authz do
     }
 
     case Evaluator.evaluate(ctx, statements) do
-      :allow -> :ok
-      {:deny, reason} -> deny(conn, :put_object_tagging, required_action, resource, reason)
+      :allow ->
+        authorize_session_policy!(conn, principal, required_action, resource, conditions)
+
+      {:deny, reason} ->
+        deny(conn, :put_object_tagging, required_action, resource, reason)
     end
   end
 
@@ -101,6 +104,8 @@ defmodule Maxio.S3.Authz do
 
     case Evaluator.evaluate(ctx, statements) do
       :allow ->
+        authorize_session_policy!(conn, principal, required_action, resource, conditions)
+
         maybe_authorize_acl_headers(
           conn,
           action,
@@ -137,6 +142,73 @@ defmodule Maxio.S3.Authz do
         ]
   def object_statements(bucket, key, principal),
     do: gather_statements(:object, bucket, key, principal, nil, nil)
+
+  @doc """
+  Evaluates inline AssumeRole session policy as a permissions boundary.
+
+  The normal S3 authorization path may include owner/resource-policy/ACL allows.
+  When an assumed-role principal carries a session policy, AWS session
+  permissions are still bounded by the role identity policy and the inline
+  session policy. Both are evaluated here with owner shortcuts disabled so the
+  boundary cannot grant permissions the role lacks.
+  """
+  @spec session_policy_allows?(
+          map() | :anonymous,
+          String.t(),
+          String.t(),
+          map()
+        ) :: boolean()
+  def session_policy_allows?(
+        %{session_policy_statements: :invalid},
+        _action,
+        _resource,
+        _conditions
+      ),
+      do: false
+
+  def session_policy_allows?(
+        %{session_policy_statements: statements} = principal,
+        action,
+        resource,
+        conditions
+      )
+      when is_list(statements) do
+    if statements == [] do
+      true
+    else
+      identity_policy_allows?(principal, action, resource, conditions) and
+        evaluates_to_allow?(statements, principal, action, resource, conditions)
+    end
+  end
+
+  def session_policy_allows?(_principal, _action, _resource, _conditions), do: true
+
+  defp identity_policy_allows?(principal, action, resource, conditions) do
+    principal
+    |> Store.principal_policies()
+    |> evaluates_to_allow?(principal, action, resource, conditions)
+  end
+
+  defp evaluates_to_allow?(statements, principal, action, resource, conditions) do
+    ctx = %RequestContext{
+      principal: principal,
+      authenticated?: principal != :anonymous,
+      owner?: false,
+      action: action,
+      resource: resource,
+      conditions: conditions
+    }
+
+    Evaluator.evaluate(ctx, statements) == :allow
+  end
+
+  defp authorize_session_policy!(conn, principal, action, resource, conditions) do
+    if session_policy_allows?(principal, action, resource, conditions) do
+      :ok
+    else
+      deny(conn, :session_policy, action, resource, :session_policy)
+    end
+  end
 
   # ── owner 短路判定（单租户）──
   @doc "principal 是否为该桶 owner 或 root（短路放行）。供批量 handler 复用，语义同单请求授权。"
@@ -229,10 +301,18 @@ defmodule Maxio.S3.Authz do
       else: "s3:PutObjectAcl"
   end
 
+  defp effective_required_action(:delete_object, _required_action, conn) do
+    if version_request?(request_version_id(conn)),
+      do: "s3:DeleteObjectVersion",
+      else: "s3:DeleteObject"
+  end
+
   defp effective_required_action(_action, required_action, _conn), do: required_action
 
   defp version_acl_request?(nil), do: false
   defp version_acl_request?(_version_id_or_invalid), do: true
+  defp version_request?(nil), do: false
+  defp version_request?(_version_id_or_invalid), do: true
 
   defp request_version_id(nil), do: nil
 
@@ -266,6 +346,7 @@ defmodule Maxio.S3.Authz do
     |> maybe_put("aws:PrincipalArn", principal_arn(principal))
     |> put_principal_context(principal)
     |> put_principal_tag_conditions(principal)
+    |> put_session_context(principal)
     |> put_header_conditions(conn)
     |> put_list_conditions(conn, action)
     |> put_resource_tag_conditions(conn, action)
@@ -303,6 +384,21 @@ defmodule Maxio.S3.Authz do
     do: put_tag_conditions(conds, ["aws:PrincipalTag"], tags)
 
   defp put_principal_tag_conditions(conds, _principal), do: conds
+
+  defp put_session_context(conds, principal) when is_map(principal) do
+    conds
+    |> maybe_put("aws:SourceIdentity", principal[:source_identity])
+    |> put_mfa_context(principal)
+  end
+
+  defp put_session_context(conds, _principal), do: conds
+
+  defp put_mfa_context(conds, %{type: :assumed_role}), do: conds
+
+  defp put_mfa_context(conds, %{mfa_authenticated: value}) when is_boolean(value),
+    do: Map.put(conds, "aws:MultiFactorAuthPresent", value)
+
+  defp put_mfa_context(conds, _principal), do: conds
 
   defp username_from_arn("arn:aws:iam:::user/" <> path) do
     path
@@ -592,8 +688,11 @@ defmodule Maxio.S3.Authz do
       }
 
       case Evaluator.evaluate(ctx, statements) do
-        :allow -> :ok
-        {:deny, reason} -> deny(conn, :put_object_acl_header, "s3:PutObjectAcl", resource, reason)
+        :allow ->
+          authorize_session_policy!(conn, principal, "s3:PutObjectAcl", resource, conditions)
+
+        {:deny, reason} ->
+          deny(conn, :put_object_acl_header, "s3:PutObjectAcl", resource, reason)
       end
     else
       :ok
@@ -643,7 +742,13 @@ defmodule Maxio.S3.Authz do
 
         case Evaluator.evaluate(ctx, statements) do
           :allow ->
-            :ok
+            authorize_session_policy!(
+              conn,
+              principal,
+              copy_source_action(src_version_id),
+              resource,
+              source_conditions
+            )
 
           {:deny, reason} ->
             deny(conn, :copy_object_source, copy_source_action(src_version_id), resource, reason)

@@ -112,6 +112,133 @@ defmodule Maxio.Cluster.RebalanceSourceCleanupTest do
     assert finished.source_cleanup_status == "complete"
   end
 
+  test "rebalance cleanup deletes non-authoritative object and delete-marker copies", ctx do
+    bucket = bucket_name("rebalance-cleanup-dynamic")
+    opts = dist_opts(ctx)
+    source_opts = Keyword.put(opts, :placement_set_id, 0)
+    destination_opts = Keyword.put(opts, :placement_set_id, 1)
+    key = key_for_set(bucket, ctx.topology, 1, "rebalance-cleanup")
+    marker_key = key_for_set(bucket, ctx.topology, 1, "rebalance-cleanup-deleted")
+    body = "rebalance-cleanup-copy-pass-body"
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    :ok = Distributed.put_bucket(bucket, opts)
+
+    {:ok, _object} = put_object_version!(bucket, key, "v1", body, source_opts)
+    :ok = Distributed.put_delete_marker(bucket, marker_key, "dm1", [], source_opts)
+
+    {:ok, _marker} =
+      Objects.insert_delete_marker_with_id(
+        bucket,
+        marker_key,
+        "dm1",
+        Placement.attrs_for_write(bucket, marker_key, source_opts)
+      )
+
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {:ok, move_report} =
+             Runner.run_once(job.id, topology: ctx.topology, transport: InProcess)
+
+    assert move_report.status == :ok
+    assert move_report.job_kind == "rebalance"
+
+    assert {:ok, running_source_stream} = Distributed.get(bucket, key, "v1", nil, source_opts)
+    assert IO.iodata_to_binary(Enum.to_list(running_source_stream)) == body
+    assert delete_marker_sidecar?(ctx.topology, marker_key, bucket, "dm1", 0)
+
+    assert {:ok, cleanup} =
+             SourceCleanup.cleanup_once(job.id, topology: ctx.topology, transport: InProcess)
+
+    assert cleanup.status == :ok
+    assert cleanup.job_kind == "rebalance"
+    assert cleanup.source_cleanup_status == "complete"
+    assert cleanup.scanned == 2
+    assert cleanup.deleted == 2
+    assert cleanup.skipped == 0
+    assert cleanup.errors == 0
+    assert is_nil(cleanup.target_set_id)
+    assert is_nil(cleanup.destination_set_id)
+
+    assert {:ok, destination_stream} = Distributed.get(bucket, key, "v1", nil, destination_opts)
+    assert IO.iodata_to_binary(Enum.to_list(destination_stream)) == body
+    assert {:error, :enoent} = Distributed.get(bucket, key, "v1", nil, source_opts)
+    assert delete_marker_sidecar?(ctx.topology, marker_key, bucket, "dm1", 1)
+    refute delete_marker_sidecar?(ctx.topology, marker_key, bucket, "dm1", 0)
+
+    assert {:ok, finished} = Jobs.get(job.id)
+    assert finished.status == "complete"
+    assert finished.data_movement_status == "complete"
+    assert finished.source_cleanup_status == "complete"
+    assert is_nil(finished.destination_set_id)
+  end
+
+  test "rebalance cleanup fails closed when PG placement is missing", ctx do
+    bucket = bucket_name("rebalance-cleanup-missing-placement")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+    {:ok, _running} = Jobs.begin_rebalance_data_movement(job.id)
+    {:ok, _complete} = Jobs.complete_data_movement(job.id)
+    key = key_for_set(bucket, ctx.topology, 1, "missing-placement")
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, "v1", %{
+        size: 1,
+        etag: "e1"
+      })
+
+    assert {:ok, report} =
+             SourceCleanup.cleanup_once(job.id, topology: ctx.topology, transport: InProcess)
+
+    assert report.status == :failed
+    assert report.job_kind == "rebalance"
+    assert report.deleted == 0
+    assert report.errors == 1
+
+    assert {:ok, failed} = Jobs.get(job.id)
+    assert failed.status == "failed"
+    assert failed.data_movement_status == "complete"
+    assert failed.source_cleanup_status == "failed"
+    assert failed.error_reason =~ "rebalance_source_cleanup_failed"
+  end
+
+  test "rebalance cleanup fails closed when cleanup topology differs from copy topology", ctx do
+    bucket = bucket_name("rebalance-cleanup-stale-topology")
+    opts = dist_opts(ctx)
+    source_opts = Keyword.put(opts, :placement_set_id, 0)
+    key = key_for_set(bucket, ctx.topology, 1, "stale-topology")
+    body = "stale-topology-source-copy"
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    :ok = Distributed.put_bucket(bucket, opts)
+    {:ok, _object} = put_object_version!(bucket, key, "v1", body, source_opts)
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {:ok, %{status: :ok}} =
+             Runner.run_once(job.id, topology: ctx.topology, transport: InProcess)
+
+    stale_topology = same_sets_topology(ctx.topology, 2048)
+
+    assert {:ok, report} =
+             SourceCleanup.cleanup_once(job.id,
+               topology: stale_topology,
+               transport: InProcess
+             )
+
+    assert report.status == :failed
+    assert report.deleted == 0
+    assert report.errors == 1
+
+    assert {:ok, source_stream} = Distributed.get(bucket, key, "v1", nil, source_opts)
+    assert IO.iodata_to_binary(Enum.to_list(source_stream)) == body
+
+    assert {:ok, failed} = Jobs.get(job.id)
+    assert failed.status == "failed"
+    assert failed.data_movement_status == "complete"
+    assert failed.source_cleanup_status == "failed"
+    assert failed.error_reason =~ "rebalance_source_cleanup_failed"
+  end
+
   test "max_versions leaves cleanup moving and second pass resumes from cursor", ctx do
     bucket = bucket_name("rebalance-cleanup-resume")
     opts = dist_opts(ctx)
@@ -352,6 +479,25 @@ defmodule Maxio.Cluster.RebalanceSourceCleanupTest do
       key = "#{prefix}-#{set_id}-#{i}.txt"
       if Router.set_for(bucket, key, topology) == set_id, do: key
     end) || flunk("could not find key for set #{inspect(set_id)}")
+  end
+
+  defp same_sets_topology(topology, block_size) do
+    Topology.parse_and_validate!(
+      data_shards: topology.data_shards,
+      parity_shards: topology.parity_shards,
+      block_size: block_size,
+      allow_colocated_endpoints: true,
+      pools:
+        for pool_id <- Topology.pool_ids_from(topology) do
+          %{
+            id: pool_id,
+            sets:
+              for set_id <- Topology.set_ids_for_pool_from(topology, pool_id) do
+                %{id: set_id, endpoints: Topology.endpoints_from(topology, set_id)}
+              end
+          }
+        end
+    )
   end
 
   defp bucket_name(prefix) do

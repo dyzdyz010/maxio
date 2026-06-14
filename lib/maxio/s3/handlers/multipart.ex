@@ -149,7 +149,7 @@ defmodule Maxio.S3.Handlers.Multipart do
         raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
 
       {:error, reason} ->
-        raise Error.new(:internal_error, message: inspect(reason))
+        raise upload_part_error(reason, bucket, key)
     end
   end
 
@@ -466,24 +466,78 @@ defmodule Maxio.S3.Handlers.Multipart do
   defp complete_error(reason, b, k) when reason in [:write_quorum, :rename_busy],
     do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
 
-  defp complete_error(_other, b, k), do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+  defp complete_error(reason, b, k) do
+    if placement_unavailable?(reason) do
+      Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+    else
+      Error.new(:internal_error, resource: "/#{b}/#{k}")
+    end
+  end
+
+  defp upload_part_error(reason, b, k) do
+    cond do
+      placement_unavailable?(reason) ->
+        Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+
+      placement_internal_error?(reason) ->
+        Error.new(:internal_error, resource: "/#{b}/#{k}")
+
+      true ->
+        Error.new(:internal_error, message: inspect(reason))
+    end
+  end
 
   defp initiate_error({:write_routing_unavailable, _reason}, b, k),
     do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
 
-  defp initiate_error({:unknown_set_id, _set_id, _known}, b, k),
+  defp initiate_error(reason, b, k) do
+    if placement_unavailable?(reason) do
+      Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+    else
+      initiate_known_error(reason, b, k)
+    end
+  end
+
+  defp initiate_known_error({:unknown_set_id, _set_id, _known}, b, k),
     do: Error.new(:internal_error, resource: "/#{b}/#{k}")
 
-  defp initiate_error({:decommission_write_route_cycle, _set_id, _destination}, b, k),
+  defp initiate_known_error({:decommission_write_route_cycle, _set_id, _destination}, b, k),
     do: Error.new(:internal_error, resource: "/#{b}/#{k}")
 
-  defp initiate_error({:invalid_decommission_write_destination, _set_id, _destination}, b, k),
-    do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+  defp initiate_known_error(
+         {:invalid_decommission_write_destination, _set_id, _destination},
+         b,
+         k
+       ),
+       do: Error.new(:internal_error, resource: "/#{b}/#{k}")
 
-  defp initiate_error(reason, b, k) when reason in [:write_quorum, :rename_busy],
+  defp initiate_known_error(reason, b, k) when reason in [:write_quorum, :rename_busy],
     do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
 
-  defp initiate_error(_reason, b, k), do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+  defp initiate_known_error(_reason, b, k), do: Error.new(:internal_error, resource: "/#{b}/#{k}")
+
+  defp placement_unavailable?({:pool_telemetry_incomplete, _candidates}), do: true
+  defp placement_unavailable?({:no_eligible_pool, _candidates}), do: true
+  defp placement_unavailable?({:drive_stats_crashed, _message}), do: true
+  defp placement_unavailable?({:drive_stats_caught, _kind, _reason}), do: true
+  defp placement_unavailable?({:invalid_drive_stats, _stats}), do: true
+  defp placement_unavailable?({:write_routing_unavailable, _reason}), do: true
+  defp placement_unavailable?(:no_topology), do: true
+  defp placement_unavailable?(_reason), do: false
+
+  defp placement_internal_error?({:unknown_set_id, _set_id, _known}), do: true
+  defp placement_internal_error?({:invalid_decommission_write_route, _route}), do: true
+  defp placement_internal_error?({:invalid_decommission_write_routes, _routes}), do: true
+
+  defp placement_internal_error?({:decommission_write_route_cycle, _set_id, _destination}),
+    do: true
+
+  defp placement_internal_error?(
+         {:invalid_decommission_write_destination, _set_id, _destination}
+       ),
+       do: true
+
+  defp placement_internal_error?(_reason), do: false
 
   defp parse_part_number!(str) do
     case Integer.parse(str) do

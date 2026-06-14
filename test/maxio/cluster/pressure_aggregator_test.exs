@@ -20,7 +20,11 @@ defmodule Maxio.Cluster.PressureAggregatorTest do
   end
 
   test "refreshes cached peer pressure snapshots and exposes cluster source counts" do
-    InProcess.set_pressure_snapshot(:maxio@n1, %{s3_in_flight: 2, storage_ops: 3})
+    InProcess.set_pressure_snapshot(:maxio@n1, %{
+      s3_in_flight: 2,
+      storage_ops: 3,
+      drive_device_io: 4
+    })
 
     assert {:ok, %{:maxio@n1 => %{s3_in_flight: 2, storage_ops: 3, combined: 5}}} =
              PressureAggregator.refresh_once(
@@ -32,6 +36,7 @@ defmodule Maxio.Cluster.PressureAggregatorTest do
     assert IOPressure.count(:cluster_s3_in_flight, now_ms: 100) == 2
     assert IOPressure.count(:cluster_storage_ops, now_ms: 100) == 3
     assert IOPressure.count(:cluster_combined, now_ms: 100) == 5
+    assert IOPressure.count(:cluster_drive_device_io, now_ms: 100) == 4
   end
 
   test "cluster counts add node-local pressure to fresh peer cache" do
@@ -108,9 +113,25 @@ defmodule Maxio.Cluster.PressureAggregatorTest do
     assert IOPressure.normalize_source("cluster-s3-in-flight") == :cluster_s3_in_flight
     assert IOPressure.normalize_source("cluster-storage-ops") == :cluster_storage_ops
     assert IOPressure.normalize_source("cluster-combined") == :cluster_combined
+    assert IOPressure.normalize_source("drive-device-io") == :drive_device_io
+    assert IOPressure.normalize_source("cluster-drive-device-io") == :cluster_drive_device_io
 
     assert IOPressure.normalize_local_source(:cluster_s3_in_flight) == :s3_in_flight
     assert IOPressure.normalize_local_source(:cluster_storage_ops) == :storage_ops
     assert IOPressure.normalize_local_source(:cluster_combined) == :combined
+    assert IOPressure.normalize_local_source(:cluster_drive_device_io) == :drive_device_io
+  end
+
+  test "missing device pressure fields default to zero for mixed-version peers" do
+    InProcess.set_pressure_snapshot(:maxio@n1, %{combined: 5})
+
+    assert {:ok, %{:maxio@n1 => %{drive_device_io: 0}}} =
+             PressureAggregator.refresh_once(
+               nodes: [:maxio@n1],
+               transport: InProcess,
+               now_ms: 400
+             )
+
+    assert IOPressure.count(:cluster_drive_device_io, now_ms: 400) == 0
   end
 end

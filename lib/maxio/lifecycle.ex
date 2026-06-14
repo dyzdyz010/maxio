@@ -6,6 +6,9 @@ defmodule Maxio.Lifecycle do
   AWS state: current-version Expiration, ExpiredObjectDeleteMarker cleanup, and
   NoncurrentVersionExpiration, and AbortIncompleteMultipartUpload. Transition remains an explicit
   defer until maxio has tiering backends to move objects into.
+
+  MFA Delete buckets are handled conservatively: lifecycle actions that would permanently delete
+  object versions are skipped and counted instead of bypassing the HTTP `x-amz-mfa` verifier.
   """
 
   import Ecto.Query
@@ -30,6 +33,7 @@ defmodule Maxio.Lifecycle do
           delete_markers_removed: non_neg_integer(),
           multipart_uploads_aborted: non_neg_integer(),
           unsupported_rules: non_neg_integer(),
+          mfa_delete_protected_actions_skipped: non_neg_integer(),
           errors: [map()]
         }
 
@@ -77,6 +81,7 @@ defmodule Maxio.Lifecycle do
       delete_markers_removed: 0,
       multipart_uploads_aborted: 0,
       unsupported_rules: 0,
+      mfa_delete_protected_actions_skipped: 0,
       errors: []
     }
   end
@@ -122,17 +127,25 @@ defmodule Maxio.Lifecycle do
       cond do
         object.is_delete_marker and expired_delete_marker?(object, rules, now) ->
           if only_version?(object) do
-            apply_action(acc, :delete_markers_removed, object, dry_run?, fn ->
-              delete_version(bucket.name, object.key, object.version_id, opts)
-            end)
+            if mfa_delete_enabled?(bucket) do
+              skip_mfa_delete_protected_action(acc, object, :expired_delete_marker)
+            else
+              apply_action(acc, :delete_markers_removed, object, dry_run?, fn ->
+                delete_version(bucket.name, object.key, object.version_id, opts)
+              end)
+            end
           else
             acc
           end
 
         not object.is_delete_marker and current_expired?(object, rules, now) ->
-          apply_action(acc, :objects_expired, object, dry_run?, fn ->
-            expire_current_object(bucket, object, opts)
-          end)
+          if mfa_delete_enabled?(bucket) and current_expiration_deletes_version?(bucket) do
+            skip_mfa_delete_protected_action(acc, object, :current_expiration)
+          else
+            apply_action(acc, :objects_expired, object, dry_run?, fn ->
+              expire_current_object(bucket, object, opts)
+            end)
+          end
 
         true ->
           acc
@@ -147,14 +160,24 @@ defmodule Maxio.Lifecycle do
       if noncurrent_expired?(candidate, rules, now) do
         object = candidate.object
 
-        apply_action(acc, :noncurrent_versions_expired, object, dry_run?, fn ->
-          delete_version(bucket.name, object.key, object.version_id, opts)
-        end)
+        if mfa_delete_enabled?(bucket) do
+          skip_mfa_delete_protected_action(acc, object, :noncurrent_version_expiration)
+        else
+          apply_action(acc, :noncurrent_versions_expired, object, dry_run?, fn ->
+            delete_version(bucket.name, object.key, object.version_id, opts)
+          end)
+        end
       else
         acc
       end
     end)
   end
+
+  defp mfa_delete_enabled?(%Bucket{mfa_delete: "Enabled"}), do: true
+  defp mfa_delete_enabled?(%Bucket{}), do: false
+
+  defp current_expiration_deletes_version?(%Bucket{versioning: "Enabled"}), do: false
+  defp current_expiration_deletes_version?(%Bucket{}), do: true
 
   defp latest_objects(bucket_name) do
     from(o in Object,
@@ -580,6 +603,18 @@ defmodule Maxio.Lifecycle do
   rescue
     err ->
       add_error(summary, object.bucket_name, object.key, Exception.message(err))
+  end
+
+  defp skip_mfa_delete_protected_action(summary, %Object{} = object, reason) do
+    Log.warn("lifecycle skipped MFA Delete protected action",
+      action: :lifecycle,
+      bucket: object.bucket_name,
+      key: object.key,
+      version_id: object.version_id,
+      reason: reason
+    )
+
+    incr(summary, :mfa_delete_protected_actions_skipped)
   end
 
   defp incr(summary, field), do: Map.update!(summary, field, &(&1 + 1))

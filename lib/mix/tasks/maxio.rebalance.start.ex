@@ -9,8 +9,9 @@ defmodule Mix.Tasks.Maxio.Rebalance.Start do
       mix maxio.rebalance.start --json
 
   This stores a plan snapshot and job row only. It does not move shards yet.
-  Jobs with placement fallback rows are refused because future movement needs
-  persisted source placement.
+  Job creation shares the runtime-topology mutation lock used by explicit
+  topology removal apply. Jobs with placement fallback rows are refused because
+  future movement needs persisted source placement.
   """
   use Mix.Task
 
@@ -95,6 +96,10 @@ defmodule Mix.Tasks.Maxio.Rebalance.Start do
     do: "invalid --decommission-set #{inspect(value)}"
 
   defp error_message(:missing_target_set_id), do: "missing --decommission-set"
+
+  defp error_message(:topology_mutation_locked),
+    do: "cannot create rebalance/decommission job while runtime topology mutation is locked"
+
   defp error_message(reason), do: "rebalance start failed: #{inspect(reason)}"
 
   defp validate_positive!(opts, key, flag) do

@@ -1,22 +1,25 @@
 defmodule Maxio.Cluster.Rebalance.SourceCleanup do
   @moduledoc """
-  Guarded foreground cleanup for decommissioned source-set replicas.
+  Guarded foreground cleanup for decommissioned/rebalanced source-set replicas.
 
-  This is not pool removal. It only deletes the old source-set copy for object
-  versions whose current PG placement has already moved to the job destination
-  set. PG object metadata remains authoritative and is never deleted here.
+  This is not pool removal. Decommission cleanup deletes the old target-set copy
+  for versions whose current PG placement has already moved to the job
+  destination set. Rebalance cleanup keeps the PG-authoritative placement set and
+  deletes configured non-authoritative set copies for the same version. PG object
+  metadata remains authoritative and is never deleted here.
   """
 
   alias Maxio.{Buckets, ObjectMeta, Objects, Storage}
-  alias Maxio.Cluster.{Lock, Topology}
+  alias Maxio.Cluster.{Lock, Placement, Topology}
   alias Maxio.Cluster.Rebalance.{Job, Jobs}
   alias Maxio.S3.Log
 
   @type report :: %{
           status: :ok | :dry_run | :partial | :failed | :canceled,
           job_id: String.t(),
-          target_set_id: non_neg_integer(),
-          destination_set_id: non_neg_integer(),
+          job_kind: String.t(),
+          target_set_id: non_neg_integer() | nil,
+          destination_set_id: non_neg_integer() | nil,
           dry_run: boolean(),
           truncated: boolean(),
           source_cleanup: true,
@@ -53,7 +56,7 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
     with {:ok, job} <- Jobs.get(job_id),
          :ok <- validate_job(job),
          :ok <- ensure_pg_authority(opts),
-         :ok <- validate_sets(job.target_set_id, job.destination_set_id, opts) do
+         :ok <- validate_job_sets(job, opts) do
       cleanup_job(job, opts)
     end
   end
@@ -94,7 +97,7 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
     end
   end
 
-  defp validate_job(%Job{kind: kind}) when kind != "decommission",
+  defp validate_job(%Job{kind: kind}) when kind not in ["decommission", "rebalance"],
     do: {:error, {:unsupported_job_kind, kind}}
 
   defp validate_job(%Job{data_movement_status: status}) when status != "complete",
@@ -105,18 +108,35 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
   defp validate_job(%Job{source_cleanup_status: "complete"}),
     do: {:error, :source_cleanup_complete}
 
-  defp validate_job(%Job{source_cleanup_status: "skipped"}), do: {:error, :source_cleanup_skipped}
+  defp validate_job(%Job{kind: "decommission", source_cleanup_status: "skipped"}),
+    do: {:error, :source_cleanup_skipped}
 
-  defp validate_job(%Job{target_set_id: target, destination_set_id: destination})
+  defp validate_job(%Job{
+         kind: "decommission",
+         target_set_id: target,
+         destination_set_id: destination
+       })
        when is_integer(target) and is_integer(destination) and target != destination,
        do: :ok
 
-  defp validate_job(%Job{target_set_id: target, destination_set_id: destination})
+  defp validate_job(%Job{
+         kind: "decommission",
+         target_set_id: target,
+         destination_set_id: destination
+       })
        when target == destination,
        do: {:error, :destination_matches_target}
 
-  defp validate_job(%Job{destination_set_id: nil}), do: {:error, :missing_destination_set_id}
-  defp validate_job(%Job{target_set_id: nil}), do: {:error, :missing_target_set_id}
+  defp validate_job(%Job{kind: "decommission", destination_set_id: nil}),
+    do: {:error, :missing_destination_set_id}
+
+  defp validate_job(%Job{kind: "decommission", target_set_id: nil}),
+    do: {:error, :missing_target_set_id}
+
+  defp validate_job(%Job{kind: "rebalance", target_set_id: nil, destination_set_id: nil}),
+    do: :ok
+
+  defp validate_job(%Job{kind: "rebalance"}), do: {:error, :stale_job}
 
   defp ensure_pg_authority(opts) do
     Enum.reduce_while([:read, :list], :ok, fn kind, :ok ->
@@ -125,6 +145,17 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
         source -> {:halt, {:error, {:unsupported_authoritative_source, kind, source}}}
       end
     end)
+  end
+
+  defp validate_job_sets(%Job{kind: "rebalance"}, opts) do
+    case all_set_ids(opts) do
+      [] -> {:error, :no_topology}
+      _set_ids -> :ok
+    end
+  end
+
+  defp validate_job_sets(%Job{kind: "decommission"} = job, opts) do
+    validate_sets(job.target_set_id, job.destination_set_id, opts)
   end
 
   defp validate_sets(target_set_id, destination_set_id, opts) do
@@ -149,7 +180,38 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
   end
 
   defp maybe_begin(job, _opts, true), do: {:ok, job}
-  defp maybe_begin(job, opts, false), do: Jobs.begin_source_cleanup(job, opts)
+
+  defp maybe_begin(job, opts, false) do
+    with_topology_lock(job.id, opts, fn ->
+      with {:ok, current} <- Jobs.get(job.id),
+           :ok <- validate_job(current),
+           :ok <- ensure_pg_authority(opts),
+           :ok <- validate_job_sets(current, opts) do
+        opts = Keyword.put(opts, :topology_lock_held, true)
+        Jobs.begin_source_cleanup(current, opts)
+      end
+    end)
+  end
+
+  defp with_topology_lock(job_id, opts, fun) do
+    resource = Topology.runtime_mutation_lock_resource()
+
+    case Lock.quorum_with_lock(resource, fun, topology_lock_opts(opts)) do
+      {:ok, result} ->
+        result
+
+      {:error, :no_quorum} ->
+        Log.error("rebalance source cleanup topology lock unavailable",
+          action: :rebalance_source_cleanup,
+          reason: "job_id=#{job_id} resource=#{inspect(resource)}"
+        )
+
+        {:error, :topology_mutation_locked}
+    end
+  end
+
+  defp topology_lock_opts(opts),
+    do: Keyword.get(opts, :topology_lock_opts, Keyword.get(opts, :lock_opts, []))
 
   defp config(job, opts) do
     common_opts =
@@ -159,8 +221,11 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
 
     %{
       job_id: job.id,
+      job_kind: job.kind,
       target_set_id: job.target_set_id,
       destination_set_id: job.destination_set_id,
+      all_set_ids: all_set_ids(opts),
+      topology_hash: Placement.topology_hash_for_opts(common_opts),
       page_size: positive_int(Keyword.get(opts, :page_size), job.page_size || 500),
       max_versions: positive_int_or_nil(Keyword.get(opts, :max_versions)),
       dry_run: Keyword.get(opts, :dry_run, false),
@@ -173,6 +238,7 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
     %{
       status: :ok,
       job_id: job.id,
+      job_kind: job.kind,
       target_set_id: job.target_set_id,
       destination_set_id: job.destination_set_id,
       dry_run: Keyword.get(opts, :dry_run, false),
@@ -291,7 +357,7 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
   defp process_object(bucket, cfg, report, object) do
     result =
       if cfg[:dry_run] do
-        dry_run_result(classify(object, cfg))
+        dry_run_result(classify(bucket, object, cfg))
       else
         cleanup_with_lock(bucket, cfg, object)
       end
@@ -316,10 +382,10 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
 
   defp cleanup_locked(bucket, cfg, object) do
     with {:ok, current} <- Objects.get_version(bucket, object.key, object.version_id),
-         {:ok, action} <- classify(current, cfg) do
+         {:ok, action} <- classify(bucket, current, cfg) do
       case action do
-        :delete ->
-          delete_source_copy(bucket, cfg, current)
+        {:delete, source_set_ids} ->
+          delete_source_copies(bucket, cfg, current, source_set_ids)
 
         :skip ->
           {:ok, :skipped}
@@ -330,26 +396,119 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
     end
   end
 
-  defp classify(%{placement_set_id: target_set_id}, %{target_set_id: target_set_id}) do
+  defp classify(_bucket, object, %{job_kind: "decommission"} = cfg),
+    do: classify_decommission(object, cfg)
+
+  defp classify(bucket, object, %{job_kind: "rebalance"} = cfg),
+    do: classify_rebalance(bucket, object, cfg)
+
+  defp classify_decommission(%{placement_set_id: target_set_id}, %{target_set_id: target_set_id}) do
     {:error, :source_still_authoritative}
   end
 
-  defp classify(%{placement_set_id: destination_set_id}, %{
+  defp classify_decommission(%{placement_set_id: destination_set_id}, %{
          destination_set_id: destination_set_id
        }) do
-    {:ok, :delete}
+    {:ok, {:delete, [destination_target_placeholder()]}}
   end
 
-  defp classify(_object, _cfg), do: {:ok, :skip}
+  defp classify_decommission(_object, _cfg), do: {:ok, :skip}
 
-  defp dry_run_result({:ok, :delete}), do: {:ok, :deleted}
+  defp classify_rebalance(_bucket, %{placement_set_id: nil} = object, _cfg) do
+    {:error, {:missing_persisted_placement, object.key, object.version_id}}
+  end
+
+  defp classify_rebalance(
+         bucket,
+         %{placement_set_id: placement_set_id} = object,
+         %{
+           all_set_ids: set_ids
+         } = cfg
+       ) do
+    cond do
+      placement_set_id not in set_ids ->
+        {:error,
+         {:unknown_placement_set_id, object.key, object.version_id, placement_set_id, set_ids}}
+
+      true ->
+        with :ok <- ensure_rebalance_topology_current(bucket, object, cfg) do
+          source_set_ids = Enum.reject(set_ids, &(&1 == placement_set_id))
+
+          if source_set_ids == [] do
+            {:ok, :skip}
+          else
+            {:ok, {:delete, source_set_ids}}
+          end
+        end
+    end
+  end
+
+  defp ensure_rebalance_topology_current(bucket, object, cfg) do
+    with :ok <- ensure_topology_hash_current(object, cfg),
+         {:ok, %{set_id: routed_set_id}} <-
+           Placement.resolve(bucket, object.key, cfg[:common_opts]) do
+      cond do
+        is_nil(routed_set_id) ->
+          {:error, :no_topology}
+
+        object.placement_set_id == routed_set_id ->
+          :ok
+
+        true ->
+          {:error,
+           {:stale_rebalance_placement, object.key, object.version_id, object.placement_set_id,
+            routed_set_id}}
+      end
+    end
+  end
+
+  defp ensure_topology_hash_current(%{placement_topology_hash: nil} = object, _cfg) do
+    {:error, {:missing_placement_topology_hash, object.key, object.version_id}}
+  end
+
+  defp ensure_topology_hash_current(object, %{topology_hash: topology_hash})
+       when is_binary(topology_hash) do
+    if object.placement_topology_hash == topology_hash do
+      :ok
+    else
+      {:error,
+       {:stale_topology_hash, object.key, object.version_id, object.placement_topology_hash,
+        topology_hash}}
+    end
+  end
+
+  defp ensure_topology_hash_current(object, %{topology_hash: nil}) do
+    {:error,
+     {:stale_topology_hash, object.key, object.version_id, object.placement_topology_hash, nil}}
+  end
+
+  defp dry_run_result({:ok, {:delete, _source_set_ids}}), do: {:ok, :deleted}
   defp dry_run_result({:ok, :skip}), do: {:ok, :skipped}
   defp dry_run_result({:error, reason}), do: {:error, reason}
 
-  defp delete_source_copy(bucket, cfg, object) do
+  defp delete_source_copies(bucket, cfg, object, [placeholder])
+       when placeholder == :decommission_target do
     case Storage.delete_version(bucket, object.key, object.version_id, cfg[:source_opts]) do
       :ok -> {:ok, :deleted}
       {:error, reason} -> {:error, {:delete_source_failed, reason}}
+    end
+  end
+
+  defp delete_source_copies(bucket, cfg, object, source_set_ids) do
+    Enum.reduce_while(source_set_ids, :ok, fn source_set_id, :ok ->
+      opts = Keyword.put(cfg[:common_opts], :placement_set_id, source_set_id)
+
+      case Storage.delete_version(bucket, object.key, object.version_id, opts) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {source_set_id, reason}}}
+      end
+    end)
+    |> case do
+      :ok ->
+        {:ok, :deleted}
+
+      {:error, {source_set_id, reason}} ->
+        {:error, {:delete_source_failed, source_set_id, reason}}
     end
   end
 
@@ -424,7 +583,7 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
 
   defp maybe_finish(job, %{status: :ok} = report, opts) do
     with :ok <- run_before_complete(opts),
-         :ok <- ensure_no_remaining_target_placements(job.target_set_id),
+         :ok <- ensure_completion_guard(job, opts),
          {:ok, _job} <- Jobs.complete_source_cleanup(job.id, opts) do
       report = %{report | source_cleanup_status: "complete"}
       log_complete(report)
@@ -469,6 +628,35 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
     end
   end
 
+  defp ensure_completion_guard(%Job{kind: "decommission"} = job, _opts) do
+    ensure_no_remaining_target_placements(job.target_set_id)
+  end
+
+  defp ensure_completion_guard(%Job{kind: "rebalance"}, opts) do
+    set_ids = all_set_ids(opts)
+    topology_hash = Placement.topology_hash_for_opts(opts)
+
+    cond do
+      set_ids == [] ->
+        {:error, :no_topology}
+
+      is_nil(topology_hash) ->
+        {:error, :no_topology}
+
+      Objects.any_version_missing_placement_set?() ->
+        {:error, :missing_persisted_placement}
+
+      Objects.any_version_with_unknown_placement_set?(set_ids) ->
+        {:error, {:unknown_placement_set_id, set_ids}}
+
+      Objects.any_version_with_placement_topology_hash_mismatch?(topology_hash) ->
+        {:error, {:stale_topology_hash, topology_hash}}
+
+      true ->
+        :ok
+    end
+  end
+
   defp ensure_no_remaining_target_placements(target_set_id) do
     if Objects.any_version_with_placement_set?(target_set_id),
       do: {:error, {:source_target_placements_remaining, target_set_id}},
@@ -506,7 +694,8 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
         "job_id=#{report.job_id} status=#{report.status} target_set_id=#{report.target_set_id} " <>
           "destination_set_id=#{report.destination_set_id} scanned=#{report.scanned} " <>
           "deleted=#{report.deleted} skipped=#{report.skipped} errors=#{report.errors} " <>
-          "truncated=#{report.truncated} source_cleanup=true topology_mutation=false"
+          "truncated=#{report.truncated} job_kind=#{report.job_kind} " <>
+          "source_cleanup=true topology_mutation=false"
     )
   end
 
@@ -564,6 +753,8 @@ defmodule Maxio.Cluster.Rebalance.SourceCleanup do
 
   defp positive_int_or_nil(n) when is_integer(n) and n > 0, do: n
   defp positive_int_or_nil(_n), do: nil
+
+  defp destination_target_placeholder, do: :decommission_target
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)

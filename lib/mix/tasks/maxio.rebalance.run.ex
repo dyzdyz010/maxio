@@ -1,16 +1,19 @@
 defmodule Mix.Tasks.Maxio.Rebalance.Run do
-  @shortdoc "Run a foreground decommission copy pass"
+  @shortdoc "Run a foreground rebalance/decommission copy pass"
   @moduledoc """
-  Run a restricted foreground decommission copy pass.
+  Run a restricted foreground rebalance/decommission copy pass.
 
       mix maxio.rebalance.run --job-id <uuid> --destination-set 1
       mix maxio.rebalance.run <uuid> --destination-set 1 --max-versions 500
       mix maxio.rebalance.run --auto-destination
+      mix maxio.rebalance.run --job-id <rebalance-uuid>
       mix maxio.rebalance.run --destination-set 1 --dry-run --json
 
-  The command copies versions/delete markers from the job's target set to the
-  explicit or free-space selected destination set, then switches PG placement. It
-  does not delete source shards, mutate topology, or remove pools.
+  Decommission jobs copy versions/delete markers from the job's target set to
+  the explicit or free-space selected destination set, then switch PG placement.
+  Rebalance jobs copy versions/delete markers whose persisted placement differs
+  from current topology routing. The command does not delete source shards,
+  mutate topology, or remove pools.
   """
   use Mix.Task
 
@@ -38,7 +41,8 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
       unexpected = extra ++ Enum.map(invalid, &elem(&1, 0))
 
       Mix.raise(
-        "usage: mix maxio.rebalance.run [JOB_ID|--job-id <uuid>] --destination-set <id> " <>
+        "usage: mix maxio.rebalance.run [JOB_ID|--job-id <uuid>] " <>
+          "[--destination-set <id>] " <>
           "[--auto-destination] [--max-versions <n>] [--page-size <n>] [--dry-run] [--json] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
@@ -69,7 +73,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
   defp resolve_job_id(job_id) when is_binary(job_id), do: {:ok, job_id}
 
   defp resolve_job_id(nil) do
-    case Jobs.active_job(kind: "decommission") do
+    case Jobs.active_job() do
       nil -> {:error, :not_found}
       job -> {:ok, job.id}
     end
@@ -81,7 +85,8 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
     else
       IO.puts(
         "[maxio rebalance.run] job_id=#{report.job_id} status=#{report.status} " <>
-          "target_set_id=#{report.target_set_id} destination_set_id=#{report.destination_set_id} " <>
+          "kind=#{report.job_kind} target_set_id=#{report.target_set_id} " <>
+          "destination_set_id=#{report.destination_set_id} " <>
           "dry_run=#{report.dry_run} scanned=#{report.scanned} moved=#{report.moved} " <>
           "skipped=#{report.skipped} errors=#{report.errors} truncated=#{report.truncated} " <>
           "source_cleanup=false free_space_placement=#{report.free_space_placement} " <>
@@ -90,27 +95,31 @@ defmodule Mix.Tasks.Maxio.Rebalance.Run do
     end
   end
 
-  defp error_message(:not_found), do: "no active decommission job found"
+  defp error_message(:not_found), do: "no active rebalance/decommission job found"
 
   defp error_message(:missing_destination_set_id),
     do: "missing required --destination-set <id> or --auto-destination"
+
+  defp error_message(:rebalance_uses_dynamic_destinations),
+    do:
+      "rebalance jobs choose per-object destinations; omit --destination-set and --auto-destination"
 
   defp error_message(:destination_matches_target),
     do: "--destination-set must differ from the decommission target set"
 
   defp error_message(:no_topology),
-    do: "cannot run decommission copy-pass without configured topology"
+    do: "cannot run rebalance/decommission copy-pass without configured topology"
 
-  defp error_message(:canceled), do: "decommission job is canceled"
+  defp error_message(:canceled), do: "rebalance/decommission job is canceled"
 
   defp error_message(:runner_locked),
-    do: "decommission job runner is already active for this job"
+    do: "rebalance/decommission job runner is already active for this job"
 
   defp error_message({:not_runnable, status}),
-    do: "decommission job is not runnable from status=#{status}"
+    do: "rebalance/decommission job is not runnable from status=#{status}"
 
   defp error_message({:unsupported_job_kind, kind}),
-    do: "rebalance.run only supports decommission jobs, got kind=#{inspect(kind)}"
+    do: "rebalance.run only supports rebalance/decommission jobs, got kind=#{inspect(kind)}"
 
   defp error_message({:unsupported_authoritative_source, kind, source}) do
     "rebalance.run requires authoritative_source(:#{kind}) == :pg, got #{inspect(source)}"

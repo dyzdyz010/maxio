@@ -86,6 +86,73 @@ defmodule Maxio.Cluster.TopologyTest do
     end
   end
 
+  test "remove_set_from removes a set and preserves surviving pool/set order" do
+    mk = fn id ->
+      eps = for i <- 0..2, do: {:"maxio@n#{i}", "/data/s#{id}d#{i}"}
+      %{id: id, endpoints: eps}
+    end
+
+    topology =
+      Topology.parse_and_validate!(
+        data_shards: 2,
+        parity_shards: 1,
+        block_size: 1024,
+        pools: [
+          %{id: 3, sets: [mk.(10), mk.(11)]},
+          %{id: 7, sets: [mk.(20)]}
+        ]
+      )
+
+    assert {:ok, candidate} = Topology.remove_set_from(topology, 10)
+    assert Topology.pool_ids_from(candidate) == [3, 7]
+    assert Topology.all_set_ids_from(candidate) == [11, 20]
+    assert Topology.set_ids_for_pool_from(candidate, 3) == [11]
+    assert Topology.set_ids_for_pool_from(candidate, 7) == [20]
+    refute Map.has_key?(candidate.sets, 10)
+  end
+
+  test "remove_set_from drops an empty pool" do
+    mk = fn id ->
+      eps = for i <- 0..2, do: {:"maxio@n#{i}", "/data/s#{id}d#{i}"}
+      %{id: id, endpoints: eps}
+    end
+
+    topology =
+      Topology.parse_and_validate!(
+        data_shards: 2,
+        parity_shards: 1,
+        block_size: 1024,
+        pools: [
+          %{id: 3, sets: [mk.(10)]},
+          %{id: 7, sets: [mk.(20), mk.(21)]}
+        ]
+      )
+
+    assert {:ok, candidate} = Topology.remove_set_from(topology, 10)
+    assert Topology.pool_ids_from(candidate) == [7]
+    assert Topology.all_set_ids_from(candidate) == [20, 21]
+    refute Map.has_key?(candidate.pools, 3)
+  end
+
+  test "remove_set_from fails closed for unknown set and last set removal" do
+    topology = Topology.parse_and_validate!(cfg(1, 4, 2))
+
+    assert {:error, {:unknown_set_id, 99, [0]}} = Topology.remove_set_from(topology, 99)
+    assert {:error, :would_remove_last_set} = Topology.remove_set_from(topology, 0)
+  end
+
+  test "to_config returns operator-facing keyword topology" do
+    topology = Topology.parse_and_validate!(cfg(2, 4, 2))
+    config = Topology.to_config(topology)
+
+    assert Keyword.fetch!(config, :data_shards) == 4
+    assert Keyword.fetch!(config, :parity_shards) == 2
+    assert Keyword.fetch!(config, :allow_colocated_endpoints) == true
+    assert [%{id: 0, sets: sets}] = Keyword.fetch!(config, :pools)
+    assert Enum.map(sets, & &1.id) == [0, 1]
+    assert Topology.parse_and_validate!(config).set_ids == [0, 1]
+  end
+
   test "endpoints 数 != K+M -> raise" do
     bad = put_in(cfg(1, 4, 2), [:pools], [%{id: 0, sets: [%{id: 0, endpoints: [{:n, "/d"}]}]}])
     assert_raise ArgumentError, ~r/endpoints/, fn -> Topology.parse_and_validate!(bad) end

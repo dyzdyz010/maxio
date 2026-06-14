@@ -25,8 +25,10 @@ defmodule Maxio.Auth do
   @spec authenticate(map()) :: {:ok, map(), map()} | {:error, Error.t()}
   def authenticate(%{signed_request: sr} = material) do
     with :ok <- check_signed_headers(sr),
+         :ok <- check_session_token_binding(sr, material),
          :ok <- check_request_time(sr, material.now),
-         {:ok, %{secret_key: secret, principal: principal}} <- lookup_secret(sr.access_key),
+         {:ok, %{secret_key: secret, principal: principal}} <-
+           lookup_secret(sr.access_key, material),
          {:ok, sig_context} <- verify_signature(sr, material, secret) do
       Log.info("sigv4 authenticated", auth_type: sr.auth_type)
       {:ok, principal, sig_context}
@@ -43,6 +45,23 @@ defmodule Maxio.Auth do
       {:error, Error.new(:unsigned_headers)}
     end
   end
+
+  defp check_session_token_binding(_sr, %{session_token_error: code})
+       when is_atom(code) and not is_nil(code) do
+    Log.warn("invalid session token placement", reason: code)
+    {:error, Error.new(code)}
+  end
+
+  defp check_session_token_binding(%{session_token_source: :header} = sr, _material) do
+    if "x-amz-security-token" in Enum.map(sr.signed_headers, &String.downcase/1) do
+      :ok
+    else
+      Log.warn("unsigned session token header", reason: :unsigned_headers)
+      {:error, Error.new(:unsigned_headers)}
+    end
+  end
+
+  defp check_session_token_binding(_sr, _material), do: :ok
 
   # ── 请求时间有效性 ──
   # 时间语义按 auth_type 区分（铁律 5，对齐真实 AWS）：
@@ -107,14 +126,37 @@ defmodule Maxio.Auth do
   defp check_presigned_expiry(_sr, _now), do: :ok
 
   # ── 查 secret ──
-  defp lookup_secret(access_key) do
-    case CredentialStore.get_secret(access_key) do
+  defp lookup_secret(access_key, material) do
+    case CredentialStore.get_secret(access_key,
+           session_token: Map.get(material, :session_token),
+           now: material.now
+         ) do
       {:ok, found} ->
         {:ok, found}
 
       :error ->
-        Log.warn("unknown access key", auth_type: :header, reason: :invalid_access_key_id)
+        Log.warn("unknown access key",
+          auth_type: material.signed_request.auth_type,
+          reason: :invalid_access_key_id
+        )
+
         {:error, Error.new(:invalid_access_key_id)}
+
+      {:error, :expired_token} ->
+        Log.warn("expired session token",
+          auth_type: material.signed_request.auth_type,
+          reason: :expired_token
+        )
+
+        {:error, Error.new(:expired_token)}
+
+      {:error, reason} when reason in [:missing_session_token, :invalid_token] ->
+        Log.warn("invalid session token",
+          auth_type: material.signed_request.auth_type,
+          reason: reason
+        )
+
+        {:error, Error.new(:invalid_token)}
     end
   end
 
@@ -153,7 +195,7 @@ defmodule Maxio.Auth do
 
   # 仅保留 SignedHeaders 列出的 header（已小写名比较），保持调用方给的值。
   defp filter_signed_headers(headers, signed_names) do
-    set = MapSet.new(signed_names)
+    set = signed_names |> Enum.map(&String.downcase/1) |> MapSet.new()
     Enum.filter(headers, fn {name, _v} -> MapSet.member?(set, String.downcase(name)) end)
   end
 

@@ -37,12 +37,14 @@ defmodule Maxio.Cluster.ListDirTest do
     mkdir(root, "b/.versions")
     mkdir(root, "b/.uploads")
     mkdir(root, "b/.tmp")
+    mkdir(root, "b/.maxio-removal-quarantine")
     {:ok, entries} = ShardServer.list_dir(Path.join(root, "b"), [])
     names = Enum.map(entries, & &1.name)
     assert "k.txt" in names
     refute ".versions" in names
     refute ".uploads" in names
     refute ".tmp" in names
+    refute ".maxio-removal-quarantine" in names
   end
 
   test "list_dir 不存在的目录 -> {:ok, []}", %{root: root} do

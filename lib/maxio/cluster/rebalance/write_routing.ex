@@ -2,8 +2,9 @@ defmodule Maxio.Cluster.Rebalance.WriteRouting do
   @moduledoc """
   Write-time placement exclusions derived from decommission jobs.
 
-  A decommission target remains excluded after data movement completes until a
-  later topology mutation removes or rewrites the set membership.
+  A decommission target remains excluded after data movement completes and after
+  runtime-local topology apply. The route retires only after deployment config
+  has been verified against the proposed removal topology.
   """
 
   import Ecto.Query
@@ -49,6 +50,7 @@ defmodule Maxio.Cluster.Rebalance.WriteRouting do
       |> where([j], j.status != "canceled")
       |> where([j], j.data_movement_status in ^@movement_statuses)
       |> where([j], j.source_cleanup_status in ^@cleanup_statuses)
+      |> where([j], j.topology_removal_deployment_status != "verified")
       |> order_by([j], desc: j.updated_at)
       |> select([j], {j.target_set_id, j.destination_set_id})
       |> Repo.all()

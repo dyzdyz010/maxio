@@ -14,6 +14,7 @@ defmodule Maxio.S3.Handlers.Object do
     Error,
     Log,
     PublicAccessBlock,
+    MFADelete,
     SSE,
     StorageClass,
     SystemHeaders,
@@ -201,7 +202,7 @@ defmodule Maxio.S3.Handlers.Object do
         raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
 
       {:ok, {:error, reason}} ->
-        raise Error.new(:internal_error, message: inspect(reason))
+        raise_storage_write_error(reason, bucket, key)
 
       {:error, :locked} ->
         raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
@@ -430,7 +431,7 @@ defmodule Maxio.S3.Handlers.Object do
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
     conn = fetch_query_params(conn)
-    _ = ensure_bucket!(bucket)
+    bucket_meta = ensure_bucket!(bucket)
 
     # B5-3 R3/R4：key 守卫（保留布局名段/点段 → 400，修 delete-marker 路径此前的 500 InternalError）。
     :ok = validate_object_key!(bucket, key)
@@ -444,10 +445,12 @@ defmodule Maxio.S3.Handlers.Object do
     # B5-4：客户端 ?versionId 入口守卫（非法形状 → 400 InvalidArgument，先于任何查找/盘路径构造
     # ——尤其 :write=:sidecar 下 Storage.delete_version 直接以 versionId 构造盘路径）。
     :ok = validate_version_id!(bucket, key, version_id)
-    versioning = bucket_versioning(bucket)
+    versioning = bucket_meta.versioning
 
     cond do
       version_id != nil ->
+        MFADelete.require_for_delete_version!(conn, bucket_meta)
+
         # 永久删除指定版本（含 delete marker）。ROUTE B fidelity：按写权威分流的单一提交路径
         # commit_version_delete（:sidecar → 盘上 quorum 删除即权威提交，quorum 不足 503 绝不 204；
         # :pg → PG 删行权威先行），与 DeleteObjects 的 do_delete_one 共用。幂等：不存在也 204。
@@ -462,6 +465,8 @@ defmodule Maxio.S3.Handlers.Object do
         |> send_resp(204, "")
 
       versioning in ["Enabled", "Suspended"] ->
+        MFADelete.require_for_delete_marker!(conn, bucket_meta)
+
         # 插入 delete marker（Enabled 新 ULID；Suspended null）。ROUTE B B5-0：先盘上落
         # delete-marker sidecar（sidecar 权威下的删除完整性，quorum 致命），再 PG 索引（best-effort）。
         dm_vid = commit_delete_marker(bucket, key, versioning)
@@ -494,7 +499,7 @@ defmodule Maxio.S3.Handlers.Object do
   @spec delete_objects(Plug.Conn.t()) :: Plug.Conn.t()
   def delete_objects(conn) do
     bucket = conn.assigns.s3_bucket
-    _ = ensure_bucket!(bucket)
+    bucket_meta = ensure_bucket!(bucket)
     {conn, xml} = read_small_body!(conn)
 
     %{quiet: quiet, objects: objects} =
@@ -507,7 +512,9 @@ defmodule Maxio.S3.Handlers.Object do
       raise Error.new(:malformed_xml, message: "A maximum of 1000 keys may be specified")
     end
 
-    versioning = bucket_versioning(bucket)
+    MFADelete.validate_batch_delete!(conn, bucket_meta, objects)
+
+    versioning = bucket_meta.versioning
 
     # 逐 key 对象级授权（铁律 2：复用 Authz 单一授权路径，仅资源 ARN 改成每个 key 的对象 ARN）。
     # 无权 key 回 per-key <Error>AccessDenied</Error>（HTTP 200 混合结果）且绝不删；有权 key 才删。
@@ -518,7 +525,15 @@ defmodule Maxio.S3.Handlers.Object do
 
     {deleted, errors} =
       Enum.reduce(objects, {[], []}, fn obj, {dacc, eacc} ->
-        if delete_authorized?(bucket, obj.key, principal, authenticated?, owner?, conditions) do
+        if delete_authorized?(
+             bucket,
+             obj.key,
+             obj.version_id,
+             principal,
+             authenticated?,
+             owner?,
+             conditions
+           ) do
           case delete_one(bucket, obj, versioning) do
             {:ok, entry} -> {[entry | dacc], eacc}
             {:error, err} -> {dacc, [err | eacc]}
@@ -617,25 +632,40 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
-  # 单 key 是否被授权删除：owner/root 短路放行；否则对该 key 的对象 ARN 跑 Evaluator（s3:DeleteObject）。
+  # 单 key 是否被授权删除：owner/root 短路放行；否则对该 key 的对象 ARN 跑 Evaluator。
+  # VersionId 永久删除必须要求 s3:DeleteObjectVersion；普通删除仍要求 s3:DeleteObject。
   # 复用 Maxio.S3.Authz 暴露的同源零件（conditions/object_statements/Evaluator），绝不另起授权逻辑。
-  defp delete_authorized?(_bucket, _key, _principal, _authenticated?, true, _conditions), do: true
+  defp delete_authorized?(
+         bucket,
+         key,
+         version_id,
+         principal,
+         _authenticated?,
+         true,
+         conditions
+       ) do
+    resource = Maxio.Policy.Arn.object_arn(bucket, key)
+    action = if version_id, do: "s3:DeleteObjectVersion", else: "s3:DeleteObject"
 
-  defp delete_authorized?(bucket, key, principal, authenticated?, _owner?, conditions) do
+    Maxio.S3.Authz.session_policy_allows?(principal, action, resource, conditions)
+  end
+
+  defp delete_authorized?(bucket, key, version_id, principal, authenticated?, _owner?, conditions) do
     resource = Maxio.Policy.Arn.object_arn(bucket, key)
     statements = Maxio.S3.Authz.object_statements(bucket, key, principal)
+    action = if version_id, do: "s3:DeleteObjectVersion", else: "s3:DeleteObject"
 
     ctx = %Maxio.Policy.RequestContext{
       principal: principal,
       authenticated?: authenticated?,
       owner?: false,
-      action: "s3:DeleteObject",
+      action: action,
       resource: resource,
       conditions: conditions
     }
 
     case Maxio.Policy.Evaluator.evaluate(ctx, statements) do
-      :allow -> true
+      :allow -> Maxio.S3.Authz.session_policy_allows?(principal, action, resource, conditions)
       {:deny, _reason} -> false
     end
   end
@@ -978,8 +1008,41 @@ defmodule Maxio.S3.Handlers.Object do
        when reason in [:write_quorum, :rename_busy],
        do: raise(Error.new(:slow_down_write, resource: "/#{bucket}/#{key}"))
 
-  defp raise_storage_write_error(reason, _bucket, _key),
-    do: raise(Error.new(:internal_error, message: inspect(reason)))
+  defp raise_storage_write_error(reason, bucket, key) do
+    cond do
+      placement_unavailable?(reason) ->
+        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+
+      placement_internal_error?(reason) ->
+        raise Error.new(:internal_error, resource: "/#{bucket}/#{key}")
+
+      true ->
+        raise Error.new(:internal_error, message: inspect(reason))
+    end
+  end
+
+  defp placement_unavailable?({:pool_telemetry_incomplete, _candidates}), do: true
+  defp placement_unavailable?({:no_eligible_pool, _candidates}), do: true
+  defp placement_unavailable?({:drive_stats_crashed, _message}), do: true
+  defp placement_unavailable?({:drive_stats_caught, _kind, _reason}), do: true
+  defp placement_unavailable?({:invalid_drive_stats, _stats}), do: true
+  defp placement_unavailable?({:write_routing_unavailable, _reason}), do: true
+  defp placement_unavailable?(:no_topology), do: true
+  defp placement_unavailable?(_reason), do: false
+
+  defp placement_internal_error?({:unknown_set_id, _set_id, _known}), do: true
+  defp placement_internal_error?({:invalid_decommission_write_route, _route}), do: true
+  defp placement_internal_error?({:invalid_decommission_write_routes, _routes}), do: true
+
+  defp placement_internal_error?({:decommission_write_route_cycle, _set_id, _destination}),
+    do: true
+
+  defp placement_internal_error?(
+         {:invalid_decommission_write_destination, _set_id, _destination}
+       ),
+       do: true
+
+  defp placement_internal_error?(_reason), do: false
 
   # ── helpers ──
 
@@ -1031,7 +1094,7 @@ defmodule Maxio.S3.Handlers.Object do
         raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
 
       {:ok, {:error, reason}} ->
-        raise Error.new(:internal_error, message: inspect(reason))
+        raise_storage_write_error(reason, bucket, key)
 
       {:error, :locked} ->
         raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
@@ -1199,16 +1262,18 @@ defmodule Maxio.S3.Handlers.Object do
   # marker sidecar）不影响已权威提交的删除（盘上残留对 PG 读/列权威不可见），绝不让 :pg 路径因盘失败而失败。
   defp commit_delete_marker_pg(bucket, key, version_id, versioning) do
     old_null_opts = storage_opts_for_version(bucket, key, "null")
-    {:ok, placement} = Placement.resolve_write(bucket, key)
-    placement_storage_opts = Placement.storage_opts(placement)
-    placement_attrs = Placement.attrs_from_result(placement)
 
-    {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id, placement_attrs)
+    with {:ok, placement} <- Placement.resolve_write(bucket, key) do
+      placement_storage_opts = Placement.storage_opts(placement)
+      placement_attrs = Placement.attrs_from_result(placement)
 
-    # Suspended：null marker 替换既有 null 版本 → 清理被替换的 null 版本字节 + sidecar。
-    if versioning == "Suspended", do: _ = Storage.delete(bucket, key, "null", old_null_opts)
-    _ = Storage.put_delete_marker(bucket, key, version_id, [], placement_storage_opts)
-    :ok
+      {:ok, _} = Objects.insert_delete_marker_with_id(bucket, key, version_id, placement_attrs)
+
+      # Suspended：null marker 替换既有 null 版本 → 清理被替换的 null 版本字节 + sidecar。
+      if versioning == "Suspended", do: _ = Storage.delete(bucket, key, "null", old_null_opts)
+      _ = Storage.put_delete_marker(bucket, key, version_id, [], placement_storage_opts)
+      :ok
+    end
   end
 
   # ROUTE B B4-2 —— 元数据提交按写权威分流（authoritative_source(:write)）：

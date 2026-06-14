@@ -5,18 +5,38 @@ defmodule Maxio.Auth.CredentialStore do
   """
   @callback get_secret(access_key :: String.t()) ::
               {:ok, %{secret_key: String.t(), principal: map()}} | :error
+  @callback get_secret(access_key :: String.t(), opts :: keyword()) ::
+              {:ok, %{secret_key: String.t(), principal: map()}}
+              | :error
+              | {:error, :missing_session_token | :invalid_token | :expired_token}
   @callback put_access_key(map()) :: :ok | {:error, term()}
   @callback list_keys() :: [map()]
   @callback invalidate(scope :: term()) :: :ok
 
-  @optional_callbacks invalidate: 1
+  @optional_callbacks invalidate: 1, get_secret: 2
 
   @doc "当前配置的凭据后端模块。"
   @spec impl() :: module()
   def impl, do: Application.fetch_env!(:maxio, :credential_store)
 
-  @spec get_secret(String.t()) :: {:ok, map()} | :error
-  def get_secret(access_key), do: impl().get_secret(access_key)
+  @spec get_secret(String.t()) :: {:ok, map()} | :error | {:error, term()}
+  def get_secret(access_key), do: get_secret(access_key, [])
+
+  @spec get_secret(String.t(), keyword()) :: {:ok, map()} | :error | {:error, term()}
+  def get_secret(access_key, opts) do
+    backend = impl()
+
+    cond do
+      function_exported?(backend, :get_secret, 2) ->
+        backend.get_secret(access_key, opts)
+
+      session_token?(Keyword.get(opts, :session_token)) ->
+        {:error, :invalid_token}
+
+      true ->
+        backend.get_secret(access_key)
+    end
+  end
 
   @spec put_access_key(map()) :: :ok | {:error, term()}
   def put_access_key(attrs), do: impl().put_access_key(attrs)
@@ -34,4 +54,8 @@ defmodule Maxio.Auth.CredentialStore do
       :ok
     end
   end
+
+  defp session_token?(nil), do: false
+  defp session_token?(""), do: false
+  defp session_token?(_token), do: true
 end

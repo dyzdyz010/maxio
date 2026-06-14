@@ -12,7 +12,7 @@ defmodule Maxio.Repo.Migrations.AddVersioningToBuckets do
       add :mfa_delete, :string,
         null: true,
         comment:
-          "MFA Delete 状态（Enabled|Disabled）；仅当曾配置时 GetBucketVersioning 才回显 <MfaDelete>。MVP 不强制 MFA 校验（无设备），仅存储/回显（defer，文档化）"
+          "MFA Delete 状态（Enabled|Disabled）；仅当曾配置时 GetBucketVersioning 才回显 <MfaDelete>。S3 API 对受保护操作要求 root principal、HTTPS 且已签名的 x-amz-mfa，并通过配置的 verifier；未配置 verifier fail-closed"
     end
   end
 end

@@ -7,18 +7,19 @@ defmodule Maxio.Cluster.IOPressure do
   decision.
   """
 
-  @type local_source :: :s3_in_flight | :storage_ops | :combined
+  @type local_source :: :s3_in_flight | :storage_ops | :combined | :drive_device_io
   @type source ::
           local_source()
           | :cluster_s3_in_flight
           | :cluster_storage_ops
           | :cluster_combined
+          | :cluster_drive_device_io
 
   @doc "Return the current pressure count for `source`."
   @spec count(source() | String.t() | nil, keyword()) :: non_neg_integer()
   def count(source, opts \\ []) do
     case normalize_source(source) do
-      source when source in [:s3_in_flight, :storage_ops, :combined] ->
+      source when source in [:s3_in_flight, :storage_ops, :combined, :drive_device_io] ->
         local_count(source)
 
       :cluster_s3_in_flight ->
@@ -29,6 +30,9 @@ defmodule Maxio.Cluster.IOPressure do
 
       :cluster_combined ->
         Maxio.Cluster.PressureAggregator.count(:combined, opts)
+
+      :cluster_drive_device_io ->
+        Maxio.Cluster.PressureAggregator.count(:drive_device_io, opts)
     end
   end
 
@@ -39,6 +43,7 @@ defmodule Maxio.Cluster.IOPressure do
       :s3_in_flight -> Maxio.S3.InFlight.count()
       :storage_ops -> Maxio.Cluster.DriveIO.active_count()
       :combined -> Maxio.S3.InFlight.count() + Maxio.Cluster.DriveIO.active_count()
+      :drive_device_io -> Maxio.Cluster.DriveDeviceIO.pressure_count()
     end
   end
 
@@ -47,11 +52,13 @@ defmodule Maxio.Cluster.IOPressure do
   def local_snapshot do
     s3_in_flight = local_count(:s3_in_flight)
     storage_ops = local_count(:storage_ops)
+    drive_device_io = local_count(:drive_device_io)
 
     %{
       s3_in_flight: s3_in_flight,
       storage_ops: storage_ops,
-      combined: s3_in_flight + storage_ops
+      combined: s3_in_flight + storage_ops,
+      drive_device_io: drive_device_io
     }
   end
 
@@ -71,17 +78,23 @@ defmodule Maxio.Cluster.IOPressure do
   def normalize_source(:cluster_s3_in_flight), do: :cluster_s3_in_flight
   def normalize_source(:cluster_storage_ops), do: :cluster_storage_ops
   def normalize_source(:cluster_combined), do: :cluster_combined
+  def normalize_source(:drive_device_io), do: :drive_device_io
+  def normalize_source(:cluster_drive_device_io), do: :cluster_drive_device_io
   def normalize_source("s3-in-flight"), do: :s3_in_flight
   def normalize_source("s3_in_flight"), do: :s3_in_flight
   def normalize_source("storage-ops"), do: :storage_ops
   def normalize_source("storage_ops"), do: :storage_ops
   def normalize_source("combined"), do: :combined
+  def normalize_source("drive-device-io"), do: :drive_device_io
+  def normalize_source("drive_device_io"), do: :drive_device_io
   def normalize_source("cluster-s3-in-flight"), do: :cluster_s3_in_flight
   def normalize_source("cluster_s3_in_flight"), do: :cluster_s3_in_flight
   def normalize_source("cluster-storage-ops"), do: :cluster_storage_ops
   def normalize_source("cluster_storage_ops"), do: :cluster_storage_ops
   def normalize_source("cluster-combined"), do: :cluster_combined
   def normalize_source("cluster_combined"), do: :cluster_combined
+  def normalize_source("cluster-drive-device-io"), do: :cluster_drive_device_io
+  def normalize_source("cluster_drive_device_io"), do: :cluster_drive_device_io
   def normalize_source(_source), do: :combined
 
   @doc "Normalize any source to its node-local base source."
@@ -91,6 +104,7 @@ defmodule Maxio.Cluster.IOPressure do
       :cluster_s3_in_flight -> :s3_in_flight
       :cluster_storage_ops -> :storage_ops
       :cluster_combined -> :combined
+      :cluster_drive_device_io -> :drive_device_io
       source -> source
     end
   end

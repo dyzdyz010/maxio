@@ -8,15 +8,18 @@ defmodule Maxio.Application do
   @impl true
   def start(_type, _args) do
     children =
-      cluster_children() ++
+      [
+        MaxioWeb.Telemetry,
+        Maxio.Repo
+      ] ++
+        cluster_children() ++
         [
-          MaxioWeb.Telemetry,
-          Maxio.Repo,
           {DNSCluster, query: Application.get_env(:maxio, :dns_cluster_query) || :ignore},
           {Phoenix.PubSub, name: Maxio.PubSub},
           # M8 live-IO 自适应限流：本节点 S3 handler in-flight 计数器，由长期进程持有 ETS。
           Maxio.S3.InFlight,
           Maxio.Cluster.DriveIO,
+          Maxio.Cluster.DriveDeviceIO,
           Maxio.Cluster.PressureAggregator,
           Maxio.Cluster.CacheInvalidator,
           Maxio.Cluster.DriveHealth,
@@ -82,7 +85,7 @@ defmodule Maxio.Application do
       "maxio deferred: " <>
         lifecycle_scheduler <>
         "lifecycle transition actions remain no-op; SSE-S3 uses single static master key " <>
-        "(no rotation/KMS); MFA Delete not enforced; SSE-C/SSE-KMS return 501"
+        "(no rotation/KMS); MFA Delete requires configured verifier; SSE-C/SSE-KMS return 501"
     )
   end
 

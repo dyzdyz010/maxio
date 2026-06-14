@@ -19,6 +19,12 @@ defmodule Maxio.Cluster.Transport do
               {:ok, %{size: non_neg_integer(), mtime_ms: integer()}} | {:error, :enoent}
   @callback delete_shard(node(), String.t()) :: :ok
   @callback delete_part_file(node(), String.t()) :: :ok | {:error, term()}
+  @callback quarantine_layout_roots(node(), String.t(), [String.t()], String.t(), map()) ::
+              {:ok, map()} | {:error, term()}
+  @callback purge_quarantine_root(node(), String.t(), String.t(), map()) ::
+              {:ok, map()} | {:error, term()}
+  @callback preflight_quarantine_purge_root(node(), String.t(), String.t(), map()) ::
+              {:ok, map()} | {:error, term()}
   @callback heal_shard(node(), String.t(), %{non_neg_integer() => binary()}, pos_integer(), map()) ::
               {:ok, non_neg_integer()}
 
@@ -34,6 +40,8 @@ defmodule Maxio.Cluster.Transport do
               {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
   @callback probe_drive(node(), String.t()) :: :ok | {:error, term()}
   @callback probe_drive_identity(node(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  @callback drive_hardware_evidence(node(), String.t(), keyword()) ::
+              {:ok, map()} | {:error, term()}
   @callback drive_stats(node(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   @callback pressure_snapshot(node(), keyword()) :: {:ok, map()} | {:error, term()}
 
@@ -100,6 +108,36 @@ defmodule Maxio.Cluster.Transport.Erpc do
   end
 
   @impl true
+  def quarantine_layout_roots(node, drive_root, bucket_names, quarantine_id, marker) do
+    call(
+      node,
+      :quarantine_layout_roots,
+      [drive_root, bucket_names, quarantine_id, marker],
+      fn -> {:error, :unavailable} end
+    )
+  end
+
+  @impl true
+  def purge_quarantine_root(node, drive_root, quarantine_id, expected_marker) do
+    call(
+      node,
+      :purge_quarantine_root,
+      [drive_root, quarantine_id, expected_marker],
+      fn -> {:error, :unavailable} end
+    )
+  end
+
+  @impl true
+  def preflight_quarantine_purge_root(node, drive_root, quarantine_id, expected_marker) do
+    call(
+      node,
+      :preflight_quarantine_purge_root,
+      [drive_root, quarantine_id, expected_marker],
+      fn -> {:error, :unavailable} end
+    )
+  end
+
+  @impl true
   def heal_shard(node, dir, block_map, shard_len, meta) do
     call(node, :heal_shard, [dir, block_map, shard_len, meta], fn -> {:ok, 0} end)
   end
@@ -127,6 +165,11 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def probe_drive_identity(node, drive_root, opts \\ []) do
     call(node, :probe_drive_identity, [drive_root, opts], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def drive_hardware_evidence(node, drive_root, opts \\ []) do
+    call(node, :drive_hardware_evidence, [drive_root, opts], fn -> {:error, :unavailable} end)
   end
 
   @impl true

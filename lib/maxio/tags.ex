@@ -29,7 +29,7 @@ defmodule Maxio.Tags do
   defp valid_tag?({k, v}) when is_binary(k) and is_binary(v) do
     String.length(k) >= 1 and String.length(k) <= 128 and
       String.length(v) <= 256 and
-      not String.starts_with?(k, "aws:") and
+      not String.starts_with?(String.downcase(k), "aws:") and
       Regex.match?(@allowed, k) and Regex.match?(@allowed, v)
   end
 

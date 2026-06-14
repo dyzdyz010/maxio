@@ -15,6 +15,7 @@ defmodule Mix.Tasks.Maxio.Lifecycle.Run do
     * AbortIncompleteMultipartUpload
 
   Transition actions remain explicit defers until maxio has tiering backends.
+  MFA Delete buckets skip lifecycle actions that would permanently delete object versions.
   """
   use Mix.Task
 
@@ -49,6 +50,7 @@ defmodule Mix.Tasks.Maxio.Lifecycle.Run do
         "noncurrent_versions_expired=#{summary.noncurrent_versions_expired} " <>
         "delete_markers_removed=#{summary.delete_markers_removed} " <>
         "multipart_uploads_aborted=#{summary.multipart_uploads_aborted} " <>
+        "mfa_delete_protected_actions_skipped=#{summary.mfa_delete_protected_actions_skipped} " <>
         "unsupported_rules=#{summary.unsupported_rules} errors=#{length(summary.errors)}"
     )
 

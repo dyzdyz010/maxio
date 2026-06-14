@@ -8,10 +8,17 @@ defmodule Maxio.Cluster.Placement do
   """
 
   alias Maxio.Cluster.{Router, Topology}
+  alias Maxio.Cluster.Placement.PoolWritePolicy
   alias Maxio.Cluster.Rebalance.WriteRouting
   alias Maxio.Objects.Object
 
-  @type source :: :persisted | :override | :router | :decommission_redirect | :no_topology
+  @type source ::
+          :persisted
+          | :override
+          | :router
+          | :pool_free_space
+          | :decommission_redirect
+          | :no_topology
   @type resolution :: %{
           set_id: Topology.set_id() | nil,
           pool_id: non_neg_integer() | nil,
@@ -151,20 +158,15 @@ defmodule Maxio.Cluster.Placement do
   def topology_hash(nil), do: nil
 
   def topology_hash(topology) when is_map(topology) do
-    material = %{
-      data_shards: Map.get(topology, :data_shards),
-      parity_shards: Map.get(topology, :parity_shards),
-      block_size: Map.get(topology, :block_size),
-      pool_ids: Topology.pool_ids_from(topology),
-      pools:
-        Map.new(Topology.pool_ids_from(topology), fn pool_id ->
-          {pool_id, Topology.set_ids_for_pool_from(topology, pool_id)}
-        end),
-      set_ids: Topology.all_set_ids_from(topology)
-    }
+    Topology.fingerprint(topology)
+  end
 
-    :crypto.hash(:sha256, :erlang.term_to_binary(material))
-    |> Base.encode16(case: :lower)
+  @doc "Return the topology hash implied by placement options."
+  @spec topology_hash_for_opts(keyword()) :: String.t() | nil
+  def topology_hash_for_opts(opts \\ []) do
+    with {:ok, view} <- topology_view(opts) do
+      topology_hash(view)
+    end
   end
 
   defp resolve_routed(_bucket, _key, {:configured, nil}), do: {:ok, no_topology()}
@@ -184,18 +186,53 @@ defmodule Maxio.Cluster.Placement do
   defp resolve_routed_write(_bucket, _key, {:configured, nil}, _opts),
     do: {:ok, no_topology()}
 
-  defp resolve_routed_write(bucket, key, {:injected, _topology} = view, opts) do
-    with {:ok, placement} <- resolve_routed(bucket, key, view),
-         {:ok, set_id} <- WriteRouting.reroute_set(placement.set_id, opts),
-         :ok <- validate_set_id(set_id, view) do
-      source =
-        if set_id == placement.set_id do
-          placement.source
-        else
-          :decommission_redirect
-        end
+  defp resolve_routed_write(bucket, key, {:injected, topology} = view, opts) do
+    with {:ok, routes} <- WriteRouting.active_routes(opts) do
+      opts = write_routing_opts(opts, routes)
 
-      {:ok, %{placement | set_id: set_id, pool_id: pool_id_for_set(set_id, view), source: source}}
+      with {:ok, placement} <- resolve_write_candidate(bucket, key, topology, view, opts),
+           {:ok, set_id} <- WriteRouting.reroute_set(placement.set_id, opts),
+           :ok <- validate_set_id(set_id, view) do
+        source =
+          if set_id == placement.set_id do
+            placement.source
+          else
+            :decommission_redirect
+          end
+
+        {:ok,
+         %{placement | set_id: set_id, pool_id: pool_id_for_set(set_id, view), source: source}}
+      end
+    end
+  end
+
+  defp write_routing_opts(opts, routes) do
+    excluded_set_ids =
+      routes
+      |> Map.keys()
+      |> Enum.concat(List.wrap(Keyword.get(opts, :pool_write_exclude_set_ids, [])))
+
+    opts
+    |> Keyword.put(:decommission_write_routes, routes)
+    |> Keyword.put(:pool_write_exclude_set_ids, excluded_set_ids)
+  end
+
+  defp resolve_write_candidate(bucket, key, topology, view, opts) do
+    case PoolWritePolicy.select(bucket, key, topology, opts) do
+      :skip ->
+        resolve_routed(bucket, key, view)
+
+      {:ok, selection} ->
+        {:ok,
+         %{
+           set_id: selection.set_id,
+           pool_id: selection.pool_id,
+           topology_hash: topology_hash(view),
+           source: :pool_free_space
+         }}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

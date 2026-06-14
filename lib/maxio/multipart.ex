@@ -61,6 +61,51 @@ defmodule Maxio.Multipart do
     )
   end
 
+  @doc "Count active multipart upload sessions persisted on the given placement set."
+  @spec count_uploads_with_placement_set(integer()) :: non_neg_integer()
+  def count_uploads_with_placement_set(set_id) when is_integer(set_id) do
+    query =
+      from u in Upload,
+        where: u.placement_set_id == ^set_id
+
+    Repo.aggregate(query, :count, :id)
+  end
+
+  @doc "Count all active multipart upload sessions."
+  @spec count_uploads() :: non_neg_integer()
+  def count_uploads, do: Repo.aggregate(Upload, :count, :id)
+
+  @doc "Count active multipart upload sessions that lack a persisted placement set."
+  @spec count_uploads_missing_placement_set() :: non_neg_integer()
+  def count_uploads_missing_placement_set do
+    query =
+      from u in Upload,
+        where: is_nil(u.placement_set_id)
+
+    Repo.aggregate(query, :count, :id)
+  end
+
+  @doc "Count active multipart upload sessions pointing outside the configured topology."
+  @spec count_uploads_with_unknown_placement_set([integer()]) :: non_neg_integer()
+  def count_uploads_with_unknown_placement_set(set_ids) when is_list(set_ids) do
+    query =
+      from u in Upload,
+        where: not is_nil(u.placement_set_id) and u.placement_set_id not in ^set_ids
+
+    Repo.aggregate(query, :count, :id)
+  end
+
+  @doc "Count active multipart upload sessions written under another topology hash."
+  @spec count_uploads_with_placement_topology_hash_mismatch(String.t()) :: non_neg_integer()
+  def count_uploads_with_placement_topology_hash_mismatch(topology_hash)
+      when is_binary(topology_hash) do
+    query =
+      from u in Upload,
+        where: is_nil(u.placement_topology_hash) or u.placement_topology_hash != ^topology_hash
+
+    Repo.aggregate(query, :count, :id)
+  end
+
   @doc """
   列出会话已上传 part（升序）。opts: :max_parts(默认1000), :part_number_marker(仅列更大的)。
   返回 %{parts, is_truncated, next_part_number_marker}。

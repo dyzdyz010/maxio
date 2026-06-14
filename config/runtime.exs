@@ -39,6 +39,54 @@ if s3_port = System.get_env("MAXIO_S3_PORT") do
   config :maxio, Maxio.S3.Endpoint, port: String.to_integer(s3_port)
 end
 
+if account_id = System.get_env("MAXIO_ACCOUNT_ID") do
+  config :maxio, :sts, account_id: account_id
+end
+
+case System.get_env("MAXIO_MFA_SECRET_KEY") do
+  key when is_binary(key) ->
+    config :maxio, :mfa, secret_key: key
+
+  nil ->
+    if config_env() == :prod do
+      raise """
+      environment variable MAXIO_MFA_SECRET_KEY is missing.
+      Provide a base64-encoded 32 byte key for local MFA TOTP seed envelopes.
+      """
+    end
+end
+
+if topology_source = System.get_env("MAXIO_TOPOLOGY_SOURCE") do
+  source =
+    case topology_source do
+      "config" -> :config
+      "db" -> :db
+      other -> raise "invalid MAXIO_TOPOLOGY_SOURCE=#{inspect(other)}; expected config or db"
+    end
+
+  config :maxio, :topology_source, source
+end
+
+if pool_write_policy = System.get_env("MAXIO_POOL_WRITE_POLICY") do
+  mode =
+    case pool_write_policy do
+      "weighted_free_space" ->
+        :weighted_free_space
+
+      "hash" ->
+        :hash
+
+      other ->
+        raise "invalid MAXIO_POOL_WRITE_POLICY=#{inspect(other)}; expected hash or weighted_free_space"
+    end
+
+  config :maxio, :pool_write_policy, mode: mode
+end
+
+if max_used = System.get_env("MAXIO_POOL_WRITE_MAX_USED_PERCENT_X100") do
+  config :maxio, :pool_write_policy, max_used_percent_x100: String.to_integer(max_used)
+end
+
 # ── M7 多节点：prod 从 MAXIO_PEERS（逗号分隔 node 名）静态 epmd 组网。──
 # 例：MAXIO_PEERS="maxio@10.0.0.1,maxio@10.0.0.2,maxio@10.0.0.3"
 # 每节点须以 --name maxio@<ip> --cookie <同一 cookie> 启动（分布式 Erlang 前提）。

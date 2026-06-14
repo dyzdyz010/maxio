@@ -20,10 +20,32 @@ defmodule Maxio.Policy.Store do
               :ok | {:error, term()}
   @callback delete_principal_policy(principal_arn :: String.t(), name :: String.t()) :: :ok
   @callback list_principal_policies(principal_arn :: String.t()) :: [map()]
+  @callback put_managed_session_policy(policy_arn :: String.t(), json :: binary()) ::
+              :ok | {:error, term()}
+  @callback create_managed_session_policy(policy_arn :: String.t(), json :: binary()) ::
+              :ok | {:error, term()}
+  @callback managed_session_policy(policy_arn :: String.t()) ::
+              {:ok, binary()} | {:error, :not_found | :malformed | :not_supported}
+  @callback delete_managed_session_policy(policy_arn :: String.t()) :: :ok | {:error, term()}
+  @callback list_managed_session_policies() :: [map()]
+  @callback attach_role_managed_policy(role_arn :: String.t(), policy_arn :: String.t()) ::
+              :ok | {:error, term()}
+  @callback detach_role_managed_policy(role_arn :: String.t(), policy_arn :: String.t()) :: :ok
+  @callback list_attached_role_managed_policies(role_arn :: String.t()) :: [map()]
+  @callback managed_session_policy_attached?(policy_arn :: String.t()) :: boolean()
 
   @optional_callbacks put_principal_policy: 3,
                       delete_principal_policy: 2,
-                      list_principal_policies: 1
+                      list_principal_policies: 1,
+                      put_managed_session_policy: 2,
+                      create_managed_session_policy: 2,
+                      managed_session_policy: 1,
+                      delete_managed_session_policy: 1,
+                      list_managed_session_policies: 0,
+                      attach_role_managed_policy: 2,
+                      detach_role_managed_policy: 2,
+                      list_attached_role_managed_policies: 1,
+                      managed_session_policy_attached?: 1
 
   @doc "当前配置的策略后端模块。"
   @spec impl() :: module()
@@ -59,7 +81,7 @@ defmodule Maxio.Policy.Store do
     backend = impl()
 
     result =
-      if function_exported?(backend, :put_principal_policy, 3) do
+      if callback_exported?(backend, :put_principal_policy, 3) do
         backend.put_principal_policy(principal_arn, name, json)
       else
         {:error, :not_supported}
@@ -79,7 +101,7 @@ defmodule Maxio.Policy.Store do
   def delete_principal_policy(principal_arn, name) do
     backend = impl()
 
-    if function_exported?(backend, :delete_principal_policy, 2) do
+    if callback_exported?(backend, :delete_principal_policy, 2) do
       :ok = backend.delete_principal_policy(principal_arn, name)
     end
 
@@ -91,11 +113,156 @@ defmodule Maxio.Policy.Store do
   def list_principal_policies(principal_arn) do
     backend = impl()
 
-    if function_exported?(backend, :list_principal_policies, 1) do
+    if callback_exported?(backend, :list_principal_policies, 1) do
       backend.list_principal_policies(principal_arn)
     else
       []
     end
+  end
+
+  @spec put_managed_session_policy(String.t(), binary()) :: :ok | {:error, term()}
+  def put_managed_session_policy(policy_arn, json) do
+    backend = impl()
+
+    result =
+      if callback_exported?(backend, :put_managed_session_policy, 2) do
+        backend.put_managed_session_policy(policy_arn, json)
+      else
+        {:error, :not_supported}
+      end
+
+    case result do
+      :ok ->
+        Notify.broadcast({:managed_session_policy_changed, policy_arn})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec create_managed_session_policy(String.t(), binary()) :: :ok | {:error, term()}
+  def create_managed_session_policy(policy_arn, json) do
+    backend = impl()
+
+    result =
+      if callback_exported?(backend, :create_managed_session_policy, 2) do
+        backend.create_managed_session_policy(policy_arn, json)
+      else
+        {:error, :not_supported}
+      end
+
+    case result do
+      :ok ->
+        Notify.broadcast({:managed_session_policy_changed, policy_arn})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec managed_session_policy(String.t()) ::
+          {:ok, binary()} | {:error, :not_found | :malformed | :not_supported}
+  def managed_session_policy(policy_arn) do
+    backend = impl()
+
+    if callback_exported?(backend, :managed_session_policy, 1) do
+      backend.managed_session_policy(policy_arn)
+    else
+      {:error, :not_supported}
+    end
+  end
+
+  @spec delete_managed_session_policy(String.t()) :: :ok | {:error, term()}
+  def delete_managed_session_policy(policy_arn) do
+    backend = impl()
+
+    result =
+      if callback_exported?(backend, :delete_managed_session_policy, 1) do
+        backend.delete_managed_session_policy(policy_arn)
+      else
+        :ok
+      end
+
+    case result do
+      :ok ->
+        Notify.broadcast({:managed_session_policy_changed, policy_arn})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec list_managed_session_policies() :: [map()]
+  def list_managed_session_policies do
+    backend = impl()
+
+    if callback_exported?(backend, :list_managed_session_policies, 0) do
+      backend.list_managed_session_policies()
+    else
+      []
+    end
+  end
+
+  @spec attach_role_managed_policy(String.t(), String.t()) :: :ok | {:error, term()}
+  def attach_role_managed_policy(role_arn, policy_arn) do
+    backend = impl()
+
+    result =
+      if callback_exported?(backend, :attach_role_managed_policy, 2) do
+        backend.attach_role_managed_policy(role_arn, policy_arn)
+      else
+        {:error, :not_supported}
+      end
+
+    case result do
+      :ok ->
+        Notify.broadcast({:principal_policy_changed, role_arn})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec detach_role_managed_policy(String.t(), String.t()) :: :ok
+  def detach_role_managed_policy(role_arn, policy_arn) do
+    backend = impl()
+
+    if callback_exported?(backend, :detach_role_managed_policy, 2) do
+      :ok = backend.detach_role_managed_policy(role_arn, policy_arn)
+    end
+
+    Notify.broadcast({:principal_policy_changed, role_arn})
+    :ok
+  end
+
+  @spec list_attached_role_managed_policies(String.t()) :: [map()]
+  def list_attached_role_managed_policies(role_arn) do
+    backend = impl()
+
+    if callback_exported?(backend, :list_attached_role_managed_policies, 1) do
+      backend.list_attached_role_managed_policies(role_arn)
+    else
+      []
+    end
+  end
+
+  @spec managed_session_policy_attached?(String.t()) :: boolean()
+  def managed_session_policy_attached?(policy_arn) do
+    backend = impl()
+
+    if callback_exported?(backend, :managed_session_policy_attached?, 1) do
+      backend.managed_session_policy_attached?(policy_arn)
+    else
+      false
+    end
+  end
+
+  defp callback_exported?(backend, function, arity) do
+    Code.ensure_loaded?(backend) and function_exported?(backend, function, arity)
   end
 
   @doc """

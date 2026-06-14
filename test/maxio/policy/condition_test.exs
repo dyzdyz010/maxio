@@ -66,6 +66,12 @@ defmodule Maxio.Policy.ConditionTest do
            })
   end
 
+  test "condition key lookup is case-insensitive" do
+    assert Condition.hold?(%{"StringEquals" => %{"aws:PrincipalTag/Team" => "platform"}}, %{
+             "aws:PrincipalTag/team" => "platform"
+           })
+  end
+
   test "正向算子缺键 → false" do
     refute Condition.hold?(%{"StringEquals" => %{"s3:prefix" => "a/"}}, %{})
   end

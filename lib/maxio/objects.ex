@@ -304,9 +304,58 @@ defmodule Maxio.Objects do
   @doc "Return true when any object version row is still authoritative on the given placement set."
   @spec any_version_with_placement_set?(integer()) :: boolean()
   def any_version_with_placement_set?(set_id) when is_integer(set_id) do
+    count_versions_with_placement_set(set_id) > 0
+  end
+
+  @doc "Count object version rows still authoritative on the given placement set."
+  @spec count_versions_with_placement_set(integer()) :: non_neg_integer()
+  def count_versions_with_placement_set(set_id) when is_integer(set_id) do
     query =
       from o in Object,
-        where: o.placement_set_id == ^set_id,
+        where: o.placement_set_id == ^set_id
+
+    Repo.aggregate(query, :count, :id)
+  end
+
+  @doc "Return true when any object version lacks a persisted placement set."
+  @spec any_version_missing_placement_set?() :: boolean()
+  def any_version_missing_placement_set? do
+    count_versions_missing_placement_set() > 0
+  end
+
+  @doc "Count object version rows that lack a persisted placement set."
+  @spec count_versions_missing_placement_set() :: non_neg_integer()
+  def count_versions_missing_placement_set do
+    query =
+      from o in Object,
+        where: is_nil(o.placement_set_id)
+
+    Repo.aggregate(query, :count, :id)
+  end
+
+  @doc "Return true when any object version points at a placement set outside the configured topology."
+  @spec any_version_with_unknown_placement_set?([integer()]) :: boolean()
+  def any_version_with_unknown_placement_set?(set_ids) when is_list(set_ids) do
+    count_versions_with_unknown_placement_set(set_ids) > 0
+  end
+
+  @doc "Count object version rows that point at a placement set outside the configured topology."
+  @spec count_versions_with_unknown_placement_set([integer()]) :: non_neg_integer()
+  def count_versions_with_unknown_placement_set(set_ids) when is_list(set_ids) do
+    query =
+      from o in Object,
+        where: not is_nil(o.placement_set_id) and o.placement_set_id not in ^set_ids
+
+    Repo.aggregate(query, :count, :id)
+  end
+
+  @doc "Return true when any object version was written under another topology hash."
+  @spec any_version_with_placement_topology_hash_mismatch?(String.t()) :: boolean()
+  def any_version_with_placement_topology_hash_mismatch?(topology_hash)
+      when is_binary(topology_hash) do
+    query =
+      from o in Object,
+        where: is_nil(o.placement_topology_hash) or o.placement_topology_hash != ^topology_hash,
         select: o.id,
         limit: 1
 

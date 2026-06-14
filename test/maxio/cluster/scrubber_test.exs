@@ -1,7 +1,7 @@
 defmodule Maxio.Cluster.ScrubberTest do
   use Maxio.DataCase, async: false
 
-  alias Maxio.Cluster.{DriveIO, Lock, PressureAggregator, Scrubber}
+  alias Maxio.Cluster.{DriveDeviceIO, DriveIO, Lock, PressureAggregator, Scrubber}
   alias Maxio.Cluster.Scrubber.Usage
   alias Maxio.Cluster.Transport.InProcess
   alias Maxio.{Buckets, Objects}
@@ -389,6 +389,38 @@ defmodule Maxio.Cluster.ScrubberTest do
     assert Task.await(task) == :ok
   after
     DriveIO.reset()
+  end
+
+  test "adaptive IO gate can use cached device IO pressure" do
+    DriveDeviceIO.reset()
+    parent = self()
+    drive = Path.join(System.tmp_dir!(), "maxio_scrub_device_io")
+
+    _ =
+      DriveDeviceIO.sample_local_drive(drive,
+        provider: fn ^drive -> {:ok, %{device_id: "device-io", queue_depth: 1, source: :test}} end,
+        now_ms: 0
+      )
+
+    throttle =
+      Scrubber.Throttle.new(
+        [
+          adaptive_io: true,
+          io_load_source: :drive_device_io,
+          max_live_requests: 0,
+          io_pause_ms: 10,
+          io_max_pause_ms: 20,
+          throttle_now_fun: fn -> 0 end,
+          throttle_sleep_fun: fn ms -> send(parent, {:device_io_sleep, ms}) end
+        ],
+        0
+      )
+
+    _ = Scrubber.Throttle.maybe_wait(throttle)
+    assert_receive {:device_io_sleep, 10}
+    assert_receive {:device_io_sleep, 10}
+  after
+    DriveDeviceIO.reset()
   end
 
   test "scrubber adaptive IO gate can use cached cluster pressure" do

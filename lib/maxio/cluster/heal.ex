@@ -288,12 +288,29 @@ defmodule Maxio.Cluster.Heal do
   end
 
   defp endpoints_for(bucket, key, opts) do
+    case Keyword.get(opts, :placement_set_id) do
+      set_id when is_integer(set_id) ->
+        endpoints_for_set(set_id, opts)
+
+      _other ->
+        endpoints_for_route(bucket, key, opts)
+    end
+  end
+
+  defp endpoints_for_route(bucket, key, opts) do
     case topology(opts) do
       nil ->
         Topology.endpoints(Router.set_for(bucket, key, nil))
 
       t ->
         Topology.endpoints_from(t, Router.set_for(bucket, key, t))
+    end
+  end
+
+  defp endpoints_for_set(set_id, opts) do
+    case topology(opts) do
+      nil -> Topology.endpoints(set_id)
+      t -> Topology.endpoints_from(t, set_id)
     end
   end
 

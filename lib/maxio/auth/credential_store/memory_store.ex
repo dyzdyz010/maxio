@@ -1,58 +1,71 @@
 defmodule Maxio.Auth.CredentialStore.MemoryStore do
   @moduledoc """
-  内存凭据后端（ETS）。root 凭据从 config :maxio, :s3 的 root_user/root_password 引导。
-  惰性建表：首次访问若表不存在则建表并注入 root。principal 形如
-  %{type: :root, access_key: ..., arn: "arn:aws:iam:::root"}。
+  ETS credential backend used by tests and local development.
+
+  Long-term credentials are stored as `{access_key, secret_key, principal}`.
+  Temporary session credentials are stored as
+  `{access_key, secret_key, principal, session_meta}` and require a matching
+  session token on lookup.
   """
   @behaviour Maxio.Auth.CredentialStore
+
+  alias Maxio.Auth.SessionToken
 
   @table :maxio_credentials
 
   @impl true
-  def get_secret(access_key) do
+  def get_secret(access_key), do: get_secret(access_key, [])
+
+  @impl true
+  def get_secret(access_key, opts) do
     ensure_table()
 
     case :ets.lookup(@table, access_key) do
       [{^access_key, secret_key, principal}] ->
-        {:ok, %{secret_key: secret_key, principal: principal}}
+        if session_token?(Keyword.get(opts, :session_token)) do
+          {:error, :invalid_token}
+        else
+          {:ok, %{secret_key: secret_key, principal: principal}}
+        end
+
+      [{^access_key, secret_key, principal, meta}] ->
+        session_secret(secret_key, principal, meta, opts)
 
       [] ->
-        # 并发惰性建表竞态：另一进程已建表但尚未注入 root 时，本进程可能读到空。
-        # 仅当查询的是 root key 且表中确无该行时，幂等补一次 bootstrap 再重查（绝不静默丢失 root）。
-        maybe_bootstrap_root_for(access_key)
-    end
-  end
-
-  # 表已存在但 root 行尚未可见（建表进程的 bootstrap_root 与本进程 lookup 交错）时，
-  # 幂等补注入 root 并重查；非 root key 仍正常返回 :error。
-  defp maybe_bootstrap_root_for(access_key) do
-    if access_key == root_access_key() do
-      bootstrap_root()
-
-      case :ets.lookup(@table, access_key) do
-        [{^access_key, secret_key, principal}] ->
-          {:ok, %{secret_key: secret_key, principal: principal}}
-
-        [] ->
-          :error
-      end
-    else
-      :error
+        maybe_bootstrap_root_for(access_key, opts)
     end
   end
 
   @impl true
-  def put_access_key(%{access_key: ak, secret_key: sk} = attrs) do
+  def put_access_key(%{access_key: ak, secret_key: sk, session_token: token} = attrs) do
     ensure_table()
 
-    principal =
-      Map.get(attrs, :principal, %{
-        type: :iam_user,
-        access_key: ak,
-        arn: "arn:aws:iam:::user/#{ak}"
-      })
+    case Map.get(attrs, :expires_at) do
+      %DateTime{} = expires_at ->
+        principal =
+          attrs
+          |> default_principal(ak)
+          |> Map.put(:credential_type, :session)
+          |> Map.put_new(:session_access_key, ak)
+          |> Map.put_new(:session_expires_at, expires_at)
 
-    :ets.insert(@table, {ak, sk, principal})
+        meta = %{
+          session_token_sha256: SessionToken.hash(token),
+          expires_at: expires_at,
+          status: Map.get(attrs, :status, :active)
+        }
+
+        :ets.insert(@table, {ak, sk, principal, meta})
+        :ok
+
+      _other ->
+        {:error, :invalid_attrs}
+    end
+  end
+
+  def put_access_key(%{access_key: ak, secret_key: sk} = attrs) do
+    ensure_table()
+    :ets.insert(@table, {ak, sk, default_principal(attrs, ak)})
     :ok
   end
 
@@ -62,8 +75,12 @@ defmodule Maxio.Auth.CredentialStore.MemoryStore do
   def list_keys do
     ensure_table()
 
-    :ets.tab2list(@table)
-    |> Enum.map(fn {ak, _sk, principal} -> %{access_key: ak, principal: principal} end)
+    @table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn
+      {ak, _sk, principal} -> [%{access_key: ak, principal: principal}]
+      {_ak, _sk, _principal, _meta} -> []
+    end)
   end
 
   @impl true
@@ -82,7 +99,56 @@ defmodule Maxio.Auth.CredentialStore.MemoryStore do
 
   def invalidate(_scope), do: :ok
 
-  # 惰性建表 + 注入 root（幂等）。并发安全：用 :public named table，已存在则忽略。
+  defp maybe_bootstrap_root_for(access_key, opts) do
+    if access_key == root_access_key() do
+      bootstrap_root()
+
+      case :ets.lookup(@table, access_key) do
+        [{^access_key, secret_key, principal}] ->
+          if session_token?(Keyword.get(opts, :session_token)) do
+            {:error, :invalid_token}
+          else
+            {:ok, %{secret_key: secret_key, principal: principal}}
+          end
+
+        [] ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp session_secret(secret_key, principal, meta, opts) do
+    now = Keyword.get(opts, :now) || DateTime.utc_now()
+    token = Keyword.get(opts, :session_token)
+
+    cond do
+      Map.get(meta, :status) != :active ->
+        {:error, :invalid_token}
+
+      DateTime.compare(Map.fetch!(meta, :expires_at), now) != :gt ->
+        {:error, :expired_token}
+
+      not session_token?(token) ->
+        {:error, :missing_session_token}
+
+      not SessionToken.verify(token, Map.fetch!(meta, :session_token_sha256)) ->
+        {:error, :invalid_token}
+
+      true ->
+        {:ok, %{secret_key: secret_key, principal: principal}}
+    end
+  end
+
+  defp default_principal(attrs, access_key) do
+    Map.get(attrs, :principal, %{
+      type: :iam_user,
+      access_key: access_key,
+      arn: "arn:aws:iam:::user/#{access_key}"
+    })
+  end
+
   defp ensure_table do
     case :ets.whereis(@table) do
       :undefined ->
@@ -109,4 +175,8 @@ defmodule Maxio.Auth.CredentialStore.MemoryStore do
     |> Application.fetch_env!(:s3)
     |> Keyword.fetch!(:root_user)
   end
+
+  defp session_token?(nil), do: false
+  defp session_token?(""), do: false
+  defp session_token?(_token), do: true
 end

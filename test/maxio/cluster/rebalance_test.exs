@@ -46,6 +46,7 @@ defmodule Maxio.Cluster.RebalanceTest do
     assert report.versions == 4
     assert report.delete_markers == 1
     assert report.placement_fallbacks == 4
+    assert report.routing_mismatches == 0
     assert report.bytes == 37
 
     per_set = Map.new(report.per_set, &{&1.set_id, &1})
@@ -55,6 +56,7 @@ defmodule Maxio.Cluster.RebalanceTest do
     assert per_set[0].versions == 2
     assert per_set[0].delete_markers == 0
     assert per_set[0].placement_fallbacks == 2
+    assert per_set[0].routing_mismatches == 0
     assert per_set[0].bytes == 30
 
     refute Map.fetch!(per_set[1], :target?)
@@ -62,6 +64,7 @@ defmodule Maxio.Cluster.RebalanceTest do
     assert per_set[1].versions == 2
     assert per_set[1].delete_markers == 1
     assert per_set[1].placement_fallbacks == 2
+    assert per_set[1].routing_mismatches == 0
     assert per_set[1].bytes == 7
 
     assert report.decommission.set_id == 0
@@ -92,6 +95,7 @@ defmodule Maxio.Cluster.RebalanceTest do
     assert report.versions == 1
     assert report.delete_markers == 0
     assert report.placement_fallbacks == 1
+    assert report.routing_mismatches == 0
     assert report.bytes == 20
   end
 
@@ -121,15 +125,19 @@ defmodule Maxio.Cluster.RebalanceTest do
 
     assert report.scanned == 2
     assert report.placement_fallbacks == 1
+    assert report.routing_mismatches == 1
     assert per_set[0].objects == 0
     assert per_set[0].bytes == 0
     assert per_set[0].placement_fallbacks == 0
+    assert per_set[0].routing_mismatches == 0
     assert per_set[1].objects == 2
     assert per_set[1].bytes == 17
     assert per_set[1].placement_fallbacks == 1
+    assert per_set[1].routing_mismatches == 1
     assert report.decommission.objects == 2
     assert report.decommission.bytes == 17
     assert report.decommission.placement_fallbacks == 1
+    assert report.decommission.routing_mismatches == 1
   end
 
   test "partial drive stats are surfaced without hiding inventory totals" do

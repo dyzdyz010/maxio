@@ -104,7 +104,7 @@ defmodule Maxio.Policy.Condition do
     {base_op, if_exists?, set_qualifier} = normalize_operator(op)
 
     Enum.all?(kv, fn {key, policy_val} ->
-      case Map.fetch(ctx, key) do
+      case fetch_condition_value(ctx, key) do
         :error ->
           missing_key_holds?(
             base_op,
@@ -122,6 +122,30 @@ defmodule Maxio.Policy.Condition do
   end
 
   defp operator_holds?(_op, _kv, _ctx, _variables_enabled?), do: false
+
+  defp fetch_condition_value(ctx, key) do
+    case Map.fetch(ctx, key) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :error ->
+        fetch_condition_value_case_insensitive(ctx, key)
+    end
+  end
+
+  defp fetch_condition_value_case_insensitive(ctx, key) when is_binary(key) do
+    normalized_key = String.downcase(key)
+
+    Enum.find_value(ctx, :error, fn
+      {ctx_key, value} when is_binary(ctx_key) ->
+        if String.downcase(ctx_key) == normalized_key, do: {:ok, value}, else: false
+
+      _other ->
+        false
+    end)
+  end
+
+  defp fetch_condition_value_case_insensitive(_ctx, _key), do: :error
 
   defp normalize_operator(op) do
     {set_qualifier, op_without_set} = normalize_set_operator(op)

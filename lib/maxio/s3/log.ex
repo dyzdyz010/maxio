@@ -18,7 +18,13 @@ defmodule Maxio.S3.Log do
     :reason,
     :code,
     :status,
-    :size
+    :size,
+    :principal_arn,
+    :mfa_serial_hash,
+    :mfa_device_status,
+    :mfa_outcome,
+    :mfa_reason,
+    :mfa_window_offset
   ]
 
   @doc "把关键字参数中已知的 S3 元数据键提取为 Logger metadata keyword 列表。"

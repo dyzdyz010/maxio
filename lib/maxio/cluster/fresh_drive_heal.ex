@@ -297,7 +297,7 @@ defmodule Maxio.Cluster.FreshDriveHeal do
   end
 
   defp maybe_scan_object(bucket, cfg, report, object) do
-    set_id = Router.set_for(bucket, object.key, cfg[:topology])
+    set_id = object_set_id(bucket, object, cfg)
 
     cond do
       not MapSet.member?(cfg[:target_sets], set_id) ->
@@ -315,10 +315,11 @@ defmodule Maxio.Cluster.FreshDriveHeal do
   defp scan_object(bucket, cfg, report, object, set_id) do
     resource = {:scrubber_set, {:distributed, set_id}}
     report = bump(report, :scanned)
+    healer_opts = Keyword.put(cfg[:healer_opts], :placement_set_id, set_id)
 
     case Lock.quorum_with_lock(
            resource,
-           fn -> Heal.heal_object(bucket, object.key, object.version_id, cfg[:healer_opts]) end,
+           fn -> Heal.heal_object(bucket, object.key, object.version_id, healer_opts) end,
            lock_opts(set_id, cfg)
          ) do
       {:ok, {:ok, %{healed: healed}}} when healed > 0 ->
@@ -481,6 +482,11 @@ defmodule Maxio.Cluster.FreshDriveHeal do
   defp cap_reached?(report, cfg) do
     is_integer(cfg[:max_objects]) and report.scanned >= cfg[:max_objects]
   end
+
+  defp object_set_id(_bucket, %{placement_set_id: set_id}, _cfg) when is_integer(set_id),
+    do: set_id
+
+  defp object_set_id(bucket, object, cfg), do: Router.set_for(bucket, object.key, cfg[:topology])
 
   defp bucket_names(nil), do: Buckets.list() |> Enum.map(& &1.name)
 

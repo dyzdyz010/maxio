@@ -84,9 +84,33 @@ defmodule Maxio.Cluster.TransportInProcessTest do
     assert {:error, :unavailable} = InProcess.probe_drive_identity(node, drive)
   end
 
-  test "drive stats follow drive down state", %{base: base} do
+  test "drive hardware evidence follows drive down state", %{base: base} do
     node = :maxio@n6
     drive = Path.join(base, "n6_d0")
+    File.mkdir_p!(drive)
+
+    provider = fn ^drive ->
+      {:ok,
+       %{
+         mount_root: "hardware-mount",
+         major_minor: "8:1",
+         block_device: "sda1",
+         source: :test
+       }}
+    end
+
+    assert {:ok, %{mount_root: "hardware-mount", block_device: "sda1"}} =
+             InProcess.drive_hardware_evidence(node, drive, provider: provider)
+
+    InProcess.set_drive_down(node, drive)
+
+    assert {:error, :unavailable} =
+             InProcess.drive_hardware_evidence(node, drive, provider: provider)
+  end
+
+  test "drive stats follow drive down state", %{base: base} do
+    node = :maxio@n7
+    drive = Path.join(base, "n7_d0")
     File.mkdir_p!(drive)
 
     provider = fn ^drive ->
@@ -105,5 +129,16 @@ defmodule Maxio.Cluster.TransportInProcessTest do
 
     InProcess.set_drive_down(node, drive)
     assert {:error, :unavailable} = InProcess.drive_stats(node, drive, provider: provider)
+  end
+
+  test "strict layout quarantine follows drive down state", %{base: base} do
+    node = :maxio@n8
+    drive = Path.join(base, "n8_d0")
+    File.mkdir_p!(Path.join(drive, "bucket-a"))
+
+    InProcess.set_drive_down(node, drive)
+
+    assert {:error, :unavailable} =
+             InProcess.quarantine_layout_roots(node, drive, ["bucket-a"], "q-1", %{})
   end
 end

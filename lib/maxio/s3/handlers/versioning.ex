@@ -6,7 +6,7 @@ defmodule Maxio.S3.Handlers.Versioning do
   """
   import Plug.Conn
   alias Maxio.Buckets
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{Error, Log, MFADelete}
   alias Maxio.S3.RequestParsers.VersioningConfiguration, as: Parser
   alias Maxio.S3.Views.VersioningConfiguration, as: View
 
@@ -15,11 +15,13 @@ defmodule Maxio.S3.Handlers.Versioning do
   @spec put(Plug.Conn.t()) :: Plug.Conn.t()
   def put(conn) do
     bucket = conn.assigns.s3_bucket
-    _ = ensure_bucket!(bucket)
+    bucket_meta = ensure_bucket!(bucket)
     {conn, xml} = read_small_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, %{status: status, mfa_delete: mfa}} ->
+        MFADelete.require_for_versioning_put!(conn, bucket_meta, status, mfa)
+
         # status 缺省（空 body）→ 不改状态（保留现状）；显式 Enabled/Suspended → 落库。
         :ok = Buckets.put_versioning(bucket, status, mfa)
 

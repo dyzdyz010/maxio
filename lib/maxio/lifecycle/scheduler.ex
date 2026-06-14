@@ -106,6 +106,7 @@ defmodule Maxio.Lifecycle.Scheduler do
         "noncurrent=#{Map.get(summary, :noncurrent_versions_expired, 0)} " <>
         "markers=#{Map.get(summary, :delete_markers_removed, 0)} " <>
         "multipart=#{Map.get(summary, :multipart_uploads_aborted, 0)} " <>
+        "mfa_skipped=#{Map.get(summary, :mfa_delete_protected_actions_skipped, 0)} " <>
         "unsupported=#{Map.get(summary, :unsupported_rules, 0)} " <>
         "errors=#{length(Map.get(summary, :errors, []))}",
       action: :lifecycle

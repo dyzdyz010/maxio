@@ -29,6 +29,7 @@ defmodule Maxio.TagsTest do
 
   test "aws: 前缀保留 → invalid_tag" do
     assert {:error, :invalid_tag} = Tags.validate([{"aws:foo", "v"}], :object)
+    assert {:error, :invalid_tag} = Tags.validate([{"AWS:foo", "v"}], :object)
   end
 
   test "非法字符 → invalid_tag" do

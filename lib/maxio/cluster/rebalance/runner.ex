@@ -1,11 +1,12 @@
 defmodule Maxio.Cluster.Rebalance.Runner do
   @moduledoc """
-  Foreground decommission copy-pass runner.
+  Foreground rebalance/decommission copy-pass runner.
 
   This is a restricted M8 data movement primitive: it copies object versions and
-  delete markers from a persisted source set to an operator-selected destination
-  set, then atomically switches the PG placement row. It can choose a bounded
-  DriveStats-based destination when explicitly requested, but it never deletes
+  delete markers to a new placement set, then atomically switches the PG
+  placement row. Decommission copies from one source set to an operator-selected
+  or DriveStats-selected destination set. Rebalance jobs copy only rows whose
+  persisted set differs from current topology routing. Neither mode deletes
   source shards or mutates topology.
   """
 
@@ -17,8 +18,9 @@ defmodule Maxio.Cluster.Rebalance.Runner do
   @type report :: %{
           status: :ok | :dry_run | :partial | :failed | :canceled,
           job_id: String.t(),
-          target_set_id: non_neg_integer(),
-          destination_set_id: non_neg_integer(),
+          job_kind: String.t(),
+          target_set_id: non_neg_integer() | nil,
+          destination_set_id: non_neg_integer() | nil,
           dry_run: boolean(),
           truncated: boolean(),
           source_cleanup: false,
@@ -31,12 +33,12 @@ defmodule Maxio.Cluster.Rebalance.Runner do
         }
 
   @doc """
-  Run one foreground decommission copy pass.
+  Run one foreground rebalance/decommission copy pass.
 
   Options:
 
-    * `:destination_set_id` - explicit destination set.
-    * `:auto_destination` - when true, choose a destination by DriveStats free space.
+    * `:destination_set_id` - explicit destination set for decommission jobs.
+    * `:auto_destination` - when true, choose a decommission destination by DriveStats free space.
     * `:max_versions` - cap versions/delete markers processed in this invocation.
     * `:page_size` - ListObjectVersions page size; defaults to job page size.
     * `:dry_run` - enumerate target rows without writing bytes or job progress.
@@ -56,8 +58,8 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     with {:ok, job} <- Jobs.get(job_id),
          :ok <- validate_job(job),
          :ok <- ensure_pg_authority(opts),
-         {:ok, destination_set_id} <- resolve_destination(job, opts),
-         :ok <- validate_sets(job.target_set_id, destination_set_id, opts) do
+         {:ok, destination_set_id} <- resolve_job_destination(job, opts),
+         :ok <- validate_job_sets(job, destination_set_id, opts) do
       opts =
         Keyword.put(opts, :free_space_destination, free_space_destination_selected?(job, opts))
 
@@ -113,6 +115,15 @@ defmodule Maxio.Cluster.Rebalance.Runner do
   defp validate_job(%Job{kind: "decommission", status: status}),
     do: {:error, {:not_runnable, status}}
 
+  defp validate_job(%Job{kind: "rebalance", status: status})
+       when status in ["planned", "running"],
+       do: :ok
+
+  defp validate_job(%Job{kind: "rebalance", status: "canceled"}), do: {:error, :canceled}
+
+  defp validate_job(%Job{kind: "rebalance", status: status}),
+    do: {:error, {:not_runnable, status}}
+
   defp validate_job(%Job{kind: kind}), do: {:error, {:unsupported_job_kind, kind}}
 
   defp ensure_pg_authority(opts) do
@@ -124,7 +135,20 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     end)
   end
 
-  defp resolve_destination(%Job{} = job, opts) do
+  defp resolve_job_destination(%Job{kind: "rebalance"}, opts) do
+    cond do
+      is_integer(Keyword.get(opts, :destination_set_id)) ->
+        {:error, :rebalance_uses_dynamic_destinations}
+
+      Keyword.get(opts, :auto_destination, false) ->
+        {:error, :rebalance_uses_dynamic_destinations}
+
+      true ->
+        {:ok, nil}
+    end
+  end
+
+  defp resolve_job_destination(%Job{kind: "decommission"} = job, opts) do
     requested = Keyword.get(opts, :destination_set_id)
 
     cond do
@@ -154,6 +178,16 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     end
   end
 
+  defp validate_job_sets(%Job{kind: "rebalance"}, nil, opts) do
+    case all_set_ids(opts) do
+      [] -> {:error, :no_topology}
+      _set_ids -> :ok
+    end
+  end
+
+  defp validate_job_sets(%Job{kind: "decommission"} = job, destination_set_id, opts),
+    do: validate_sets(job.target_set_id, destination_set_id, opts)
+
   defp validate_sets(target_set_id, destination_set_id, opts) do
     set_ids = all_set_ids(opts)
 
@@ -177,6 +211,10 @@ defmodule Maxio.Cluster.Rebalance.Runner do
 
   defp maybe_begin(job, _destination_set_id, _opts, true), do: {:ok, job}
 
+  defp maybe_begin(%Job{kind: "rebalance"} = job, nil, opts, false) do
+    Jobs.begin_rebalance_data_movement(job, opts)
+  end
+
   defp maybe_begin(job, destination_set_id, opts, false) do
     Jobs.begin_data_movement(job, destination_set_id, opts)
   end
@@ -188,6 +226,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
       |> maybe_put(:transport, Keyword.get(opts, :transport))
 
     [
+      job_kind: job.kind,
       job_id: job.id,
       target_set_id: job.target_set_id,
       destination_set_id: destination_set_id,
@@ -195,8 +234,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
       max_versions: positive_int_or_nil(Keyword.get(opts, :max_versions)),
       dry_run: Keyword.get(opts, :dry_run, false),
       free_space_placement: Keyword.get(opts, :free_space_destination, false),
-      common_opts: common_opts,
-      destination_opts: Keyword.put(common_opts, :placement_set_id, destination_set_id)
+      common_opts: common_opts
     ]
   end
 
@@ -204,6 +242,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     %{
       status: :ok,
       job_id: job.id,
+      job_kind: job.kind,
       target_set_id: job.target_set_id,
       destination_set_id: destination_set_id,
       dry_run: Keyword.get(opts, :dry_run, false),
@@ -303,30 +342,111 @@ defmodule Maxio.Cluster.Rebalance.Runner do
         cap_reached?(acc, cfg) ->
           {:halt, %{acc | truncated: true}}
 
-        object.placement_set_id != cfg[:target_set_id] ->
-          {:cont, acc}
-
         canceled?(cfg[:job_id]) ->
           {:halt, %{acc | canceled: true}}
 
         true ->
-          acc = process_target_object(bucket, cfg, acc, object)
+          case movement_candidate(bucket, cfg, object) do
+            :skip ->
+              {:cont, acc}
 
-          cond do
-            stop?(acc) -> {:halt, acc}
-            cap_reached?(acc, cfg) -> {:halt, %{acc | truncated: true}}
-            true -> {:cont, acc}
+            {:skip, destination_set_id} ->
+              reduce_movement_candidate(bucket, cfg, acc, object, destination_set_id, :skipped)
+
+            {:error, reason} ->
+              acc =
+                acc
+                |> bump(:errors)
+                |> bump(:run_errors)
+                |> log_candidate_error(bucket, object, reason)
+
+              {:halt, acc}
+
+            {:ok, destination_set_id} ->
+              reduce_movement_candidate(bucket, cfg, acc, object, destination_set_id, :moved)
           end
       end
     end)
   end
 
-  defp process_target_object(bucket, cfg, report, object) do
+  defp reduce_movement_candidate(bucket, cfg, report, object, destination_set_id, dry_run_result) do
+    cond do
+      stop?(report) ->
+        {:halt, report}
+
+      cap_reached?(report, cfg) ->
+        {:halt, %{report | truncated: true}}
+
+      canceled?(cfg[:job_id]) ->
+        {:halt, %{report | canceled: true}}
+
+      true ->
+        report =
+          process_target_object(bucket, cfg, report, object, destination_set_id, dry_run_result)
+
+        cond do
+          stop?(report) -> {:halt, report}
+          cap_reached?(report, cfg) -> {:halt, %{report | truncated: true}}
+          true -> {:cont, report}
+        end
+    end
+  end
+
+  defp movement_candidate(bucket, cfg, object) do
+    case cfg[:job_kind] do
+      "decommission" -> decommission_movement_candidate(cfg, object)
+      "rebalance" -> rebalance_movement_candidate(bucket, cfg, object)
+    end
+  end
+
+  defp decommission_movement_candidate(cfg, object) do
+    if object.placement_set_id == cfg[:target_set_id] do
+      {:ok, cfg[:destination_set_id]}
+    else
+      :skip
+    end
+  end
+
+  defp rebalance_movement_candidate(bucket, cfg, object) do
+    with {:ok, destination} <- rebalance_destination(bucket, cfg, object) do
+      cond do
+        is_nil(object.placement_set_id) ->
+          {:error, {:missing_persisted_placement, object.key, object.version_id}}
+
+        destination == object.placement_set_id ->
+          {:skip, destination}
+
+        true ->
+          {:ok, destination}
+      end
+    end
+  end
+
+  defp rebalance_destination(bucket, cfg, object) do
+    case Placement.resolve(bucket, object.key, cfg[:common_opts]) do
+      {:ok, %{set_id: nil}} -> {:error, :no_topology}
+      {:ok, %{set_id: set_id}} -> {:ok, set_id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp log_candidate_error(report, bucket, object, reason) do
+    Log.error("rebalance runner object candidate failed",
+      action: :rebalance_run,
+      bucket: bucket,
+      key: object.key,
+      reason: "version_id=#{object.version_id} reason=#{inspect(reason)}"
+    )
+
+    report
+  end
+
+  defp process_target_object(bucket, cfg, report, object, destination_set_id, dry_run_result) do
     result =
       if cfg[:dry_run] do
-        {:ok, :moved}
+        {:ok, dry_run_result}
       else
-        move_with_lock(bucket, cfg, object)
+        move_with_lock(bucket, cfg, object, destination_set_id)
       end
 
     report =
@@ -338,22 +458,23 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     maybe_record_progress(report, bucket, object, cfg, result)
   end
 
-  defp move_with_lock(bucket, cfg, object) do
+  defp move_with_lock(bucket, cfg, object, destination_set_id) do
     case Maxio.Lock.with_object_lock({bucket, object.key}, fn ->
-           move_locked(bucket, cfg, object)
+           move_locked(bucket, cfg, object, destination_set_id)
          end) do
       {:ok, result} -> result
       {:error, :locked} -> {:error, :locked}
     end
   end
 
-  defp move_locked(bucket, cfg, object) do
+  defp move_locked(bucket, cfg, object, destination_set_id) do
     with {:ok, current} <- Objects.get_version(bucket, object.key, object.version_id),
-         :ok <- ensure_current_target(current, cfg[:target_set_id]) do
+         {:ok, destination_set_id} <-
+           locked_destination(bucket, cfg, current, destination_set_id) do
       if current.is_delete_marker do
-        copy_delete_marker(bucket, cfg, current)
+        copy_delete_marker(bucket, cfg, current, destination_set_id)
       else
-        copy_object(bucket, cfg, current)
+        copy_object(bucket, cfg, current, destination_set_id)
       end
     else
       {:error, :not_found} -> {:ok, :skipped}
@@ -362,18 +483,47 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     end
   end
 
-  defp ensure_current_target(%{placement_set_id: target_set_id}, target_set_id), do: :ok
-  defp ensure_current_target(_object, _target_set_id), do: {:error, :stale}
+  defp locked_destination(bucket, cfg, object, destination_set_id) do
+    case cfg[:job_kind] do
+      "decommission" ->
+        locked_decommission_destination(cfg, object, destination_set_id)
 
-  defp copy_object(bucket, cfg, object) do
+      "rebalance" ->
+        locked_rebalance_destination(bucket, cfg, object)
+    end
+  end
+
+  defp locked_decommission_destination(cfg, object, destination_set_id) do
+    if object.placement_set_id == cfg[:target_set_id] do
+      {:ok, destination_set_id}
+    else
+      {:error, :stale}
+    end
+  end
+
+  defp locked_rebalance_destination(bucket, cfg, object) do
+    with {:ok, destination_set_id} <- rebalance_destination(bucket, cfg, object) do
+      cond do
+        is_nil(object.placement_set_id) -> {:error, :stale}
+        object.placement_set_id == destination_set_id -> {:error, :stale}
+        true -> {:ok, destination_set_id}
+      end
+    end
+  end
+
+  defp copy_object(bucket, cfg, object, destination_set_id) do
     source_opts = cfg[:common_opts] ++ Placement.storage_opts(object)
-    destination_opts = Keyword.put(cfg[:destination_opts], :object_meta, object_meta(object))
+
+    destination_opts =
+      cfg
+      |> destination_opts(destination_set_id)
+      |> Keyword.put(:object_meta, object_meta(object))
 
     with {:ok, stream} <- Storage.get(bucket, object.key, object.version_id, nil, source_opts),
          {:ok, write_result} <-
            Storage.put(bucket, object.key, object.version_id, stream, destination_opts),
          :ok <- verify_unencrypted_size(object, write_result),
-         {:ok, attrs} <- placement_attrs_from_write(write_result, cfg, object),
+         {:ok, attrs} <- placement_attrs_from_write(write_result, destination_set_id, object),
          {:ok, _updated} <- Objects.update_placement_if_current(object, attrs) do
       {:ok, :moved}
     else
@@ -382,7 +532,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     end
   end
 
-  defp copy_delete_marker(bucket, cfg, object) do
+  defp copy_delete_marker(bucket, cfg, object, destination_set_id) do
     entry_opts = [modtime: modtime_ns(object), generation: object.index_generation || 0]
 
     with :ok <-
@@ -391,9 +541,9 @@ defmodule Maxio.Cluster.Rebalance.Runner do
              object.key,
              object.version_id,
              entry_opts,
-             cfg[:destination_opts]
+             destination_opts(cfg, destination_set_id)
            ),
-         {:ok, attrs} <- marker_placement_attrs(bucket, cfg, object),
+         {:ok, attrs} <- marker_placement_attrs(bucket, cfg, object, destination_set_id),
          {:ok, _updated} <- Objects.update_placement_if_current(object, attrs) do
       {:ok, :moved}
     else
@@ -403,6 +553,10 @@ defmodule Maxio.Cluster.Rebalance.Runner do
       {:error, reason} ->
         {:error, {:copy_delete_marker_failed, object.key, object.version_id, reason}}
     end
+  end
+
+  defp destination_opts(cfg, destination_set_id) do
+    Keyword.put(cfg[:common_opts], :placement_set_id, destination_set_id)
   end
 
   defp object_meta(object) do
@@ -442,9 +596,7 @@ defmodule Maxio.Cluster.Rebalance.Runner do
 
   defp verify_unencrypted_size(_object, _write_result), do: {:error, :missing_write_size}
 
-  defp placement_attrs_from_write(write_result, cfg, object) do
-    destination_set_id = cfg[:destination_set_id]
-
+  defp placement_attrs_from_write(write_result, destination_set_id, object) do
     attrs =
       write_result
       |> Placement.attrs_from_result()
@@ -459,12 +611,10 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     end
   end
 
-  defp marker_placement_attrs(bucket, cfg, object) do
-    destination_set_id = cfg[:destination_set_id]
-
+  defp marker_placement_attrs(bucket, cfg, object, destination_set_id) do
     attrs =
       bucket
-      |> Placement.attrs_for_write(object.key, cfg[:destination_opts])
+      |> Placement.attrs_for_write(object.key, destination_opts(cfg, destination_set_id))
       |> Map.put(:index_generation, object.index_generation || 0)
 
     case Map.get(attrs, :placement_set_id) do

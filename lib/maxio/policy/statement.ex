@@ -68,6 +68,29 @@ defmodule Maxio.Policy.Statement do
   end
 
   @doc """
+  Parses an IAM role trust policy attached to `role_arn`.
+
+  Trust policies are resource-based policies for STS. They normally omit
+  `Resource` because the policy is attached to exactly one role; this parser
+  injects that role ARN as the resource so the shared evaluator can be reused.
+  """
+  @spec parse_trust_policy(binary(), String.t()) :: {:ok, [t()]} | {:error, :malformed}
+  def parse_trust_policy(json, role_arn) when is_binary(json) and is_binary(role_arn) do
+    with true <- role_arn != "",
+         {:ok, doc} <- decode(json),
+         :ok <- check_version(doc),
+         {:ok, raw_stmts} <- fetch_statements(doc),
+         {:ok, stmts} <- normalize_trust_all(raw_stmts, role_arn, variables_enabled?(doc)),
+         true <- Enum.all?(stmts, &trust_action?/1) do
+      {:ok, stmts}
+    else
+      _ -> {:error, :malformed}
+    end
+  end
+
+  def parse_trust_policy(_json, _role_arn), do: {:error, :malformed}
+
+  @doc """
   解析整篇 policy JSON，并（当 bucket 非 nil 时）校验每条 statement 的每个 Resource ARN 都引用
   目标桶（对齐 minio/pkg Resource.ValidateBucket：桶段精确或通配匹配 bucket，允许 'bucket' 与
   'bucket/...'）。任一 Resource 桶段不匹配 → {:error, :malformed}（→ 400 MalformedPolicy）。
@@ -174,6 +197,41 @@ defmodule Maxio.Policy.Statement do
       {:ok, acc} -> {:ok, Enum.reverse(acc)}
       err -> err
     end
+  end
+
+  defp normalize_trust_all(raw, role_arn, variables_enabled?) do
+    Enum.reduce_while(raw, {:ok, []}, fn
+      %{} = stmt, {:ok, acc} ->
+        if Map.has_key?(stmt, "Resource") or Map.has_key?(stmt, "NotResource") do
+          {:halt, {:error, :malformed}}
+        else
+          case from_json(Map.put(stmt, "Resource", role_arn),
+                 variables_enabled?: variables_enabled?
+               ) do
+            {:ok, s} -> {:cont, {:ok, [s | acc]}}
+            {:error, _} -> {:halt, {:error, :malformed}}
+          end
+        end
+
+      _stmt, _acc ->
+        {:halt, {:error, :malformed}}
+    end)
+    |> case do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      err -> err
+    end
+  end
+
+  defp trust_action?(%__MODULE__{not_action?: true}), do: false
+
+  defp trust_action?(%__MODULE__{actions: actions}) do
+    actions != [] and Enum.all?(actions, &trust_action_name?/1)
+  end
+
+  defp trust_action_name?(action) do
+    Arn.glob_match?(action, "sts:AssumeRole", case_insensitive: true) or
+      Arn.glob_match?(action, "sts:SetSourceIdentity", case_insensitive: true) or
+      Arn.glob_match?(action, "sts:TagSession", case_insensitive: true)
   end
 
   defp parse_effect("Allow"), do: {:ok, :allow}
