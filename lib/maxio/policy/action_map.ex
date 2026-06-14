@@ -19,6 +19,7 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:create_bucket), do: {"s3:CreateBucket", :bucket}
   def for_action(:delete_bucket), do: {"s3:DeleteBucket", :bucket}
   def for_action(:head_bucket), do: {"s3:ListBucket", :bucket}
+  def for_action(:list_objects), do: {"s3:ListBucket", :bucket}
   def for_action(:list_objects_v2), do: {"s3:ListBucket", :bucket}
   def for_action(:list_object_versions), do: {"s3:ListBucketVersions", :bucket}
   def for_action(:get_bucket_location), do: {"s3:GetBucketLocation", :bucket}

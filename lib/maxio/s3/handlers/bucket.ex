@@ -4,7 +4,7 @@ defmodule Maxio.S3.Handlers.Bucket do
   alias Maxio.{Buckets, Objects, Storage}
   alias Maxio.Policy.ACL
   alias Maxio.S3.{Error, Log}
-  alias Maxio.S3.Views.{ListBucket, LocationConstraint, ListVersions}
+  alias Maxio.S3.Views.{ListBucket, ListBucketV1, LocationConstraint, ListVersions}
 
   @max_keys_limit 1000
   @owner_id "maxio"
@@ -70,6 +70,52 @@ defmodule Maxio.S3.Handlers.Bucket do
     end
   end
 
+  @spec list_objects(Plug.Conn.t()) :: Plug.Conn.t()
+  def list_objects(conn) do
+    bucket = conn.assigns.s3_bucket
+    conn = fetch_query_params(conn)
+    qp = conn.query_params
+
+    with {:ok, b} <- bucket_or_raise(bucket) do
+      prefix = Map.get(qp, "prefix", "")
+      delimiter = Map.get(qp, "delimiter")
+      marker = Map.get(qp, "marker")
+      max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
+      encoding_type = Map.get(qp, "encoding-type")
+
+      list_opts = %{
+        prefix: prefix,
+        delimiter: delimiter,
+        max_keys: max_keys,
+        continuation_token: nil,
+        start_after: list_v1_marker_cursor(marker, delimiter)
+      }
+
+      res = Maxio.ObjectMeta.list(bucket, list_opts, bucket_versioning: versioning_of(b))
+      objects = list_object_entries(res.objects)
+
+      body =
+        ListBucketV1.render(%{
+          name: bucket,
+          prefix: prefix,
+          marker: marker,
+          delimiter: delimiter,
+          max_keys: max_keys,
+          is_truncated: res.is_truncated,
+          next_marker: next_marker(res, delimiter),
+          objects: objects,
+          common_prefixes: res.common_prefixes,
+          encoding_type: encoding_type
+        })
+
+      Log.info("list objects", action: :list_objects, bucket: bucket)
+
+      conn
+      |> put_resp_content_type("application/xml")
+      |> send_resp(200, body)
+    end
+  end
+
   @spec list_objects_v2(Plug.Conn.t()) :: Plug.Conn.t()
   def list_objects_v2(conn) do
     bucket = conn.assigns.s3_bucket
@@ -92,24 +138,16 @@ defmodule Maxio.S3.Handlers.Bucket do
         start_after: start_after
       }
 
+      res = Maxio.ObjectMeta.list(bucket, list_opts, bucket_versioning: versioning_of(b))
+
       # ROUTE B B4-4：ListObjectsV2 经元数据门面分流（默认 :pg → SQL 权威 + drive-walk shadow 比对；
       # :list=:sidecar → drive-walk + quorum 确认权威返回）。透传桶 versioning：:pg 分支 shadow 门控到
       # Unversioned 桶（见 Maxio.ObjectMeta.list_shadow），避免 versioned/suspended 桶上纯 PG delete
       # marker 在盘无痕迹导致的保证性伪分歧。默认 :pg 行为与 P3 完全一致（向后兼容、可回滚）。
-      res = Maxio.ObjectMeta.list(bucket, list_opts, bucket_versioning: versioning_of(b))
 
       # objects 元素：:pg 分支为 %Objects.Object{}（富元数据）；:sidecar 分支为 %{key: ...}
       # （B6-2 后同样富集 LastModified/ETag/Size/StorageClass）。统一用 Map.get 取，缺失留 nil。
-      objects =
-        Enum.map(res.objects, fn o ->
-          %{
-            key: o.key,
-            last_modified: Map.get(o, :updated_at) || Map.get(o, :last_modified),
-            etag: Map.get(o, :etag),
-            size: Map.get(o, :size),
-            storage_class: Map.get(o, :storage_class)
-          }
-        end)
+      objects = list_object_entries(res.objects)
 
       body =
         ListBucket.render(%{
@@ -204,6 +242,56 @@ defmodule Maxio.S3.Handlers.Bucket do
   # 桶 versioning 状态（Unversioned|Enabled|Suspended）；缺省 "Unversioned"。
   defp versioning_of(%{versioning: v}) when is_binary(v), do: v
   defp versioning_of(_), do: "Unversioned"
+
+  defp list_object_entries(objects) do
+    Enum.map(objects, fn o ->
+      %{
+        key: o.key,
+        last_modified: Map.get(o, :updated_at) || Map.get(o, :last_modified),
+        etag: Map.get(o, :etag),
+        size: Map.get(o, :size),
+        storage_class: Map.get(o, :storage_class)
+      }
+    end)
+  end
+
+  defp next_marker(%{is_truncated: true, next_continuation_token: token}, delimiter)
+       when is_binary(delimiter) and delimiter != "",
+       do: token
+
+  defp next_marker(_res, _delimiter), do: nil
+
+  defp list_v1_marker_cursor(nil, _delimiter), do: nil
+
+  defp list_v1_marker_cursor(marker, delimiter)
+       when is_binary(marker) and is_binary(delimiter) and delimiter != "" do
+    if String.ends_with?(marker, delimiter) do
+      lexicographic_successor(marker) || marker
+    else
+      marker
+    end
+  end
+
+  defp list_v1_marker_cursor(marker, _delimiter), do: marker
+
+  defp lexicographic_successor(binary) do
+    binary
+    |> :binary.bin_to_list()
+    |> Enum.reverse()
+    |> bump_reversed_bytes()
+    |> case do
+      nil ->
+        nil
+
+      bytes ->
+        successor = :erlang.list_to_binary(bytes)
+        if String.valid?(successor), do: successor, else: nil
+    end
+  end
+
+  defp bump_reversed_bytes([]), do: nil
+  defp bump_reversed_bytes([255 | rest]), do: bump_reversed_bytes(rest)
+  defp bump_reversed_bytes([byte | rest]), do: Enum.reverse(rest, [byte + 1])
 
   defp parse_int(nil, default, _limit), do: default
 

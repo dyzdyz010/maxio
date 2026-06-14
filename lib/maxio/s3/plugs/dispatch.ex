@@ -19,10 +19,9 @@ defmodule Maxio.S3.Plugs.Dispatch do
 
   defp do_call(conn) do
     conn = fetch_query_params(conn)
-    query_keys = conn.query_params |> Map.keys() |> Enum.map(&String.downcase/1) |> MapSet.new()
 
     try do
-      case Dispatcher.resolve(conn.assigns.s3_level, conn.method, query_keys) do
+      case Dispatcher.resolve(conn.assigns.s3_level, conn.method, conn.query_params) do
         {:ok, action} ->
           conn = assign(conn, :s3_action, action)
           :ok = Maxio.S3.Authz.authorize(conn, action)

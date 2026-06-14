@@ -18,9 +18,12 @@ defmodule Maxio.S3.Dispatcher do
                       attributes select torrent restore accelerate analytics inventory metrics
                       ownershipcontrols requestpayment logging)
 
-  @spec resolve(level(), String.t(), MapSet.t()) ::
+  @spec resolve(level(), String.t(), MapSet.t() | map()) ::
           {:ok, action()} | {:error, :method_not_allowed | :not_implemented}
-  def resolve(level, method, query_keys) do
+  def resolve(level, method, query_input) do
+    query = normalize_query(query_input)
+    query_keys = query |> Map.keys() |> MapSet.new()
+
     cond do
       multipart_action(level, method, query_keys) != nil ->
         {:ok, multipart_action(level, method, query_keys)}
@@ -107,6 +110,9 @@ defmodule Maxio.S3.Dispatcher do
       level == :bucket and method == "GET" and MapSet.member?(query_keys, "location") ->
         {:ok, :get_bucket_location}
 
+      level == :bucket and method == "GET" and list_type_v2?(query) ->
+        {:ok, :list_objects_v2}
+
       true ->
         dispatch(level, method)
     end
@@ -145,13 +151,31 @@ defmodule Maxio.S3.Dispatcher do
     Enum.any?(@m2_subresources, &MapSet.member?(query_keys, &1))
   end
 
+  defp normalize_query(%MapSet{} = query_keys) do
+    Map.new(query_keys, fn key -> {String.downcase(to_string(key)), ""} end)
+  end
+
+  defp normalize_query(query) when is_map(query) do
+    Map.new(query, fn {key, value} ->
+      {String.downcase(to_string(key)), normalize_query_value(value)}
+    end)
+  end
+
+  defp normalize_query(_query), do: %{}
+
+  defp normalize_query_value([value | _rest]), do: to_string(value)
+  defp normalize_query_value(value) when is_binary(value), do: value
+  defp normalize_query_value(value), do: to_string(value)
+
+  defp list_type_v2?(query), do: Map.get(query, "list-type") == "2"
+
   # ── M1 动作表 ──
   defp dispatch(:service, "GET"), do: {:ok, :list_buckets}
 
   defp dispatch(:bucket, "PUT"), do: {:ok, :create_bucket}
   defp dispatch(:bucket, "DELETE"), do: {:ok, :delete_bucket}
   defp dispatch(:bucket, "HEAD"), do: {:ok, :head_bucket}
-  defp dispatch(:bucket, "GET"), do: {:ok, :list_objects_v2}
+  defp dispatch(:bucket, "GET"), do: {:ok, :list_objects}
 
   defp dispatch(:object, "PUT"), do: {:ok, :put_object}
   defp dispatch(:object, "GET"), do: {:ok, :get_object}

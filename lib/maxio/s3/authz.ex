@@ -429,7 +429,7 @@ defmodule Maxio.S3.Authz do
 
   # ListObjects* 的 s3:prefix / s3:delimiter / s3:max-keys（来自 query；max-keys 与 handler 同源归一化）。
   defp put_list_conditions(conds, conn, action)
-       when action in [:list_objects_v2, :list_object_versions] do
+       when action in [:list_objects, :list_objects_v2, :list_object_versions] do
     qp = conn.query_params || %{}
 
     conds
@@ -476,6 +476,7 @@ defmodule Maxio.S3.Authz do
        when action in [
               :delete_bucket,
               :head_bucket,
+              :list_objects,
               :list_objects_v2,
               :list_object_versions,
               :get_bucket_location,

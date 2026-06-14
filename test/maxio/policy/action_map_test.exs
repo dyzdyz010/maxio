@@ -3,6 +3,7 @@ defmodule Maxio.Policy.ActionMapTest do
   alias Maxio.Policy.ActionMap
 
   test "桶级动作 → :bucket" do
+    assert ActionMap.for_action(:list_objects) == {"s3:ListBucket", :bucket}
     assert ActionMap.for_action(:list_objects_v2) == {"s3:ListBucket", :bucket}
     assert ActionMap.for_action(:head_bucket) == {"s3:ListBucket", :bucket}
 

@@ -22,11 +22,17 @@ defmodule Maxio.S3.DispatcherTest do
   end
 
   test "bucket GET list-type=2 → list_objects_v2" do
-    assert {:ok, :list_objects_v2} = Dispatcher.resolve(:bucket, "GET", keys(["list-type"]))
+    assert {:ok, :list_objects_v2} =
+             Dispatcher.resolve(:bucket, "GET", %{"list-type" => "2"})
   end
 
-  test "bucket GET 无 list-type 默认 → list_objects_v2（兼容 V1 入口也走 V2）" do
-    assert {:ok, :list_objects_v2} = Dispatcher.resolve(:bucket, "GET", keys([]))
+  test "bucket GET list-type other than 2 defaults to list_objects" do
+    assert {:ok, :list_objects} =
+             Dispatcher.resolve(:bucket, "GET", %{"list-type" => "1"})
+  end
+
+  test "bucket GET 无 list-type 默认 → list_objects" do
+    assert {:ok, :list_objects} = Dispatcher.resolve(:bucket, "GET", keys([]))
   end
 
   test "bucket GET ?location → get_bucket_location" do
