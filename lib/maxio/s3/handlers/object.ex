@@ -56,15 +56,15 @@ defmodule Maxio.S3.Handlers.Object do
     payload_mode = conn.assigns.payload_mode
     checksum = Checksum.from_conn!(conn)
 
-    {chunks, get_checksum, discard_checksum} =
-      conn |> BodyReader.stream(payload_mode) |> Checksum.wrap_stream(checksum)
-
     # 版本字节路径对齐：先按桶 versioning 算 version_id（Enabled→新 ULID，否则 "null"），
     # 字节流式写入该 version_id 路径；落库用同一 version_id（铁律 4：不缓冲重写）。
-    versioning = bucket_versioning(bucket)
-
     version_id =
-      if versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
+      if bucket_versioning(bucket) == "Enabled",
+        do: Maxio.Versioning.VersionId.generate(),
+        else: "null"
+
+    user_metadata = parse_user_metadata(conn)
+    :ok = Maxio.Metadata.validate_size!(user_metadata)
 
     # x-amz-tagging 头（PutObject）→ jsonb tag map（校验失败 → InvalidTag 400，铁律 3）。
     tags_map = parse_tagging_header!(conn)
@@ -78,42 +78,67 @@ defmodule Maxio.S3.Handlers.Object do
     user_metadata = parse_user_metadata(conn)
     :ok = Maxio.Metadata.validate_size!(user_metadata)
 
-    {chunks, sse_envelope, visible_size} =
-      case sse_requested do
-        "AES256" ->
-          {plain_chunks, visible_size} = counted_stream(chunks)
-          {cipher_stream, envelope} = Maxio.Crypto.SSE.wrap_stream(plain_chunks)
-          {cipher_stream, envelope, visible_size}
-
-        nil ->
-          {chunks, nil, nil}
-      end
-
     # ROUTE B B4-5：把已算出的富 S3 元数据组成 object_meta，透传进 Storage.put，使纠删/分布式后端
     # 写出完整 maxio/2 sidecar（盘上即事实来源，read/list=:sidecar 下对真实对象可读/可列）。
     # PutObject 当前未捕获 x-amz-meta-*，此处用既有 parse_user_metadata/1 解析并入 sidecar（自描述完整）；
     # PG 索引侧 attrs 保持不变（:pg 默认路径字节级可回滚，user_metadata 仅注入 sidecar）。
-    object_meta =
-      build_object_meta(
-        content_type,
-        system_headers,
-        storage_class,
-        tags_map,
-        sse_requested,
-        sse_envelope,
-        user_metadata,
-        visible_size,
-        acl_input
-      )
-
     # B1-1：把整个提交 seam（字节经 Storage.put + 元数据经 Objects.put_version_with_id）纳入
     # 同一对象锁，消灭并发同 key 写的「A 字节 + B 元数据」交错（静默 ETag/bytes 分歧）。
     # version_id/SSE/tags 等纯计算/读保持锁外；获锁失败 -> {:error,:locked} -> 503 RequestTimeout（铁律 3）。
+    # PutObject body/checksum state is created only after static validation and object lock.
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        {body_stream, get_trailers, discard_trailers} =
+          BodyReader.stream_with_trailers(conn, payload_mode)
+
+        checksum = Checksum.with_trailer_getter(checksum, get_trailers)
+
+        {plain_chunks, get_checksum, discard_checksum} =
+          body_stream |> Checksum.wrap_stream(checksum)
+
         try do
-          case Storage.put(bucket, key, version_id, chunks, object_meta: object_meta) do
-            {:ok, %{size: stored_size, etag: etag, sha256: sha256} = write_result} ->
+          {chunks, sse_envelope, visible_size} =
+            case sse_requested do
+              "AES256" ->
+                {counted_chunks, visible_size} = counted_stream(plain_chunks)
+                {cipher_stream, envelope} = Maxio.Crypto.SSE.wrap_stream(counted_chunks)
+                {cipher_stream, envelope, visible_size}
+
+              nil ->
+                {plain_chunks, nil, nil}
+            end
+
+          object_meta =
+            build_object_meta(
+              content_type,
+              system_headers,
+              storage_class,
+              tags_map,
+              sse_requested,
+              sse_envelope,
+              user_metadata,
+              visible_size,
+              acl_input
+            )
+
+          before_object_commit = fn %{size: stored_size, sha256: sha256} ->
+            size = if sse_requested == "AES256", do: visible_size.(), else: stored_size
+            checksum = get_checksum.()
+            :ok = checksum.verify!.()
+            :ok = verify_decoded_length!(conn, payload_mode, size)
+
+            unless sse_requested do
+              :ok = verify_content_sha256!(conn, payload_mode, sha256)
+            end
+
+            %{checksum: checksum, visible_size: size}
+          end
+
+          case Storage.put(bucket, key, version_id, chunks,
+                 object_meta: object_meta,
+                 before_object_commit: before_object_commit
+               ) do
+            {:ok, %{size: stored_size, etag: etag} = write_result} ->
               # 校验/落库失败 → 先清理已写字节再抛（绝不留孤儿，铁律 3）。
               # SSE 加密对象：后端返回的 stored_size 是密文帧长度；S3 可见 size 用明文计数流统计。
               # x-amz-decoded-content-length 仍按明文 size 校验；x-amz-content-sha256 在 SSE 路径暂不复算
@@ -122,18 +147,11 @@ defmodule Maxio.S3.Handlers.Object do
               # 传输完整性（decoded-length / content-sha256）失败在两条权威分支下都**致命 + 回滚孤儿**
               # （这是 digest/签名失配，与 PG 无关，铁律 3 绝不静默接受）；仅 PG 索引写在
               # authoritative_source(:write)==:sidecar 时降为 best-effort（见下）。
-              size = if sse_requested == "AES256", do: visible_size.(), else: stored_size
+              size = Map.get(write_result, :visible_size, stored_size)
+              checksum = Map.get(write_result, :checksum, checksum)
 
               {obj, checksum} =
                 try do
-                  checksum = get_checksum.()
-                  :ok = checksum.verify!.()
-                  :ok = verify_decoded_length!(conn, payload_mode, size)
-
-                  unless sse_requested do
-                    :ok = verify_content_sha256!(conn, payload_mode, sha256)
-                  end
-
                   attrs =
                     %{
                       size: size,
@@ -176,16 +194,16 @@ defmodule Maxio.S3.Handlers.Object do
               {:ok, {size, etag, obj, checksum}}
 
             {:error, reason} ->
-              discard_checksum.()
+              discard_upload_body_state(discard_checksum, discard_trailers)
               {:error, reason}
           end
         rescue
           err ->
-            discard_checksum.()
+            discard_upload_body_state(discard_checksum, discard_trailers)
             reraise(err, __STACKTRACE__)
         catch
           kind, reason ->
-            discard_checksum.()
+            discard_upload_body_state(discard_checksum, discard_trailers)
             :erlang.raise(kind, reason, __STACKTRACE__)
         end
       end)
@@ -1575,6 +1593,11 @@ defmodule Maxio.S3.Handlers.Object do
       end)
 
     {counted, fn -> :counters.get(counter, 1) end}
+  end
+
+  defp discard_upload_body_state(discard_checksum, discard_trailers) do
+    discard_checksum.()
+    discard_trailers.()
   end
 
   defp send_authenticated_sse_object!(conn, object, total, range, raw_stream, plain_slice) do

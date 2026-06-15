@@ -42,6 +42,7 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
     :flavor,
     expected_decoded_len: nil,
     trailer_names: [],
+    trailers: %{},
     decoded_count: 0,
     buffer: "",
     stage: :data
@@ -103,11 +104,17 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
     consume(%{v | buffer: v.buffer <> bytes}, [])
   end
 
-  # 已到 done：忽略多余字节（终止块后只可能是 trailer，已在 done 前处理）
-  defp consume(%__MODULE__{stage: :done} = v, acc), do: {:ok, Enum.reverse(acc), v}
+  @doc "Returns verified trailing headers parsed from the aws-chunked trailer chunk."
+  @spec trailers(t()) :: %{String.t() => String.t()}
+  def trailers(%__MODULE__{trailers: trailers}), do: trailers
+
+  defp consume(%__MODULE__{stage: :done, buffer: ""} = v, acc),
+    do: {:ok, Enum.reverse(acc), v}
+
+  defp consume(%__MODULE__{stage: :done}, _acc), do: {:error, :invalid_chunk}
 
   defp consume(%__MODULE__{stage: :data} = v, acc) do
-    case take_frame(v.buffer) do
+    case take_frame(v) do
       :need_more ->
         {:ok, Enum.reverse(acc), v}
 
@@ -120,7 +127,7 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
           v2 = %{v | prev_sig: expected, buffer: rest, decoded_count: v.decoded_count + size}
 
           cond do
-            size == 0 and v.flavor == :signed_trailer ->
+            size == 0 and trailer_flavor?(v.flavor) ->
               # 终止块已验；进入 trailer 解析（prev_sig = 终止块签名）
               consume(%{v2 | stage: :trailer}, acc)
 
@@ -135,24 +142,51 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
   end
 
   defp consume(%__MODULE__{stage: :trailer} = v, acc) do
-    case parse_trailer(v.buffer) do
+    case parse_trailer(v) do
       :need_more ->
         {:ok, Enum.reverse(acc), v}
 
       {:error, reason} ->
         {:error, reason}
 
-      {:ok, trailer_block, provided_sig, rest} ->
+      {:ok, trailer_block, trailers, provided_sig, rest} ->
         sts =
           trailer_string_to_sign(v.date, v.scope, v.prev_sig, Signer.hex_sha256(trailer_block))
 
         expected = Signer.signature(v.k_signing, sts)
 
-        if Signer.secure_compare(expected, provided_sig) do
-          consume(%{v | stage: :done, buffer: rest}, acc)
-        else
-          {:error, :signature_does_not_match}
+        with :ok <- validate_declared_trailers(v, trailers) do
+          if Signer.secure_compare(expected, provided_sig) do
+            consume(%{v | stage: :done, buffer: rest, trailers: trailers}, acc)
+          else
+            {:error, :signature_does_not_match}
+          end
         end
+
+      {:ok, _trailer_block, trailers, rest} ->
+        with :ok <- validate_declared_trailers(v, trailers) do
+          consume(%{v | stage: :done, buffer: rest, trailers: trailers}, acc)
+        end
+    end
+  end
+
+  defp trailer_flavor?(:signed_trailer), do: true
+  defp trailer_flavor?(:unsigned_trailer), do: true
+  defp trailer_flavor?(_), do: false
+
+  defp validate_declared_trailers(%__MODULE__{trailer_names: names}, trailers) do
+    declared = MapSet.new(names)
+    actual = trailers |> Map.keys() |> MapSet.new()
+
+    cond do
+      MapSet.size(declared) == 0 ->
+        {:error, :invalid_chunk}
+
+      MapSet.equal?(declared, actual) ->
+        :ok
+
+      true ->
+        {:error, :invalid_chunk}
     end
   end
 
@@ -175,9 +209,27 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
     Signer.signature(v.k_signing, sts)
   end
 
-  # ── 帧解析：<hexsize>;chunk-signature=<64hex>\r\n<data>\r\n ──
+  # ── 帧解析：<hexsize>[;chunk-signature=<64hex>]\r\n<data>\r\n ──
   # 返回 {:frame, size, sig, data, rest} | :need_more | {:error, reason}
-  defp take_frame(buffer) do
+  defp take_frame(%__MODULE__{buffer: buffer, flavor: :unsigned_trailer} = v) do
+    case :binary.split(buffer, "\r\n") do
+      [_only] ->
+        :need_more
+
+      [header, after_header] ->
+        with {:ok, size} <- parse_size(header) do
+          if byte_size(after_header) >= size + 2 do
+            take_frame_data(v, size, nil, after_header)
+          else
+            :need_more
+          end
+        else
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp take_frame(%__MODULE__{buffer: buffer} = v) do
     case :binary.split(buffer, "\r\n") do
       [_only] ->
         :need_more
@@ -186,17 +238,32 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
         with {:ok, size} <- parse_size(header),
              {:ok, sig} <- parse_signature(header) do
           if byte_size(after_header) >= size + 2 do
-            case after_header do
-              <<data::binary-size(^size), "\r\n", rest::binary>> ->
-                {:frame, size, sig, data, rest}
-
-              _ ->
-                {:error, :invalid_chunk}
-            end
+            take_frame_data(v, size, sig, after_header)
           else
             :need_more
           end
         end
+    end
+  end
+
+  defp take_frame_data(%__MODULE__{flavor: flavor}, 0, sig, after_header)
+       when flavor in [:signed_trailer, :unsigned_trailer] do
+    rest =
+      case after_header do
+        <<"\r\n", tail::binary>> -> tail
+        _ -> after_header
+      end
+
+    {:frame, 0, sig, "", rest}
+  end
+
+  defp take_frame_data(_v, size, sig, after_header) do
+    case after_header do
+      <<data::binary-size(^size), "\r\n", rest::binary>> ->
+        {:frame, size, sig, data, rest}
+
+      _ ->
+        {:error, :invalid_chunk}
     end
   end
 
@@ -225,10 +292,10 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
     byte_size(sig) == 64 and String.match?(sig, ~r/\A[0-9a-fA-F]{64}\z/)
   end
 
-  # ── trailer chunk：<name>:<value>\r\nx-amz-trailer-signature:<sig>\r\n ──
-  # 返回 {:ok, trailer_block, sig, rest} | :need_more | {:error, reason}
+  # ── trailer chunk：unsigned `<name>:<value>\r\n\r\n`; signed adds x-amz-trailer-signature. ──
+  # 返回 {:ok, trailer_block, trailers, sig, rest} | {:ok, trailer_block, trailers, rest} | :need_more | {:error, reason}
   # trailer_block 用于哈希：每个 trailing header "name:value\n"（小写名，无空白）。
-  defp parse_trailer(buffer) do
+  defp parse_trailer(%__MODULE__{flavor: :signed_trailer, buffer: buffer}) do
     case :binary.match(buffer, "x-amz-trailer-signature:") do
       :nomatch ->
         :need_more
@@ -244,27 +311,61 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
           [sig_raw, rest] ->
             sig = String.trim(sig_raw)
 
-            if valid_hex64?(sig) do
-              {:ok, normalize_trailer_block(header_part), sig, rest}
+            with true <- valid_hex64?(sig),
+                 {:ok, trailer_block, trailers} <- normalize_trailer_headers(header_part) do
+              {:ok, trailer_block, trailers, sig, rest}
             else
-              {:error, :invalid_chunk}
+              _ -> {:error, :invalid_chunk}
             end
         end
     end
   end
 
-  # header_part 形如 "x-amz-checksum-crc32c:sOO8/Q==\r\n"（可能多行），
-  # 规整为按行 "name:value\n"（小写名、去空白）。
-  defp normalize_trailer_block(header_part) do
-    header_part
-    |> String.split("\r\n", trim: true)
-    |> Enum.map(fn line ->
+  defp parse_trailer(%__MODULE__{flavor: :unsigned_trailer, buffer: buffer}) do
+    case :binary.split(buffer, "\r\n\r\n") do
+      [_only] ->
+        :need_more
+
+      [header_part, rest] ->
+        case normalize_trailer_headers(header_part) do
+          {:ok, trailer_block, trailers} -> {:ok, trailer_block, trailers, rest}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  # header_part 形如 "x-amz-checksum-crc32:sOO8/Q==\r\n"（可能多行），
+  # 规整为按行 "name:value\n"（小写名、去空白），并返回同源 map 供上层校验 checksum。
+  defp normalize_trailer_headers(header_part) do
+    lines = String.split(header_part, "\r\n", trim: true)
+
+    Enum.reduce_while(lines, {:ok, [], %{}}, fn line, {:ok, block_acc, map_acc} ->
       case String.split(line, ":", parts: 2) do
-        [name, value] -> String.downcase(String.trim(name)) <> ":" <> String.trim(value) <> "\n"
-        _ -> ""
+        [name, value] ->
+          name = name |> String.trim() |> String.downcase()
+          value = String.trim(value)
+
+          if name == "" do
+            {:halt, {:error, :invalid_chunk}}
+          else
+            {:cont,
+             {:ok, [name <> ":" <> value <> "\n" | block_acc], Map.put(map_acc, name, value)}}
+          end
+
+        _ ->
+          {:halt, {:error, :invalid_chunk}}
       end
     end)
-    |> Enum.join("")
+    |> case do
+      {:ok, [], _map} ->
+        {:error, :invalid_chunk}
+
+      {:ok, block_lines, trailers} ->
+        {:ok, block_lines |> Enum.reverse() |> Enum.join(""), trailers}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @doc "校验已达终止块（stage == :done）且 decoded 长度与声明一致。"

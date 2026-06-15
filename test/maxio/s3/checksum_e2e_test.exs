@@ -132,6 +132,57 @@ defmodule Maxio.S3.ChecksumE2ETest do
     assert get_resp_header(put, "x-amz-checksum-crc32") == [checksum]
   end
 
+  test "PutObject validates aws-chunked checksum trailer and echoes it" do
+    SigV4Request.signed_conn(:put, "/cktrail") |> call()
+    body = "trailer payload"
+    checksum = hash_b64(:sha256, body)
+
+    put =
+      SigV4Request.signed_chunked_conn(:put, "/cktrail/ok.txt", body,
+        trailer_headers: [{"x-amz-checksum-sha256", checksum}]
+      )
+      |> call()
+
+    assert put.status == 200
+    assert get_resp_header(put, "x-amz-checksum-sha256") == [checksum]
+
+    get = SigV4Request.signed_conn(:get, "/cktrail/ok.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == body
+  end
+
+  test "PutObject validates signed aws-chunked checksum trailer" do
+    SigV4Request.signed_conn(:put, "/cktrailsigned") |> call()
+    body = "signed trailer payload"
+    checksum = hash_b64(:sha256, body)
+
+    put =
+      SigV4Request.signed_chunked_conn(:put, "/cktrailsigned/ok.txt", body,
+        streaming_payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        trailer_headers: [{"x-amz-checksum-sha256", checksum}]
+      )
+      |> call()
+
+    assert put.status == 200
+    assert get_resp_header(put, "x-amz-checksum-sha256") == [checksum]
+  end
+
+  test "PutObject bad checksum trailer returns BadDigest and does not leave an object" do
+    SigV4Request.signed_conn(:put, "/cktrailbad") |> call()
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/cktrailbad/bad.txt", "real bytes",
+        trailer_headers: [{"x-amz-checksum-crc32", crc32_b64("different bytes")}]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "<Code>BadDigest</Code>"
+
+    get = SigV4Request.signed_conn(:get, "/cktrailbad/bad.txt") |> call()
+    assert get.status == 404
+  end
+
   test "unsupported checksum algorithms fail closed" do
     SigV4Request.signed_conn(:put, "/ckunsupported") |> call()
 
@@ -204,6 +255,37 @@ defmodule Maxio.S3.ChecksumE2ETest do
     assert complete.status == 200
 
     get = SigV4Request.signed_conn(:get, "/ckmp/object.bin") |> call()
+    assert get.status == 200
+    assert get.resp_body == body
+  end
+
+  test "UploadPart validates aws-chunked checksum trailer and echoes it" do
+    SigV4Request.signed_conn(:put, "/ckmptrail") |> call()
+    body = "trailer part"
+    checksum = hash_b64(:sha256, body)
+
+    init =
+      SigV4Request.signed_conn(:post, "/ckmptrail/object.bin", query: %{"uploads" => ""})
+      |> call()
+
+    assert init.status == 200
+    upload_id = upload_id(init.resp_body)
+
+    part =
+      SigV4Request.signed_chunked_conn(:put, "/ckmptrail/object.bin", body,
+        query: %{"partNumber" => "1", "uploadId" => upload_id},
+        trailer_headers: [{"x-amz-checksum-sha256", checksum}]
+      )
+      |> call()
+
+    assert part.status == 200
+    assert get_resp_header(part, "x-amz-checksum-sha256") == [checksum]
+    [etag] = get_resp_header(part, "etag")
+
+    complete = complete_multipart_upload("ckmptrail", "object.bin", upload_id, [etag])
+    assert complete.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/ckmptrail/object.bin") |> call()
     assert get.status == 200
     assert get.resp_body == body
   end

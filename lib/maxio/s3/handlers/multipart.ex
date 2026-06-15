@@ -129,8 +129,13 @@ defmodule Maxio.S3.Handlers.Multipart do
   defp upload_part_body(conn, bucket, key, upload_id, part_number, upload) do
     checksum = Checksum.from_conn!(conn)
 
+    {body_stream, get_trailers, discard_trailers} =
+      BodyReader.stream_with_trailers(conn, conn.assigns.payload_mode)
+
+    checksum = Checksum.with_trailer_getter(checksum, get_trailers)
+
     {chunks, get_checksum, discard_checksum} =
-      conn |> BodyReader.stream(conn.assigns.payload_mode) |> Checksum.wrap_stream(checksum)
+      body_stream |> Checksum.wrap_stream(checksum)
 
     opts =
       upload
@@ -146,11 +151,11 @@ defmodule Maxio.S3.Handlers.Multipart do
         Storage.put_part(bucket, key, upload_id, part_number, chunks, opts)
       rescue
         err ->
-          discard_checksum.()
+          discard_upload_part_body_state(discard_checksum, discard_trailers)
           reraise(err, __STACKTRACE__)
       catch
         kind, reason ->
-          discard_checksum.()
+          discard_upload_part_body_state(discard_checksum, discard_trailers)
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
 
@@ -172,7 +177,7 @@ defmodule Maxio.S3.Handlers.Multipart do
         |> send_resp(200, "")
 
       {:error, :invalid_key} ->
-        discard_checksum.()
+        discard_upload_part_body_state(discard_checksum, discard_trailers)
 
         # B5-3 R4 backstop：入口守卫部署前遗留的在途会话（点段 key）打到后端路径层
         # （FS object_path）结构化拒绝 → 400 XMinioInvalidObjectName，绝不塌缩 500（铁律 3）。
@@ -180,11 +185,11 @@ defmodule Maxio.S3.Handlers.Multipart do
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       {:error, reason} when reason in [:write_quorum, :rename_busy] ->
-        discard_checksum.()
+        discard_upload_part_body_state(discard_checksum, discard_trailers)
         raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
 
       {:error, reason} ->
-        discard_checksum.()
+        discard_upload_part_body_state(discard_checksum, discard_trailers)
         raise upload_part_error(reason, bucket, key)
     end
   end
@@ -519,6 +524,11 @@ defmodule Maxio.S3.Handlers.Multipart do
       {:error, :key_too_long} ->
         raise Error.new(:key_too_long, resource: "/#{bucket}/#{key}")
     end
+  end
+
+  defp discard_upload_part_body_state(discard_checksum, discard_trailers) do
+    discard_checksum.()
+    discard_trailers.()
   end
 
   defp upload_or_raise(bucket, key, upload_id) do

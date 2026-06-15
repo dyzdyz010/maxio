@@ -144,41 +144,58 @@ defmodule Maxio.Storage.FS do
       # B1-2 原子提交：同卷 .tmp temp obj-dir 内流式写 part.0，流尾写 maxio/2 sidecar（meta.json），
       # 数据先于元数据原子 rename 到 final（crash 前 final 保旧值/缺失）。
       {:ok, tmp} = ShardServer.begin_tmp(data_dir(opts))
-      {:ok, fd} = File.open(Path.join(tmp, @part_file), [:write, :binary, :raw])
 
-      {etag, sha256, size} =
-        try do
-          md5_0 = :crypto.hash_init(:md5)
-          sha_0 = :crypto.hash_init(:sha256)
+      try do
+        {:ok, fd} = File.open(Path.join(tmp, @part_file), [:write, :binary, :raw])
 
-          {md5_ctx, sha_ctx, size} =
-            Enum.reduce(chunks, {md5_0, sha_0, 0}, fn chunk, {m, s, acc} ->
-              :ok = IO.binwrite(fd, chunk)
+        {etag, sha256, size} =
+          try do
+            md5_0 = :crypto.hash_init(:md5)
+            sha_0 = :crypto.hash_init(:sha256)
 
-              {:crypto.hash_update(m, chunk), :crypto.hash_update(s, chunk),
-               acc + byte_size(chunk)}
-            end)
+            {md5_ctx, sha_ctx, size} =
+              Enum.reduce(chunks, {md5_0, sha_0, 0}, fn chunk, {m, s, acc} ->
+                :ok = IO.binwrite(fd, chunk)
 
-          etag = md5_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
-          sha256 = sha_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
-          {etag, sha256, size}
-        after
-          File.close(fd)
+                {:crypto.hash_update(m, chunk), :crypto.hash_update(s, chunk),
+                 acc + byte_size(chunk)}
+              end)
+
+            etag = md5_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
+            sha256 = sha_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
+            {etag, sha256, size}
+          after
+            File.close(fd)
+          end
+
+        result = %{size: size, etag: etag, sha256: sha256}
+        extra = run_before_object_commit!(opts, result)
+        meta = build_meta(version_id, opts, size, etag, sha256)
+
+        case ShardServer.put_sidecar(tmp, meta) do
+          :ok ->
+            commit_obj_dir(
+              tmp,
+              final_dir,
+              bucket,
+              key,
+              version_id,
+              opts,
+              Map.merge(result, extra)
+            )
+
+          {:error, reason} ->
+            _ = File.rm_rf(tmp)
+            {:error, reason}
         end
-
-      meta = build_meta(version_id, opts, size, etag, sha256)
-
-      case ShardServer.put_sidecar(tmp, meta) do
-        :ok ->
-          commit_obj_dir(tmp, final_dir, bucket, key, version_id, opts, %{
-            size: size,
-            etag: etag,
-            sha256: sha256
-          })
-
-        {:error, reason} ->
+      rescue
+        err ->
           _ = File.rm_rf(tmp)
-          {:error, reason}
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          _ = File.rm_rf(tmp)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
     end
   end
@@ -314,6 +331,14 @@ defmodule Maxio.Storage.FS do
 
   defp run_before_part_commit!(opts, result) do
     case Keyword.get(opts, :before_part_commit) do
+      nil -> %{}
+      fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
+      fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())
+    end
+  end
+
+  defp run_before_object_commit!(opts, result) do
+    case Keyword.get(opts, :before_object_commit) do
       nil -> %{}
       fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
       fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())

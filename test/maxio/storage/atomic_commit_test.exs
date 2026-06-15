@@ -230,6 +230,28 @@ defmodule Maxio.Storage.AtomicCommitTest do
     end)
   end
 
+  test "EC put precommit failure cleans temp and preserves old object", %{root: root} do
+    drives = for i <- 0..5, do: Path.join(root, "d#{i}")
+    Enum.each(drives, &File.mkdir_p!/1)
+    opts = [drives: drives, data_shards: 4, parity_shards: 2, block_size: 16]
+    :ok = ErasureCoded.put_bucket("b", opts)
+    {:ok, _old} = ErasureCoded.put("b", "k", "null", ["OLD"], opts)
+
+    assert_raise RuntimeError, "precommit failed", fn ->
+      ErasureCoded.put(
+        "b",
+        "k",
+        "null",
+        ["NEW"],
+        Keyword.put(opts, :before_object_commit, fn _result -> raise "precommit failed" end)
+      )
+    end
+
+    {:ok, stream} = ErasureCoded.get("b", "k", "null", nil, opts)
+    assert IO.iodata_to_binary(Enum.to_list(stream)) == "OLD"
+    assert_tmp_roots_empty(drives)
+  end
+
   test "EC put_part commit quorum failure restores the old part", %{root: root} do
     drives = for i <- 0..5, do: Path.join(root, "d#{i}")
     Enum.each(drives, &File.mkdir_p!/1)

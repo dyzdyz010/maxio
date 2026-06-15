@@ -47,6 +47,19 @@ defmodule Maxio.Storage.Backend do
   @type put_result :: %{size: non_neg_integer(), etag: String.t(), sha256: String.t()}
   @type object_meta :: %{optional(atom()) => term()}
 
+  @doc """
+  Streams one object into a staged location and commits it atomically.
+
+  Backends may receive `opts[:before_object_commit]` as a precommit hook. When
+  present, the backend must write object bytes into a temp/staged location,
+  compute `%{size, etag, sha256}`, call the hook with that result, then commit
+  the final object only if the hook succeeds. A hook may return a map, which is
+  merged into the successful result.
+
+  If the hook raises, backends must clean staged bytes and must not replace an
+  existing final object. This keeps checksum and decoded-length failures
+  fail-closed before object visibility.
+  """
   @callback put(
               bucket(),
               key(),

@@ -96,10 +96,12 @@ defmodule Maxio.Test.SigV4Request do
   end
 
   @doc """
-  自签一个 aws-chunked（STREAMING-AWS4-HMAC-SHA256-PAYLOAD）流式请求。
+  自签一个 aws-chunked 流式请求。
   用项目自己的 Signer 算 seed 与逐块签名，拼合法 chunk-signed body（"我们签→我们验"闭环）。
   opts：:chunk_size（默认整 body 一块）、:headers、:tamper（fn binary -> binary，
-  对最终 chunked body 做篡改，用于负向测试）、:decoded_length_override（覆盖声明长度）。
+  对最终 chunked body 做篡改，用于负向测试）、:decoded_length_override（覆盖声明长度）、
+  :trailer_headers（map/list；存在时默认 STREAMING-UNSIGNED-PAYLOAD-TRAILER）、
+  :streaming_payload_hash（覆盖 x-amz-content-sha256）。
   """
   def signed_chunked_conn(method, path, body, opts \\ []) do
     chunk_size = Keyword.get(opts, :chunk_size, max(byte_size(body), 1))
@@ -108,6 +110,7 @@ defmodule Maxio.Test.SigV4Request do
     secret = Keyword.get(opts, :secret, @secret)
     session_token = Keyword.get(opts, :session_token)
     service = Keyword.get(opts, :service, @service)
+    query = Keyword.get(opts, :query, %{})
 
     now = DateTime.utc_now()
     amz_date = Calendar.strftime(now, "%Y%m%dT%H%M%SZ")
@@ -115,6 +118,20 @@ defmodule Maxio.Test.SigV4Request do
     scope = "#{scope_date}/#{@region}/#{service}/aws4_request"
     decoded_len = byte_size(body)
     decoded_len_header = Keyword.get(opts, :decoded_length_override, decoded_len)
+    trailer_headers = Keyword.get(opts, :trailer_headers, [])
+    trailer_names = trailer_headers |> Enum.map(fn {name, _value} -> String.downcase(name) end)
+
+    default_payload_hash =
+      if trailer_names == [],
+        do: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        else: "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+
+    payload_hash =
+      Keyword.get(
+        opts,
+        :streaming_payload_hash,
+        default_payload_hash
+      )
 
     data_chunks = chunk_body(body, chunk_size)
 
@@ -123,19 +140,21 @@ defmodule Maxio.Test.SigV4Request do
         [
           {"host", @host},
           {"content-encoding", "aws-chunked"},
-          {"x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
+          {"x-amz-content-sha256", payload_hash},
           {"x-amz-date", amz_date},
           {"x-amz-decoded-content-length", Integer.to_string(decoded_len_header)}
-        ] ++ Enum.map(extra_headers, fn {k, v} -> {String.downcase(k), v} end),
+        ] ++
+          maybe_trailer_header(trailer_names) ++
+          Enum.map(extra_headers, fn {k, v} -> {String.downcase(k), v} end),
         session_token
       )
 
     canonical_req = %{
       method: to_string(method) |> String.upcase(),
       path: path,
-      query: %{},
+      query: query,
       headers: base_headers,
-      payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+      payload_hash: payload_hash
     }
 
     canonical = Canonical.canonical_request(canonical_req)
@@ -148,11 +167,23 @@ defmodule Maxio.Test.SigV4Request do
       "AWS4-HMAC-SHA256 Credential=#{access_key}/#{scope}," <>
         "SignedHeaders=#{signed_headers},Signature=#{seed_sig}"
 
-    chunked_body = build_chunked_body(data_chunks, key, amz_date, scope, seed_sig)
+    chunked_body =
+      build_chunked_body(
+        data_chunks,
+        trailer_headers,
+        payload_hash,
+        key,
+        amz_date,
+        scope,
+        seed_sig
+      )
+
     chunked_body = if t = Keyword.get(opts, :tamper), do: t.(chunked_body), else: chunked_body
+    query_string = URI.encode_query(query)
+    full_path = if query_string == "", do: path, else: path <> "?" <> query_string
 
     conn =
-      conn(method, path, chunked_body)
+      conn(method, full_path, chunked_body)
       |> Map.put(:host, @host)
       |> put_private(:maxio_now, now)
 
@@ -171,9 +202,69 @@ defmodule Maxio.Test.SigV4Request do
     |> Enum.map(&:erlang.list_to_binary/1)
   end
 
-  defp build_chunked_body(data_chunks, key, amz_date, scope, seed_sig) do
-    {frames, _last} =
-      Enum.reduce(data_chunks ++ [""], {[], seed_sig}, fn data, {acc, prev} ->
+  defp maybe_trailer_header([]), do: []
+  defp maybe_trailer_header(names), do: [{"x-amz-trailer", Enum.join(names, ",")}]
+
+  defp build_chunked_body(
+         data_chunks,
+         trailer_headers,
+         "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+         _key,
+         _amz_date,
+         _scope,
+         _seed_sig
+       ) do
+    frames =
+      data_chunks
+      |> Enum.map(fn data ->
+        size_hex = Integer.to_string(byte_size(data), 16) |> String.downcase()
+        "#{size_hex}\r\n" <> data <> "\r\n"
+      end)
+
+    IO.iodata_to_binary([frames, "0\r\n", trailer_block(trailer_headers), "\r\n"])
+  end
+
+  defp build_chunked_body(
+         data_chunks,
+         trailer_headers,
+         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+         key,
+         amz_date,
+         scope,
+         seed_sig
+       ) do
+    {frames, last_sig} = signed_data_frames(data_chunks ++ [""], key, amz_date, scope, seed_sig)
+    trailer = trailer_block(trailer_headers)
+    trailer_signature_block = trailer_signature_block(trailer_headers)
+
+    trailer_sts =
+      Maxio.Auth.SigV4.StreamingVerifier.trailer_string_to_sign(
+        amz_date,
+        scope,
+        last_sig,
+        Signer.hex_sha256(trailer_signature_block)
+      )
+
+    trailer_sig = Signer.signature(key, trailer_sts)
+    IO.iodata_to_binary([frames, trailer, "x-amz-trailer-signature:", trailer_sig, "\r\n"])
+  end
+
+  defp build_chunked_body(
+         data_chunks,
+         _trailer_headers,
+         _payload_hash,
+         key,
+         amz_date,
+         scope,
+         seed_sig
+       ) do
+    {frames, _last} = signed_data_frames(data_chunks ++ [""], key, amz_date, scope, seed_sig)
+    frames |> IO.iodata_to_binary()
+  end
+
+  defp signed_data_frames(chunks, key, amz_date, scope, seed_sig) do
+    {frames, last} =
+      Enum.reduce(chunks, {[], seed_sig}, fn data, {acc, prev} ->
         data_hash = Signer.hex_sha256(data)
 
         chunk_sts =
@@ -190,7 +281,19 @@ defmodule Maxio.Test.SigV4Request do
         {[frame | acc], sig}
       end)
 
-    frames |> Enum.reverse() |> IO.iodata_to_binary()
+    {Enum.reverse(frames), last}
+  end
+
+  defp trailer_block(headers) do
+    headers
+    |> Enum.map(fn {name, value} -> String.downcase(name) <> ":" <> value <> "\r\n" end)
+    |> IO.iodata_to_binary()
+  end
+
+  defp trailer_signature_block(headers) do
+    headers
+    |> Enum.map(fn {name, value} -> String.downcase(name) <> ":" <> value <> "\n" end)
+    |> IO.iodata_to_binary()
   end
 
   def access_key, do: @access_key

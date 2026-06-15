@@ -225,67 +225,77 @@ defmodule Maxio.Storage.ErasureCoded do
       tmps =
         commit_pairs |> Enum.map(fn {drive_root, _final} -> drive_root end) |> begin_tmp_dirs!()
 
-      fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
+      try do
+        fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
 
-      acc =
-        try do
-          acc0 = %{
-            md5: :crypto.hash_init(:md5),
-            sha: :crypto.hash_init(:sha256),
-            size: 0,
-            shard_len: nil,
-            block_hashes: List.duplicate([], Config.total(cfg)),
-            buffer: <<>>,
-            fds: fds
-          }
+        acc =
+          try do
+            acc0 = %{
+              md5: :crypto.hash_init(:md5),
+              sha: :crypto.hash_init(:sha256),
+              size: 0,
+              shard_len: nil,
+              block_hashes: List.duplicate([], Config.total(cfg)),
+              buffer: <<>>,
+              fds: fds
+            }
 
-          # 逐 part 解码 -> 喂入对象编码流（块接块流式）。
-          acc =
-            Enum.reduce(part_numbers, acc0, fn pn, acc ->
-              {:ok, part_stream} = do_get_part_stream(bucket, key, upload_id, pn, opts)
-              Enum.reduce(part_stream, acc, fn chunk, a -> feed(cfg, a, chunk) end)
-            end)
+            # 逐 part 解码 -> 喂入对象编码流（块接块流式）。
+            acc =
+              Enum.reduce(part_numbers, acc0, fn pn, acc ->
+                {:ok, part_stream} = do_get_part_stream(bucket, key, upload_id, pn, opts)
+                Enum.reduce(part_stream, acc, fn chunk, a -> feed(cfg, a, chunk) end)
+              end)
 
-          flush_final(cfg, acc)
-        after
-          Enum.each(fds, &File.close/1)
+            flush_final(cfg, acc)
+          after
+            Enum.each(fds, &File.close/1)
+          end
+
+        etag = acc.md5 |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        shard_len = acc.shard_len || 0
+
+        # 多段 assemble 的最终对象落 opts[:version_id] 指定布局（缺省 null）；同样产 maxio/2 sidecar
+        # 使其 sidecar-可读/可列。ROUTE B B4-6 D1：透传 assemble 的 opts（携 opts[:object_meta]，由
+        # Multipart.complete 从 upload 会话取 content_type/user_metadata 构造），version_opts 据此自描述
+        # 真实 content_type/user_metadata（替换原硬编码 []，消除多段 :sidecar 读 content-type 错误）。
+        meta =
+          build_meta(
+            cfg,
+            version_id,
+            opts,
+            acc.size,
+            etag,
+            sha256,
+            shard_len,
+            Enum.map(acc.block_hashes, &Enum.reverse/1)
+          )
+
+        write_tmp_sidecars(tmps, meta)
+
+        ok_drives = commit_drives(tmps, commit_pairs, opts)
+
+        if ok_drives >= cfg.write_quorum do
+          {:ok, %{size: acc.size}}
+        else
+          Logger.error("erasure assemble below write quorum",
+            bucket: bucket,
+            key: key,
+            reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
+          )
+
+          rollback_commit(tmps, commit_pairs)
+          {:error, :write_quorum}
         end
-
-      etag = acc.md5 |> :crypto.hash_final() |> Base.encode16(case: :lower)
-      sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
-      shard_len = acc.shard_len || 0
-
-      # 多段 assemble 的最终对象落 opts[:version_id] 指定布局（缺省 null）；同样产 maxio/2 sidecar
-      # 使其 sidecar-可读/可列。ROUTE B B4-6 D1：透传 assemble 的 opts（携 opts[:object_meta]，由
-      # Multipart.complete 从 upload 会话取 content_type/user_metadata 构造），version_opts 据此自描述
-      # 真实 content_type/user_metadata（替换原硬编码 []，消除多段 :sidecar 读 content-type 错误）。
-      meta =
-        build_meta(
-          cfg,
-          version_id,
-          opts,
-          acc.size,
-          etag,
-          sha256,
-          shard_len,
-          Enum.map(acc.block_hashes, &Enum.reverse/1)
-        )
-
-      write_tmp_sidecars(tmps, meta)
-
-      ok_drives = commit_drives(tmps, commit_pairs, opts)
-
-      if ok_drives >= cfg.write_quorum do
-        {:ok, %{size: acc.size}}
-      else
-        Logger.error("erasure assemble below write quorum",
-          bucket: bucket,
-          key: key,
-          reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
-        )
-
-        rollback_commit(tmps, commit_pairs)
-        {:error, :write_quorum}
+      rescue
+        err ->
+          cleanup_tmps(tmps)
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          cleanup_tmps(tmps)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
     end
   end
@@ -519,6 +529,14 @@ defmodule Maxio.Storage.ErasureCoded do
     end
   end
 
+  defp run_before_object_commit!(opts, result) do
+    case Keyword.get(opts, :before_object_commit) do
+      nil -> %{}
+      fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
+      fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())
+    end
+  end
+
   defp normalize_part_commit_extra(nil), do: %{}
   defp normalize_part_commit_extra(extra) when is_map(extra), do: extra
 
@@ -531,59 +549,72 @@ defmodule Maxio.Storage.ErasureCoded do
       tmps =
         commit_pairs |> Enum.map(fn {drive_root, _final} -> drive_root end) |> begin_tmp_dirs!()
 
-      fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
+      try do
+        fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
 
-      acc =
-        try do
-          acc0 = %{
-            md5: :crypto.hash_init(:md5),
-            sha: :crypto.hash_init(:sha256),
-            size: 0,
-            shard_len: nil,
-            # 每盘一个 block_hashes 反序列表（hex）
-            block_hashes: List.duplicate([], Config.total(cfg)),
-            buffer: <<>>,
-            fds: fds
-          }
+        acc =
+          try do
+            acc0 = %{
+              md5: :crypto.hash_init(:md5),
+              sha: :crypto.hash_init(:sha256),
+              size: 0,
+              shard_len: nil,
+              # 每盘一个 block_hashes 反序列表（hex）
+              block_hashes: List.duplicate([], Config.total(cfg)),
+              buffer: <<>>,
+              fds: fds
+            }
 
-          acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed(cfg, acc, chunk) end)
-          flush_final(cfg, acc)
-        after
-          Enum.each(fds, &File.close/1)
+            acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed(cfg, acc, chunk) end)
+            flush_final(cfg, acc)
+          after
+            Enum.each(fds, &File.close/1)
+          end
+
+        etag = acc.md5 |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        shard_len = acc.shard_len || 0
+
+        meta =
+          build_meta(
+            cfg,
+            version_id,
+            opts,
+            acc.size,
+            etag,
+            sha256,
+            shard_len,
+            Enum.map(acc.block_hashes, &Enum.reverse/1)
+          )
+
+        result = %{size: acc.size, etag: etag, sha256: sha256}
+        extra = run_before_object_commit!(opts, result)
+
+        # sidecar 写各盘 temp（与 part.0 同 temp obj-dir，一并原子提交）。
+        write_tmp_sidecars(tmps, meta)
+
+        ok_drives = commit_drives(tmps, commit_pairs, opts)
+
+        if ok_drives >= cfg.write_quorum do
+          {:ok, Map.merge(result, extra)}
+        else
+          Logger.error("erasure put below write quorum",
+            bucket: bucket,
+            key: key,
+            reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
+          )
+
+          rollback_commit(tmps, commit_pairs)
+          {:error, :write_quorum}
         end
-
-      etag = acc.md5 |> :crypto.hash_final() |> Base.encode16(case: :lower)
-      sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
-      shard_len = acc.shard_len || 0
-
-      meta =
-        build_meta(
-          cfg,
-          version_id,
-          opts,
-          acc.size,
-          etag,
-          sha256,
-          shard_len,
-          Enum.map(acc.block_hashes, &Enum.reverse/1)
-        )
-
-      # sidecar 写各盘 temp（与 part.0 同 temp obj-dir，一并原子提交）。
-      write_tmp_sidecars(tmps, meta)
-
-      ok_drives = commit_drives(tmps, commit_pairs, opts)
-
-      if ok_drives >= cfg.write_quorum do
-        {:ok, %{size: acc.size, etag: etag, sha256: sha256}}
-      else
-        Logger.error("erasure put below write quorum",
-          bucket: bucket,
-          key: key,
-          reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
-        )
-
-        rollback_commit(tmps, commit_pairs)
-        {:error, :write_quorum}
+      rescue
+        err ->
+          cleanup_tmps(tmps)
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          cleanup_tmps(tmps)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
     end
   end

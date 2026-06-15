@@ -187,5 +187,22 @@ defmodule Maxio.Auth.SigV4.StreamingVerifierTest do
       {:ok, _c, v2} = StreamingVerifier.feed(v, stream)
       assert {:error, :incomplete_body} = StreamingVerifier.finalize(v2)
     end
+
+    test "unsigned trailer rejects extra bytes after trailer block" do
+      v =
+        StreamingVerifier.init(
+          k_signing: k_signing(),
+          date: @amz_date,
+          scope: @scope,
+          seed_signature: @seed,
+          expected_decoded_len: 3,
+          flavor: :unsigned_trailer,
+          trailer_names: ["x-amz-checksum-crc32"]
+        )
+
+      stream = "3\r\nabc\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\njunk"
+
+      assert {:error, :invalid_chunk} = StreamingVerifier.feed(v, stream)
+    end
   end
 end

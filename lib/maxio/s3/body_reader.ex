@@ -24,6 +24,56 @@ defmodule Maxio.S3.BodyReader do
   @doc "返回逐块产出纯净对象字节的 Stream.resource。"
   @spec stream(Plug.Conn.t(), :single | :unsigned | :streaming) :: Enumerable.t()
   def stream(conn, :streaming) do
+    streaming_resource(conn, nil)
+  end
+
+  def stream(conn, mode) do
+    {stream, _get_trailers, _discard_trailers} = stream_with_trailers(conn, mode)
+    stream
+  end
+
+  @doc """
+  Returns `{stream, get_trailers, discard_trailers}`.
+
+  `get_trailers` yields verified aws-chunked trailing headers after the stream
+  has been fully consumed. For non-trailer payloads it returns `%{}`.
+  """
+  @spec stream_with_trailers(Plug.Conn.t(), :single | :unsigned | :streaming) ::
+          {Enumerable.t(), (-> %{String.t() => String.t()}), (-> :ok)}
+  def stream_with_trailers(conn, :streaming) do
+    {:ok, trailer_agent} = Agent.start_link(fn -> %{} end)
+
+    stream = streaming_resource(conn, trailer_agent)
+
+    get_trailers = fn ->
+      get_and_stop_agent(trailer_agent)
+    end
+
+    {stream, get_trailers, fn -> stop_agent(trailer_agent) end}
+  end
+
+  def stream_with_trailers(conn, _mode) do
+    stream =
+      Stream.resource(
+        fn -> conn end,
+        fn
+          :done ->
+            {:halt, :done}
+
+          c ->
+            case Plug.Conn.read_body(c, @read_opts) do
+              {:ok, chunk, _c2} -> {[chunk], :done}
+              {:more, chunk, c2} -> {[chunk], c2}
+              {:error, _} -> {:halt, :done}
+            end
+        end,
+        fn _ -> :ok end
+      )
+
+    {stream, fn -> %{} end, fn -> :ok end}
+  end
+
+  defp streaming_resource(conn, trailer_agent) do
     # 铁律 3：aws-chunked 逐块签名验证由 StreamingVerifier 显式状态机驱动；
     # 坏块/截断/长度不符在 emit 前硬 raise Maxio.S3.Error（绝不把半验证字节交下游）。
     ctx = conn.assigns[:sigv4_context]
@@ -46,50 +96,39 @@ defmodule Maxio.S3.BodyReader do
     Log.info("aws-chunked streaming verify start", payload_mode: :streaming, reason: flavor)
 
     Stream.resource(
-      fn -> {conn, verifier, :reading} end,
+      fn -> {conn, verifier, :reading, trailer_agent} end,
       &verify_step/1,
-      fn _ -> :ok end
-    )
-  end
-
-  def stream(conn, _mode) do
-    Stream.resource(
-      fn -> conn end,
-      fn
-        :done ->
-          {:halt, :done}
-
-        c ->
-          case Plug.Conn.read_body(c, @read_opts) do
-            {:ok, chunk, _c2} -> {[chunk], :done}
-            {:more, chunk, c2} -> {[chunk], c2}
-            {:error, _} -> {:halt, :done}
-          end
-      end,
       fn _ -> :ok end
     )
   end
 
   # ── aws-chunked 逐块签名验证驱动（StreamingVerifier 状态机）──
   # body 读尽后切到 {:done, v2}，下一迭代过 finalize 校验终止块 + decoded 长度再 :halt。
-  defp verify_step({:done, verifier}) do
+  defp verify_step({:done, verifier, trailer_agent}) do
     case StreamingVerifier.finalize(verifier) do
-      :ok -> {:halt, :ok}
-      {:error, reason} -> raise streaming_error(reason)
+      :ok ->
+        if trailer_agent do
+          Agent.update(trailer_agent, fn _ -> StreamingVerifier.trailers(verifier) end)
+        end
+
+        {:halt, :ok}
+
+      {:error, reason} ->
+        raise streaming_error(reason)
     end
   end
 
-  defp verify_step({conn, verifier, :reading}) do
+  defp verify_step({conn, verifier, :reading, trailer_agent}) do
     case Plug.Conn.read_body(conn, @read_opts) do
       {:ok, more, _conn2} ->
         case StreamingVerifier.feed(verifier, more) do
-          {:ok, chunks, v2} -> {chunks, {:done, v2}}
+          {:ok, chunks, v2} -> {chunks, {:done, v2, trailer_agent}}
           {:error, reason} -> raise streaming_error(reason)
         end
 
       {:more, more, conn2} ->
         case StreamingVerifier.feed(verifier, more) do
-          {:ok, chunks, v2} -> {chunks, {conn2, v2, :reading}}
+          {:ok, chunks, v2} -> {chunks, {conn2, v2, :reading, trailer_agent}}
           {:error, reason} -> raise streaming_error(reason)
         end
 
@@ -123,6 +162,22 @@ defmodule Maxio.S3.BodyReader do
 
   defp parse_trailer_names(str) do
     str |> String.split(",", trim: true) |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+  end
+
+  defp stop_agent(agent) do
+    Agent.stop(agent)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp get_and_stop_agent(agent) do
+    try do
+      Agent.get(agent, & &1)
+    catch
+      :exit, _reason -> %{}
+    after
+      stop_agent(agent)
+    end
   end
 
   @doc """

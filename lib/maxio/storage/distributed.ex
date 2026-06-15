@@ -275,61 +275,74 @@ defmodule Maxio.Storage.Distributed do
     # 保序 N 元素 (node, tmp_dir | nil)：分片 i 必须写端点 i 的 temp（down 端点 nil 跳过，绝不错位）。
     tmp_dirs = ordered_tmp_dirs(commit_targets)
 
-    acc0 = %{
-      md5: :crypto.hash_init(:md5),
-      sha: :crypto.hash_init(:sha256),
-      size: 0,
-      shard_len: nil,
-      block_hashes: List.duplicate([], n),
-      buffer: <<>>,
-      block_index: 0,
-      dirs: tmp_dirs,
-      tx: tx
-    }
+    try do
+      acc0 = %{
+        md5: :crypto.hash_init(:md5),
+        sha: :crypto.hash_init(:sha256),
+        size: 0,
+        shard_len: nil,
+        block_hashes: List.duplicate([], n),
+        buffer: <<>>,
+        block_index: 0,
+        dirs: tmp_dirs,
+        tx: tx
+      }
 
-    acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed(c, acc, chunk) end)
-    acc = flush_final(c, acc)
+      acc = Enum.reduce(chunks, acc0, fn chunk, acc -> feed(c, acc, chunk) end)
+      acc = flush_final(c, acc)
 
-    etag = acc.md5 |> :crypto.hash_final() |> Base.encode16(case: :lower)
-    sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
-    shard_len = acc.shard_len || 0
+      etag = acc.md5 |> :crypto.hash_final() |> Base.encode16(case: :lower)
+      sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
+      shard_len = acc.shard_len || 0
 
-    meta =
-      build_meta(
-        c,
-        version_id,
-        opts,
-        acc.size,
-        etag,
-        sha256,
-        shard_len,
-        Enum.map(acc.block_hashes, &Enum.reverse/1)
-      )
+      result = %{
+        size: acc.size,
+        etag: etag,
+        sha256: sha256,
+        placement_set_id: placement.set_id,
+        placement_pool_id: placement.pool_id,
+        placement_topology_hash: placement.topology_hash
+      }
 
-    # sidecar 写进各端点 temp（与 part.0 同 temp obj-dir，一并原子提交）。
-    _ = write_sidecars(tx, tmp_dirs, meta)
+      extra = run_before_object_commit!(opts, result)
 
-    ok_endpoints = commit_all(tx, commit_targets, opts)
+      meta =
+        build_meta(
+          c,
+          version_id,
+          opts,
+          acc.size,
+          etag,
+          sha256,
+          shard_len,
+          Enum.map(acc.block_hashes, &Enum.reverse/1)
+        )
 
-    if ok_endpoints >= c.write_quorum do
-      {:ok,
-       %{
-         size: acc.size,
-         etag: etag,
-         sha256: sha256,
-         placement_set_id: placement.set_id,
-         placement_pool_id: placement.pool_id,
-         placement_topology_hash: placement.topology_hash
-       }}
-    else
-      Logger.error("distributed put below write quorum",
-        bucket: bucket,
-        key: key,
-        reason: "ok_endpoints=#{ok_endpoints} < write_quorum=#{c.write_quorum}"
-      )
+      # sidecar 写进各端点 temp（与 part.0 同 temp obj-dir，一并原子提交）。
+      _ = write_sidecars(tx, tmp_dirs, meta)
 
-      cleanup_tmp(tx, commit_targets)
-      {:error, :write_quorum}
+      ok_endpoints = commit_all(tx, commit_targets, opts)
+
+      if ok_endpoints >= c.write_quorum do
+        {:ok, Map.merge(result, extra)}
+      else
+        Logger.error("distributed put below write quorum",
+          bucket: bucket,
+          key: key,
+          reason: "ok_endpoints=#{ok_endpoints} < write_quorum=#{c.write_quorum}"
+        )
+
+        cleanup_tmp(tx, commit_targets)
+        {:error, :write_quorum}
+      end
+    rescue
+      err ->
+        cleanup_tmp(tx, commit_targets)
+        reraise(err, __STACKTRACE__)
+    catch
+      kind, reason ->
+        cleanup_tmp(tx, commit_targets)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
   end
 
@@ -822,6 +835,14 @@ defmodule Maxio.Storage.Distributed do
 
   defp run_before_part_commit!(opts, result) do
     case Keyword.get(opts, :before_part_commit) do
+      nil -> %{}
+      fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
+      fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())
+    end
+  end
+
+  defp run_before_object_commit!(opts, result) do
+    case Keyword.get(opts, :before_object_commit) do
       nil -> %{}
       fun when is_function(fun, 1) -> normalize_part_commit_extra(fun.(result))
       fun when is_function(fun, 0) -> normalize_part_commit_extra(fun.())

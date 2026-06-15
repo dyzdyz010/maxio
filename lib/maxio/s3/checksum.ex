@@ -2,9 +2,8 @@ defmodule Maxio.S3.Checksum do
   @moduledoc """
   S3 upload checksum header validation.
 
-  Supports checksum values carried in ordinary request headers. aws-chunked
-  trailing checksums are intentionally handled in a later slice because they
-  require BodyReader to expose verified trailing headers.
+  Supports checksum values carried in ordinary request headers and in verified
+  aws-chunked trailing headers.
   """
 
   import Plug.Conn
@@ -14,14 +13,16 @@ defmodule Maxio.S3.Checksum do
   @type t :: %{
           checks: [check()],
           response_headers: [{String.t(), String.t()}],
+          get_trailers: (-> %{String.t() => String.t()}),
           verify!: (-> :ok)
         }
 
   @type check :: %{
           required(:kind) => {:hash, atom()} | :crc32,
           required(:response_header) => String.t() | nil,
-          required(:expected) => binary(),
           required(:context) => term(),
+          optional(:expected) => binary(),
+          optional(:trailer_header) => String.t(),
           optional(:actual) => binary()
         }
 
@@ -42,20 +43,17 @@ defmodule Maxio.S3.Checksum do
 
   @unsupported_sdk_algorithms ~w(CRC32C CRC64NVME SHA512 XXHASH3 XXHASH64 XXHASH128)
 
-  @doc "Builds a checksum context from S3 upload request headers."
-  @spec from_conn!(Plug.Conn.t()) :: t()
-  def from_conn!(conn) do
+  @doc "Builds a checksum context from S3 upload request headers and verified trailer getter."
+  @spec from_conn!(Plug.Conn.t(), (-> %{String.t() => String.t()})) :: t()
+  def from_conn!(conn, get_trailers \\ fn -> %{} end) do
     headers = conn.req_headers
-    unsupported = unsupported_header(headers)
+    unsupported = unsupported_header(headers) || unsupported_trailer_header(headers)
 
     if unsupported do
       raise Error.new(:not_implemented, message: "Unsupported checksum header: #{unsupported}")
     end
 
-    if trailer_checksum?(headers) do
-      raise Error.new(:not_implemented, message: "Checksum trailers are not implemented")
-    end
-
+    validate_trailer_payload_mode!(conn, headers)
     validate_sdk_algorithm!(headers)
 
     checks =
@@ -63,12 +61,35 @@ defmodule Maxio.S3.Checksum do
       |> content_md5_check()
       |> Kernel.++(hash_checks(headers))
       |> Kernel.++(crc32_checks(headers))
+      |> Kernel.++(trailer_checks(headers))
 
+    build_context(checks, get_trailers)
+  end
+
+  @doc "Returns a checksum context that reads verified aws-chunked trailer headers from `get_trailers`."
+  @spec with_trailer_getter(t(), (-> %{String.t() => String.t()})) :: t()
+  def with_trailer_getter(%{checks: checks} = checksum, get_trailers) do
+    %{
+      checksum
+      | get_trailers: get_trailers,
+        verify!: verify_fun(checks, get_trailers)
+    }
+  end
+
+  defp build_context(checks, get_trailers) do
     %{
       checks: checks,
+      get_trailers: get_trailers,
       response_headers: response_headers(checks),
-      verify!: fn -> :ok end
+      verify!: verify_fun(checks, get_trailers)
     }
+  end
+
+  defp verify_fun(checks, get_trailers) do
+    fn ->
+      trailers = get_trailers.()
+      if checks == [], do: :ok, else: verify!(finalize_checks(checks, trailers))
+    end
   end
 
   @doc "Rejects checksum headers on UploadPartCopy until copy checksum validation is implemented."
@@ -97,10 +118,21 @@ defmodule Maxio.S3.Checksum do
   has been fully consumed by storage.
   """
   @spec wrap_stream(Enumerable.t(), t()) :: {Enumerable.t(), (-> t()), (-> :ok)}
-  def wrap_stream(chunks, %{checks: []} = checksum),
-    do: {chunks, fn -> checksum end, fn -> :ok end}
+  def wrap_stream(chunks, %{checks: [], get_trailers: get_trailers} = checksum) do
+    get_context = fn ->
+      _ = get_trailers.()
+      %{checksum | verify!: fn -> :ok end}
+    end
 
-  def wrap_stream(chunks, %{checks: checks} = checksum) do
+    discard = fn ->
+      _ = get_trailers.()
+      :ok
+    end
+
+    {chunks, get_context, discard}
+  end
+
+  def wrap_stream(chunks, %{checks: checks, get_trailers: get_trailers} = checksum) do
     {:ok, agent} = Agent.start_link(fn -> checks end)
 
     stream =
@@ -111,14 +143,19 @@ defmodule Maxio.S3.Checksum do
       end)
 
     get_context = fn ->
-      final = agent |> Agent.get(& &1) |> finalize_checks()
-      stop_agent(agent)
+      checks = Agent.get(agent, & &1)
 
-      %{
-        checksum
-        | response_headers: response_headers(final),
-          verify!: fn -> verify!(final) end
-      }
+      try do
+        final = finalize_checks(checks, get_trailers.())
+
+        %{
+          checksum
+          | response_headers: response_headers(final),
+            verify!: fn -> verify!(final) end
+        }
+      after
+        stop_agent(agent)
+      end
     end
 
     {stream, get_context, fn -> stop_agent(agent) end}
@@ -184,6 +221,37 @@ defmodule Maxio.S3.Checksum do
     end
   end
 
+  defp trailer_checks(headers) do
+    headers
+    |> declared_trailer_names()
+    |> Enum.flat_map(fn name ->
+      cond do
+        Map.has_key?(@hash_algorithms, name) ->
+          [
+            %{
+              response_header: name,
+              kind: {:hash, Map.fetch!(@hash_algorithms, name)},
+              trailer_header: name,
+              context: :crypto.hash_init(Map.fetch!(@hash_algorithms, name))
+            }
+          ]
+
+        name == "x-amz-checksum-crc32" ->
+          [
+            %{
+              response_header: name,
+              kind: :crc32,
+              trailer_header: name,
+              context: 0
+            }
+          ]
+
+        true ->
+          []
+      end
+    end)
+  end
+
   defp update_check(%{kind: {:hash, _algorithm}, context: context} = check, chunk) do
     %{check | context: :crypto.hash_update(context, chunk)}
   end
@@ -192,13 +260,25 @@ defmodule Maxio.S3.Checksum do
     %{check | context: :erlang.crc32(crc, chunk)}
   end
 
-  defp finalize_checks(checks) do
+  defp finalize_checks(checks, trailers) do
     Enum.map(checks, fn %{context: context} = check ->
       check
       |> Map.put(:actual, final_value(check.kind, context))
+      |> put_expected_from_trailer(trailers)
       |> Map.put(:context, nil)
     end)
   end
+
+  defp put_expected_from_trailer(%{trailer_header: name} = check, trailers) do
+    expected_size = expected_size(check.kind)
+
+    case Map.fetch(trailers, name) do
+      {:ok, value} -> Map.put(check, :expected, decode_base64!(value, expected_size))
+      :error -> raise Error.new(:bad_digest)
+    end
+  end
+
+  defp put_expected_from_trailer(check, _trailers), do: check
 
   defp verify!(checks) do
     case Enum.find(checks, fn check -> check.actual != check.expected end) do
@@ -224,6 +304,9 @@ defmodule Maxio.S3.Checksum do
   defp hash_length(:md5), do: 16
   defp hash_length(:sha), do: 20
   defp hash_length(:sha256), do: 32
+
+  defp expected_size({:hash, algorithm}), do: hash_length(algorithm)
+  defp expected_size(:crc32), do: 4
 
   defp decode_base64!(value, expected_size) do
     case Base.decode64(String.trim(value)) do
@@ -274,11 +357,32 @@ defmodule Maxio.S3.Checksum do
     end
   end
 
+  defp validate_trailer_payload_mode!(conn, headers) do
+    if trailer_checksum?(headers) and not streaming_trailer_payload?(conn) do
+      raise Error.new(:invalid_request,
+              message: "Checksum trailers require a streaming trailer payload"
+            )
+    end
+  end
+
+  defp streaming_trailer_payload?(conn) do
+    conn.assigns[:payload_mode] == :streaming and
+      conn.req_headers
+      |> header("x-amz-content-sha256")
+      |> case do
+        value when is_binary(value) -> String.ends_with?(value, "-TRAILER")
+        _ -> false
+      end
+  end
+
   defp validate_supported_sdk_algorithm!(headers, algorithm) do
     expected_header = Map.fetch!(@sdk_algorithm_headers, algorithm)
 
     cond do
       header(headers, expected_header) ->
+        :ok
+
+      expected_header in declared_trailer_names(headers) ->
         :ok
 
       checksum_value_header?(headers) ->
@@ -308,27 +412,39 @@ defmodule Maxio.S3.Checksum do
     end)
   end
 
+  defp unsupported_trailer_header(headers) do
+    Enum.find(declared_trailer_names(headers), fn name ->
+      String.starts_with?(name, "x-amz-checksum-") and name not in @supported_checksum_headers
+    end)
+  end
+
   defp trailer_checksum?(headers) do
+    Enum.any?(declared_trailer_names(headers), &String.starts_with?(&1, "x-amz-checksum-"))
+  end
+
+  defp declared_trailer_names(headers) do
     headers
     |> header("x-amz-trailer")
     |> case do
       nil ->
-        false
+        []
 
       trailer ->
         trailer
         |> String.split(",", trim: true)
-        |> Enum.any?(fn name ->
-          String.starts_with?(String.downcase(String.trim(name)), "x-amz-checksum-")
-        end)
+        |> Enum.map(fn name -> name |> String.trim() |> String.downcase() end)
     end
   end
 
   defp response_headers(checks) do
     checks
     |> Enum.reject(&is_nil(&1.response_header))
-    |> Enum.map(fn check ->
-      {check.response_header, Base.encode64(Map.get(check, :actual, check.expected))}
+    |> Enum.uniq_by(& &1.response_header)
+    |> Enum.flat_map(fn check ->
+      case Map.get(check, :actual) || Map.get(check, :expected) do
+        nil -> []
+        value -> [{check.response_header, Base.encode64(value)}]
+      end
     end)
   end
 
