@@ -533,7 +533,10 @@ defmodule Maxio.S3.Authz do
               :delete_public_access_block,
               :put_bucket_ownership_controls,
               :get_bucket_ownership_controls,
-              :delete_bucket_ownership_controls
+              :delete_bucket_ownership_controls,
+              :put_bucket_website,
+              :get_bucket_website,
+              :delete_bucket_website
             ],
        do: true
 

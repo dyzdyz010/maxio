@@ -79,6 +79,10 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:put_bucket_ownership_controls),
     do: {"s3:PutBucketOwnershipControls", :bucket}
 
+  def for_action(:put_bucket_website), do: {"s3:PutBucketWebsite", :bucket}
+  def for_action(:get_bucket_website), do: {"s3:GetBucketWebsite", :bucket}
+  def for_action(:delete_bucket_website), do: {"s3:DeleteBucketWebsite", :bucket}
+
   def for_action(:get_bucket_ownership_controls),
     do: {"s3:GetBucketOwnershipControls", :bucket}
 

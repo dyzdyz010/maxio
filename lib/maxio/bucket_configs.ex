@@ -8,8 +8,9 @@ defmodule Maxio.BucketConfigs do
   alias Maxio.Cluster.Notify
   alias Maxio.BucketConfigs.BucketConfig
 
-  @type kind :: :cors | :lifecycle | :encryption | :public_access_block | :ownership_controls
-  @kinds [:cors, :lifecycle, :encryption, :public_access_block, :ownership_controls]
+  @type kind ::
+          :cors | :lifecycle | :encryption | :public_access_block | :ownership_controls | :website
+  @kinds [:cors, :lifecycle, :encryption, :public_access_block, :ownership_controls, :website]
 
   @doc "取某桶某类配置。未配置（行不存在或该列为 nil）→ :none。"
   @spec get(String.t(), kind()) :: {:ok, list() | map()} | :none

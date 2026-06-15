@@ -149,6 +149,8 @@ defmodule Maxio.S3.Error do
       {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist."},
     no_such_lifecycle_configuration:
       {"NoSuchLifecycleConfiguration", 404, "The lifecycle configuration does not exist."},
+    no_such_website_configuration:
+      {"NoSuchWebsiteConfiguration", 404, "The website configuration does not exist."},
     server_side_encryption_configuration_not_found:
       {"ServerSideEncryptionConfigurationNotFoundError", 404,
        "The server side encryption configuration was not found."}

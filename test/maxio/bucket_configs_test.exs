@@ -20,12 +20,18 @@ defmodule Maxio.BucketConfigsTest do
     assert :ok =
              BucketConfigs.put("b2", :ownership_controls, %{"ObjectOwnership" => "ObjectWriter"})
 
+    assert :ok =
+             BucketConfigs.put("b2", :website, %{"index_document" => %{"suffix" => "index.html"}})
+
     assert {:ok, [%{"x" => 1}]} = BucketConfigs.get("b2", :cors)
     assert {:ok, %{"algorithm" => "AES256"}} = BucketConfigs.get("b2", :encryption)
     assert {:ok, %{"BlockPublicAcls" => true}} = BucketConfigs.get("b2", :public_access_block)
 
     assert {:ok, %{"ObjectOwnership" => "ObjectWriter"}} =
              BucketConfigs.get("b2", :ownership_controls)
+
+    assert {:ok, %{"index_document" => %{"suffix" => "index.html"}}} =
+             BucketConfigs.get("b2", :website)
 
     assert BucketConfigs.get("b2", :lifecycle) == :none
   end
@@ -45,5 +51,15 @@ defmodule Maxio.BucketConfigsTest do
              })
 
     assert_receive {:bucket_config_changed, "b-notify", :ownership_controls}
+
+    assert :ok =
+             BucketConfigs.put("b-notify", :website, %{
+               "index_document" => %{"suffix" => "index.html"}
+             })
+
+    assert_receive {:bucket_config_changed, "b-notify", :website}
+
+    assert :ok = BucketConfigs.delete("b-notify", :website)
+    assert_receive {:bucket_config_changed, "b-notify", :website}
   end
 end

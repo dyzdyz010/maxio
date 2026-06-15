@@ -103,6 +103,13 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **Policy 防护**：`BlockPublicPolicy=true` 在 PutBucketPolicy 写入前拒绝公共 bucket policy 并保留既有 policy；`RestrictPublicBuckets=true` 对已存在公共 bucket policy 在授权聚合阶段抑制公共 Allow。
 - **边界**：当前仅实现 bucket-level 设置；AWS account / organization / access point 级叠加、跨账户精细限制、Service principal 例外仍随多租户/IAM 扩展后续实现。
 
+### Bucket Website（续作已支持）
+
+- **API**：`PutBucketWebsite` / `GetBucketWebsite` / `DeleteBucketWebsite`（`?website`）支持 bucket-level `WebsiteConfiguration` 持久化与 XML 回放；无配置的 GET 返回 `NoSuchWebsiteConfiguration 404`，DELETE 幂等返回 `204`。
+- **配置校验**：请求体按 AWS 上限限制为 128 KiB；`RedirectAllRequestsTo` 与其它属性互斥；普通 website 模式必须有 `IndexDocument/Suffix`；`RoutingRules` 最多 50 条，`Redirect` 必填，`ReplaceKeyWith` 与 `ReplaceKeyPrefixWith` 互斥；`Protocol` 仅支持 `http|https`。
+- **授权**：ActionMap/Authz 映射 `s3:PutBucketWebsite` / `s3:GetBucketWebsite` / `s3:DeleteBucketWebsite`，其中 DELETE 使用独立 `s3:DeleteBucketWebsite` 权限。
+- **边界**：当前只实现控制面配置 API，不实现静态网站 endpoint、索引文档重写、错误文档回退或 routing rule 对对象读取路径的影响。
+
 ### SSE-S3（服务端加密）
 
 - **真实 AES-256-GCM 信封加密**：PutObject 带 `x-amz-server-side-encryption: AES256`（或桶默认加密配置）时，对象字节**真实加密落盘**——每对象生成随机 256-bit 数据密钥（DEK），数据重切为 64KB 帧、每帧独立 AES-256-GCM（随机 IV + 认证 tag），DEK 由服务端主密钥 AES-256-GCM 包裹后随对象元数据存储。GET 透明解密；GCM 认证失败会**抛错**，绝不静默返回错数据。

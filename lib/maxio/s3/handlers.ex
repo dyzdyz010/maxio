@@ -16,7 +16,8 @@ defmodule Maxio.S3.Handlers do
     Lifecycle,
     Encryption,
     PublicAccessBlock,
-    OwnershipControls
+    OwnershipControls,
+    Website
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -82,4 +83,8 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:put_bucket_ownership_controls, conn), do: OwnershipControls.put(conn)
   def dispatch(:get_bucket_ownership_controls, conn), do: OwnershipControls.get(conn)
   def dispatch(:delete_bucket_ownership_controls, conn), do: OwnershipControls.delete(conn)
+
+  def dispatch(:put_bucket_website, conn), do: Website.put(conn)
+  def dispatch(:get_bucket_website, conn), do: Website.get(conn)
+  def dispatch(:delete_bucket_website, conn), do: Website.delete(conn)
 end

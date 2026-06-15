@@ -115,6 +115,18 @@ defmodule Maxio.S3.DispatcherTest do
   end
 
   test "无匹配方法 → method_not_allowed" do
+    assert {:ok, :put_bucket_website} =
+             Dispatcher.resolve(:bucket, "PUT", keys(["website"]))
+
+    assert {:ok, :get_bucket_website} =
+             Dispatcher.resolve(:bucket, "GET", keys(["website"]))
+
+    assert {:ok, :delete_bucket_website} =
+             Dispatcher.resolve(:bucket, "DELETE", keys(["website"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["website"]))
+
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))
   end
