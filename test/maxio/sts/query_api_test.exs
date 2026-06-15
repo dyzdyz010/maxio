@@ -881,13 +881,19 @@ defmodule Maxio.STS.QueryAPITest do
     role_policy =
       policy_doc([
         allow_statement("s3:CreateBucket", "arn:aws:s3:::#{bucket}"),
+        allow_statement("s3:PutBucketOwnershipControls", "arn:aws:s3:::#{bucket}"),
         allow_statement("s3:PutObject", "arn:aws:s3:::#{bucket}/*")
       ])
 
     session_policy =
       policy_doc(
         allow_statement(
-          ["s3:CreateBucket", "s3:PutObject", "s3:PutObjectAcl"],
+          [
+            "s3:CreateBucket",
+            "s3:PutBucketOwnershipControls",
+            "s3:PutObject",
+            "s3:PutObjectAcl"
+          ],
           ["arn:aws:s3:::#{bucket}", "arn:aws:s3:::#{bucket}/*"]
         )
       )
@@ -900,7 +906,9 @@ defmodule Maxio.STS.QueryAPITest do
         "Policy" => session_policy
       })
 
-    assert signed_s3(:put, "/#{bucket}", credentials).status == 200
+    assert signed_s3(:put, "/#{bucket}", credentials,
+             headers: [{"x-amz-object-ownership", "ObjectWriter"}]
+           ).status == 200
 
     denied_acl_put =
       signed_s3(:put, "/#{bucket}/public.txt", credentials,

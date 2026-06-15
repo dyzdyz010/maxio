@@ -135,6 +135,13 @@ defmodule Maxio.S3.Error do
     no_such_public_access_block_configuration:
       {"NoSuchPublicAccessBlockConfiguration", 404,
        "The public access block configuration was not found."},
+    ownership_controls_not_found:
+      {"OwnershipControlsNotFoundError", 404, "The bucket ownership controls were not found."},
+    access_control_list_not_supported:
+      {"AccessControlListNotSupported", 400, "The bucket does not allow ACLs."},
+    invalid_bucket_acl_with_object_ownership:
+      {"InvalidBucketAclWithObjectOwnership", 400,
+       "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting."},
     access_forbidden:
       {"AccessForbidden", 403,
        "CORSResponse: This CORS request is not allowed. This is usually because the evaluation of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted."},

@@ -100,6 +100,20 @@ defmodule Maxio.S3.DispatcherTest do
              Dispatcher.resolve(:object, "GET", keys(["publicaccessblock"]))
   end
 
+  test "OwnershipControls 子资源 → bucket-level actions" do
+    assert {:ok, :put_bucket_ownership_controls} =
+             Dispatcher.resolve(:bucket, "PUT", keys(["ownershipcontrols"]))
+
+    assert {:ok, :get_bucket_ownership_controls} =
+             Dispatcher.resolve(:bucket, "GET", keys(["ownershipcontrols"]))
+
+    assert {:ok, :delete_bucket_ownership_controls} =
+             Dispatcher.resolve(:bucket, "DELETE", keys(["ownershipcontrols"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["ownershipcontrols"]))
+  end
+
   test "无匹配方法 → method_not_allowed" do
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))

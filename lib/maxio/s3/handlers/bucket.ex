@@ -1,9 +1,9 @@
 defmodule Maxio.S3.Handlers.Bucket do
   @moduledoc "Bucket 级 handler：create / delete / head / list_objects_v2 / get_location。"
   import Plug.Conn
-  alias Maxio.{Buckets, Objects, Storage}
+  alias Maxio.{BucketConfigs, Buckets, Objects, Storage}
   alias Maxio.Policy.ACL
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{Error, Log, OwnershipControls}
   alias Maxio.S3.Views.{ListBucket, ListBucketV1, LocationConstraint, ListVersions}
 
   @max_keys_limit 1000
@@ -13,7 +13,9 @@ defmodule Maxio.S3.Handlers.Bucket do
   def create(conn) do
     bucket = conn.assigns.s3_bucket
     owner = conn.assigns.principal.arn
+    ownership_config = object_ownership_from_headers!(conn)
     acl_input = bucket_acl_from_headers!(conn)
+    :ok = OwnershipControls.reject_acl_input_for_enforced!(bucket, ownership_config, acl_input)
 
     case Buckets.create(bucket, owner,
            region: region(),
@@ -21,8 +23,14 @@ defmodule Maxio.S3.Handlers.Bucket do
            acl_grants: acl_input.grants_doc
          ) do
       {:ok, _b} ->
+        :ok = BucketConfigs.put(bucket, :ownership_controls, ownership_config)
         :ok = Storage.put_bucket(bucket)
-        Log.info("create bucket", action: :create_bucket, bucket: bucket)
+
+        Log.info("create bucket",
+          action: :create_bucket,
+          bucket: bucket,
+          object_ownership: ownership_config["ObjectOwnership"]
+        )
 
         conn
         |> put_resp_header("location", "/" <> bucket)
@@ -303,6 +311,21 @@ defmodule Maxio.S3.Handlers.Bucket do
   end
 
   defp region, do: Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:region)
+
+  defp object_ownership_from_headers!(conn) do
+    case conn |> get_req_header("x-amz-object-ownership") |> List.first() do
+      nil ->
+        %{"ObjectOwnership" => OwnershipControls.create_default()}
+
+      value when value in ["BucketOwnerEnforced", "BucketOwnerPreferred", "ObjectWriter"] ->
+        %{"ObjectOwnership" => value}
+
+      value ->
+        raise Error.new(:invalid_argument,
+                message: "Unsupported x-amz-object-ownership: #{value}"
+              )
+    end
+  end
 
   # CreateBucket 的对象专属 canned（bucket-owner-*）在桶级被官方忽略，落 private。
   defp bucket_acl_from_headers!(conn) do

@@ -15,6 +15,7 @@ defmodule Maxio.S3.Handlers.Multipart do
     CopySource,
     Error,
     Log,
+    OwnershipControls,
     PublicAccessBlock,
     SSE,
     StorageClass,
@@ -54,6 +55,7 @@ defmodule Maxio.S3.Handlers.Multipart do
     system_headers = SystemHeaders.from_req_headers(conn.req_headers)
     storage_class = StorageClass.parse!(header(conn, "x-amz-storage-class"))
     acl_input = acl_from_headers!(conn)
+    :ok = OwnershipControls.reject_object_acl_headers!(bucket, conn, acl_input)
     :ok = PublicAccessBlock.reject_public_acl_write!(bucket, acl_input)
     sse_algorithm = SSE.resolve_target!(conn.req_headers, bucket)
     owner = conn.assigns.principal.arn

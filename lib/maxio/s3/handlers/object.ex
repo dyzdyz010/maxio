@@ -15,6 +15,7 @@ defmodule Maxio.S3.Handlers.Object do
     Checksum,
     Error,
     Log,
+    OwnershipControls,
     PublicAccessBlock,
     MFADelete,
     SSE,
@@ -53,6 +54,7 @@ defmodule Maxio.S3.Handlers.Object do
     system_headers = SystemHeaders.from_req_headers(conn.req_headers)
     storage_class = StorageClass.parse!(header(conn, "x-amz-storage-class"))
     acl_input = acl_from_headers!(conn)
+    :ok = OwnershipControls.reject_object_acl_headers!(bucket, conn, acl_input)
     :ok = PublicAccessBlock.reject_public_acl_write!(bucket, acl_input)
     payload_mode = conn.assigns.payload_mode
     checksum = Checksum.from_conn!(conn)
@@ -798,6 +800,7 @@ defmodule Maxio.S3.Handlers.Object do
     tagging_directive = parse_copy_directive!(conn, "x-amz-tagging-directive")
     storage_class = StorageClass.parse!(header(conn, "x-amz-storage-class"))
     acl_input = acl_from_headers!(conn)
+    :ok = OwnershipControls.reject_object_acl_headers!(dest_bucket, conn, acl_input)
     :ok = PublicAccessBlock.reject_public_acl_write!(dest_bucket, acl_input)
     target_sse = SSE.resolve_target!(conn.req_headers, dest_bucket)
     SSE.reject_copy_source_customer_headers!(conn.req_headers)

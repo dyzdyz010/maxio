@@ -26,6 +26,13 @@ defmodule Maxio.S3.MultipartIntegrationTest do
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
 
+  defp create_acl_bucket(bucket) do
+    SigV4Request.signed_conn(:put, "/#{bucket}",
+      headers: [{"x-amz-object-ownership", "ObjectWriter"}]
+    )
+    |> call()
+  end
+
   # 从 InitiateMultipartUploadResult 抠 UploadId（简单字符串切，无需 XML 解析依赖）
   defp upload_id(xml) do
     [_, rest] = String.split(xml, "<UploadId>")
@@ -497,7 +504,7 @@ defmodule Maxio.S3.MultipartIntegrationTest do
     bucket = "mpacl"
     key = "granted.bin"
 
-    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    create_acl_bucket(bucket)
 
     complete =
       complete_single_part(bucket, key, "multipart body", [

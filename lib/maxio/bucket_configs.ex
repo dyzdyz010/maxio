@@ -1,6 +1,6 @@
 defmodule Maxio.BucketConfigs do
   @moduledoc """
-  桶高级特性配置上下文（CORS / Lifecycle / 默认加密 / PublicAccessBlock）。
+  桶高级特性配置上下文（CORS / Lifecycle / 默认加密 / PublicAccessBlock / OwnershipControls）。
   每桶至多一行 bucket_configs；
   按 kind 读/写/删单个配置字段。get 返回已解析的结构（list 或 map）或 :none。
   """
@@ -8,8 +8,8 @@ defmodule Maxio.BucketConfigs do
   alias Maxio.Cluster.Notify
   alias Maxio.BucketConfigs.BucketConfig
 
-  @type kind :: :cors | :lifecycle | :encryption | :public_access_block
-  @kinds [:cors, :lifecycle, :encryption, :public_access_block]
+  @type kind :: :cors | :lifecycle | :encryption | :public_access_block | :ownership_controls
+  @kinds [:cors, :lifecycle, :encryption, :public_access_block, :ownership_controls]
 
   @doc "取某桶某类配置。未配置（行不存在或该列为 nil）→ :none。"
   @spec get(String.t(), kind()) :: {:ok, list() | map()} | :none

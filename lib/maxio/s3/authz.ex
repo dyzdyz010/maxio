@@ -19,7 +19,7 @@ defmodule Maxio.S3.Authz do
   import Plug.Conn
   alias Maxio.{Buckets, ObjectMeta, Objects, Tags}
   alias Maxio.Policy.{ACL, ActionMap, Arn, Evaluator, RequestContext, Store}
-  alias Maxio.S3.{CopySource, Error, Log, PublicAccessBlock}
+  alias Maxio.S3.{CopySource, Error, Log, OwnershipControls, PublicAccessBlock}
 
   @max_keys_limit 1000
 
@@ -105,6 +105,15 @@ defmodule Maxio.S3.Authz do
     case Evaluator.evaluate(ctx, statements) do
       :allow ->
         authorize_session_policy!(conn, principal, required_action, resource, conditions)
+
+        maybe_authorize_create_bucket_headers(
+          conn,
+          action,
+          bucket,
+          principal,
+          authenticated?,
+          conditions
+        )
 
         maybe_authorize_acl_headers(
           conn,
@@ -293,7 +302,11 @@ defmodule Maxio.S3.Authz do
 
   defp acl_to_statements(bucket, canned, grants_doc, level, key) do
     {effective_canned, effective_grants_doc} =
-      PublicAccessBlock.effective_acl(bucket, canned, grants_doc)
+      if OwnershipControls.bucket_owner_enforced?(bucket) do
+        OwnershipControls.effective_acl(bucket, canned, grants_doc)
+      else
+        PublicAccessBlock.effective_acl(bucket, canned, grants_doc)
+      end
 
     ACL.to_statements(effective_canned, effective_grants_doc, level, bucket, key)
   end
@@ -517,7 +530,10 @@ defmodule Maxio.S3.Authz do
               :delete_bucket_encryption,
               :put_public_access_block,
               :get_public_access_block,
-              :delete_public_access_block
+              :delete_public_access_block,
+              :put_bucket_ownership_controls,
+              :get_bucket_ownership_controls,
+              :delete_bucket_ownership_controls
             ],
        do: true
 
@@ -677,6 +693,83 @@ defmodule Maxio.S3.Authz do
 
   defp now(conn), do: conn.private[:maxio_now] || DateTime.utc_now()
 
+  defp maybe_authorize_create_bucket_headers(
+         conn,
+         :create_bucket,
+         bucket,
+         principal,
+         authenticated?,
+         conditions
+       )
+       when is_binary(bucket) do
+    :ok =
+      if get_req_header(conn, "x-amz-object-ownership") != [] do
+        authorize_additional_action!(
+          conn,
+          :create_bucket_ownership_controls,
+          "s3:PutBucketOwnershipControls",
+          :bucket,
+          bucket,
+          nil,
+          principal,
+          authenticated?,
+          conditions
+        )
+      else
+        :ok
+      end
+
+    if acl_headers?(conn) do
+      authorize_additional_action!(
+        conn,
+        :create_bucket_acl_header,
+        "s3:PutBucketAcl",
+        :bucket,
+        bucket,
+        nil,
+        principal,
+        authenticated?,
+        conditions
+      )
+    else
+      :ok
+    end
+  end
+
+  defp maybe_authorize_create_bucket_headers(_conn, _action, _bucket, _p, _a, _c), do: :ok
+
+  defp authorize_additional_action!(
+         conn,
+         denied_action,
+         required_action,
+         level,
+         bucket,
+         key,
+         principal,
+         authenticated?,
+         conditions
+       ) do
+    resource = resource_arn(level, bucket, key)
+    statements = gather_statements(level, bucket, key, principal, conn, denied_action)
+
+    ctx = %RequestContext{
+      principal: principal,
+      authenticated?: authenticated?,
+      owner?: owner?(principal, bucket),
+      action: required_action,
+      resource: resource,
+      conditions: conditions
+    }
+
+    case Evaluator.evaluate(ctx, statements) do
+      :allow ->
+        authorize_session_policy!(conn, principal, required_action, resource, conditions)
+
+      {:deny, reason} ->
+        deny(conn, denied_action, required_action, resource, reason)
+    end
+  end
+
   # Object writes that carry ACL-setting headers require the normal write permission and
   # s3:PutObjectAcl. Without this second check, bucket WRITE grants can mint public ACLs.
   defp maybe_authorize_acl_headers(
@@ -691,26 +784,18 @@ defmodule Maxio.S3.Authz do
        )
        when action in [:put_object, :create_multipart_upload] and is_binary(bucket) and
               is_binary(key) do
-    if acl_headers?(conn) do
-      resource = Arn.object_arn(bucket, key)
-      statements = gather_statements(:object, bucket, key, principal, conn, action)
-
-      ctx = %RequestContext{
-        principal: principal,
-        authenticated?: authenticated?,
-        owner?: owner?(principal, bucket),
-        action: "s3:PutObjectAcl",
-        resource: resource,
-        conditions: conditions
-      }
-
-      case Evaluator.evaluate(ctx, statements) do
-        :allow ->
-          authorize_session_policy!(conn, principal, "s3:PutObjectAcl", resource, conditions)
-
-        {:deny, reason} ->
-          deny(conn, :put_object_acl_header, "s3:PutObjectAcl", resource, reason)
-      end
+    if acl_headers?(conn) and not OwnershipControls.bucket_owner_enforced?(bucket) do
+      authorize_additional_action!(
+        conn,
+        :put_object_acl_header,
+        "s3:PutObjectAcl",
+        :object,
+        bucket,
+        key,
+        principal,
+        authenticated?,
+        conditions
+      )
     else
       :ok
     end

@@ -39,6 +39,13 @@ defmodule Maxio.S3.AuthzMatrixTest do
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
 
+  defp create_acl_bucket(bucket) do
+    SigV4Request.signed_conn(:put, "/#{bucket}",
+      headers: [{"x-amz-object-ownership", "ObjectWriter"}]
+    )
+    |> call()
+  end
+
   defp put_policy(bucket, policy) do
     SigV4Request.signed_conn(:put, "/#{bucket}",
       query: %{"policy" => ""},
@@ -245,7 +252,7 @@ defmodule Maxio.S3.AuthzMatrixTest do
   end
 
   test "policy 可用 s3:x-amz-acl 阻止 public ACL 写入" do
-    SigV4Request.signed_conn(:put, "/mb7") |> call()
+    create_acl_bucket("mb7")
 
     pol =
       ~s({"Statement":[{"Effect":"Allow","Principal":{"AWS":"#{@alice_arn}"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::mb7/*"},{"Effect":"Deny","Principal":{"AWS":"#{@alice_arn}"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::mb7/*","Condition":{"StringEquals":{"s3:x-amz-acl":"public-read"}}}]})

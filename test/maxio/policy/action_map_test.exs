@@ -9,6 +9,15 @@ defmodule Maxio.Policy.ActionMapTest do
 
     assert ActionMap.for_action(:list_multipart_uploads) ==
              {"s3:ListBucketMultipartUploads", :bucket}
+
+    assert ActionMap.for_action(:put_bucket_ownership_controls) ==
+             {"s3:PutBucketOwnershipControls", :bucket}
+
+    assert ActionMap.for_action(:get_bucket_ownership_controls) ==
+             {"s3:GetBucketOwnershipControls", :bucket}
+
+    assert ActionMap.for_action(:delete_bucket_ownership_controls) ==
+             {"s3:PutBucketOwnershipControls", :bucket}
   end
 
   test "对象级动作 → :object" do

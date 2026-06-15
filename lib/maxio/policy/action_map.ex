@@ -76,6 +76,15 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:get_public_access_block), do: {"s3:GetBucketPublicAccessBlock", :bucket}
   def for_action(:delete_public_access_block), do: {"s3:PutBucketPublicAccessBlock", :bucket}
 
+  def for_action(:put_bucket_ownership_controls),
+    do: {"s3:PutBucketOwnershipControls", :bucket}
+
+  def for_action(:get_bucket_ownership_controls),
+    do: {"s3:GetBucketOwnershipControls", :bucket}
+
+  def for_action(:delete_bucket_ownership_controls),
+    do: {"s3:PutBucketOwnershipControls", :bucket}
+
   # CopyObject 走 :put_object（put 路径内部分流），源读权限的二次检查由 Authz 特判（见 authorize/2 的 copy 分支）。
   def for_action(_other), do: nil
 end

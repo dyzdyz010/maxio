@@ -49,8 +49,15 @@ defmodule Maxio.S3.AclTest do
     )
   end
 
+  defp create_acl_bucket(bucket) do
+    SigV4Request.signed_conn(:put, "/#{bucket}",
+      headers: [{"x-amz-object-ownership", "ObjectWriter"}]
+    )
+    |> call()
+  end
+
   test "PutObject x-amz-acl=public-read → GetObjectAcl 展开 AllUsers READ" do
-    SigV4Request.signed_conn(:put, "/abk") |> call()
+    create_acl_bucket("abk")
 
     SigV4Request.signed_conn(:put, "/abk/pub.txt",
       body: "hi",
@@ -67,7 +74,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "GetBucketAcl 默认 private → 仅 owner FULL_CONTROL" do
-    SigV4Request.signed_conn(:put, "/abk2") |> call()
+    create_acl_bucket("abk2")
     acl = SigV4Request.signed_conn(:get, "/abk2", query: %{"acl" => ""}) |> call()
     assert acl.status == 200
     assert acl.resp_body =~ "<Permission>FULL_CONTROL</Permission>"
@@ -75,7 +82,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutBucketAcl x-amz-acl=public-read → GetBucketAcl 展开" do
-    SigV4Request.signed_conn(:put, "/abk3") |> call()
+    create_acl_bucket("abk3")
 
     put =
       SigV4Request.signed_conn(:put, "/abk3",
@@ -91,7 +98,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutBucketAcl x-amz-grant-read=AllUsers → 匿名 ListBucket allow" do
-    SigV4Request.signed_conn(:put, "/abkgra") |> call()
+    create_acl_bucket("abkgra")
 
     put =
       SigV4Request.signed_conn(:put, "/abkgra",
@@ -111,7 +118,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObjectAcl XML body → GetObjectAcl 展开（round-trip）" do
-    SigV4Request.signed_conn(:put, "/abk4") |> call()
+    create_acl_bucket("abk4")
     SigV4Request.signed_conn(:put, "/abk4/x.txt", body: "hi") |> call()
 
     xml =
@@ -131,7 +138,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObject x-amz-grant-read=AllUsers stores explicit grant and allows anonymous read" do
-    SigV4Request.signed_conn(:put, "/abkgrant") |> call()
+    create_acl_bucket("abkgrant")
 
     put =
       SigV4Request.signed_conn(:put, "/abkgrant/pub.txt",
@@ -156,7 +163,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObjectAcl XML canonical READ grants named principal object read" do
-    SigV4Request.signed_conn(:put, "/abkcanon") |> call()
+    create_acl_bucket("abkcanon")
     SigV4Request.signed_conn(:put, "/abkcanon/private.txt", body: "secret") |> call()
 
     denied = alice(:get, "/abkcanon/private.txt") |> call()
@@ -184,7 +191,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObjectAcl email grantee → 400 InvalidArgument" do
-    SigV4Request.signed_conn(:put, "/abk5") |> call()
+    create_acl_bucket("abk5")
     SigV4Request.signed_conn(:put, "/abk5/y.txt", body: "hi") |> call()
 
     xml =
@@ -201,7 +208,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObjectAcl x-amz-grant email grantee → 400 InvalidArgument" do
-    SigV4Request.signed_conn(:put, "/abkemailhdr") |> call()
+    create_acl_bucket("abkemailhdr")
     SigV4Request.signed_conn(:put, "/abkemailhdr/y.txt", body: "hi") |> call()
 
     resp =
@@ -216,7 +223,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObject rejects mixed x-amz-acl and x-amz-grant headers before commit" do
-    SigV4Request.signed_conn(:put, "/abkmix") |> call()
+    create_acl_bucket("abkmix")
 
     resp =
       SigV4Request.signed_conn(:put, "/abkmix/bad.txt",
@@ -234,7 +241,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "CopyObject 默认不继承源 ACL，显式 x-amz-acl 应用到目标" do
-    SigV4Request.signed_conn(:put, "/abk6") |> call()
+    create_acl_bucket("abk6")
 
     SigV4Request.signed_conn(:put, "/abk6/src.txt",
       body: "hi",
@@ -280,7 +287,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "CopyObject invalid x-amz-acl → 400 before target commit" do
-    SigV4Request.signed_conn(:put, "/abk7") |> call()
+    create_acl_bucket("abk7")
     SigV4Request.signed_conn(:put, "/abk7/src.txt", body: "hi") |> call()
 
     resp =
@@ -295,7 +302,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "CopyObject self-copy with explicit x-amz-acl updates ACL and is not rejected" do
-    SigV4Request.signed_conn(:put, "/abk8") |> call()
+    create_acl_bucket("abk8")
     SigV4Request.signed_conn(:put, "/abk8/self.txt", body: "hi") |> call()
 
     copy =
@@ -318,7 +325,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObjectAcl updates sidecar generation and scanner does not revert explicit grant" do
-    SigV4Request.signed_conn(:put, "/abksidecar") |> call()
+    create_acl_bucket("abksidecar")
     SigV4Request.signed_conn(:put, "/abksidecar/private.txt", body: "secret") |> call()
 
     put =
@@ -345,7 +352,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "PutObjectAcl remains committed in PG authority when sidecar mirror is unavailable" do
-    SigV4Request.signed_conn(:put, "/abkpgacl") |> call()
+    create_acl_bucket("abkpgacl")
     SigV4Request.signed_conn(:put, "/abkpgacl/private.txt", body: "secret") |> call()
     File.rm_rf!(@data_dir)
 
@@ -363,7 +370,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "ObjectAclSidecar update uses atomic meta-only commit" do
-    SigV4Request.signed_conn(:put, "/abkatomic") |> call()
+    create_acl_bucket("abkatomic")
     SigV4Request.signed_conn(:put, "/abkatomic/private.txt", body: "secret") |> call()
 
     assert {:error, :write_quorum} =
@@ -383,7 +390,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "sidecar read authority uses sidecar ACLs for authorization instead of stale PG ACLs" do
-    SigV4Request.signed_conn(:put, "/abksideauth") |> call()
+    create_acl_bucket("abksideauth")
     SigV4Request.signed_conn(:put, "/abksideauth/private.txt", body: "secret") |> call()
 
     put =
@@ -415,7 +422,7 @@ defmodule Maxio.S3.AclTest do
     bucket = "abkvidacl"
     key = "doc.txt"
 
-    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    create_acl_bucket(bucket)
 
     versioning_xml =
       ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
@@ -482,7 +489,7 @@ defmodule Maxio.S3.AclTest do
     bucket = "abkvidaction"
     key = "doc.txt"
 
-    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    create_acl_bucket(bucket)
 
     versioning_xml =
       ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
@@ -552,7 +559,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "Bucket WRITE grants authorize object writes from PutBucketAcl and CreateBucket headers" do
-    SigV4Request.signed_conn(:put, "/abkwriteput") |> call()
+    create_acl_bucket("abkwriteput")
 
     grant =
       SigV4Request.signed_conn(:put, "/abkwriteput",
@@ -566,7 +573,10 @@ defmodule Maxio.S3.AclTest do
 
     created =
       SigV4Request.signed_conn(:put, "/abkwritecreate",
-        headers: [{"x-amz-grant-write", ~s(id="#{@alice_arn}")}]
+        headers: [
+          {"x-amz-object-ownership", "ObjectWriter"},
+          {"x-amz-grant-write", ~s(id="#{@alice_arn}")}
+        ]
       )
       |> call()
 
@@ -575,7 +585,7 @@ defmodule Maxio.S3.AclTest do
   end
 
   test "object write ACL headers require s3:PutObjectAcl in addition to PutObject" do
-    SigV4Request.signed_conn(:put, "/abkaclperm") |> call()
+    create_acl_bucket("abkaclperm")
 
     grant =
       SigV4Request.signed_conn(:put, "/abkaclperm",

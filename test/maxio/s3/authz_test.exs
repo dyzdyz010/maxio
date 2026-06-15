@@ -24,6 +24,13 @@ defmodule Maxio.S3.AuthzTest do
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
 
+  defp create_acl_bucket(bucket) do
+    SigV4Request.signed_conn(:put, "/#{bucket}",
+      headers: [{"x-amz-object-ownership", "ObjectWriter"}]
+    )
+    |> call()
+  end
+
   test "root（owner）始终放行（owner 短路）" do
     SigV4Request.signed_conn(:put, "/rootb") |> call()
     put = SigV4Request.signed_conn(:put, "/rootb/k.txt", body: "x") |> call()
@@ -59,7 +66,7 @@ defmodule Maxio.S3.AuthzTest do
   end
 
   test "匿名请求 + public-read ACL 对象 → 放行 GetObject" do
-    SigV4Request.signed_conn(:put, "/aclb") |> call()
+    create_acl_bucket("aclb")
 
     SigV4Request.signed_conn(:put, "/aclb/p.txt",
       body: "acl-open",
@@ -73,7 +80,7 @@ defmodule Maxio.S3.AuthzTest do
   end
 
   test "匿名 + public-read 只放行 Get，不放行 Delete → 403" do
-    SigV4Request.signed_conn(:put, "/rob") |> call()
+    create_acl_bucket("rob")
 
     SigV4Request.signed_conn(:put, "/rob/x.txt",
       body: "ro",

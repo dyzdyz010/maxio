@@ -36,6 +36,13 @@ defmodule Maxio.S3.PublicAccessBlockTest do
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
 
+  defp create_acl_bucket(bucket) do
+    SigV4Request.signed_conn(:put, "/#{bucket}",
+      headers: [{"x-amz-object-ownership", "ObjectWriter"}]
+    )
+    |> call()
+  end
+
   defp alice(method, path, opts \\ []) do
     SigV4Request.signed_conn(
       method,
@@ -111,7 +118,7 @@ defmodule Maxio.S3.PublicAccessBlockTest do
   end
 
   test "BlockPublicAcls rejects new public ACL writes before side effects" do
-    SigV4Request.signed_conn(:put, "/pabacl") |> call()
+    create_acl_bucket("pabacl")
     assert put_pab("pabacl", %{"BlockPublicAcls" => true}).status == 200
 
     put_bucket_acl =
@@ -172,7 +179,7 @@ defmodule Maxio.S3.PublicAccessBlockTest do
   end
 
   test "IgnorePublicAcls keeps stored ACL but removes public ACL from authz and GetObjectAcl" do
-    SigV4Request.signed_conn(:put, "/pabignore") |> call()
+    create_acl_bucket("pabignore")
 
     put =
       SigV4Request.signed_conn(:put, "/pabignore/pub.txt",

@@ -8,7 +8,7 @@ defmodule Maxio.S3.Handlers.Acl do
   alias Maxio.{Buckets, ObjectAclSidecar, ObjectMeta, Objects}
   alias Maxio.Policy.ACL
   alias Maxio.Versioning.VersionId
-  alias Maxio.S3.{Error, Log, PublicAccessBlock}
+  alias Maxio.S3.{Error, Log, OwnershipControls, PublicAccessBlock}
   alias Maxio.S3.Views.AccessControlPolicy, as: AclView
   alias Maxio.S3.RequestParsers.AccessControlPolicy, as: AclParser
 
@@ -27,6 +27,7 @@ defmodule Maxio.S3.Handlers.Acl do
   def put_bucket_acl(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = OwnershipControls.reject_acl_update!(bucket)
     {conn, %{canned: canned, grants_doc: grants_doc}} = resolve_acl!(conn)
 
     :ok =
@@ -59,6 +60,7 @@ defmodule Maxio.S3.Handlers.Acl do
     key = conn.assigns.s3_key
     version_id = version_id!(conn, bucket, key)
     _ = ensure_bucket!(bucket)
+    :ok = OwnershipControls.reject_acl_update!(bucket)
     {conn, %{canned: canned, grants_doc: grants_doc}} = resolve_acl!(conn)
 
     :ok =
@@ -225,7 +227,13 @@ defmodule Maxio.S3.Handlers.Acl do
 
   defp render_acl(conn, canned, grants_doc) do
     bucket = conn.assigns.s3_bucket
-    {canned, grants_doc} = PublicAccessBlock.effective_acl(bucket, canned, grants_doc)
+
+    {canned, grants_doc} =
+      if OwnershipControls.bucket_owner_enforced?(bucket) do
+        OwnershipControls.effective_acl(bucket, canned, grants_doc)
+      else
+        PublicAccessBlock.effective_acl(bucket, canned, grants_doc)
+      end
 
     body =
       AclView.render(%{
