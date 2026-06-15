@@ -110,6 +110,12 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **授权**：ActionMap/Authz 映射 `s3:PutBucketWebsite` / `s3:GetBucketWebsite` / `s3:DeleteBucketWebsite`，其中 DELETE 使用独立 `s3:DeleteBucketWebsite` 权限。
 - **边界**：当前只实现控制面配置 API，不实现静态网站 endpoint、索引文档重写、错误文档回退或 routing rule 对对象读取路径的影响。
 
+### Bucket RequestPayment（续作已支持）
+
+- **API**：`PutBucketRequestPayment` / `GetBucketRequestPayment`（`?requestPayment`）支持 bucket-level `RequestPaymentConfiguration/Payer` 持久化与 XML 回放；`Payer` 仅允许 `Requester` 或 `BucketOwner`。
+- **默认值**：未显式配置时 GET 返回 `BucketOwner`，与 AWS 默认语义对齐，不返回配置缺失错误。
+- **边界**：当前只实现控制面配置 API；Requester Pays 对对象数据面请求头、计费语义和 `x-amz-request-charged` 响应仍未接入。
+
 ### SSE-S3（服务端加密）
 
 - **真实 AES-256-GCM 信封加密**：PutObject 带 `x-amz-server-side-encryption: AES256`（或桶默认加密配置）时，对象字节**真实加密落盘**——每对象生成随机 256-bit 数据密钥（DEK），数据重切为 64KB 帧、每帧独立 AES-256-GCM（随机 IV + 认证 tag），DEK 由服务端主密钥 AES-256-GCM 包裹后随对象元数据存储。GET 透明解密；GCM 认证失败会**抛错**，绝不静默返回错数据。

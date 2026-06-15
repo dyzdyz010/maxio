@@ -22,6 +22,12 @@ defmodule Maxio.Policy.ActionMapTest do
     assert ActionMap.for_action(:put_bucket_website) == {"s3:PutBucketWebsite", :bucket}
     assert ActionMap.for_action(:get_bucket_website) == {"s3:GetBucketWebsite", :bucket}
     assert ActionMap.for_action(:delete_bucket_website) == {"s3:DeleteBucketWebsite", :bucket}
+
+    assert ActionMap.for_action(:put_bucket_request_payment) ==
+             {"s3:PutBucketRequestPayment", :bucket}
+
+    assert ActionMap.for_action(:get_bucket_request_payment) ==
+             {"s3:GetBucketRequestPayment", :bucket}
   end
 
   test "对象级动作 → :object" do

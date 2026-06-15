@@ -17,7 +17,8 @@ defmodule Maxio.S3.Handlers do
     Encryption,
     PublicAccessBlock,
     OwnershipControls,
-    Website
+    Website,
+    RequestPayment
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -87,4 +88,7 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:put_bucket_website, conn), do: Website.put(conn)
   def dispatch(:get_bucket_website, conn), do: Website.get(conn)
   def dispatch(:delete_bucket_website, conn), do: Website.delete(conn)
+
+  def dispatch(:put_bucket_request_payment, conn), do: RequestPayment.put(conn)
+  def dispatch(:get_bucket_request_payment, conn), do: RequestPayment.get(conn)
 end

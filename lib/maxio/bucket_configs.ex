@@ -9,8 +9,23 @@ defmodule Maxio.BucketConfigs do
   alias Maxio.BucketConfigs.BucketConfig
 
   @type kind ::
-          :cors | :lifecycle | :encryption | :public_access_block | :ownership_controls | :website
-  @kinds [:cors, :lifecycle, :encryption, :public_access_block, :ownership_controls, :website]
+          :cors
+          | :lifecycle
+          | :encryption
+          | :public_access_block
+          | :ownership_controls
+          | :website
+          | :request_payment
+
+  @kinds [
+    :cors,
+    :lifecycle,
+    :encryption,
+    :public_access_block,
+    :ownership_controls,
+    :website,
+    :request_payment
+  ]
 
   @doc "取某桶某类配置。未配置（行不存在或该列为 nil）→ :none。"
   @spec get(String.t(), kind()) :: {:ok, list() | map()} | :none

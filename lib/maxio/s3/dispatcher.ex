@@ -15,7 +15,7 @@ defmodule Maxio.S3.Dispatcher do
   # 注：uploads/uploadid/partnumber 已从本表移除，由 multipart_action/3 分发到具体 multipart 动作（M2-5）。
   @m2_subresources ~w(notification replication object-lock legal-hold retention
                       select torrent restore accelerate analytics inventory metrics
-                      requestpayment logging)
+                      logging)
 
   @spec resolve(level(), String.t(), MapSet.t() | map()) ::
           {:ok, action()} | {:error, :method_not_allowed | :not_implemented}
@@ -87,6 +87,16 @@ defmodule Maxio.S3.Dispatcher do
         end
 
       MapSet.member?(query_keys, "website") ->
+        {:error, :method_not_allowed}
+
+      level == :bucket and MapSet.member?(query_keys, "requestpayment") ->
+        case method do
+          "PUT" -> {:ok, :put_bucket_request_payment}
+          "GET" -> {:ok, :get_bucket_request_payment}
+          _ -> {:error, :method_not_allowed}
+        end
+
+      MapSet.member?(query_keys, "requestpayment") ->
         {:error, :method_not_allowed}
 
       level == :bucket and MapSet.member?(query_keys, "lifecycle") ->
