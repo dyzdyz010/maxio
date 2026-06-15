@@ -15,7 +15,7 @@ defmodule Maxio.S3.Dispatcher do
   # 注：uploads/uploadid/partnumber 已从本表移除，由 multipart_action/3 分发到具体 multipart 动作（M2-5）。
   @m2_subresources ~w(website
                       notification replication object-lock legal-hold retention
-                      attributes select torrent restore accelerate analytics inventory metrics
+                      select torrent restore accelerate analytics inventory metrics
                       ownershipcontrols requestpayment logging)
 
   @spec resolve(level(), String.t(), MapSet.t() | map()) ::
@@ -101,6 +101,12 @@ defmodule Maxio.S3.Dispatcher do
           {:bucket, "PUT"} -> {:ok, :put_bucket_acl}
           {:object, "GET"} -> {:ok, :get_object_acl}
           {:object, "PUT"} -> {:ok, :put_object_acl}
+          _ -> {:error, :method_not_allowed}
+        end
+
+      MapSet.member?(query_keys, "attributes") ->
+        case {level, method} do
+          {:object, "GET"} -> {:ok, :get_object_attributes}
           _ -> {:error, :method_not_allowed}
         end
 

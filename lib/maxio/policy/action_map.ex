@@ -27,6 +27,7 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:put_object), do: {"s3:PutObject", :object}
   def for_action(:get_object), do: {"s3:GetObject", :object}
   def for_action(:head_object), do: {"s3:GetObject", :object}
+  def for_action(:get_object_attributes), do: {"s3:GetObjectAttributes", :object}
   def for_action(:delete_object), do: {"s3:DeleteObject", :object}
 
   # DeleteObjects 批删：授权在 handler 内逐 key 对对象 ARN 评估（s3:DeleteObject on bucket/key），

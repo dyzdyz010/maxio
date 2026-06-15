@@ -119,6 +119,15 @@ defmodule Maxio.S3.Authz do
 
         # CopyObject/UploadPartCopy 二次检查：源对象 s3:GetObject（铁律 5，对齐官方 copy source 双检查）。
         maybe_authorize_copy_source(conn, action, principal, authenticated?, conditions)
+
+        maybe_authorize_get_object_attributes_read(
+          conn,
+          action,
+          principal,
+          authenticated?,
+          conditions
+        )
+
         :ok
 
       {:deny, reason} ->
@@ -305,6 +314,12 @@ defmodule Maxio.S3.Authz do
     if version_request?(request_version_id(conn)),
       do: "s3:DeleteObjectVersion",
       else: "s3:DeleteObject"
+  end
+
+  defp effective_required_action(:get_object_attributes, _required_action, conn) do
+    if version_request?(request_version_id(conn)),
+      do: "s3:GetObjectVersionAttributes",
+      else: "s3:GetObjectAttributes"
   end
 
   defp effective_required_action(_action, required_action, _conn), do: required_action
@@ -529,6 +544,7 @@ defmodule Maxio.S3.Authz do
        when action in [
               :get_object,
               :head_object,
+              :get_object_attributes,
               :get_object_tagging,
               :put_object_tagging,
               :delete_object_tagging,
@@ -765,6 +781,54 @@ defmodule Maxio.S3.Authz do
   end
 
   defp maybe_authorize_copy_source(_conn, _action, _p, _a, _c), do: :ok
+
+  defp maybe_authorize_get_object_attributes_read(
+         conn,
+         :get_object_attributes,
+         principal,
+         authenticated?,
+         conditions
+       ) do
+    bucket = conn.assigns[:s3_bucket]
+    key = conn.assigns[:s3_key]
+    version_id = request_version_id(conn)
+    resource = Arn.object_arn(bucket, key)
+    statements = gather_statements(:object, bucket, key, principal, conn, :get_object_attributes)
+
+    ctx = %RequestContext{
+      principal: principal,
+      authenticated?: authenticated?,
+      owner?: owner?(principal, bucket),
+      action: object_attributes_read_action(version_id),
+      resource: resource,
+      conditions: conditions
+    }
+
+    case Evaluator.evaluate(ctx, statements) do
+      :allow ->
+        authorize_session_policy!(
+          conn,
+          principal,
+          object_attributes_read_action(version_id),
+          resource,
+          conditions
+        )
+
+      {:deny, reason} ->
+        deny(
+          conn,
+          :get_object_attributes_read,
+          object_attributes_read_action(version_id),
+          resource,
+          reason
+        )
+    end
+  end
+
+  defp maybe_authorize_get_object_attributes_read(_conn, _action, _p, _a, _c), do: :ok
+
+  defp object_attributes_read_action(nil), do: "s3:GetObject"
+  defp object_attributes_read_action(_version_id), do: "s3:GetObjectVersion"
 
   defp copy_source_action(nil), do: "s3:GetObject"
   defp copy_source_action(_version_id), do: "s3:GetObjectVersion"

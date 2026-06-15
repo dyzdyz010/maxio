@@ -25,6 +25,7 @@ defmodule Maxio.S3.Handlers.Object do
 
   alias Maxio.S3.RequestParsers.Delete, as: DeleteParser
   alias Maxio.S3.Views.DeleteResult
+  alias Maxio.S3.Views.ObjectAttributes
 
   @complete_xml_limit 1_048_576
   @owner_id "maxio"
@@ -457,6 +458,65 @@ defmodule Maxio.S3.Handlers.Object do
         )
 
         send_resp(conn, 503, "")
+    end
+  end
+
+  @spec get_attributes(Plug.Conn.t()) :: Plug.Conn.t()
+  def get_attributes(conn) do
+    bucket = conn.assigns.s3_bucket
+    key = conn.assigns.s3_key
+    conn = fetch_query_params(conn)
+    _ = ensure_bucket!(bucket)
+
+    :ok = validate_object_key!(bucket, key)
+
+    version_id =
+      conn.query_params
+      |> Map.get("versionId")
+      |> Maxio.Versioning.VersionId.normalize_param()
+
+    :ok = validate_version_id!(bucket, key, version_id)
+    attributes = parse_object_attributes!(conn)
+
+    {object, _total} = resolve_object_for_get!(bucket, key, version_id)
+
+    cond do
+      object.is_delete_marker and version_id == nil ->
+        conn
+        |> put_resp_header("x-amz-delete-marker", "true")
+        |> maybe_put_version_id(object.version_id)
+        |> send_resp(404, "")
+
+      object.is_delete_marker ->
+        conn
+        |> put_resp_header("x-amz-delete-marker", "true")
+        |> put_resp_header("last-modified", http_date(object.updated_at))
+        |> maybe_put_version_id(object.version_id)
+        |> send_resp(405, "")
+
+      true ->
+        unsupported_object_attributes!(attributes)
+
+        case Conditional.evaluate(conn.req_headers, meta(object), "GET") do
+          :proceed ->
+            body =
+              ObjectAttributes.render(%{
+                attributes: attributes,
+                object: object
+              })
+
+            conn
+            |> maybe_put_version_id(object.version_id)
+            |> put_resp_header("last-modified", http_date(object.updated_at))
+            |> put_resp_content_type("application/xml")
+            |> send_resp(200, body)
+
+          {:respond, 304} ->
+            send_resp(conn, 304, "")
+
+          {:error, :precondition_failed} ->
+            raise Error.new(:precondition_failed, resource: "/#{bucket}/#{key}")
+        end
     end
   end
 
@@ -2005,6 +2065,57 @@ defmodule Maxio.S3.Handlers.Object do
             raise Error.new(:invalid_tag)
         end
     end
+  end
+
+  @supported_object_attributes %{
+    "etag" => "ETag",
+    "checksum" => "Checksum",
+    "objectparts" => "ObjectParts",
+    "storageclass" => "StorageClass",
+    "objectsize" => "ObjectSize"
+  }
+
+  defp parse_object_attributes!(conn) do
+    case header(conn, "x-amz-object-attributes") do
+      nil ->
+        raise Error.new(:invalid_request,
+                message: "Missing required x-amz-object-attributes header"
+              )
+
+      raw ->
+        attributes =
+          raw
+          |> String.split(",", trim: true)
+          |> Enum.map(&String.trim/1)
+          |> Enum.map(fn value ->
+            Map.get(@supported_object_attributes, String.downcase(value)) ||
+              raise Error.new(:invalid_argument,
+                      message: "Invalid x-amz-object-attributes value: #{value}"
+                    )
+          end)
+          |> Enum.uniq()
+
+        if attributes == [] do
+          raise Error.new(:invalid_request,
+                  message: "Missing required x-amz-object-attributes header"
+                )
+        end
+
+        attributes
+    end
+  end
+
+  defp unsupported_object_attributes!(attributes) do
+    unsupported = Enum.filter(attributes, &(&1 in ["Checksum", "ObjectParts"]))
+
+    if unsupported != [] do
+      raise Error.new(:not_implemented,
+              message:
+                "GetObjectAttributes #{Enum.join(unsupported, ",")} response is not implemented"
+            )
+    end
+
+    :ok
   end
 
   defp header(conn, name), do: conn |> get_req_header(name) |> List.first()

@@ -47,6 +47,14 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:ok, :get_object} = Dispatcher.resolve(:object, "GET", keys([]))
   end
 
+  test "object GET ?attributes → get_object_attributes" do
+    assert {:ok, :get_object_attributes} =
+             Dispatcher.resolve(:object, "GET", keys(["attributes"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:bucket, "GET", keys(["attributes"]))
+  end
+
   test "object HEAD → head_object" do
     assert {:ok, :head_object} = Dispatcher.resolve(:object, "HEAD", keys([]))
   end

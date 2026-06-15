@@ -14,6 +14,7 @@ defmodule Maxio.Policy.ActionMapTest do
   test "对象级动作 → :object" do
     assert ActionMap.for_action(:get_object) == {"s3:GetObject", :object}
     assert ActionMap.for_action(:head_object) == {"s3:GetObject", :object}
+    assert ActionMap.for_action(:get_object_attributes) == {"s3:GetObjectAttributes", :object}
     assert ActionMap.for_action(:upload_part) == {"s3:PutObject", :object}
     assert ActionMap.for_action(:list_parts) == {"s3:ListMultipartUploadParts", :object}
   end

@@ -32,6 +32,7 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:put_object, conn), do: Object.put(conn)
   def dispatch(:get_object, conn), do: Object.get(conn)
   def dispatch(:head_object, conn), do: Object.head(conn)
+  def dispatch(:get_object_attributes, conn), do: Object.get_attributes(conn)
   def dispatch(:delete_object, conn), do: Object.delete(conn)
   def dispatch(:delete_objects, conn), do: Object.delete_objects(conn)
 
