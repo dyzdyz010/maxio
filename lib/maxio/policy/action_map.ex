@@ -86,6 +86,12 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:put_bucket_request_payment), do: {"s3:PutBucketRequestPayment", :bucket}
   def for_action(:get_bucket_request_payment), do: {"s3:GetBucketRequestPayment", :bucket}
 
+  def for_action(:put_bucket_accelerate_configuration),
+    do: {"s3:PutAccelerateConfiguration", :bucket}
+
+  def for_action(:get_bucket_accelerate_configuration),
+    do: {"s3:GetAccelerateConfiguration", :bucket}
+
   def for_action(:get_bucket_ownership_controls),
     do: {"s3:GetBucketOwnershipControls", :bucket}
 

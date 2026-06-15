@@ -139,6 +139,18 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:error, :method_not_allowed} =
              Dispatcher.resolve(:object, "GET", keys(["requestPayment"]))
 
+    assert {:ok, :put_bucket_accelerate_configuration} =
+             Dispatcher.resolve(:bucket, "PUT", keys(["accelerate"]))
+
+    assert {:ok, :get_bucket_accelerate_configuration} =
+             Dispatcher.resolve(:bucket, "GET", keys(["accelerate"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:bucket, "DELETE", keys(["accelerate"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["accelerate"]))
+
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))
   end

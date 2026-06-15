@@ -24,6 +24,7 @@ defmodule Maxio.BucketConfigsTest do
              BucketConfigs.put("b2", :website, %{"index_document" => %{"suffix" => "index.html"}})
 
     assert :ok = BucketConfigs.put("b2", :request_payment, %{"Payer" => "Requester"})
+    assert :ok = BucketConfigs.put("b2", :accelerate, %{"Status" => "Enabled"})
 
     assert {:ok, [%{"x" => 1}]} = BucketConfigs.get("b2", :cors)
     assert {:ok, %{"algorithm" => "AES256"}} = BucketConfigs.get("b2", :encryption)
@@ -36,6 +37,7 @@ defmodule Maxio.BucketConfigsTest do
              BucketConfigs.get("b2", :website)
 
     assert {:ok, %{"Payer" => "Requester"}} = BucketConfigs.get("b2", :request_payment)
+    assert {:ok, %{"Status" => "Enabled"}} = BucketConfigs.get("b2", :accelerate)
 
     assert BucketConfigs.get("b2", :lifecycle) == :none
   end
@@ -68,5 +70,8 @@ defmodule Maxio.BucketConfigsTest do
 
     assert :ok = BucketConfigs.put("b-notify", :request_payment, %{"Payer" => "Requester"})
     assert_receive {:bucket_config_changed, "b-notify", :request_payment}
+
+    assert :ok = BucketConfigs.put("b-notify", :accelerate, %{"Status" => "Enabled"})
+    assert_receive {:bucket_config_changed, "b-notify", :accelerate}
   end
 end

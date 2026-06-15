@@ -116,6 +116,12 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **默认值**：未显式配置时 GET 返回 `BucketOwner`，与 AWS 默认语义对齐，不返回配置缺失错误。
 - **边界**：当前只实现控制面配置 API；Requester Pays 对对象数据面请求头、计费语义和 `x-amz-request-charged` 响应仍未接入。
 
+### Bucket Accelerate（续作已支持）
+
+- **API**：`PutBucketAccelerateConfiguration` / `GetBucketAccelerateConfiguration`（`?accelerate`）支持 bucket-level `AccelerateConfiguration/Status` 持久化与 XML 回放；`Status` 仅允许 `Enabled` 或 `Suspended`。
+- **兼容约束**：未显式配置时 GET 返回空配置；GET/PUT 均校验 `x-amz-expected-bucket-owner`；PUT 会校验 modeled checksum headers，声明 checksum trailer 时 fail-closed 为 `NotImplemented`，并按 AWS 约束拒绝带点号的 bucket 名。
+- **边界**：当前只实现控制面配置 API；Transfer Acceleration edge endpoint、加速域名路由与真实跨区域加速传输仍未接入。
+
 ### SSE-S3（服务端加密）
 
 - **真实 AES-256-GCM 信封加密**：PutObject 带 `x-amz-server-side-encryption: AES256`（或桶默认加密配置）时，对象字节**真实加密落盘**——每对象生成随机 256-bit 数据密钥（DEK），数据重切为 64KB 帧、每帧独立 AES-256-GCM（随机 IV + 认证 tag），DEK 由服务端主密钥 AES-256-GCM 包裹后随对象元数据存储。GET 透明解密；GCM 认证失败会**抛错**，绝不静默返回错数据。
