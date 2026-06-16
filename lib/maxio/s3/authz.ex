@@ -127,6 +127,44 @@ defmodule Maxio.S3.Authz do
     end
   end
 
+  @doc """
+  Authorizes the IAM role passed in PutBucketReplication.
+
+  `iam:PassRole` is evaluated against the role ARN from the XML body, so it must
+  not reuse the normal S3 bucket/object resource path. Only identity/session
+  policies participate here; bucket policies and ACLs do not grant IAM actions.
+  """
+  @spec authorize_pass_role(Plug.Conn.t(), String.t()) :: :ok
+  def authorize_pass_role(conn, role_arn) when is_binary(role_arn) do
+    principal = conn.assigns[:principal]
+    authenticated? = principal != :anonymous
+    required_action = "iam:PassRole"
+    conditions = extract_conditions(conn, authenticated?, :put_bucket_replication)
+
+    ctx = %RequestContext{
+      principal: principal,
+      authenticated?: authenticated?,
+      owner?: false,
+      action: required_action,
+      resource: role_arn,
+      conditions: conditions
+    }
+
+    result = Evaluator.evaluate(ctx, Store.principal_policies(principal))
+
+    cond do
+      result == {:deny, :explicit_deny} ->
+        deny(conn, :iam_pass_role, required_action, role_arn, :explicit_deny)
+
+      result == :allow or match?(%{type: :root}, principal) ->
+        authorize_session_policy!(conn, principal, required_action, role_arn, conditions)
+
+      match?({:deny, _reason}, result) ->
+        {:deny, reason} = result
+        deny(conn, :iam_pass_role, required_action, role_arn, reason)
+    end
+  end
+
   defp do_authorize(conn, action, required_action, level) do
     bucket = conn.assigns[:s3_bucket]
     key = conn.assigns[:s3_key]

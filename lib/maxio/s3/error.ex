@@ -160,6 +160,9 @@ defmodule Maxio.S3.Error do
       {"NoSuchConfiguration", 404, "The specified analytics configuration does not exist."},
     no_such_inventory_configuration:
       {"NoSuchConfiguration", 404, "The specified inventory configuration does not exist."},
+    replication_configuration_not_found:
+      {"ReplicationConfigurationNotFoundError", 404,
+       "The replication configuration was not found."},
     too_many_configurations:
       {"TooManyConfigurations", 400,
        "You are attempting to create a new configuration but have already reached the configuration limit."},
