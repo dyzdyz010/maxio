@@ -122,6 +122,18 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:list_bucket_analytics_configurations),
     do: {"s3:GetAnalyticsConfiguration", :bucket}
 
+  def for_action(:put_bucket_inventory_configuration),
+    do: {"s3:PutInventoryConfiguration", :bucket}
+
+  def for_action(:delete_bucket_inventory_configuration),
+    do: {"s3:PutInventoryConfiguration", :bucket}
+
+  def for_action(:get_bucket_inventory_configuration),
+    do: {"s3:GetInventoryConfiguration", :bucket}
+
+  def for_action(:list_bucket_inventory_configurations),
+    do: {"s3:GetInventoryConfiguration", :bucket}
+
   def for_action(:get_bucket_ownership_controls),
     do: {"s3:GetBucketOwnershipControls", :bucket}
 

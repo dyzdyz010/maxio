@@ -27,6 +27,7 @@ defmodule Maxio.S3.Authz do
   # PutObjectTagging 的 s3:RequestObjectTag* 条件键来自 bounded XML body。
   # 前置 Authz 不能读取 body；handler 解析/校验 XML 后、写入前调用 authorize_put_object_tagging/5。
   def authorize(_conn, :put_object_tagging), do: :ok
+  def authorize(_conn, :put_bucket_inventory_configuration), do: :ok
 
   def authorize(conn, action) do
     case ActionMap.for_action(action) do
@@ -78,6 +79,51 @@ defmodule Maxio.S3.Authz do
 
       {:deny, reason} ->
         deny(conn, :put_object_tagging, required_action, resource, reason)
+    end
+  end
+
+  @doc """
+  PutBucketInventoryConfiguration 的 `s3:InventoryAccessibleOptionalFields` 条件键来自 XML body。
+  前置 Authz 不能读取 body；handler 在 bounded read + XML 校验后、写入前调用本函数。
+  """
+  @spec authorize_put_bucket_inventory_configuration(Plug.Conn.t(), String.t(), [String.t()]) ::
+          :ok
+  def authorize_put_bucket_inventory_configuration(conn, bucket, optional_fields) do
+    principal = conn.assigns[:principal]
+    authenticated? = principal != :anonymous
+    required_action = "s3:PutInventoryConfiguration"
+    resource = resource_arn(:bucket, bucket, nil)
+
+    conditions =
+      conn
+      |> extract_conditions(authenticated?, :put_bucket_inventory_configuration)
+      |> put_inventory_optional_fields_condition(optional_fields)
+
+    statements =
+      gather_statements(
+        :bucket,
+        bucket,
+        nil,
+        principal,
+        conn,
+        :put_bucket_inventory_configuration
+      )
+
+    ctx = %RequestContext{
+      principal: principal,
+      authenticated?: authenticated?,
+      owner?: owner?(principal, bucket),
+      action: required_action,
+      resource: resource,
+      conditions: conditions
+    }
+
+    case Evaluator.evaluate(ctx, statements) do
+      :allow ->
+        authorize_session_policy!(conn, principal, required_action, resource, conditions)
+
+      {:deny, reason} ->
+        deny(conn, :put_bucket_inventory_configuration, required_action, resource, reason)
     end
   end
 
@@ -450,6 +496,13 @@ defmodule Maxio.S3.Authz do
       "x-amz-server-side-encryption"
     )
     |> maybe_put_header(conn, "s3:x-amz-copy-source", "x-amz-copy-source")
+  end
+
+  defp put_inventory_optional_fields_condition(conds, []), do: conds
+
+  defp put_inventory_optional_fields_condition(conds, optional_fields)
+       when is_list(optional_fields) do
+    Map.put(conds, "s3:InventoryAccessibleOptionalFields", optional_fields)
   end
 
   defp maybe_put_header(map, conn, condition_key, header_name),

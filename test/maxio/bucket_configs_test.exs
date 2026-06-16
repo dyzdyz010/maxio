@@ -55,6 +55,25 @@ defmodule Maxio.BucketConfigsTest do
                ]
              })
 
+    assert :ok =
+             BucketConfigs.put("b2", :inventory, %{
+               "Configurations" => [
+                 %{
+                   "Id" => "daily",
+                   "Destination" => %{
+                     "S3BucketDestination" => %{
+                       "AccountId" => "000000000000",
+                       "Bucket" => "arn:aws:s3:::dest",
+                       "Format" => "CSV"
+                     }
+                   },
+                   "IsEnabled" => true,
+                   "IncludedObjectVersions" => "All",
+                   "Schedule" => %{"Frequency" => "Daily"}
+                 }
+               ]
+             })
+
     assert {:ok, [%{"x" => 1}]} = BucketConfigs.get("b2", :cors)
     assert {:ok, %{"algorithm" => "AES256"}} = BucketConfigs.get("b2", :encryption)
     assert {:ok, %{"BlockPublicAcls" => true}} = BucketConfigs.get("b2", :public_access_block)
@@ -83,6 +102,9 @@ defmodule Maxio.BucketConfigsTest do
 
     assert {:ok, %{"Configurations" => [%{"Id" => "daily"}]}} =
              BucketConfigs.get("b2", :analytics)
+
+    assert {:ok, %{"Configurations" => [%{"Id" => "daily"}]}} =
+             BucketConfigs.get("b2", :inventory)
 
     assert BucketConfigs.get("b2", :lifecycle) == :none
   end
@@ -152,5 +174,29 @@ defmodule Maxio.BucketConfigsTest do
 
     assert :ok = BucketConfigs.delete("b-notify", :analytics)
     assert_receive {:bucket_config_changed, "b-notify", :analytics}
+
+    assert :ok =
+             BucketConfigs.put("b-notify", :inventory, %{
+               "Configurations" => [
+                 %{
+                   "Id" => "daily",
+                   "Destination" => %{
+                     "S3BucketDestination" => %{
+                       "AccountId" => "000000000000",
+                       "Bucket" => "arn:aws:s3:::dest",
+                       "Format" => "CSV"
+                     }
+                   },
+                   "IsEnabled" => true,
+                   "IncludedObjectVersions" => "All",
+                   "Schedule" => %{"Frequency" => "Daily"}
+                 }
+               ]
+             })
+
+    assert_receive {:bucket_config_changed, "b-notify", :inventory}
+
+    assert :ok = BucketConfigs.delete("b-notify", :inventory)
+    assert_receive {:bucket_config_changed, "b-notify", :inventory}
   end
 end
