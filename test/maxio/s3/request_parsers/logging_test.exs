@@ -1,0 +1,183 @@
+defmodule Maxio.S3.RequestParsers.LoggingTest do
+  use ExUnit.Case, async: true
+
+  alias Maxio.S3.RequestParsers.Logging
+
+  test "parses empty BucketLoggingStatus" do
+    assert Logging.parse("""
+           <BucketLoggingStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />
+           """) == {:ok, %{"LoggingEnabled" => nil}}
+  end
+
+  test "parses basic LoggingEnabled target" do
+    xml = """
+    <BucketLoggingStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <LoggingEnabled>
+        <TargetBucket>log-target</TargetBucket>
+        <TargetPrefix>logs/</TargetPrefix>
+      </LoggingEnabled>
+    </BucketLoggingStatus>
+    """
+
+    assert {:ok, %{"LoggingEnabled" => enabled}} = Logging.parse(xml)
+    assert enabled["TargetBucket"] == "log-target"
+    assert enabled["TargetPrefix"] == "logs/"
+    assert enabled["TargetGrants"] == []
+    assert enabled["TargetObjectKeyFormat"] == %{"type" => "simple"}
+  end
+
+  test "parses namespaced target grants and partitioned key format" do
+    xml = """
+    <s3:BucketLoggingStatus xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/">
+      <s3:LoggingEnabled>
+        <s3:TargetBucket>log-target</s3:TargetBucket>
+        <s3:TargetPrefix>logs/</s3:TargetPrefix>
+        <s3:TargetGrants>
+          <s3:Grant>
+            <s3:Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+              <s3:ID>abc123</s3:ID>
+              <s3:DisplayName>owner</s3:DisplayName>
+            </s3:Grantee>
+            <s3:Permission>FULL_CONTROL</s3:Permission>
+          </s3:Grant>
+          <s3:Grant>
+            <s3:Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+              <s3:URI>http://acs.amazonaws.com/groups/s3/LogDelivery</s3:URI>
+            </s3:Grantee>
+            <s3:Permission>WRITE</s3:Permission>
+          </s3:Grant>
+        </s3:TargetGrants>
+        <s3:TargetObjectKeyFormat>
+          <s3:PartitionedPrefix>
+            <s3:PartitionDateSource>EventTime</s3:PartitionDateSource>
+          </s3:PartitionedPrefix>
+        </s3:TargetObjectKeyFormat>
+      </s3:LoggingEnabled>
+    </s3:BucketLoggingStatus>
+    """
+
+    assert {:ok, %{"LoggingEnabled" => enabled}} = Logging.parse(xml)
+
+    assert enabled["TargetGrants"] == [
+             %{
+               "Grantee" => %{
+                 "type" => "CanonicalUser",
+                 "ID" => "abc123",
+                 "DisplayName" => "owner"
+               },
+               "Permission" => "FULL_CONTROL"
+             },
+             %{
+               "Grantee" => %{
+                 "type" => "Group",
+                 "URI" => "http://acs.amazonaws.com/groups/s3/LogDelivery"
+               },
+               "Permission" => "WRITE"
+             }
+           ]
+
+    assert enabled["TargetObjectKeyFormat"] == %{
+             "type" => "partitioned",
+             "partition_date_source" => "EventTime"
+           }
+  end
+
+  test "rejects wrong root duplicate logging and duplicate target fields" do
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <Wrapper><BucketLoggingStatus /></Wrapper>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled><TargetBucket>a</TargetBucket></LoggingEnabled>
+               <LoggingEnabled><TargetBucket>b</TargetBucket></LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled>
+                 <TargetBucket>a</TargetBucket>
+                 <TargetBucket>b</TargetBucket>
+               </LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+  end
+
+  test "rejects unknown misnested or mixed text elements" do
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               unexpected
+               <LoggingEnabled><TargetBucket>a</TargetBucket></LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled><Wrapper><TargetBucket>a</TargetBucket></Wrapper></LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled><Unknown /></LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+  end
+
+  test "semantic validation rejects missing required TargetPrefix" do
+    assert {:ok, %{"LoggingEnabled" => enabled}} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled>
+                 <TargetBucket>log-target</TargetBucket>
+               </LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+
+    assert enabled["TargetPrefix"] == nil
+  end
+
+  test "parses partitioned key format without explicit date source" do
+    assert {:ok, %{"LoggingEnabled" => enabled}} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled>
+                 <TargetBucket>log-target</TargetBucket>
+                 <TargetPrefix>logs/</TargetPrefix>
+                 <TargetObjectKeyFormat>
+                   <PartitionedPrefix />
+                 </TargetObjectKeyFormat>
+               </LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+
+    assert enabled["TargetObjectKeyFormat"] == %{
+             "type" => "partitioned",
+             "partition_date_source" => nil
+           }
+  end
+
+  test "rejects duplicate target object key format variants" do
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled>
+                 <TargetBucket>log-target</TargetBucket>
+                 <TargetObjectKeyFormat>
+                   <SimplePrefix />
+                   <PartitionedPrefix>
+                     <PartitionDateSource>DeliveryTime</PartitionDateSource>
+                   </PartitionedPrefix>
+                 </TargetObjectKeyFormat>
+               </LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+  end
+end

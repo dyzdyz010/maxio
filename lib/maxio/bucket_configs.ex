@@ -17,6 +17,7 @@ defmodule Maxio.BucketConfigs do
           | :website
           | :request_payment
           | :accelerate
+          | :logging
 
   @kinds [
     :cors,
@@ -26,7 +27,8 @@ defmodule Maxio.BucketConfigs do
     :ownership_controls,
     :website,
     :request_payment,
-    :accelerate
+    :accelerate,
+    :logging
   ]
 
   @doc "取某桶某类配置。未配置（行不存在或该列为 nil）→ :none。"

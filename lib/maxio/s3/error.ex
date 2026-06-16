@@ -56,6 +56,9 @@ defmodule Maxio.S3.Error do
       {"InvalidTag", 400,
        "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation."},
     invalid_bucket_name: {"InvalidBucketName", 400, "The specified bucket is not valid."},
+    invalid_target_bucket_for_logging:
+      {"InvalidTargetBucketForLogging", 400,
+       "The target bucket for logging does not exist or is not writable."},
     # ROUTE B B5-3 R3/R4：key 含盘上布局保留名段（meta.json/part.0/.versions/.uploads/.tmp）或
     # ./.. 点段 → 对齐 MinIO ErrInvalidObjectName（Code "XMinioInvalidObjectName"，HTTP 400，
     # cmd/api-errors.go，描述逐字对齐）。结构化 400 拒绝，绝不 500（铁律 3）。

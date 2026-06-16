@@ -26,6 +26,11 @@ defmodule Maxio.BucketConfigsTest do
     assert :ok = BucketConfigs.put("b2", :request_payment, %{"Payer" => "Requester"})
     assert :ok = BucketConfigs.put("b2", :accelerate, %{"Status" => "Enabled"})
 
+    assert :ok =
+             BucketConfigs.put("b2", :logging, %{
+               "LoggingEnabled" => %{"TargetBucket" => "logs", "TargetPrefix" => "access/"}
+             })
+
     assert {:ok, [%{"x" => 1}]} = BucketConfigs.get("b2", :cors)
     assert {:ok, %{"algorithm" => "AES256"}} = BucketConfigs.get("b2", :encryption)
     assert {:ok, %{"BlockPublicAcls" => true}} = BucketConfigs.get("b2", :public_access_block)
@@ -38,6 +43,9 @@ defmodule Maxio.BucketConfigsTest do
 
     assert {:ok, %{"Payer" => "Requester"}} = BucketConfigs.get("b2", :request_payment)
     assert {:ok, %{"Status" => "Enabled"}} = BucketConfigs.get("b2", :accelerate)
+
+    assert {:ok, %{"LoggingEnabled" => %{"TargetBucket" => "logs"}}} =
+             BucketConfigs.get("b2", :logging)
 
     assert BucketConfigs.get("b2", :lifecycle) == :none
   end
@@ -73,5 +81,12 @@ defmodule Maxio.BucketConfigsTest do
 
     assert :ok = BucketConfigs.put("b-notify", :accelerate, %{"Status" => "Enabled"})
     assert_receive {:bucket_config_changed, "b-notify", :accelerate}
+
+    assert :ok =
+             BucketConfigs.put("b-notify", :logging, %{
+               "LoggingEnabled" => %{"TargetBucket" => "logs", "TargetPrefix" => "access/"}
+             })
+
+    assert_receive {:bucket_config_changed, "b-notify", :logging}
   end
 end

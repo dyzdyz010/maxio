@@ -17,6 +17,7 @@ defmodule Maxio.BucketConfigs.BucketConfig do
     field :website, :map
     field :request_payment, :map
     field :accelerate, :map
+    field :logging, :map
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -30,7 +31,8 @@ defmodule Maxio.BucketConfigs.BucketConfig do
     :ownership_controls,
     :website,
     :request_payment,
-    :accelerate
+    :accelerate,
+    :logging
   ]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()

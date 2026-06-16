@@ -19,7 +19,8 @@ defmodule Maxio.S3.Handlers do
     OwnershipControls,
     Website,
     RequestPayment,
-    Accelerate
+    Accelerate,
+    Logging
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -95,4 +96,7 @@ defmodule Maxio.S3.Handlers do
 
   def dispatch(:put_bucket_accelerate_configuration, conn), do: Accelerate.put(conn)
   def dispatch(:get_bucket_accelerate_configuration, conn), do: Accelerate.get(conn)
+
+  def dispatch(:put_bucket_logging, conn), do: Logging.put(conn)
+  def dispatch(:get_bucket_logging, conn), do: Logging.get(conn)
 end

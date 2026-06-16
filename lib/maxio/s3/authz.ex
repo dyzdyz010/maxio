@@ -538,7 +538,9 @@ defmodule Maxio.S3.Authz do
               :get_bucket_website,
               :delete_bucket_website,
               :put_bucket_request_payment,
-              :get_bucket_request_payment
+              :get_bucket_request_payment,
+              :put_bucket_logging,
+              :get_bucket_logging
             ],
        do: true
 

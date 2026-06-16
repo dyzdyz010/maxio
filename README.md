@@ -122,6 +122,13 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **兼容约束**：未显式配置时 GET 返回空配置；GET/PUT 均校验 `x-amz-expected-bucket-owner`；PUT 会校验 modeled checksum headers，声明 checksum trailer 时 fail-closed 为 `NotImplemented`，并按 AWS 约束拒绝带点号的 bucket 名。
 - **边界**：当前只实现控制面配置 API；Transfer Acceleration edge endpoint、加速域名路由与真实跨区域加速传输仍未接入。
 
+### Bucket Logging（续作已支持）
+
+- **API**：`PutBucketLogging` / `GetBucketLogging`（`?logging`）支持 bucket-level `BucketLoggingStatus/LoggingEnabled` 持久化与 XML 回放；空 `BucketLoggingStatus` 会关闭并删除配置，未显式配置时 GET 返回空配置。
+- **兼容约束**：PUT 要求并校验 `Content-MD5`，同时支持 modeled checksum headers；GET/PUT 均校验 `x-amz-expected-bucket-owner`。支持 `TargetBucket` / required `TargetPrefix`、`TargetGrants`、`TargetObjectKeyFormat`（`SimplePrefix` 或 `PartitionedPrefix`，缺 `PartitionDateSource` 默认 `EventTime`）。目标 bucket 不存在、TargetGrants 指向 BucketOwnerEnforced 目标桶、非法 grantee/permission、checksum trailer 或 aws-chunked 小 XML body 都 fail-closed 且不覆盖旧配置。
+- **授权**：ActionMap/Authz 映射 `s3:PutBucketLogging` / `s3:GetBucketLogging`，并支持 bucket `aws:ResourceTag/*` 条件键。
+- **边界**：当前只实现控制面配置 API，不实现 server access log 对象投递、LogDelivery service principal 写入、日志格式或投递重试。
+
 ### SSE-S3（服务端加密）
 
 - **真实 AES-256-GCM 信封加密**：PutObject 带 `x-amz-server-side-encryption: AES256`（或桶默认加密配置）时，对象字节**真实加密落盘**——每对象生成随机 256-bit 数据密钥（DEK），数据重切为 64KB 帧、每帧独立 AES-256-GCM（随机 IV + 认证 tag），DEK 由服务端主密钥 AES-256-GCM 包裹后随对象元数据存储。GET 透明解密；GCM 认证失败会**抛错**，绝不静默返回错数据。
