@@ -88,6 +88,12 @@ defmodule Maxio.Policy.ActionMapTest do
 
     assert ActionMap.for_action(:get_bucket_replication) ==
              {"s3:GetReplicationConfiguration", :bucket}
+
+    assert ActionMap.for_action(:put_bucket_object_lock_configuration) ==
+             {"s3:PutBucketObjectLockConfiguration", :bucket}
+
+    assert ActionMap.for_action(:get_bucket_object_lock_configuration) ==
+             {"s3:GetBucketObjectLockConfiguration", :bucket}
   end
 
   test "对象级动作 → :object" do

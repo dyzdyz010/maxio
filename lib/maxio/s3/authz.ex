@@ -221,6 +221,15 @@ defmodule Maxio.S3.Authz do
           conditions
         )
 
+        maybe_authorize_create_bucket_object_lock(
+          conn,
+          action,
+          bucket,
+          principal,
+          authenticated?,
+          conditions
+        )
+
         :ok
 
       {:deny, reason} ->
@@ -835,6 +844,41 @@ defmodule Maxio.S3.Authz do
   end
 
   defp maybe_authorize_create_bucket_headers(_conn, _action, _bucket, _p, _a, _c), do: :ok
+
+  defp maybe_authorize_create_bucket_object_lock(
+         conn,
+         :create_bucket,
+         bucket,
+         principal,
+         authenticated?,
+         conditions
+       )
+       when is_binary(bucket) do
+    if create_bucket_object_lock_enabled?(conn) do
+      authorize_additional_action!(
+        conn,
+        :create_bucket_object_lock_configuration,
+        "s3:PutBucketObjectLockConfiguration",
+        :bucket,
+        bucket,
+        nil,
+        principal,
+        authenticated?,
+        conditions
+      )
+    else
+      :ok
+    end
+  end
+
+  defp maybe_authorize_create_bucket_object_lock(_conn, _action, _bucket, _p, _a, _c), do: :ok
+
+  defp create_bucket_object_lock_enabled?(conn) do
+    case get_req_header(conn, "x-amz-bucket-object-lock-enabled") do
+      [value] -> value |> String.trim() |> String.downcase() == "true"
+      _other -> false
+    end
+  end
 
   defp authorize_additional_action!(
          conn,

@@ -23,6 +23,7 @@ defmodule Maxio.BucketConfigs do
           | :analytics
           | :inventory
           | :replication
+          | :object_lock
 
   @kinds [
     :cors,
@@ -38,7 +39,8 @@ defmodule Maxio.BucketConfigs do
     :metrics,
     :analytics,
     :inventory,
-    :replication
+    :replication,
+    :object_lock
   ]
 
   @doc "取某桶某类配置。未配置（行不存在或该列为 nil）→ :none。"

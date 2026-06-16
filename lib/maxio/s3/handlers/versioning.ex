@@ -5,7 +5,7 @@ defmodule Maxio.S3.Handlers.Versioning do
   注：已 Enabled 的桶不能回退 Unversioned，只能 Suspended（与 AWS 一致）——本 handler 只接受 Enabled/Suspended。
   """
   import Plug.Conn
-  alias Maxio.Buckets
+  alias Maxio.{BucketConfigs, Buckets}
   alias Maxio.S3.{Error, Log, MFADelete}
   alias Maxio.S3.RequestParsers.VersioningConfiguration, as: Parser
   alias Maxio.S3.Views.VersioningConfiguration, as: View
@@ -21,6 +21,7 @@ defmodule Maxio.S3.Handlers.Versioning do
     case Parser.parse(xml) do
       {:ok, %{status: status, mfa_delete: mfa}} ->
         MFADelete.require_for_versioning_put!(conn, bucket_meta, status, mfa)
+        :ok = reject_object_lock_versioning_suspend!(bucket_meta, status)
 
         # status 缺省（空 body）→ 不改状态（保留现状）；显式 Enabled/Suspended → 落库。
         :ok = Buckets.put_versioning(bucket, status, mfa)
@@ -55,6 +56,21 @@ defmodule Maxio.S3.Handlers.Versioning do
       {:error, :not_found} -> raise Error.new(:no_such_bucket, resource: "/" <> bucket)
     end
   end
+
+  defp reject_object_lock_versioning_suspend!(%{name: bucket}, "Suspended") do
+    case BucketConfigs.get(bucket, :object_lock) do
+      {:ok, %{"ObjectLockEnabled" => "Enabled"}} ->
+        raise Error.new(:invalid_bucket_state,
+                message: "Versioning cannot be suspended on a bucket with Object Lock enabled",
+                resource: "/" <> bucket
+              )
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp reject_object_lock_versioning_suspend!(_bucket_meta, _status), do: :ok
 
   defp read_small_body!(conn) do
     case read_body(conn, length: @xml_limit, read_length: @xml_limit) do

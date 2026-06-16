@@ -235,6 +235,18 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:error, :method_not_allowed} =
              Dispatcher.resolve(:bucket, "POST", keys(["replication"]))
 
+    assert {:ok, :put_bucket_object_lock_configuration} =
+             Dispatcher.resolve(:bucket, "PUT", keys(["object-lock"]))
+
+    assert {:ok, :get_bucket_object_lock_configuration} =
+             Dispatcher.resolve(:bucket, "GET", keys(["object-lock"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:bucket, "DELETE", keys(["object-lock"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["object-lock"]))
+
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))
   end

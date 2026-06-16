@@ -123,6 +123,9 @@ defmodule Maxio.S3.Error do
     missing_security_header:
       {"MissingSecurityHeader", 400, "Your request is missing a required header."},
     invalid_request: {"InvalidRequest", 400, "Invalid Request"},
+    invalid_bucket_state:
+      {"InvalidBucketState", 409,
+       "The request is not valid with the current state of the bucket."},
     bad_digest:
       {"BadDigest", 400,
        "The Content-MD5 or checksum value that you specified did not match what the server received."},
@@ -163,6 +166,9 @@ defmodule Maxio.S3.Error do
     replication_configuration_not_found:
       {"ReplicationConfigurationNotFoundError", 404,
        "The replication configuration was not found."},
+    object_lock_configuration_not_found:
+      {"ObjectLockConfigurationNotFoundError", 404,
+       "Object Lock configuration does not exist for this bucket."},
     too_many_configurations:
       {"TooManyConfigurations", 400,
        "You are attempting to create a new configuration but have already reached the configuration limit."},

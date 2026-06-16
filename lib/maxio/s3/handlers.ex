@@ -25,7 +25,8 @@ defmodule Maxio.S3.Handlers do
     Metrics,
     Analytics,
     Inventory,
-    Replication
+    Replication,
+    ObjectLock
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -126,4 +127,7 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:put_bucket_replication, conn), do: Replication.put(conn)
   def dispatch(:get_bucket_replication, conn), do: Replication.get(conn)
   def dispatch(:delete_bucket_replication, conn), do: Replication.delete(conn)
+
+  def dispatch(:put_bucket_object_lock_configuration, conn), do: ObjectLock.put(conn)
+  def dispatch(:get_bucket_object_lock_configuration, conn), do: ObjectLock.get(conn)
 end

@@ -138,6 +138,12 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:delete_bucket_replication), do: {"s3:PutReplicationConfiguration", :bucket}
   def for_action(:get_bucket_replication), do: {"s3:GetReplicationConfiguration", :bucket}
 
+  def for_action(:put_bucket_object_lock_configuration),
+    do: {"s3:PutBucketObjectLockConfiguration", :bucket}
+
+  def for_action(:get_bucket_object_lock_configuration),
+    do: {"s3:GetBucketObjectLockConfiguration", :bucket}
+
   def for_action(:get_bucket_ownership_controls),
     do: {"s3:GetBucketOwnershipControls", :bucket}
 

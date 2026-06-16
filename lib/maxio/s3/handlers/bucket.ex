@@ -3,7 +3,7 @@ defmodule Maxio.S3.Handlers.Bucket do
   import Plug.Conn
   alias Maxio.{BucketConfigs, Buckets, Objects, Storage}
   alias Maxio.Policy.ACL
-  alias Maxio.S3.{Error, Log, OwnershipControls}
+  alias Maxio.S3.{Error, Log, ObjectLock, OwnershipControls}
   alias Maxio.S3.Views.{ListBucket, ListBucketV1, LocationConstraint, ListVersions}
 
   @max_keys_limit 1000
@@ -15,6 +15,7 @@ defmodule Maxio.S3.Handlers.Bucket do
     owner = conn.assigns.principal.arn
     ownership_config = object_ownership_from_headers!(conn)
     acl_input = bucket_acl_from_headers!(conn)
+    object_lock_enabled? = object_lock_enabled_from_headers!(conn)
     :ok = OwnershipControls.reject_acl_input_for_enforced!(bucket, ownership_config, acl_input)
 
     case Buckets.create(bucket, owner,
@@ -24,12 +25,14 @@ defmodule Maxio.S3.Handlers.Bucket do
          ) do
       {:ok, _b} ->
         :ok = BucketConfigs.put(bucket, :ownership_controls, ownership_config)
+        :ok = maybe_enable_object_lock(bucket, object_lock_enabled?)
         :ok = Storage.put_bucket(bucket)
 
         Log.info("create bucket",
           action: :create_bucket,
           bucket: bucket,
-          object_ownership: ownership_config["ObjectOwnership"]
+          object_ownership: ownership_config["ObjectOwnership"],
+          object_lock_enabled?: object_lock_enabled?
         )
 
         conn
@@ -43,6 +46,37 @@ defmodule Maxio.S3.Handlers.Bucket do
         raise Error.new(:bucket_already_owned_by_you, resource: "/" <> bucket)
     end
   end
+
+  defp object_lock_enabled_from_headers!(conn) do
+    case get_req_header(conn, "x-amz-bucket-object-lock-enabled") do
+      [] ->
+        false
+
+      [value] ->
+        case String.downcase(String.trim(value)) do
+          "true" ->
+            true
+
+          "false" ->
+            false
+
+          _other ->
+            raise Error.new(:invalid_argument,
+                    message: "Invalid x-amz-bucket-object-lock-enabled"
+                  )
+        end
+
+      _multiple ->
+        raise Error.new(:invalid_argument, message: "Invalid x-amz-bucket-object-lock-enabled")
+    end
+  end
+
+  defp maybe_enable_object_lock(bucket, true) do
+    :ok = Buckets.put_versioning(bucket, "Enabled", nil)
+    BucketConfigs.put(bucket, :object_lock, ObjectLock.enabled_config())
+  end
+
+  defp maybe_enable_object_lock(_bucket, false), do: :ok
 
   @spec delete(Plug.Conn.t()) :: Plug.Conn.t()
   def delete(conn) do
