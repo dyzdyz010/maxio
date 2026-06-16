@@ -98,6 +98,18 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:put_bucket_notification), do: {"s3:PutBucketNotification", :bucket}
   def for_action(:get_bucket_notification), do: {"s3:GetBucketNotification", :bucket}
 
+  def for_action(:put_bucket_metrics_configuration),
+    do: {"s3:PutMetricsConfiguration", :bucket}
+
+  def for_action(:delete_bucket_metrics_configuration),
+    do: {"s3:PutMetricsConfiguration", :bucket}
+
+  def for_action(:get_bucket_metrics_configuration),
+    do: {"s3:GetMetricsConfiguration", :bucket}
+
+  def for_action(:list_bucket_metrics_configurations),
+    do: {"s3:GetMetricsConfiguration", :bucket}
+
   def for_action(:get_bucket_ownership_controls),
     do: {"s3:GetBucketOwnershipControls", :bucket}
 

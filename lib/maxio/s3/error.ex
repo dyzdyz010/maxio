@@ -154,6 +154,11 @@ defmodule Maxio.S3.Error do
       {"NoSuchLifecycleConfiguration", 404, "The lifecycle configuration does not exist."},
     no_such_website_configuration:
       {"NoSuchWebsiteConfiguration", 404, "The website configuration does not exist."},
+    no_such_metrics_configuration:
+      {"NoSuchConfiguration", 404, "The specified metrics configuration does not exist."},
+    too_many_configurations:
+      {"TooManyConfigurations", 400,
+       "You are attempting to create a new configuration but have already reached the configuration limit."},
     server_side_encryption_configuration_not_found:
       {"ServerSideEncryptionConfigurationNotFoundError", 404,
        "The server side encryption configuration was not found."}

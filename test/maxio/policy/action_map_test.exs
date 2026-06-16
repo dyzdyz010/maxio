@@ -43,6 +43,18 @@ defmodule Maxio.Policy.ActionMapTest do
 
     assert ActionMap.for_action(:get_bucket_notification) ==
              {"s3:GetBucketNotification", :bucket}
+
+    assert ActionMap.for_action(:put_bucket_metrics_configuration) ==
+             {"s3:PutMetricsConfiguration", :bucket}
+
+    assert ActionMap.for_action(:delete_bucket_metrics_configuration) ==
+             {"s3:PutMetricsConfiguration", :bucket}
+
+    assert ActionMap.for_action(:get_bucket_metrics_configuration) ==
+             {"s3:GetMetricsConfiguration", :bucket}
+
+    assert ActionMap.for_action(:list_bucket_metrics_configurations) ==
+             {"s3:GetMetricsConfiguration", :bucket}
   end
 
   test "对象级动作 → :object" do
