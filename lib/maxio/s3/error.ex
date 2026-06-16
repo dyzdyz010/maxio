@@ -156,6 +156,8 @@ defmodule Maxio.S3.Error do
       {"NoSuchWebsiteConfiguration", 404, "The website configuration does not exist."},
     no_such_metrics_configuration:
       {"NoSuchConfiguration", 404, "The specified metrics configuration does not exist."},
+    no_such_analytics_configuration:
+      {"NoSuchConfiguration", 404, "The specified analytics configuration does not exist."},
     too_many_configurations:
       {"TooManyConfigurations", 400,
        "You are attempting to create a new configuration but have already reached the configuration limit."},

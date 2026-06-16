@@ -22,7 +22,8 @@ defmodule Maxio.S3.Handlers do
     Accelerate,
     Logging,
     Notification,
-    Metrics
+    Metrics,
+    Analytics
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -109,4 +110,9 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:get_bucket_metrics_configuration, conn), do: Metrics.get(conn)
   def dispatch(:delete_bucket_metrics_configuration, conn), do: Metrics.delete(conn)
   def dispatch(:list_bucket_metrics_configurations, conn), do: Metrics.list(conn)
+
+  def dispatch(:put_bucket_analytics_configuration, conn), do: Analytics.put(conn)
+  def dispatch(:get_bucket_analytics_configuration, conn), do: Analytics.get(conn)
+  def dispatch(:delete_bucket_analytics_configuration, conn), do: Analytics.delete(conn)
+  def dispatch(:list_bucket_analytics_configurations, conn), do: Analytics.list(conn)
 end

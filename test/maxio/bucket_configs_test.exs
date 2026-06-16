@@ -48,6 +48,13 @@ defmodule Maxio.BucketConfigsTest do
                ]
              })
 
+    assert :ok =
+             BucketConfigs.put("b2", :analytics, %{
+               "Configurations" => [
+                 %{"Id" => "daily", "StorageClassAnalysis" => %{}}
+               ]
+             })
+
     assert {:ok, [%{"x" => 1}]} = BucketConfigs.get("b2", :cors)
     assert {:ok, %{"algorithm" => "AES256"}} = BucketConfigs.get("b2", :encryption)
     assert {:ok, %{"BlockPublicAcls" => true}} = BucketConfigs.get("b2", :public_access_block)
@@ -73,6 +80,9 @@ defmodule Maxio.BucketConfigsTest do
 
     assert {:ok, %{"Configurations" => [%{"Id" => "daily"}]}} =
              BucketConfigs.get("b2", :metrics)
+
+    assert {:ok, %{"Configurations" => [%{"Id" => "daily"}]}} =
+             BucketConfigs.get("b2", :analytics)
 
     assert BucketConfigs.get("b2", :lifecycle) == :none
   end
@@ -132,5 +142,15 @@ defmodule Maxio.BucketConfigsTest do
 
     assert :ok = BucketConfigs.delete("b-notify", :metrics)
     assert_receive {:bucket_config_changed, "b-notify", :metrics}
+
+    assert :ok =
+             BucketConfigs.put("b-notify", :analytics, %{
+               "Configurations" => [%{"Id" => "daily", "StorageClassAnalysis" => %{}}]
+             })
+
+    assert_receive {:bucket_config_changed, "b-notify", :analytics}
+
+    assert :ok = BucketConfigs.delete("b-notify", :analytics)
+    assert_receive {:bucket_config_changed, "b-notify", :analytics}
   end
 end

@@ -190,6 +190,21 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:error, :method_not_allowed} =
              Dispatcher.resolve(:object, "GET", keys(["metrics"]))
 
+    assert {:ok, :put_bucket_analytics_configuration} =
+             Dispatcher.resolve(:bucket, "PUT", keys(["analytics"]))
+
+    assert {:ok, :get_bucket_analytics_configuration} =
+             Dispatcher.resolve(:bucket, "GET", %{"analytics" => "", "id" => "daily"})
+
+    assert {:ok, :list_bucket_analytics_configurations} =
+             Dispatcher.resolve(:bucket, "GET", keys(["analytics"]))
+
+    assert {:ok, :delete_bucket_analytics_configuration} =
+             Dispatcher.resolve(:bucket, "DELETE", keys(["analytics"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["analytics"]))
+
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))
   end

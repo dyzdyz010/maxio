@@ -20,6 +20,7 @@ defmodule Maxio.BucketConfigs.BucketConfig do
     field :logging, :map
     field :notification, :map
     field :metrics, :map
+    field :analytics, :map
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -36,7 +37,8 @@ defmodule Maxio.BucketConfigs.BucketConfig do
     :accelerate,
     :logging,
     :notification,
-    :metrics
+    :metrics,
+    :analytics
   ]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
