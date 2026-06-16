@@ -37,6 +37,12 @@ defmodule Maxio.Policy.ActionMapTest do
 
     assert ActionMap.for_action(:put_bucket_logging) == {"s3:PutBucketLogging", :bucket}
     assert ActionMap.for_action(:get_bucket_logging) == {"s3:GetBucketLogging", :bucket}
+
+    assert ActionMap.for_action(:put_bucket_notification) ==
+             {"s3:PutBucketNotification", :bucket}
+
+    assert ActionMap.for_action(:get_bucket_notification) ==
+             {"s3:GetBucketNotification", :bucket}
   end
 
   test "对象级动作 → :object" do

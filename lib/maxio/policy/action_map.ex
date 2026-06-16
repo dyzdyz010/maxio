@@ -95,6 +95,9 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:put_bucket_logging), do: {"s3:PutBucketLogging", :bucket}
   def for_action(:get_bucket_logging), do: {"s3:GetBucketLogging", :bucket}
 
+  def for_action(:put_bucket_notification), do: {"s3:PutBucketNotification", :bucket}
+  def for_action(:get_bucket_notification), do: {"s3:GetBucketNotification", :bucket}
+
   def for_action(:get_bucket_ownership_controls),
     do: {"s3:GetBucketOwnershipControls", :bucket}
 

@@ -20,7 +20,8 @@ defmodule Maxio.S3.Handlers do
     Website,
     RequestPayment,
     Accelerate,
-    Logging
+    Logging,
+    Notification
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -99,4 +100,7 @@ defmodule Maxio.S3.Handlers do
 
   def dispatch(:put_bucket_logging, conn), do: Logging.put(conn)
   def dispatch(:get_bucket_logging, conn), do: Logging.get(conn)
+
+  def dispatch(:put_bucket_notification, conn), do: Notification.put(conn)
+  def dispatch(:get_bucket_notification, conn), do: Notification.get(conn)
 end

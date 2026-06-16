@@ -13,7 +13,7 @@ defmodule Maxio.S3.Dispatcher do
 
   # M2+ 子资源标记（出现即 not_implemented）。
   # 注：uploads/uploadid/partnumber 已从本表移除，由 multipart_action/3 分发到具体 multipart 动作（M2-5）。
-  @m2_subresources ~w(notification replication object-lock legal-hold retention
+  @m2_subresources ~w(replication object-lock legal-hold retention
                       select torrent restore analytics inventory metrics)
 
   @spec resolve(level(), String.t(), MapSet.t() | map()) ::
@@ -116,6 +116,16 @@ defmodule Maxio.S3.Dispatcher do
         end
 
       MapSet.member?(query_keys, "logging") ->
+        {:error, :method_not_allowed}
+
+      level == :bucket and MapSet.member?(query_keys, "notification") ->
+        case method do
+          "PUT" -> {:ok, :put_bucket_notification}
+          "GET" -> {:ok, :get_bucket_notification}
+          _ -> {:error, :method_not_allowed}
+        end
+
+      MapSet.member?(query_keys, "notification") ->
         {:error, :method_not_allowed}
 
       level == :bucket and MapSet.member?(query_keys, "lifecycle") ->

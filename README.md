@@ -129,6 +129,13 @@ maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策�
 - **授权**：ActionMap/Authz 映射 `s3:PutBucketLogging` / `s3:GetBucketLogging`，并支持 bucket `aws:ResourceTag/*` 条件键。
 - **边界**：当前只实现控制面配置 API，不实现 server access log 对象投递、LogDelivery service principal 写入、日志格式或投递重试。
 
+### Bucket Notification（续作已支持）
+
+- **API**：`PutBucketNotificationConfiguration` / `GetBucketNotificationConfiguration`（`?notification`）支持 bucket-level `NotificationConfiguration` 持久化与 XML 回放；未显式配置时 GET 返回空 `NotificationConfiguration`，PUT 空配置会关闭并删除配置。
+- **兼容约束**：支持 Topic / Queue / Lambda(REST `CloudFunctionConfiguration`) / EventBridge 配置、`Filter/S3Key/FilterRule`、`x-amz-expected-bucket-owner`、可选 `Content-MD5` 与 modeled checksum headers；非法 XML、未知事件、重复 Id、重复 filter rule、同事件族下重叠 prefix/suffix filter、checksum trailer 或 aws-chunked 小 XML body 都 fail-closed 且不覆盖旧配置。
+- **授权**：ActionMap/Authz 映射 `s3:PutBucketNotification` / `s3:GetBucketNotification`；按 AWS service authorization reference，当前不纳入 bucket `aws:ResourceTag/*` 条件键。
+- **边界**：当前只实现控制面配置 API。真实 SNS/SQS/Lambda/EventBridge 事件投递与目标验证未实现；非空 PUT 需显式 `x-amz-skip-destination-validation: true` 才会按“仅存配置”语义接受。
+
 ### SSE-S3（服务端加密）
 
 - **真实 AES-256-GCM 信封加密**：PutObject 带 `x-amz-server-side-encryption: AES256`（或桶默认加密配置）时，对象字节**真实加密落盘**——每对象生成随机 256-bit 数据密钥（DEK），数据重切为 64KB 帧、每帧独立 AES-256-GCM（随机 IV + 认证 tag），DEK 由服务端主密钥 AES-256-GCM 包裹后随对象元数据存储。GET 透明解密；GCM 认证失败会**抛错**，绝不静默返回错数据。
@@ -177,7 +184,7 @@ LiveView mount 时凭 access_key 重查 principal。鉴权经 `live_session` 的
 ### 显式未实现（defer，绝不假装实现 / 不画死按钮）
 
 - **Identity → Users / Groups / STS / IdP**：maxio 单租户，无独立 user/group 实体；IAM identity policy 已支持 CLI 绑定到 access-key principal，但 Console 暂未提供 UI。Console 用 **access key** 作 identity primitive；Users/Groups 在侧边栏**不出现**（不画灰条目假装有）。
-- **Bucket → Quota / Events-Notifications / Replication / Object-Lock-Retention-Legal-Hold**：后端未实现，Settings 页不画这些 tab。PublicAccessBlock 后端与 Settings tab 已接入；account / organization / access point 级叠加仍随多租户/IAM 扩展 defer。
+- **Bucket → Quota / Replication / Object-Lock-Retention-Legal-Hold**：后端未实现，Settings 页不画这些 tab。Notification 配置 API 已支持；真实事件投递与 Console tab 仍 defer。PublicAccessBlock 后端与 Settings tab 已接入；account / organization / access point 级叠加仍随多租户/IAM 扩展 defer。
 - **Object → 内联预览 / Legal hold / Retention**：后端未实现 / SSE 对象 GET 全缓冲（M4 defer）使大加密对象预览有风险——仅提供下载。
 - **Monitoring → Logs/Trace/Audit 流 / Drives/Heal / 流量·API速率·延迟 时序图**：需 Prometheus/纠删码（M6）。Dashboard 只做廉价计数，不画时序图。
 - **Configuration / Settings 运行时编辑 / Tiers / Site Replication / Batch Jobs / License**：后端无运行时配置存储；不做。

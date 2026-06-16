@@ -31,6 +31,16 @@ defmodule Maxio.BucketConfigsTest do
                "LoggingEnabled" => %{"TargetBucket" => "logs", "TargetPrefix" => "access/"}
              })
 
+    assert :ok =
+             BucketConfigs.put("b2", :notification, %{
+               "QueueConfigurations" => [
+                 %{
+                   "Queue" => "arn:aws:sqs:us-east-1:000000000000:events",
+                   "Events" => ["s3:ObjectCreated:*"]
+                 }
+               ]
+             })
+
     assert {:ok, [%{"x" => 1}]} = BucketConfigs.get("b2", :cors)
     assert {:ok, %{"algorithm" => "AES256"}} = BucketConfigs.get("b2", :encryption)
     assert {:ok, %{"BlockPublicAcls" => true}} = BucketConfigs.get("b2", :public_access_block)
@@ -46,6 +56,13 @@ defmodule Maxio.BucketConfigsTest do
 
     assert {:ok, %{"LoggingEnabled" => %{"TargetBucket" => "logs"}}} =
              BucketConfigs.get("b2", :logging)
+
+    assert {:ok,
+            %{
+              "QueueConfigurations" => [
+                %{"Queue" => "arn:aws:sqs:us-east-1:000000000000:events"}
+              ]
+            }} = BucketConfigs.get("b2", :notification)
 
     assert BucketConfigs.get("b2", :lifecycle) == :none
   end
@@ -88,5 +105,12 @@ defmodule Maxio.BucketConfigsTest do
              })
 
     assert_receive {:bucket_config_changed, "b-notify", :logging}
+
+    assert :ok =
+             BucketConfigs.put("b-notify", :notification, %{
+               "EventBridgeConfiguration" => %{}
+             })
+
+    assert_receive {:bucket_config_changed, "b-notify", :notification}
   end
 end
