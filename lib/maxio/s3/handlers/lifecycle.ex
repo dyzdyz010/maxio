@@ -213,8 +213,7 @@ defmodule Maxio.S3.Handlers.Lifecycle do
       not configured? ->
         true
 
-      r["noncurrent_transition_days"] == nil and
-          r["noncurrent_transition_newer_noncurrent_versions"] == nil ->
+      r["noncurrent_transition_days"] == nil ->
         false
 
       true ->

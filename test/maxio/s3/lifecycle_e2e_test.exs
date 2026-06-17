@@ -170,6 +170,19 @@ defmodule Maxio.S3.LifecycleE2ETest do
     assert res.status == 400
   end
 
+  test "NoncurrentVersionTransition NewerNoncurrentVersions 不能缺 NoncurrentDays" do
+    SigV4Request.signed_conn(:put, "/lcb10days") |> call()
+
+    bad =
+      ~s(<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><NoncurrentVersionTransition><NewerNoncurrentVersions>5</NewerNoncurrentVersions><StorageClass>GLACIER</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>)
+
+    res =
+      SigV4Request.signed_conn(:put, "/lcb10days", query: %{"lifecycle" => ""}, body: bad)
+      |> call()
+
+    assert res.status == 400
+  end
+
   test "NoncurrentVersionTransition NewerNoncurrentVersions 回放仍留在 transition 下" do
     SigV4Request.signed_conn(:put, "/lcb11") |> call()
 

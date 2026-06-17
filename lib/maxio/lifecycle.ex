@@ -145,9 +145,10 @@ defmodule Maxio.Lifecycle do
             acc
           end
 
-        not object.is_delete_marker and current_expired?(object, rules, now) ->
+        not object.is_delete_marker and current_expired?(object, rules, now) and
+            current_expiration_deletes_version?(bucket) ->
           cond do
-            mfa_delete_enabled?(bucket) and current_expiration_deletes_version?(bucket) ->
+            mfa_delete_enabled?(bucket) ->
               skip_mfa_delete_protected_action(acc, object, :current_expiration)
 
             stale_current_lifecycle_candidate?(object, rules, now, opts) ->
@@ -165,7 +166,22 @@ defmodule Maxio.Lifecycle do
         not object.is_delete_marker ->
           case current_transition_target(object, rules, now) do
             nil ->
-              acc
+              if current_expired?(object, rules, now) do
+                cond do
+                  stale_current_lifecycle_candidate?(object, rules, now, opts) ->
+                    acc
+
+                  current_expiration_object_lock_protected?(bucket, object, now, opts) ->
+                    skip_object_lock_protected_action(acc, object, :current_expiration)
+
+                  true ->
+                    apply_action(acc, :objects_expired, object, dry_run?, fn ->
+                      expire_current_object(bucket, object, rules, now, opts)
+                    end)
+                end
+              else
+                acc
+              end
 
             storage_class ->
               apply_action(acc, :objects_transitioned, object, dry_run?, fn ->
@@ -200,18 +216,19 @@ defmodule Maxio.Lifecycle do
               end)
           end
 
-        true ->
+        (storage_class = noncurrent_transition_target(candidate, rules, now)) != nil ->
           object = candidate.object
 
-          case noncurrent_transition_target(candidate, rules, now) do
-            nil ->
-              acc
-
-            storage_class ->
-              apply_action(acc, :noncurrent_versions_transitioned, object, dry_run?, fn ->
-                transition_noncurrent_version(bucket, candidate, storage_class, rules, now, opts)
-              end)
+          if object_lock_protected_for_lifecycle?(object, now, opts) do
+            skip_object_lock_protected_action(acc, object, :noncurrent_version_transition)
+          else
+            apply_action(acc, :noncurrent_versions_transitioned, object, dry_run?, fn ->
+              transition_noncurrent_version(bucket, candidate, storage_class, rules, now, opts)
+            end)
           end
+
+        true ->
+          acc
       end
     end)
   end
@@ -368,30 +385,58 @@ defmodule Maxio.Lifecycle do
   end
 
   defp current_transition_target(%Object{} = object, rules, now) do
-    Enum.find_value(rules, fn rule ->
+    rules
+    |> Enum.flat_map(fn rule ->
       if current_transition_rule_supported?(rule) and object_matches_rule?(object, rule) and
            transition_age_expired?(version_created_at(object), rule, now) do
-        target = transition_storage_class(rule, "transition_storage_class")
-
-        if transitioned?(object, target), do: nil, else: target
+        [transition_storage_class(rule, "transition_storage_class")]
+      else
+        []
       end
     end)
+    |> transition_target_by_precedence()
+    |> case do
+      nil -> nil
+      target -> if transitioned?(object, target), do: nil, else: target
+    end
   end
 
   defp noncurrent_transition_target(%{object: %Object{} = object} = candidate, rules, now) do
-    Enum.find_value(rules, fn rule ->
+    rules
+    |> Enum.flat_map(fn rule ->
       if noncurrent_transition_rule_supported?(rule) and object_matches_rule?(object, rule) and
            noncurrent_transition_age_expired?(candidate, rule, now) and
            newer_noncurrent_transition_versions_exceeded?(candidate, rule) do
-        target = transition_storage_class(rule, "noncurrent_transition_storage_class")
-
-        if transitioned?(object, target), do: nil, else: target
+        [transition_storage_class(rule, "noncurrent_transition_storage_class")]
+      else
+        []
       end
     end)
+    |> transition_target_by_precedence()
+    |> case do
+      nil -> nil
+      target -> if transitioned?(object, target), do: nil, else: target
+    end
   end
 
   defp transitioned?(%Object{} = object, storage_class),
     do: (object.storage_class || "STANDARD") == storage_class
+
+  defp transition_target_by_precedence([]), do: nil
+
+  defp transition_target_by_precedence(targets) do
+    targets
+    |> Enum.uniq()
+    |> Enum.max_by(&transition_precedence_rank/1)
+  end
+
+  defp transition_precedence_rank("DEEP_ARCHIVE"), do: 6
+  defp transition_precedence_rank("GLACIER"), do: 5
+  defp transition_precedence_rank("GLACIER_IR"), do: 4
+  defp transition_precedence_rank("ONEZONE_IA"), do: 3
+  defp transition_precedence_rank("STANDARD_IA"), do: 2
+  defp transition_precedence_rank("INTELLIGENT_TIERING"), do: 1
+  defp transition_precedence_rank(_storage_class), do: 0
 
   defp unsupported_transition_rule?(rule) do
     (current_transition_configured?(rule) and not current_transition_rule_supported?(rule)) or
@@ -409,7 +454,8 @@ defmodule Maxio.Lifecycle do
 
   defp noncurrent_transition_rule_supported?(rule) do
     noncurrent_transition_configured?(rule) and
-      (valid_noncurrent_days?(rule["noncurrent_transition_days"]) or
+      valid_noncurrent_days?(rule["noncurrent_transition_days"]) and
+      (rule["noncurrent_transition_newer_noncurrent_versions"] == nil or
          valid_newer_noncurrent_versions?(rule["noncurrent_transition_newer_noncurrent_versions"])) and
       valid_lifecycle_transition_storage_class?(rule["noncurrent_transition_storage_class"])
   end
@@ -522,7 +568,7 @@ defmodule Maxio.Lifecycle do
   defp age_expired?(_updated_at, _rule, _now), do: false
 
   defp transition_age_expired?(updated_at, %{"transition_days" => days}, now)
-       when is_integer(days) and days >= 1 do
+       when is_integer(days) and days >= 0 do
     threshold = lifecycle_days_threshold(updated_at, days)
     DateTime.compare(now, threshold) != :lt
   end
@@ -571,13 +617,6 @@ defmodule Maxio.Lifecycle do
     threshold = lifecycle_days_threshold(noncurrent_since, days)
     DateTime.compare(now, threshold) != :lt
   end
-
-  defp noncurrent_transition_age_expired?(
-         _candidate,
-         %{"noncurrent_transition_days" => nil},
-         _now
-       ),
-       do: true
 
   defp noncurrent_transition_age_expired?(_candidate, _rule, _now), do: false
 
@@ -806,7 +845,7 @@ defmodule Maxio.Lifecycle do
   end
 
   defp noncurrent_transition_candidate_still_eligible?(
-         %{object: %Object{} = candidate},
+         %{object: %Object{} = candidate_object} = candidate,
          storage_class,
          rules,
          now,
@@ -814,31 +853,33 @@ defmodule Maxio.Lifecycle do
        ) do
     case Maxio.ObjectMeta.authoritative_source(:write, opts) do
       :sidecar ->
-        case authoritative_object_version(
-               candidate.bucket_name,
-               candidate.key,
-               candidate.version_id,
-               opts
-             ) do
-          {:ok, %Object{is_delete_marker: false} = object} ->
-            if (object.storage_class || "STANDARD") != storage_class do
-              :ok
-            else
-              {:error, :stale_candidate}
-            end
-
-          {:ok, %Object{}} ->
+        with {:ok, %Object{is_delete_marker: false} = object} <-
+               authoritative_object_version(
+                 candidate_object.bucket_name,
+                 candidate_object.key,
+                 candidate_object.version_id,
+                 opts
+               ),
+             :ok <- sidecar_version_still_noncurrent?(object, opts),
+             {:ok, refreshed} <-
+               refreshed_noncurrent_transition_candidate(candidate, object) do
+          if noncurrent_transition_target(refreshed, rules, now) == storage_class do
+            :ok
+          else
             {:error, :stale_candidate}
-
-          {:error, reason} ->
-            {:error, reason}
+          end
+        else
+          {:ok, %Object{}} -> {:error, :stale_candidate}
+          {:error, :stale_candidate} -> {:error, :stale_candidate}
+          {:error, :not_found} -> {:error, :stale_candidate}
+          {:error, reason} -> {:error, reason}
         end
 
       _pg ->
         case refreshed_noncurrent_candidate(
-               candidate.bucket_name,
-               candidate.key,
-               candidate.version_id
+               candidate_object.bucket_name,
+               candidate_object.key,
+               candidate_object.version_id
              ) do
           nil ->
             {:error, :stale_candidate}
@@ -850,6 +891,33 @@ defmodule Maxio.Lifecycle do
               {:error, :stale_candidate}
             end
         end
+    end
+  end
+
+  defp sidecar_version_still_noncurrent?(%Object{} = object, opts) do
+    case authoritative_latest_object(object.bucket_name, object.key, opts) do
+      {:ok, %Object{} = current} ->
+        if same_version?(current, object), do: {:error, :stale_candidate}, else: :ok
+
+      {:error, :not_found} ->
+        {:error, :stale_candidate}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp refreshed_noncurrent_transition_candidate(
+         %{object: %Object{} = original_candidate},
+         %Object{} = authoritative_object
+       ) do
+    case refreshed_noncurrent_candidate(
+           original_candidate.bucket_name,
+           original_candidate.key,
+           original_candidate.version_id
+         ) do
+      nil -> {:error, :not_found}
+      refreshed -> {:ok, %{refreshed | object: authoritative_object}}
     end
   end
 

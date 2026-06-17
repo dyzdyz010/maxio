@@ -414,6 +414,48 @@ defmodule Maxio.LifecycleTest do
     assert again.errors == []
   end
 
+  test "same-day versioned expiration creates no delete marker before eligible transition" do
+    SigV4Request.signed_conn(:put, "/lcprec") |> call()
+    :ok = Maxio.Buckets.put_versioning("lcprec", "Enabled", nil)
+    version_id = put_object_version!("lcprec", "doc.txt", "v1")
+    touch_latest("lcprec", "doc.txt", @old)
+
+    :ok =
+      BucketConfigs.put("lcprec", :lifecycle, [
+        rule(%{
+          "expiration_days" => 1,
+          "transition_days" => 1,
+          "transition_storage_class" => "GLACIER_IR"
+        })
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.objects_transitioned == 1
+    assert summary.objects_expired == 0
+    {:ok, object} = Objects.get_version("lcprec", "doc.txt", version_id)
+    assert object.storage_class == "GLACIER_IR"
+    assert object.is_latest
+    assert object.is_delete_marker == false
+  end
+
+  test "Transition Days=0 executes for immediate Glacier-class rules" do
+    SigV4Request.signed_conn(:put, "/lczero") |> call()
+    SigV4Request.signed_conn(:put, "/lczero/now.txt", body: "zero") |> call()
+    touch_latest("lczero", "now.txt", @now)
+
+    :ok =
+      BucketConfigs.put("lczero", :lifecycle, [
+        rule(%{"transition_days" => 0, "transition_storage_class" => "GLACIER"})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.objects_transitioned == 1
+    {:ok, object} = Objects.get_metadata("lczero", "now.txt")
+    assert object.storage_class == "GLACIER"
+  end
+
   test "NoncurrentVersionTransition changes old version storage class and preserves version" do
     SigV4Request.signed_conn(:put, "/lcnct") |> call()
     :ok = Maxio.Buckets.put_versioning("lcnct", "Enabled", nil)
@@ -452,6 +494,36 @@ defmodule Maxio.LifecycleTest do
     assert retained.storage_class == "STANDARD"
     assert_version_status("lcnct", "doc.txt", v1, 200)
     assert_version_status("lcnct", "doc.txt", v2, 200)
+  end
+
+  test "NoncurrentVersionTransition skips Object Lock protected versions" do
+    SigV4Request.signed_conn(:put, "/lcnctlock") |> call()
+    :ok = Maxio.Buckets.put_versioning("lcnctlock", "Enabled", nil)
+
+    v1 = put_object_version!("lcnctlock", "doc.txt", "v1")
+    _v2 = put_object_version!("lcnctlock", "doc.txt", "v2")
+    touch_version("lcnctlock", "doc.txt", v1, DateTime.add(@now, -10 * 86_400, :second))
+    touch_latest("lcnctlock", "doc.txt", DateTime.add(@now, -1 * 86_400, :second))
+
+    lock_version!("lcnctlock", "doc.txt", v1, %{
+      object_lock_mode: "COMPLIANCE",
+      object_lock_retain_until: DateTime.add(@now, 86_400, :second)
+    })
+
+    :ok =
+      BucketConfigs.put("lcnctlock", :lifecycle, [
+        rule(%{
+          "noncurrent_transition_days" => 1,
+          "noncurrent_transition_storage_class" => "GLACIER"
+        })
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.noncurrent_versions_transitioned == 0
+    assert summary.object_lock_protected_actions_skipped == 1
+    {:ok, object} = Objects.get_version("lcnctlock", "doc.txt", v1)
+    assert object.storage_class == "STANDARD"
   end
 
   test "NoncurrentVersionExpiration ordering ignores mutable metadata updated_at" do
