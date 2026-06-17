@@ -373,14 +373,60 @@ defmodule Maxio.LifecycleTest do
     assert (SigV4Request.signed_conn(:get, "/lclockret/governance.txt") |> call()).status == 404
   end
 
-  test "NoncurrentVersionTransition is counted unsupported and never deletes versions" do
+  test "Transition changes current object storage class without changing bytes or last modified" do
+    SigV4Request.signed_conn(:put, "/lctrans") |> call()
+
+    SigV4Request.signed_conn(:put, "/lctrans/cold/doc.txt",
+      body: "transition me",
+      headers: [{"x-amz-storage-class", "STANDARD_IA"}]
+    )
+    |> call()
+
+    written_at = DateTime.add(@now, -3 * 86_400, :second)
+    touch_latest("lctrans", "cold/doc.txt", written_at)
+
+    :ok =
+      BucketConfigs.put("lctrans", :lifecycle, [
+        rule(%{
+          "filter_prefix" => "cold/",
+          "transition_days" => 1,
+          "transition_storage_class" => "GLACIER_IR"
+        })
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.objects_transitioned == 1
+    assert summary.unsupported_rules == 0
+    assert summary.errors == []
+
+    {:ok, object} = Objects.get_metadata("lctrans", "cold/doc.txt")
+    assert object.storage_class == "GLACIER_IR"
+    assert DateTime.compare(object.updated_at, written_at) == :eq
+
+    get = SigV4Request.signed_conn(:get, "/lctrans/cold/doc.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "transition me"
+    assert get_resp_header(get, "x-amz-storage-class") == ["GLACIER_IR"]
+
+    again = Maxio.Lifecycle.run(now: @now)
+    assert again.objects_transitioned == 0
+    assert again.errors == []
+  end
+
+  test "NoncurrentVersionTransition changes old version storage class and preserves version" do
     SigV4Request.signed_conn(:put, "/lcnct") |> call()
     :ok = Maxio.Buckets.put_versioning("lcnct", "Enabled", nil)
 
     v1 = put_object_version!("lcnct", "doc.txt", "v1")
-    _v2 = put_object_version!("lcnct", "doc.txt", "v2")
+    v2 = put_object_version!("lcnct", "doc.txt", "v2")
+    v3 = put_object_version!("lcnct", "doc.txt", "v3")
+    _v4 = put_object_version!("lcnct", "doc.txt", "v4")
 
-    touch_version("lcnct", "doc.txt", v1, DateTime.add(@now, -10 * 86_400, :second))
+    v1_written_at = DateTime.add(@now, -10 * 86_400, :second)
+    touch_version("lcnct", "doc.txt", v1, v1_written_at)
+    touch_version("lcnct", "doc.txt", v2, DateTime.add(@now, -5 * 86_400, :second))
+    touch_version("lcnct", "doc.txt", v3, DateTime.add(@now, -2 * 86_400, :second))
     touch_latest("lcnct", "doc.txt", DateTime.add(@now, -1 * 86_400, :second))
 
     :ok =
@@ -394,10 +440,18 @@ defmodule Maxio.LifecycleTest do
 
     summary = Maxio.Lifecycle.run(now: @now)
 
-    assert summary.unsupported_rules == 1
+    assert summary.unsupported_rules == 0
+    assert summary.noncurrent_versions_transitioned == 1
     assert summary.noncurrent_versions_expired == 0
     assert summary.errors == []
+
+    {:ok, transitioned} = Objects.get_version("lcnct", "doc.txt", v1)
+    {:ok, retained} = Objects.get_version("lcnct", "doc.txt", v2)
+    assert transitioned.storage_class == "GLACIER"
+    assert DateTime.compare(transitioned.updated_at, v1_written_at) == :eq
+    assert retained.storage_class == "STANDARD"
     assert_version_status("lcnct", "doc.txt", v1, 200)
+    assert_version_status("lcnct", "doc.txt", v2, 200)
   end
 
   test "NoncurrentVersionExpiration ordering ignores mutable metadata updated_at" do

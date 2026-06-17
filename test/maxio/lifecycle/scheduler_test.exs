@@ -70,7 +70,9 @@ defmodule Maxio.Lifecycle.SchedulerTest do
       %{
         buckets_scanned: 0,
         objects_expired: 0,
+        objects_transitioned: 0,
         noncurrent_versions_expired: 0,
+        noncurrent_versions_transitioned: 0,
         delete_markers_removed: 0,
         multipart_uploads_aborted: 0,
         mfa_delete_protected_actions_skipped: 0,

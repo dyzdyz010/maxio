@@ -239,6 +239,51 @@ defmodule Maxio.Objects do
     end
   end
 
+  @doc """
+  更新对象版本的 S3 storage class 元数据。version_id=nil 表示当前版本。
+
+  Lifecycle transition 不改变对象字节与 Last-Modified，因此这里只精确写 storage_class/
+  sync 字段，避免 Ecto 自动漂移 updated_at。
+  """
+  @spec put_storage_class(
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          String.t(),
+          non_neg_integer() | nil
+        ) ::
+          {:ok, Object.t()} | {:error, :not_found}
+  def put_storage_class(bucket_name, key, version_id, storage_class, generation \\ nil)
+      when is_binary(storage_class) do
+    fetch =
+      if version_id,
+        do: get_version(bucket_name, key, version_id),
+        else: get_metadata(bucket_name, key)
+
+    case fetch do
+      {:ok, %Object{} = obj} ->
+        set_attrs =
+          [storage_class: storage_class]
+          |> maybe_storage_class_generation(generation)
+
+        from(o in Object, where: o.id == ^obj.id)
+        |> Repo.update_all(set: set_attrs)
+
+        Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
+        get_version(bucket_name, key, obj.version_id)
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
+  defp maybe_storage_class_generation(attrs, generation)
+       when is_integer(generation) and generation >= 0 do
+    attrs ++ [synced_at: DateTime.utc_now(), index_generation: generation]
+  end
+
+  defp maybe_storage_class_generation(attrs, _generation), do: attrs
+
   @doc "按 (bucket, key) 取当前版本（is_latest=true）的对象元数据。delete marker 也会返回（调用方判 is_delete_marker）。"
   @spec get_metadata(String.t(), String.t()) :: {:ok, Object.t()} | {:error, :not_found}
   def get_metadata(bucket_name, key) do

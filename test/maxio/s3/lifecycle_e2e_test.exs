@@ -57,6 +57,35 @@ defmodule Maxio.S3.LifecycleE2ETest do
     refute get.resp_body =~ "<Expiration>"
   end
 
+  test "非法 Transition storage class → 400，不能存成不可执行规则" do
+    SigV4Request.signed_conn(:put, "/lcb3bad") |> call()
+
+    bad =
+      ~s(<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><Transition><Days>1</Days><StorageClass>STANDARD</StorageClass></Transition></Rule></LifecycleConfiguration>)
+
+    res =
+      SigV4Request.signed_conn(:put, "/lcb3bad", query: %{"lifecycle" => ""}, body: bad)
+      |> call()
+
+    assert res.status == 400
+  end
+
+  test "Transition Days=0 对 Glacier 目标合法但对 IA 目标需满足最小天数" do
+    SigV4Request.signed_conn(:put, "/lcb3days") |> call()
+
+    ok =
+      ~s(<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><Transition><Days>0</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>)
+
+    assert (SigV4Request.signed_conn(:put, "/lcb3days", query: %{"lifecycle" => ""}, body: ok)
+            |> call()).status == 200
+
+    bad =
+      ~s(<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><Transition><Days>1</Days><StorageClass>STANDARD_IA</StorageClass></Transition></Rule></LifecycleConfiguration>)
+
+    assert (SigV4Request.signed_conn(:put, "/lcb3days", query: %{"lifecycle" => ""}, body: bad)
+            |> call()).status == 400
+  end
+
   test "非法对象大小 filter → 400，不能静默放宽删除选择器" do
     SigV4Request.signed_conn(:put, "/lcb4") |> call()
 

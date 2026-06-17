@@ -3,8 +3,7 @@ defmodule Maxio.Lifecycle.Scheduler do
   Periodic S3 lifecycle scheduler.
 
   The scheduler is disabled by default and shares the same deterministic executor as
-  `mix maxio.lifecycle.run`: `Maxio.Lifecycle.run/1`. Transition actions remain explicit
-  no-ops in the executor until tiering backends exist.
+  `mix maxio.lifecycle.run`: `Maxio.Lifecycle.run/1`.
   """
   use GenServer
 
@@ -103,7 +102,9 @@ defmodule Maxio.Lifecycle.Scheduler do
     Log.info(
       "lifecycle scheduled sweep complete: buckets=#{Map.get(summary, :buckets_scanned, 0)} " <>
         "objects=#{Map.get(summary, :objects_expired, 0)} " <>
+        "object_transitions=#{Map.get(summary, :objects_transitioned, 0)} " <>
         "noncurrent=#{Map.get(summary, :noncurrent_versions_expired, 0)} " <>
+        "noncurrent_transitions=#{Map.get(summary, :noncurrent_versions_transitioned, 0)} " <>
         "markers=#{Map.get(summary, :delete_markers_removed, 0)} " <>
         "multipart=#{Map.get(summary, :multipart_uploads_aborted, 0)} " <>
         "mfa_skipped=#{Map.get(summary, :mfa_delete_protected_actions_skipped, 0)} " <>

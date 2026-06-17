@@ -134,7 +134,7 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
 
   defp store(cur, "Days", path, v) do
     cond do
-      "Transition" in path -> put_int(cur, "transition_days", v, 1)
+      "Transition" in path -> put_int(cur, "transition_days", v, 0)
       "Expiration" in path -> put_int(cur, "expiration_days", v, 1)
       true -> cur
     end

@@ -9,11 +9,12 @@ defmodule Maxio.S3.Handlers.Lifecycle do
   校验：每 rule 必须有 Status（Enabled|Disabled）；Expiration 不能同时 Days+Date；
   ExpiredObjectDeleteMarker 不能与 Days/Date 共存；数值/Tag filter 必须完整且非正数会被拒；
   NewerNoncurrentVersions 必须为 1..100 且请求含 Filter；≤1000 rule。违反 → MalformedXML/InvalidRequest 400。
-  Transition/NoncurrentVersionTransition 单层 maxio 接受持久化但 no-op（文档化）。
+  Transition/NoncurrentVersionTransition 单层 maxio 接受持久化，执行器会更新对象版本的
+  S3-visible storage class 元数据；真实 tiering 后端迁移仍显式 defer。
   """
   import Plug.Conn
   alias Maxio.{Buckets, BucketConfigs}
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{Error, Log, StorageClass}
   alias Maxio.S3.RequestParsers.Lifecycle, as: Parser
   alias Maxio.S3.Views.Lifecycle, as: View
 
@@ -99,7 +100,8 @@ defmodule Maxio.S3.Handlers.Lifecycle do
       end
 
     status_ok and not_both_days_date and eodm_exclusive and no_parse_errors and
-      scalar_fields_ok and numbers_ok?(r) and newer_noncurrent_filter_ok?(r) and tags_ok?(r)
+      scalar_fields_ok and numbers_ok?(r) and newer_noncurrent_filter_ok?(r) and tags_ok?(r) and
+      transition_fields_ok?(r)
   end
 
   defp valid_rule?(_r), do: false
@@ -125,7 +127,7 @@ defmodule Maxio.S3.Handlers.Lifecycle do
       {"noncurrent_days", 1, nil},
       {"newer_noncurrent_versions", 1, 100},
       {"abort_days_after_initiation", 1, nil},
-      {"transition_days", 1, nil},
+      {"transition_days", 0, nil},
       {"noncurrent_transition_days", 1, nil},
       {"noncurrent_transition_newer_noncurrent_versions", 1, 100},
       {"filter_size_gt", 0, nil},
@@ -166,6 +168,57 @@ defmodule Maxio.S3.Handlers.Lifecycle do
 
       _other ->
         false
+    end
+  end
+
+  defp transition_fields_ok?(r) do
+    current_transition_ok?(r) and noncurrent_transition_ok?(r)
+  end
+
+  defp current_transition_ok?(r) do
+    configured? =
+      r["transition_days"] != nil or r["transition_date"] != nil or
+        r["transition_storage_class"] != nil
+
+    cond do
+      not configured? ->
+        true
+
+      r["transition_days"] != nil and r["transition_date"] != nil ->
+        false
+
+      r["transition_days"] == nil and r["transition_date"] in [nil, ""] ->
+        false
+
+      true ->
+        current_transition_target_ok?(r)
+    end
+  end
+
+  defp current_transition_target_ok?(r) do
+    storage_class = r["transition_storage_class"]
+
+    StorageClass.lifecycle_transition_valid?(storage_class) and
+      (r["transition_days"] == nil or
+         StorageClass.lifecycle_transition_days_valid?(storage_class, r["transition_days"]))
+  end
+
+  defp noncurrent_transition_ok?(r) do
+    configured? =
+      r["noncurrent_transition_days"] != nil or
+        r["noncurrent_transition_newer_noncurrent_versions"] != nil or
+        r["noncurrent_transition_storage_class"] != nil
+
+    cond do
+      not configured? ->
+        true
+
+      r["noncurrent_transition_days"] == nil and
+          r["noncurrent_transition_newer_noncurrent_versions"] == nil ->
+        false
+
+      true ->
+        StorageClass.lifecycle_transition_valid?(r["noncurrent_transition_storage_class"])
     end
   end
 

@@ -74,6 +74,16 @@ defmodule Maxio.S3.RequestParsers.LifecycleTest do
     refute out =~ "<Expiration>"
   end
 
+  test "Transition Days accepts zero for immediate supported transitions" do
+    xml =
+      ~s(<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><Transition><Days>0</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>)
+
+    assert {:ok, [rule]} = P.parse(xml)
+    assert rule["transition_days"] == 0
+    assert rule["transition_storage_class"] == "GLACIER"
+    assert rule["parse_errors"] == []
+  end
+
   test "NoncurrentVersionTransition stays distinct from NoncurrentVersionExpiration" do
     xml =
       ~s(<LifecycleConfiguration><Rule><ID>nct</ID><Status>Enabled</Status><Filter></Filter><NoncurrentVersionTransition><NoncurrentDays>7</NoncurrentDays><NewerNoncurrentVersions>1</NewerNoncurrentVersions><StorageClass>GLACIER</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>)

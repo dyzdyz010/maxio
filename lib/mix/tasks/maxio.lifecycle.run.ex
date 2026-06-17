@@ -10,11 +10,14 @@ defmodule Mix.Tasks.Maxio.Lifecycle.Run do
   Implemented actions:
 
     * current-version Expiration
+    * current-version Transition
     * NoncurrentVersionExpiration
+    * NoncurrentVersionTransition
     * ExpiredObjectDeleteMarker cleanup
     * AbortIncompleteMultipartUpload
 
-  Transition actions remain explicit defers until maxio has tiering backends.
+  Transition actions update S3-visible storage class metadata. Moving bytes into
+  separate tiering backends remains a documented defer.
   MFA Delete buckets skip lifecycle actions that would permanently delete object versions.
   """
   use Mix.Task
@@ -47,7 +50,9 @@ defmodule Mix.Tasks.Maxio.Lifecycle.Run do
     IO.puts(
       "[maxio lifecycle] buckets=#{summary.buckets_scanned} " <>
         "objects_expired=#{summary.objects_expired} " <>
+        "objects_transitioned=#{summary.objects_transitioned} " <>
         "noncurrent_versions_expired=#{summary.noncurrent_versions_expired} " <>
+        "noncurrent_versions_transitioned=#{summary.noncurrent_versions_transitioned} " <>
         "delete_markers_removed=#{summary.delete_markers_removed} " <>
         "multipart_uploads_aborted=#{summary.multipart_uploads_aborted} " <>
         "mfa_delete_protected_actions_skipped=#{summary.mfa_delete_protected_actions_skipped} " <>

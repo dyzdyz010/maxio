@@ -124,6 +124,7 @@ defmodule Maxio.LifecycleObjectLockSidecarTest do
     body = "fresh on sidecar but stale in PG"
 
     {:ok, _bucket} = Buckets.create(bucket, @owner)
+
     {:ok, %{etag: etag}} = Storage.put(bucket, key, version_id, [body], storage_opts(topo))
 
     {:ok, _object} =
@@ -161,18 +162,88 @@ defmodule Maxio.LifecycleObjectLockSidecarTest do
     end
   end
 
-  defp storage_opts(topo) do
+  test "sidecar write authority lifecycle transition updates sidecar before PG index", %{
+    topo: topo
+  } do
+    bucket = "lcostrans"
+    key = "cold.txt"
+    version_id = "null"
+    now = ~U[2026-06-11 00:00:00Z]
+    old = DateTime.add(now, -3 * 86_400, :second)
+    body = "sidecar lifecycle transition"
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+
+    {:ok, %{etag: etag}} =
+      Storage.put(
+        bucket,
+        key,
+        version_id,
+        [body],
+        storage_opts(topo, %{modtime: DateTime.to_unix(old, :nanosecond)})
+      )
+
+    {:ok, _object} =
+      Objects.put_version_with_id(bucket, key, version_id, %{
+        size: byte_size(body),
+        etag: etag,
+        content_type: "text/plain",
+        storage_class: "STANDARD"
+      })
+
+    assert {1, _} =
+             from(o in Object,
+               where: o.bucket_name == ^bucket and o.key == ^key and o.version_id == ^version_id
+             )
+             |> Repo.update_all(set: [inserted_at: old, updated_at: old])
+
+    :ok =
+      BucketConfigs.put(bucket, :lifecycle, [
+        lifecycle_rule(%{"transition_days" => 1, "transition_storage_class" => "GLACIER_IR"})
+      ])
+
+    summary =
+      Maxio.Lifecycle.run(
+        now: now,
+        transport: InProcess,
+        topology: topo,
+        authoritative_source: [write: :sidecar]
+      )
+
+    assert summary.objects_transitioned == 1
+    assert summary.errors == []
+
+    assert %Object{storage_class: "GLACIER_IR"} =
+             Maxio.ObjectMeta.get(
+               bucket,
+               key,
+               version_id,
+               transport: InProcess,
+               topology: topo,
+               authoritative_source: [read: :sidecar],
+               read_prefer_index: false
+             )
+
+    {:ok, indexed} = Objects.get_version(bucket, key, version_id)
+    assert indexed.storage_class == "GLACIER_IR"
+  end
+
+  defp storage_opts(topo, meta_overrides \\ %{}) do
     [
       transport: InProcess,
       topology: topo,
-      object_meta: %{
-        content_type: "text/plain",
-        tags: %{},
-        sse: nil,
-        acl_canned: "private",
-        storage_class: "STANDARD",
-        user_metadata: %{}
-      }
+      object_meta:
+        Map.merge(
+          %{
+            content_type: "text/plain",
+            tags: %{},
+            sse: nil,
+            acl_canned: "private",
+            storage_class: "STANDARD",
+            user_metadata: %{}
+          },
+          meta_overrides
+        )
     ]
   end
 
