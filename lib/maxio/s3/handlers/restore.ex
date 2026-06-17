@@ -24,7 +24,7 @@ defmodule Maxio.S3.Handlers.Restore do
     conn = fetch_query_params(conn)
     _ = ensure_bucket!(bucket)
     :ok = verify_expected_bucket_owner!(conn, bucket)
-    :ok = Maxio.Cluster.Paths.validate_key(key)
+    :ok = validate_object_key!(bucket, key)
 
     version_id =
       conn.query_params
@@ -217,6 +217,19 @@ defmodule Maxio.S3.Handlers.Restore do
               message: "Invalid version id specified",
               resource: "/#{bucket}/#{key}"
             )
+    end
+  end
+
+  defp validate_object_key!(bucket, key) do
+    case Maxio.Cluster.Paths.validate_key(key) do
+      :ok ->
+        :ok
+
+      {:error, :invalid_key} ->
+        raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
+
+      {:error, :key_too_long} ->
+        raise Error.new(:key_too_long, resource: "/#{bucket}/#{key}")
     end
   end
 

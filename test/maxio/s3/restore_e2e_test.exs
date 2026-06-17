@@ -110,5 +110,21 @@ defmodule Maxio.S3.RestoreE2ETest do
     assert object.restore_status == nil
   end
 
+  test "RestoreObject maps invalid object names to structured S3 errors" do
+    SigV4Request.signed_conn(:put, "/restorebadkey") |> call()
+    xml = ~s(<RestoreRequest><Days>1</Days></RestoreRequest>)
+
+    restore =
+      SigV4Request.signed_conn(:post, "/restorebadkey/a/../b",
+        query: %{"restore" => ""},
+        body: xml
+      )
+      |> call()
+
+    assert restore.status == 400
+    assert restore.resp_body =~ "<Code>XMinioInvalidObjectName</Code>"
+    refute restore.resp_body =~ "InternalError"
+  end
+
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
 end
