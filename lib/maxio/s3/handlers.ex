@@ -26,7 +26,8 @@ defmodule Maxio.S3.Handlers do
     Analytics,
     Inventory,
     Replication,
-    ObjectLock
+    ObjectLock,
+    Restore
   }
 
   @spec dispatch(atom(), Plug.Conn.t()) :: Plug.Conn.t()
@@ -44,6 +45,7 @@ defmodule Maxio.S3.Handlers do
   def dispatch(:get_object, conn), do: Object.get(conn)
   def dispatch(:head_object, conn), do: Object.head(conn)
   def dispatch(:get_object_attributes, conn), do: Object.get_attributes(conn)
+  def dispatch(:restore_object, conn), do: Restore.post(conn)
   def dispatch(:delete_object, conn), do: Object.delete(conn)
   def dispatch(:delete_objects, conn), do: Object.delete_objects(conn)
 

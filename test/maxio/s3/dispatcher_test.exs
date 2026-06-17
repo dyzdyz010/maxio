@@ -55,6 +55,16 @@ defmodule Maxio.S3.DispatcherTest do
              Dispatcher.resolve(:bucket, "GET", keys(["attributes"]))
   end
 
+  test "object POST ?restore → restore_object" do
+    assert {:ok, :restore_object} = Dispatcher.resolve(:object, "POST", keys(["restore"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:bucket, "POST", keys(["restore"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["restore"]))
+  end
+
   test "object HEAD → head_object" do
     assert {:ok, :head_object} = Dispatcher.resolve(:object, "HEAD", keys([]))
   end

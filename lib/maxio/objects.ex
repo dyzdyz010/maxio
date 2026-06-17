@@ -37,6 +37,8 @@ defmodule Maxio.Objects do
     :object_lock_mode,
     :object_lock_retain_until,
     :object_lock_legal_hold,
+    :restore_status,
+    :restore_expiry,
     :is_latest,
     :is_delete_marker,
     :synced_at,
@@ -93,6 +95,7 @@ defmodule Maxio.Objects do
         }
         |> Map.merge(SystemHeaders.take(attrs))
         |> Map.merge(object_lock_attrs(attrs))
+        |> Map.merge(restore_attrs(attrs))
         |> Map.merge(placement_attrs(attrs))
 
       Repo.transaction(fn ->
@@ -121,6 +124,8 @@ defmodule Maxio.Objects do
                  :object_lock_mode,
                  :object_lock_retain_until,
                  :object_lock_legal_hold,
+                 :restore_status,
+                 :restore_expiry,
                  :placement_set_id,
                  :placement_pool_id,
                  :placement_topology_hash,
@@ -283,6 +288,46 @@ defmodule Maxio.Objects do
   end
 
   defp maybe_storage_class_generation(attrs, _generation), do: attrs
+
+  @doc """
+  更新对象版本的 S3 RestoreObject 状态。version_id=nil 表示当前版本。
+
+  Restore 状态是 S3 可见元数据，不改变对象字节与 Last-Modified，因此使用
+  `Repo.update_all/2` 精确写 restore 字段，避免 Ecto 自动漂移 updated_at。
+  """
+  @spec put_restore_state(
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          map(),
+          non_neg_integer() | nil
+        ) ::
+          {:ok, Object.t()} | {:error, :not_found}
+  def put_restore_state(bucket_name, key, version_id, attrs, generation \\ nil)
+      when is_map(attrs) do
+    fetch =
+      if version_id,
+        do: get_version(bucket_name, key, version_id),
+        else: get_metadata(bucket_name, key)
+
+    case fetch do
+      {:ok, %Object{} = obj} ->
+        set_attrs =
+          attrs
+          |> Map.take([:restore_status, :restore_expiry])
+          |> Map.to_list()
+          |> maybe_storage_class_generation(generation)
+
+        from(o in Object, where: o.id == ^obj.id)
+        |> Repo.update_all(set: set_attrs)
+
+        Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
+        get_version(bucket_name, key, obj.version_id)
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
 
   @doc "按 (bucket, key) 取当前版本（is_latest=true）的对象元数据。delete marker 也会返回（调用方判 is_delete_marker）。"
   @spec get_metadata(String.t(), String.t()) :: {:ok, Object.t()} | {:error, :not_found}
@@ -460,6 +505,8 @@ defmodule Maxio.Objects do
           :object_lock_mode,
           :object_lock_retain_until,
           :object_lock_legal_hold,
+          :restore_status,
+          :restore_expiry,
           :placement_set_id,
           :placement_pool_id,
           :placement_topology_hash
@@ -504,6 +551,8 @@ defmodule Maxio.Objects do
                     :object_lock_mode,
                     :object_lock_retain_until,
                     :object_lock_legal_hold,
+                    :restore_status,
+                    :restore_expiry,
                     :placement_set_id,
                     :placement_pool_id,
                     :placement_topology_hash,
@@ -760,6 +809,8 @@ defmodule Maxio.Objects do
       row.object_lock_mode != attrs.object_lock_mode or
       compare_datetime(row.object_lock_retain_until, attrs.object_lock_retain_until) or
       row.object_lock_legal_hold != attrs.object_lock_legal_hold or
+      row.restore_status != attrs.restore_status or
+      compare_datetime(row.restore_expiry, attrs.restore_expiry) or
       row.is_latest != attrs.is_latest or
       row.is_delete_marker != attrs.is_delete_marker
   end
@@ -802,6 +853,10 @@ defmodule Maxio.Objects do
       :object_lock_retain_until,
       :object_lock_legal_hold
     ])
+  end
+
+  defp restore_attrs(attrs) do
+    Map.take(attrs, [:restore_status, :restore_expiry])
   end
 
   defp maybe_put_generation(attrs, generation) when is_integer(generation) and generation >= 0,

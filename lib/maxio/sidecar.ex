@@ -95,6 +95,8 @@ defmodule Maxio.Sidecar do
       "object_lock_retain_until" =>
         datetime_to_iso8601(Keyword.get(opts, :object_lock_retain_until)),
       "object_lock_legal_hold" => Keyword.get(opts, :object_lock_legal_hold),
+      "restore_status" => Keyword.get(opts, :restore_status),
+      "restore_expiry" => datetime_to_iso8601(Keyword.get(opts, :restore_expiry)),
       "inline" => Keyword.get(opts, :inline)
     }
 
@@ -179,7 +181,9 @@ defmodule Maxio.Sidecar do
         "sse",
         "object_lock_mode",
         "object_lock_retain_until",
-        "object_lock_legal_hold"
+        "object_lock_legal_hold",
+        "restore_status",
+        "restore_expiry"
       ]
       |> Enum.map(fn k -> {k, Map.get(entry, k)} end)
 
@@ -221,6 +225,8 @@ defmodule Maxio.Sidecar do
       object_lock_mode: e["object_lock_mode"],
       object_lock_retain_until: parse_datetime(e["object_lock_retain_until"]),
       object_lock_legal_hold: e["object_lock_legal_hold"],
+      restore_status: e["restore_status"],
+      restore_expiry: parse_datetime(e["restore_expiry"]),
       sse_algorithm: get_in(e, ["sse", "algo"]),
       sse_envelope: e["sse"] && e["sse"]["envelope"],
       version_id: e["version_id"],
@@ -253,6 +259,8 @@ defmodule Maxio.Sidecar do
       object_lock_mode: e["object_lock_mode"],
       object_lock_retain_until: parse_datetime(e["object_lock_retain_until"]),
       object_lock_legal_hold: e["object_lock_legal_hold"],
+      restore_status: e["restore_status"],
+      restore_expiry: parse_datetime(e["restore_expiry"]),
       sse_algorithm: get_in(e, ["sse", "algo"]),
       # SSE-S3/-C 的封装信封（含 wrapped DEK）。必须随读视图携带——否则 sidecar 读权威下
       # 加密对象 GET 会拿到 sse_algorithm="AES256" 却缺信封，解密时 unwrap_dek(nil) 炸（铁律 3）。

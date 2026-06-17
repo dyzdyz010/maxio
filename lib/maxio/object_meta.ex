@@ -295,6 +295,8 @@ defmodule Maxio.ObjectMeta do
       object_lock_mode: view.object_lock_mode,
       object_lock_retain_until: view.object_lock_retain_until,
       object_lock_legal_hold: view.object_lock_legal_hold,
+      restore_status: view.restore_status,
+      restore_expiry: view.restore_expiry,
       sse_algorithm: view.sse_algorithm,
       # 信封从 sidecar 版本 entry 携带（Sidecar.to_view 读 e["sse"]["envelope"]）——绝不再硬编码 nil。
       # 否则 read=:sidecar 下 SSE-S3 对象 GET 会带 sse_algorithm="AES256" 却无信封，
@@ -442,6 +444,8 @@ defmodule Maxio.ObjectMeta do
         field_diff(:expires, pg.expires, view.expires),
         field_diff(:is_delete_marker, pg.is_delete_marker, view.is_delete_marker),
         field_diff(:storage_class, pg.storage_class, view.storage_class),
+        field_diff(:restore_status, pg.restore_status, view.restore_status),
+        field_diff(:restore_expiry, pg.restore_expiry, view.restore_expiry),
         field_diff(:acl_grants, pg.acl_grants, view.acl_grants)
       ]
       |> Enum.reject(&is_nil/1)

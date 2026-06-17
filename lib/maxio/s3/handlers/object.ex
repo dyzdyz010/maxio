@@ -307,6 +307,7 @@ defmodule Maxio.S3.Handlers.Object do
         # 故 GET 的 304 直接 send_resp(304, "")，412 raise PreconditionFailed（带 XML body，符合 S3）。
         case Conditional.evaluate(conn.req_headers, meta(object), "GET") do
           :proceed ->
+            :ok = ensure_restored_for_get!(object, bucket, key)
             range = parse_range(header(conn, "range"), total)
 
             case range do
@@ -1958,6 +1959,7 @@ defmodule Maxio.S3.Handlers.Object do
     |> put_user_metadata_headers(object)
     |> maybe_tagging_count(object)
     |> put_object_lock_headers(object)
+    |> put_restore_header(object)
   end
 
   defp maybe_put_storage_class(conn, %{storage_class: storage_class})
@@ -1966,6 +1968,33 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   defp maybe_put_storage_class(conn, _object), do: conn
+
+  defp ensure_restored_for_get!(%Objects.Object{} = object, bucket, key) do
+    if archive_storage_class?(object.storage_class) and not restore_active?(object) do
+      raise Error.new(:invalid_object_state, resource: "/#{bucket}/#{key}")
+    end
+
+    :ok
+  end
+
+  defp archive_storage_class?(storage_class), do: storage_class in ["GLACIER", "DEEP_ARCHIVE"]
+
+  defp restore_active?(%{restore_status: "restored", restore_expiry: %DateTime{} = dt}) do
+    DateTime.compare(dt, DateTime.utc_now()) == :gt
+  end
+
+  defp restore_active?(_object), do: false
+
+  defp put_restore_header(conn, %{restore_status: "restored", restore_expiry: %DateTime{} = dt}) do
+    value = ~s(ongoing-request="false", expiry-date="#{http_date(dt)}")
+    put_resp_header(conn, "x-amz-restore", value)
+  end
+
+  defp put_restore_header(conn, %{restore_status: "ongoing"}) do
+    put_resp_header(conn, "x-amz-restore", ~s(ongoing-request="true"))
+  end
+
+  defp put_restore_header(conn, _object), do: conn
 
   # ROUTE B B4-6 fidelity：把对象持久化的用户元数据原样回显为 x-amz-meta-<name> 响应头
   # （name 已去前缀、小写），闭合 PutObject/CopyObject/MPU 写入 → GET/HEAD 读回的 round-trip。

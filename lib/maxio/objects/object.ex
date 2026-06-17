@@ -30,6 +30,8 @@ defmodule Maxio.Objects.Object do
     field :object_lock_mode, :string
     field :object_lock_retain_until, :utc_datetime_usec
     field :object_lock_legal_hold, :string
+    field :restore_status, :string
+    field :restore_expiry, :utc_datetime_usec
     field :placement_set_id, :integer
     field :placement_pool_id, :integer
     field :placement_topology_hash, :string
@@ -68,6 +70,8 @@ defmodule Maxio.Objects.Object do
     :object_lock_mode,
     :object_lock_retain_until,
     :object_lock_legal_hold,
+    :restore_status,
+    :restore_expiry,
     :placement_set_id,
     :placement_pool_id,
     :placement_topology_hash,

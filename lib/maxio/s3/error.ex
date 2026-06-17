@@ -52,6 +52,8 @@ defmodule Maxio.S3.Error do
     invalid_argument: {"InvalidArgument", 400, "Invalid Argument"},
     invalid_storage_class:
       {"InvalidStorageClass", 400, "The storage class that you specified is not valid."},
+    invalid_object_state:
+      {"InvalidObjectState", 403, "The operation is not valid for the object's storage class."},
     invalid_tag:
       {"InvalidTag", 400,
        "The tag provided was not a valid tag. This error can occur if the tag did not pass input validation."},

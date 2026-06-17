@@ -28,6 +28,7 @@ defmodule Maxio.Policy.ActionMap do
   def for_action(:get_object), do: {"s3:GetObject", :object}
   def for_action(:head_object), do: {"s3:GetObject", :object}
   def for_action(:get_object_attributes), do: {"s3:GetObjectAttributes", :object}
+  def for_action(:restore_object), do: {"s3:RestoreObject", :object}
   def for_action(:put_object_retention), do: {"s3:PutObjectRetention", :object}
   def for_action(:get_object_retention), do: {"s3:GetObjectRetention", :object}
   def for_action(:put_object_legal_hold), do: {"s3:PutObjectLegalHold", :object}

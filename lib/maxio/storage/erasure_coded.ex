@@ -736,7 +736,9 @@ defmodule Maxio.Storage.ErasureCoded do
       user_metadata: Map.get(om, :user_metadata, %{}),
       object_lock_mode: Map.get(om, :object_lock_mode),
       object_lock_retain_until: Map.get(om, :object_lock_retain_until),
-      object_lock_legal_hold: Map.get(om, :object_lock_legal_hold)
+      object_lock_legal_hold: Map.get(om, :object_lock_legal_hold),
+      restore_status: Map.get(om, :restore_status),
+      restore_expiry: Map.get(om, :restore_expiry)
     ]
   end
 
