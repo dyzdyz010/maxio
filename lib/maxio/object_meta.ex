@@ -292,6 +292,9 @@ defmodule Maxio.ObjectMeta do
       acl_canned: view.acl_canned,
       acl_grants: view.acl_grants,
       tags: view.tags,
+      object_lock_mode: view.object_lock_mode,
+      object_lock_retain_until: view.object_lock_retain_until,
+      object_lock_legal_hold: view.object_lock_legal_hold,
       sse_algorithm: view.sse_algorithm,
       # 信封从 sidecar 版本 entry 携带（Sidecar.to_view 读 e["sse"]["envelope"]）——绝不再硬编码 nil。
       # 否则 read=:sidecar 下 SSE-S3 对象 GET 会带 sse_algorithm="AES256" 却无信封，

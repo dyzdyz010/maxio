@@ -22,6 +22,7 @@ defmodule Maxio.Lifecycle do
   alias Maxio.Objects
   alias Maxio.Objects.Object
   alias Maxio.Repo
+  alias Maxio.S3.ObjectLock
   alias Maxio.S3.Log
   alias Maxio.Storage
   alias Maxio.Versioning.VersionId
@@ -34,6 +35,7 @@ defmodule Maxio.Lifecycle do
           multipart_uploads_aborted: non_neg_integer(),
           unsupported_rules: non_neg_integer(),
           mfa_delete_protected_actions_skipped: non_neg_integer(),
+          object_lock_protected_actions_skipped: non_neg_integer(),
           errors: [map()]
         }
 
@@ -82,6 +84,7 @@ defmodule Maxio.Lifecycle do
       multipart_uploads_aborted: 0,
       unsupported_rules: 0,
       mfa_delete_protected_actions_skipped: 0,
+      object_lock_protected_actions_skipped: 0,
       errors: []
     }
   end
@@ -131,7 +134,7 @@ defmodule Maxio.Lifecycle do
               skip_mfa_delete_protected_action(acc, object, :expired_delete_marker)
             else
               apply_action(acc, :delete_markers_removed, object, dry_run?, fn ->
-                delete_version(bucket.name, object.key, object.version_id, opts)
+                delete_expired_delete_marker(bucket.name, object, opts)
               end)
             end
           else
@@ -139,12 +142,20 @@ defmodule Maxio.Lifecycle do
           end
 
         not object.is_delete_marker and current_expired?(object, rules, now) ->
-          if mfa_delete_enabled?(bucket) and current_expiration_deletes_version?(bucket) do
-            skip_mfa_delete_protected_action(acc, object, :current_expiration)
-          else
-            apply_action(acc, :objects_expired, object, dry_run?, fn ->
-              expire_current_object(bucket, object, opts)
-            end)
+          cond do
+            mfa_delete_enabled?(bucket) and current_expiration_deletes_version?(bucket) ->
+              skip_mfa_delete_protected_action(acc, object, :current_expiration)
+
+            stale_current_lifecycle_candidate?(object, rules, now, opts) ->
+              acc
+
+            current_expiration_object_lock_protected?(bucket, object, now, opts) ->
+              skip_object_lock_protected_action(acc, object, :current_expiration)
+
+            true ->
+              apply_action(acc, :objects_expired, object, dry_run?, fn ->
+                expire_current_object(bucket, object, rules, now, opts)
+              end)
           end
 
         true ->
@@ -160,12 +171,17 @@ defmodule Maxio.Lifecycle do
       if noncurrent_expired?(candidate, rules, now) do
         object = candidate.object
 
-        if mfa_delete_enabled?(bucket) do
-          skip_mfa_delete_protected_action(acc, object, :noncurrent_version_expiration)
-        else
-          apply_action(acc, :noncurrent_versions_expired, object, dry_run?, fn ->
-            delete_version(bucket.name, object.key, object.version_id, opts)
-          end)
+        cond do
+          mfa_delete_enabled?(bucket) ->
+            skip_mfa_delete_protected_action(acc, object, :noncurrent_version_expiration)
+
+          object_lock_protected_for_lifecycle?(object, now, opts) ->
+            skip_object_lock_protected_action(acc, object, :noncurrent_version_expiration)
+
+          true ->
+            apply_action(acc, :noncurrent_versions_expired, object, dry_run?, fn ->
+              delete_version(bucket.name, object.key, object.version_id, now, opts)
+            end)
         end
       else
         acc
@@ -178,6 +194,89 @@ defmodule Maxio.Lifecycle do
 
   defp current_expiration_deletes_version?(%Bucket{versioning: "Enabled"}), do: false
   defp current_expiration_deletes_version?(%Bucket{}), do: true
+
+  defp current_expiration_object_lock_protected?(
+         %Bucket{versioning: "Suspended"},
+         %Object{} = object,
+         now,
+         opts
+       ) do
+    case locked_null_replacement?(object.bucket_name, object.key, now, opts) do
+      {:ok, protected?} -> protected?
+      {:error, _reason} -> true
+    end
+  end
+
+  defp current_expiration_object_lock_protected?(
+         %Bucket{} = bucket,
+         %Object{} = object,
+         now,
+         opts
+       ) do
+    current_expiration_deletes_version?(bucket) and
+      object_lock_protected_for_lifecycle?(object, now, opts)
+  end
+
+  defp object_lock_protected?(%Object{is_delete_marker: true}, _now), do: false
+
+  defp object_lock_protected?(%Object{} = object, %DateTime{} = now) do
+    ObjectLock.locked?(object, now: now, bypass_governance?: false)
+  end
+
+  defp object_lock_protected_for_lifecycle?(%Object{} = object, now, opts) do
+    case object_lock_protected_authoritatively?(
+           object.bucket_name,
+           object.key,
+           object.version_id,
+           now,
+           opts
+         ) do
+      {:ok, protected?} -> protected?
+      {:error, _reason} -> true
+    end
+  end
+
+  defp object_lock_protected_authoritatively?(bucket, key, version_id, now, opts) do
+    case authoritative_object_version(bucket, key, version_id, opts) do
+      {:ok, %Object{} = object} ->
+        {:ok, object_lock_protected?(object, now)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp authoritative_object_version(bucket, key, version_id, opts) do
+    case Maxio.ObjectMeta.authoritative_source(:write, opts) do
+      :sidecar ->
+        case Maxio.ObjectMeta.get(bucket, key, version_id, sidecar_read_opts(opts)) do
+          %Object{} = object -> {:ok, object}
+          {:error, reason} -> {:error, reason}
+        end
+
+      _pg ->
+        Objects.get_version(bucket, key, version_id)
+    end
+  end
+
+  defp authoritative_latest_object(bucket, key, opts) do
+    case Maxio.ObjectMeta.authoritative_source(:write, opts) do
+      :sidecar ->
+        case Maxio.ObjectMeta.get(bucket, key, nil, sidecar_read_opts(opts)) do
+          %Object{} = object -> {:ok, object}
+          {:error, reason} -> {:error, reason}
+        end
+
+      _pg ->
+        Objects.get_metadata(bucket, key)
+    end
+  end
+
+  defp sidecar_read_opts(opts) do
+    opts
+    |> Keyword.put(:authoritative_source, read: :sidecar)
+    |> Keyword.put(:read_prefer_index, false)
+  end
 
   defp latest_objects(bucket_name) do
     from(o in Object,
@@ -389,39 +488,138 @@ defmodule Maxio.Lifecycle do
     count == 1
   end
 
-  defp expire_current_object(%Bucket{versioning: versioning} = bucket, %Object{} = object, opts) do
-    case versioning do
-      "Enabled" ->
-        put_delete_marker(bucket.name, object.key, VersionId.generate(), opts)
-
-      "Suspended" ->
-        put_delete_marker(bucket.name, object.key, "null", opts)
-
-      _unversioned ->
-        hard_delete_object(bucket.name, object)
+  defp only_version?(%Object{} = object, opts) do
+    case Maxio.ObjectMeta.authoritative_source(:write, opts) do
+      :sidecar -> false
+      _pg -> only_version?(object)
     end
   end
 
-  defp hard_delete_object(bucket, %Object{} = object) do
-    case Maxio.Lock.with_object_lock({bucket, object.key}, fn ->
-           :ok = Objects.delete_metadata(bucket, object.key)
-           _ = Storage.delete(bucket, object.key, "null", Placement.storage_opts(object))
-           :ok
+  defp latest_candidate_still_eligible?(%Object{} = candidate, rules, now, opts) do
+    case authoritative_latest_object(candidate.bucket_name, candidate.key, opts) do
+      {:ok, %Object{is_delete_marker: false} = current} ->
+        if same_version?(current, candidate) and current_expired?(current, rules, now) do
+          :ok
+        else
+          {:error, :stale_candidate}
+        end
+
+      {:ok, %Object{}} ->
+        {:error, :stale_candidate}
+
+      {:error, :not_found} ->
+        {:error, :stale_candidate}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp stale_current_lifecycle_candidate?(%Object{} = candidate, rules, now, opts) do
+    match?(
+      {:error, :stale_candidate},
+      latest_candidate_still_eligible?(candidate, rules, now, opts)
+    )
+  end
+
+  defp same_version?(%Object{} = left, %Object{} = right) do
+    left.bucket_name == right.bucket_name and left.key == right.key and
+      left.version_id == right.version_id
+  end
+
+  defp expire_current_object(
+         %Bucket{versioning: versioning} = bucket,
+         %Object{} = object,
+         rules,
+         now,
+         opts
+       ) do
+    case versioning do
+      "Enabled" ->
+        put_delete_marker(bucket.name, object, VersionId.generate(), rules, now, opts)
+
+      "Suspended" ->
+        put_delete_marker(bucket.name, object, "null", rules, now, opts)
+
+      _unversioned ->
+        hard_delete_object(bucket, object, rules, now, opts)
+    end
+  end
+
+  defp hard_delete_object(%Bucket{} = bucket, %Object{} = object, rules, now, opts) do
+    case Maxio.Lock.with_object_lock({bucket.name, object.key}, fn ->
+           with :ok <- latest_candidate_still_eligible?(object, rules, now, opts),
+                {:ok, false} <-
+                  object_lock_protected_authoritatively?(
+                    bucket.name,
+                    object.key,
+                    object.version_id,
+                    now,
+                    opts
+                  ) do
+             delete_version_authoritative(bucket.name, object.key, object.version_id, opts)
+           else
+             {:ok, true} -> {:error, :object_lock_protected}
+             {:error, :not_found} -> :skipped
+             {:error, :stale_candidate} -> :skipped
+             {:error, reason} -> {:error, reason}
+           end
          end) do
       {:ok, :ok} -> :ok
+      {:ok, :skipped} -> :skipped
+      {:ok, {:error, :object_lock_protected}} -> {:error, :object_lock_protected}
       {:error, :locked} -> {:error, :locked}
     end
   end
 
-  defp put_delete_marker(bucket, key, version_id, opts) do
-    case Maxio.Lock.with_object_lock({bucket, key}, fn ->
-           case Maxio.ObjectMeta.authoritative_source(:write, opts) do
-             :sidecar -> put_delete_marker_sidecar(bucket, key, version_id, opts)
-             _pg -> put_delete_marker_pg(bucket, key, version_id, opts)
+  defp put_delete_marker(bucket, %Object{} = object, version_id, rules, now, opts) do
+    case Maxio.Lock.with_object_lock({bucket, object.key}, fn ->
+           with :ok <- latest_candidate_still_eligible?(object, rules, now, opts),
+                :ok <- reject_locked_null_replacement(bucket, object.key, version_id, now, opts) do
+             put_delete_marker_authoritative(bucket, object.key, version_id, opts)
+           else
+             {:error, :stale_candidate} -> :skipped
+             {:error, reason} -> {:error, reason}
            end
          end) do
       {:ok, result} -> result
       {:error, :locked} -> {:error, :locked}
+    end
+  end
+
+  defp put_delete_marker_authoritative(bucket, key, version_id, opts) do
+    case Maxio.ObjectMeta.authoritative_source(:write, opts) do
+      :sidecar -> put_delete_marker_sidecar(bucket, key, version_id, opts)
+      _pg -> put_delete_marker_pg(bucket, key, version_id, opts)
+    end
+  end
+
+  defp reject_locked_null_replacement(_bucket, _key, version_id, _now, _opts)
+       when version_id != "null",
+       do: :ok
+
+  defp reject_locked_null_replacement(bucket, key, "null", now, opts) do
+    case locked_null_replacement?(bucket, key, now, opts) do
+      {:ok, true} -> {:error, :object_lock_protected}
+      {:ok, false} -> :ok
+      {:error, :not_found} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp locked_null_replacement?(bucket, key, now, opts) do
+    case Maxio.ObjectMeta.authoritative_source(:write, opts) do
+      :sidecar ->
+        object_lock_protected_authoritatively?(bucket, key, "null", now, opts)
+
+      _pg ->
+        case Objects.get_version(bucket, key, "null") do
+          {:ok, %Object{} = object} ->
+            object_lock_protected_authoritatively?(bucket, key, object.version_id, now, opts)
+
+          {:error, :not_found} ->
+            {:ok, false}
+        end
     end
   end
 
@@ -455,7 +653,7 @@ defmodule Maxio.Lifecycle do
   end
 
   defp put_delete_marker_pg(bucket, key, version_id, opts) do
-    old_null_opts = storage_opts_for_version(bucket, key, "null")
+    old_null_opts = storage_opts_for_version(bucket, key, "null", opts)
     {:ok, placement} = Placement.resolve_write(bucket, key, opts)
     placement_storage_opts = Keyword.merge(opts, Placement.storage_opts(placement))
     placement_attrs = Placement.attrs_from_result(placement)
@@ -466,11 +664,11 @@ defmodule Maxio.Lifecycle do
     :ok
   end
 
-  defp delete_version(bucket, key, version_id, opts) do
+  defp delete_version(bucket, key, version_id, now, opts) do
     case Maxio.Lock.with_object_lock({bucket, key}, fn ->
-           case Maxio.ObjectMeta.authoritative_source(:write, opts) do
-             :sidecar -> delete_version_sidecar(bucket, key, version_id)
-             _pg -> delete_version_pg(bucket, key, version_id)
+           case reject_locked_version_delete(bucket, key, version_id, now, opts) do
+             :ok -> delete_version_authoritative(bucket, key, version_id, opts)
+             {:error, reason} -> {:error, reason}
            end
          end) do
       {:ok, result} -> result
@@ -478,13 +676,44 @@ defmodule Maxio.Lifecycle do
     end
   end
 
-  defp delete_version_sidecar(bucket, key, version_id) do
+  defp delete_expired_delete_marker(bucket, %Object{} = object, opts) do
+    case Maxio.Lock.with_object_lock({bucket, object.key}, fn ->
+           with {:ok, %Object{is_delete_marker: true} = marker} <-
+                  authoritative_object_version(bucket, object.key, object.version_id, opts),
+                true <- only_version?(marker, opts) do
+             delete_version_authoritative(bucket, object.key, object.version_id, opts)
+           else
+             _other -> :skipped
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, :locked} -> {:error, :locked}
+    end
+  end
+
+  defp reject_locked_version_delete(bucket, key, version_id, now, opts) do
+    case object_lock_protected_authoritatively?(bucket, key, version_id, now, opts) do
+      {:ok, true} -> {:error, :object_lock_protected}
+      {:ok, false} -> :ok
+      {:error, :not_found} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp delete_version_authoritative(bucket, key, version_id, opts) do
+    case Maxio.ObjectMeta.authoritative_source(:write, opts) do
+      :sidecar -> delete_version_sidecar(bucket, key, version_id, opts)
+      _pg -> delete_version_pg(bucket, key, version_id, opts)
+    end
+  end
+
+  defp delete_version_sidecar(bucket, key, version_id, opts) do
     with :ok <-
            Storage.delete_version(
              bucket,
              key,
              version_id,
-             storage_opts_for_version(bucket, key, version_id)
+             storage_opts_for_version(bucket, key, version_id, opts)
            ) do
       case Objects.delete_version_index(bucket, key, version_id) do
         :ok ->
@@ -503,8 +732,8 @@ defmodule Maxio.Lifecycle do
     end
   end
 
-  defp delete_version_pg(bucket, key, version_id) do
-    storage_opts = storage_opts_for_version(bucket, key, version_id)
+  defp delete_version_pg(bucket, key, version_id, opts) do
+    storage_opts = storage_opts_for_version(bucket, key, version_id, opts)
 
     case Objects.delete_version(bucket, key, version_id) do
       {:ok, _} ->
@@ -516,10 +745,10 @@ defmodule Maxio.Lifecycle do
     end
   end
 
-  defp storage_opts_for_version(bucket, key, version_id) do
+  defp storage_opts_for_version(bucket, key, version_id, opts) do
     case Objects.get_version(bucket, key, version_id) do
-      {:ok, object} -> Placement.storage_opts(object)
-      {:error, :not_found} -> []
+      {:ok, object} -> Keyword.merge(opts, Placement.storage_opts(object))
+      {:error, :not_found} -> opts
     end
   end
 
@@ -597,6 +826,20 @@ defmodule Maxio.Lifecycle do
 
         incr(summary, field)
 
+      :skipped ->
+        Log.info("lifecycle skipped stale object action",
+          action: :lifecycle,
+          bucket: object.bucket_name,
+          key: object.key,
+          version_id: object.version_id,
+          field: field
+        )
+
+        summary
+
+      {:error, :object_lock_protected} ->
+        skip_object_lock_protected_action(summary, object, field)
+
       {:error, reason} ->
         add_error(summary, object.bucket_name, object.key, inspect(reason))
     end
@@ -615,6 +858,18 @@ defmodule Maxio.Lifecycle do
     )
 
     incr(summary, :mfa_delete_protected_actions_skipped)
+  end
+
+  defp skip_object_lock_protected_action(summary, %Object{} = object, reason) do
+    Log.warn("lifecycle skipped Object Lock protected action",
+      action: :lifecycle,
+      bucket: object.bucket_name,
+      key: object.key,
+      version_id: object.version_id,
+      reason: reason
+    )
+
+    incr(summary, :object_lock_protected_actions_skipped)
   end
 
   defp incr(summary, field), do: Map.update!(summary, field, &(&1 + 1))

@@ -51,6 +51,7 @@ defmodule Mix.Tasks.Maxio.Lifecycle.Run do
         "delete_markers_removed=#{summary.delete_markers_removed} " <>
         "multipart_uploads_aborted=#{summary.multipart_uploads_aborted} " <>
         "mfa_delete_protected_actions_skipped=#{summary.mfa_delete_protected_actions_skipped} " <>
+        "object_lock_protected_actions_skipped=#{summary.object_lock_protected_actions_skipped} " <>
         "unsupported_rules=#{summary.unsupported_rules} errors=#{length(summary.errors)}"
     )
 

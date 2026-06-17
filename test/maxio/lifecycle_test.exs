@@ -223,6 +223,156 @@ defmodule Maxio.LifecycleTest do
     assert current.resp_body == "null-live"
   end
 
+  test "Object Lock skips unversioned current Expiration hard delete" do
+    SigV4Request.signed_conn(:put, "/lclockexp") |> call()
+    SigV4Request.signed_conn(:put, "/lclockexp/locked.txt", body: "locked") |> call()
+    touch_latest("lclockexp", "locked.txt", @old)
+    lock_version!("lclockexp", "locked.txt", "null", %{object_lock_legal_hold: "ON"})
+
+    :ok =
+      BucketConfigs.put("lclockexp", :lifecycle, [
+        rule(%{"filter_prefix" => "", "expiration_days" => 1})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.objects_expired == 0
+    assert summary.object_lock_protected_actions_skipped == 1
+    assert summary.errors == []
+
+    get = SigV4Request.signed_conn(:get, "/lclockexp/locked.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "locked"
+  end
+
+  test "Object Lock skips suspended current Expiration that would replace locked null version" do
+    SigV4Request.signed_conn(:put, "/lclocksusp") |> call()
+    :ok = Maxio.Buckets.put_versioning("lclocksusp", "Suspended", nil)
+    SigV4Request.signed_conn(:put, "/lclocksusp/doc.txt", body: "null-live") |> call()
+    touch_latest("lclocksusp", "doc.txt", @old)
+    lock_version!("lclocksusp", "doc.txt", "null", %{object_lock_legal_hold: "ON"})
+
+    :ok =
+      BucketConfigs.put("lclocksusp", :lifecycle, [
+        rule(%{"filter_prefix" => "", "expiration_days" => 1})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.objects_expired == 0
+    assert summary.object_lock_protected_actions_skipped == 1
+    assert summary.errors == []
+
+    current = SigV4Request.signed_conn(:get, "/lclocksusp/doc.txt") |> call()
+    assert current.status == 200
+    assert current.resp_body == "null-live"
+
+    {:ok, object} = Objects.get_metadata("lclocksusp", "doc.txt")
+    refute object.is_delete_marker
+  end
+
+  test "Object Lock does not block versioning-enabled current Expiration delete marker insertion" do
+    SigV4Request.signed_conn(:put, "/lclockenabled") |> call()
+    :ok = Maxio.Buckets.put_versioning("lclockenabled", "Enabled", nil)
+
+    version_id = put_object_version!("lclockenabled", "doc.txt", "v1")
+    touch_latest("lclockenabled", "doc.txt", @old)
+    lock_version!("lclockenabled", "doc.txt", version_id, %{object_lock_legal_hold: "ON"})
+
+    :ok =
+      BucketConfigs.put("lclockenabled", :lifecycle, [
+        rule(%{"filter_prefix" => "", "expiration_days" => 1})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.objects_expired == 1
+    assert summary.object_lock_protected_actions_skipped == 0
+    assert summary.errors == []
+
+    latest = SigV4Request.signed_conn(:get, "/lclockenabled/doc.txt") |> call()
+    assert latest.status == 404
+
+    old =
+      SigV4Request.signed_conn(:get, "/lclockenabled/doc.txt",
+        query: %{"versionId" => version_id}
+      )
+      |> call()
+
+    assert old.status == 200
+    assert old.resp_body == "v1"
+  end
+
+  test "Object Lock skips NoncurrentVersionExpiration permanent delete" do
+    SigV4Request.signed_conn(:put, "/lclocknoncur") |> call()
+    :ok = Maxio.Buckets.put_versioning("lclocknoncur", "Enabled", nil)
+
+    v1 = put_object_version!("lclocknoncur", "doc.txt", "v1")
+    _v2 = put_object_version!("lclocknoncur", "doc.txt", "v2")
+
+    touch_version("lclocknoncur", "doc.txt", v1, DateTime.add(@now, -10 * 86_400, :second))
+    touch_latest("lclocknoncur", "doc.txt", DateTime.add(@now, -1 * 86_400, :second))
+    lock_version!("lclocknoncur", "doc.txt", v1, %{object_lock_legal_hold: "ON"})
+
+    :ok =
+      BucketConfigs.put("lclocknoncur", :lifecycle, [
+        rule(%{"filter_prefix" => "", "noncurrent_days" => 1})
+      ])
+
+    summary = Maxio.Lifecycle.run(now: @now)
+
+    assert summary.noncurrent_versions_expired == 0
+    assert summary.object_lock_protected_actions_skipped == 1
+    assert summary.errors == []
+    assert_version_status("lclocknoncur", "doc.txt", v1, 200)
+  end
+
+  test "Object Lock active retention skips lifecycle delete and expired retention resumes it" do
+    SigV4Request.signed_conn(:put, "/lclockret") |> call()
+    SigV4Request.signed_conn(:put, "/lclockret/compliance.txt", body: "compliance") |> call()
+    SigV4Request.signed_conn(:put, "/lclockret/governance.txt", body: "governance") |> call()
+    touch_objects("lclockret", @old)
+
+    lock_version!("lclockret", "compliance.txt", "null", %{
+      object_lock_mode: "COMPLIANCE",
+      object_lock_retain_until: DateTime.add(@now, 86_400, :second)
+    })
+
+    lock_version!("lclockret", "governance.txt", "null", %{
+      object_lock_mode: "GOVERNANCE",
+      object_lock_retain_until: DateTime.add(@now, 86_400, :second)
+    })
+
+    :ok =
+      BucketConfigs.put("lclockret", :lifecycle, [
+        rule(%{"filter_prefix" => "", "expiration_days" => 1})
+      ])
+
+    blocked = Maxio.Lifecycle.run(now: @now)
+
+    assert blocked.objects_expired == 0
+    assert blocked.object_lock_protected_actions_skipped == 2
+    assert blocked.errors == []
+
+    lock_version!("lclockret", "compliance.txt", "null", %{
+      object_lock_mode: "COMPLIANCE",
+      object_lock_retain_until: DateTime.add(@now, -86_400, :second)
+    })
+
+    lock_version!("lclockret", "governance.txt", "null", %{
+      object_lock_mode: "GOVERNANCE",
+      object_lock_retain_until: DateTime.add(@now, -86_400, :second)
+    })
+
+    expired = Maxio.Lifecycle.run(now: @now)
+
+    assert expired.objects_expired == 2
+    assert expired.object_lock_protected_actions_skipped == 0
+    assert expired.errors == []
+    assert (SigV4Request.signed_conn(:get, "/lclockret/compliance.txt") |> call()).status == 404
+    assert (SigV4Request.signed_conn(:get, "/lclockret/governance.txt") |> call()).status == 404
+  end
+
   test "NoncurrentVersionTransition is counted unsupported and never deletes versions" do
     SigV4Request.signed_conn(:put, "/lcnct") |> call()
     :ok = Maxio.Buckets.put_versioning("lcnct", "Enabled", nil)
@@ -483,6 +633,10 @@ defmodule Maxio.LifecycleTest do
     assert conn.status == 200
     [version_id] = get_resp_header(conn, "x-amz-version-id")
     version_id
+  end
+
+  defp lock_version!(bucket, key, version_id, attrs) do
+    assert {:ok, _object} = Objects.put_object_lock(bucket, key, version_id, attrs)
   end
 
   defp assert_version_status(bucket, key, version_id, status) do
