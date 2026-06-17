@@ -17,6 +17,28 @@ defmodule Maxio.S3.RequestParsers.ObjectLock do
     end
   end
 
+  @spec parse_retention(binary()) :: {:ok, map()} | {:error, :malformed_xml}
+  def parse_retention(xml) when is_binary(xml) do
+    case Saxy.parse_string(xml, __MODULE__, %{stack: [], root: nil, invalid?: false}) do
+      {:ok, %{root: {"Retention", _attrs, children}, invalid?: false}} ->
+        build_retention(children)
+
+      _other ->
+        {:error, :malformed_xml}
+    end
+  end
+
+  @spec parse_legal_hold(binary()) :: {:ok, map()} | {:error, :malformed_xml}
+  def parse_legal_hold(xml) when is_binary(xml) do
+    case Saxy.parse_string(xml, __MODULE__, %{stack: [], root: nil, invalid?: false}) do
+      {:ok, %{root: {"LegalHold", _attrs, children}, invalid?: false}} ->
+        build_legal_hold(children)
+
+      _other ->
+        {:error, :malformed_xml}
+    end
+  end
+
   @impl true
   def handle_event(:start_document, _prolog, state), do: {:ok, state}
 
@@ -128,6 +150,57 @@ defmodule Maxio.S3.RequestParsers.ObjectLock do
         {:halt, :error}
     end)
     |> normalize_result()
+  end
+
+  defp build_retention(children) do
+    children
+    |> structural_children()
+    |> Enum.reduce_while({:ok, %{"Mode" => @unset, "RetainUntilDate" => @unset}}, fn
+      {"Mode", _attrs, children}, {:ok, retention} ->
+        put_once(retention, "Mode", required_text(children))
+
+      {"RetainUntilDate", _attrs, children}, {:ok, retention} ->
+        put_once(retention, "RetainUntilDate", required_text(children))
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> normalize_result()
+    |> case do
+      {:ok, retention} ->
+        try do
+          {:ok, ObjectLock.normalize_object_retention(retention)}
+        rescue
+          _err -> {:error, :malformed_xml}
+        end
+
+      :error ->
+        {:error, :malformed_xml}
+    end
+  end
+
+  defp build_legal_hold(children) do
+    children
+    |> structural_children()
+    |> Enum.reduce_while({:ok, %{"Status" => @unset}}, fn
+      {"Status", _attrs, children}, {:ok, legal_hold} ->
+        put_once(legal_hold, "Status", required_text(children))
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> normalize_result()
+    |> case do
+      {:ok, legal_hold} ->
+        try do
+          {:ok, ObjectLock.normalize_object_legal_hold(legal_hold)}
+        rescue
+          _err -> {:error, :malformed_xml}
+        end
+
+      :error ->
+        {:error, :malformed_xml}
+    end
   end
 
   defp normalize_result({:ok, value}), do: {:ok, normalize_unset_fields(value)}

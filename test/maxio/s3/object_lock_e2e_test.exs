@@ -1,6 +1,8 @@
 defmodule Maxio.S3.ObjectLockE2ETest do
   use Maxio.DataCase, async: false
 
+  import Plug.Conn
+
   alias Maxio.Auth.CredentialStore
   alias Maxio.BucketConfigs
   alias Maxio.Policy.Store
@@ -119,6 +121,105 @@ defmodule Maxio.S3.ObjectLockE2ETest do
 
   defp content_md5(body), do: :crypto.hash(:md5, body) |> Base.encode64()
   defp content_sha256(body), do: :crypto.hash(:sha256, body) |> Base.encode64()
+
+  defp put_object(bucket, key, body, opts \\ []) do
+    SigV4Request.signed_conn(:put, "/#{bucket}/#{key}",
+      body: body,
+      headers: Keyword.get(opts, :headers, [])
+    )
+    |> call()
+  end
+
+  defp get_object(bucket, key, opts) do
+    SigV4Request.signed_conn(:get, "/#{bucket}/#{key}",
+      query: Keyword.get(opts, :query, %{}),
+      headers: Keyword.get(opts, :headers, [])
+    )
+    |> call()
+  end
+
+  defp head_object(bucket, key, opts) do
+    SigV4Request.signed_conn(:head, "/#{bucket}/#{key}",
+      query: Keyword.get(opts, :query, %{}),
+      headers: Keyword.get(opts, :headers, [])
+    )
+    |> call()
+  end
+
+  defp delete_object(bucket, key, opts) do
+    SigV4Request.signed_conn(:delete, "/#{bucket}/#{key}",
+      query: Keyword.get(opts, :query, %{}),
+      headers: Keyword.get(opts, :headers, [])
+    )
+    |> call()
+  end
+
+  defp put_retention(bucket, key, xml, opts) do
+    headers =
+      Keyword.get(opts, :headers, [])
+      |> maybe_add_content_md5(xml, Keyword.get(opts, :content_md5, true))
+
+    query = Map.merge(%{"retention" => ""}, Keyword.get(opts, :query, %{}))
+
+    SigV4Request.signed_conn(:put, "/#{bucket}/#{key}",
+      query: query,
+      body: xml,
+      headers: headers
+    )
+    |> call()
+  end
+
+  defp get_retention(bucket, key, opts) do
+    query = Map.merge(%{"retention" => ""}, Keyword.get(opts, :query, %{}))
+
+    SigV4Request.signed_conn(:get, "/#{bucket}/#{key}", query: query)
+    |> call()
+  end
+
+  defp put_legal_hold(bucket, key, xml, opts) do
+    headers =
+      Keyword.get(opts, :headers, [])
+      |> maybe_add_content_md5(xml, Keyword.get(opts, :content_md5, true))
+
+    query = Map.merge(%{"legal-hold" => ""}, Keyword.get(opts, :query, %{}))
+
+    SigV4Request.signed_conn(:put, "/#{bucket}/#{key}",
+      query: query,
+      body: xml,
+      headers: headers
+    )
+    |> call()
+  end
+
+  defp get_legal_hold(bucket, key, opts) do
+    query = Map.merge(%{"legal-hold" => ""}, Keyword.get(opts, :query, %{}))
+
+    SigV4Request.signed_conn(:get, "/#{bucket}/#{key}", query: query)
+    |> call()
+  end
+
+  defp retention_xml(mode, retain_until) do
+    """
+    <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Mode>#{mode}</Mode>
+      <RetainUntilDate>#{retain_until}</RetainUntilDate>
+    </Retention>
+    """
+  end
+
+  defp legal_hold_xml(status) do
+    """
+    <LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Status>#{status}</Status>
+    </LegalHold>
+    """
+  end
+
+  defp assert_iso8601_equal(actual, expected) do
+    {:ok, actual_dt, 0} = DateTime.from_iso8601(actual)
+    {:ok, expected_dt, 0} = DateTime.from_iso8601(expected)
+    assert DateTime.compare(actual_dt, expected_dt) == :eq
+  end
 
   test "create bucket object lock enables versioning and allows put/get default retention" do
     assert create_bucket("lockcfg", [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
@@ -357,5 +458,271 @@ defmodule Maxio.S3.ObjectLockE2ETest do
     assert allowed.status == 200
     assert get_object_lock("lockcreatefalse").status == 404
     assert BucketConfigs.get("lockcreatefalse", :object_lock) == :none
+  end
+
+  test "object legal hold ON blocks version delete until legal hold is OFF" do
+    assert create_bucket("locklegal", [{"x-amz-bucket-object-lock-enabled", "true"}]).status ==
+             200
+
+    put = put_object("locklegal", "doc.txt", "locked")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_legal_hold("locklegal", "doc.txt", legal_hold_xml("ON"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    legal_hold = get_legal_hold("locklegal", "doc.txt", query: %{"versionId" => version_id})
+    assert legal_hold.status == 200
+    assert legal_hold.resp_body =~ "<Status>ON</Status>"
+
+    denied = delete_object("locklegal", "doc.txt", query: %{"versionId" => version_id})
+    assert denied.status == 403
+    assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+
+    assert put_legal_hold("locklegal", "doc.txt", legal_hold_xml("OFF"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    allowed = delete_object("locklegal", "doc.txt", query: %{"versionId" => version_id})
+    assert allowed.status == 204
+
+    gone = get_object("locklegal", "doc.txt", query: %{"versionId" => version_id})
+    assert gone.status == 404
+  end
+
+  test "governance retention blocks version delete unless bypass governance is authorized" do
+    assert create_bucket("lockgov", [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object("lockgov", "report.txt", "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    retain_until = "2035-01-01T00:00:00Z"
+
+    assert put_retention("lockgov", "report.txt", retention_xml("GOVERNANCE", retain_until),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    retention = get_retention("lockgov", "report.txt", query: %{"versionId" => version_id})
+    assert retention.status == 200
+    assert retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+    assert retention.resp_body =~ "<RetainUntilDate>"
+
+    denied = delete_object("lockgov", "report.txt", query: %{"versionId" => version_id})
+    assert denied.status == 403
+    assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+
+    allowed =
+      delete_object("lockgov", "report.txt",
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+
+    assert allowed.status == 204
+  end
+
+  test "governance bypass header requires explicit bypass permission for object delete" do
+    bucket = "lockgovauthz"
+    key = "report.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    delete_only_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:DeleteObjectVersion","Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    assert :ok = Store.put_principal_policy(@alice_arn, "delete-lock-version", delete_only_policy)
+
+    denied =
+      alice(:delete, "/#{bucket}/#{key}",
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+      |> call()
+
+    assert denied.status == 403
+    assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+
+    bypass_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    assert :ok = Store.put_principal_policy(@alice_arn, "bypass-lock-version", bypass_policy)
+
+    allowed =
+      alice(:delete, "/#{bucket}/#{key}",
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+      |> call()
+
+    assert allowed.status == 204
+  end
+
+  test "governance retention update bypass requires explicit bypass permission" do
+    bucket = "lockputgovauthz"
+    key = "report.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    put_retention_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    assert :ok =
+             Store.put_principal_policy(@alice_arn, "put-lock-retention", put_retention_policy)
+
+    denied =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        body: retention_xml("GOVERNANCE", "2034-01-01T00:00:00Z"),
+        headers: [
+          {"content-md5", content_md5(retention_xml("GOVERNANCE", "2034-01-01T00:00:00Z"))},
+          {"x-amz-bypass-governance-retention", "true"}
+        ]
+      )
+      |> call()
+
+    assert denied.status == 403
+    assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+
+    bypass_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    assert :ok = Store.put_principal_policy(@alice_arn, "bypass-lock-retention", bypass_policy)
+
+    allowed =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        body: retention_xml("GOVERNANCE", "2034-01-01T00:00:00Z"),
+        headers: [
+          {"content-md5", content_md5(retention_xml("GOVERNANCE", "2034-01-01T00:00:00Z"))},
+          {"x-amz-bypass-governance-retention", "true"}
+        ]
+      )
+      |> call()
+
+    assert allowed.status == 200
+  end
+
+  test "compliance retention blocks version delete even with governance bypass header" do
+    assert create_bucket("lockcomp", [{"x-amz-bucket-object-lock-enabled", "true"}]).status ==
+             200
+
+    put = put_object("lockcomp", "audit.txt", "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(
+             "lockcomp",
+             "audit.txt",
+             retention_xml("COMPLIANCE", "2035-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    denied =
+      delete_object("lockcomp", "audit.txt",
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+
+    assert denied.status == 403
+    assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+
+    still_there = get_object("lockcomp", "audit.txt", query: %{"versionId" => version_id})
+    assert still_there.status == 200
+    assert still_there.resp_body == "v1"
+  end
+
+  test "default retention applies to PutObject and object lock headers are returned" do
+    assert create_bucket("lockdefault", [{"x-amz-bucket-object-lock-enabled", "true"}]).status ==
+             200
+
+    assert put_object_lock("lockdefault", @governance).status == 200
+
+    put = put_object("lockdefault", "default.txt", "body")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    get = get_object("lockdefault", "default.txt", query: %{"versionId" => version_id})
+    assert get.status == 200
+    assert get.resp_body == "body"
+    assert get_resp_header(get, "x-amz-object-lock-mode") == ["GOVERNANCE"]
+    assert [_retain_until] = get_resp_header(get, "x-amz-object-lock-retain-until-date")
+
+    head = head_object("lockdefault", "default.txt", query: %{"versionId" => version_id})
+    assert head.status == 200
+    assert get_resp_header(head, "x-amz-object-lock-mode") == ["GOVERNANCE"]
+    assert [_retain_until] = get_resp_header(head, "x-amz-object-lock-retain-until-date")
+
+    denied = delete_object("lockdefault", "default.txt", query: %{"versionId" => version_id})
+    assert denied.status == 403
+  end
+
+  test "explicit object lock upload headers require checksum and enabled object lock bucket" do
+    assert create_bucket("lockupload", [{"x-amz-bucket-object-lock-enabled", "true"}]).status ==
+             200
+
+    retain_until = "2035-01-01T00:00:00Z"
+
+    missing_checksum =
+      put_object("lockupload", "explicit.txt", "body",
+        headers: [
+          {"x-amz-object-lock-mode", "GOVERNANCE"},
+          {"x-amz-object-lock-retain-until-date", retain_until},
+          {"x-amz-object-lock-legal-hold", "ON"}
+        ]
+      )
+
+    assert missing_checksum.status == 400
+    assert missing_checksum.resp_body =~ "InvalidRequest"
+
+    put =
+      put_object("lockupload", "explicit.txt", "body",
+        headers: [
+          {"content-md5", content_md5("body")},
+          {"x-amz-object-lock-mode", "GOVERNANCE"},
+          {"x-amz-object-lock-retain-until-date", retain_until},
+          {"x-amz-object-lock-legal-hold", "ON"}
+        ]
+      )
+
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    get = get_object("lockupload", "explicit.txt", query: %{"versionId" => version_id})
+    assert get.resp_body == "body"
+    assert get_resp_header(get, "x-amz-object-lock-mode") == ["GOVERNANCE"]
+    [actual_retain_until] = get_resp_header(get, "x-amz-object-lock-retain-until-date")
+    assert_iso8601_equal(actual_retain_until, retain_until)
+    assert get_resp_header(get, "x-amz-object-lock-legal-hold") == ["ON"]
+
+    assert create_bucket("lockuploadplain").status == 200
+
+    disabled =
+      put_object("lockuploadplain", "plain.txt", "body",
+        headers: [
+          {"content-md5", content_md5("body")},
+          {"x-amz-object-lock-mode", "GOVERNANCE"},
+          {"x-amz-object-lock-retain-until-date", retain_until}
+        ]
+      )
+
+    assert disabled.status == 409
+    assert disabled.resp_body =~ "InvalidBucketState"
   end
 end

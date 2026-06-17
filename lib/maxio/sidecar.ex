@@ -91,6 +91,10 @@ defmodule Maxio.Sidecar do
       "acl_canned" => Keyword.get(opts, :acl_canned, "private"),
       "acl_grants" => Keyword.get(opts, :acl_grants, %{"grants" => []}),
       "storage_class" => Keyword.get(opts, :storage_class, "STANDARD"),
+      "object_lock_mode" => Keyword.get(opts, :object_lock_mode),
+      "object_lock_retain_until" =>
+        datetime_to_iso8601(Keyword.get(opts, :object_lock_retain_until)),
+      "object_lock_legal_hold" => Keyword.get(opts, :object_lock_legal_hold),
       "inline" => Keyword.get(opts, :inline)
     }
 
@@ -172,7 +176,10 @@ defmodule Maxio.Sidecar do
         "storage_class",
         "tags",
         "user_metadata",
-        "sse"
+        "sse",
+        "object_lock_mode",
+        "object_lock_retain_until",
+        "object_lock_legal_hold"
       ]
       |> Enum.map(fn k -> {k, Map.get(entry, k)} end)
 
@@ -211,6 +218,9 @@ defmodule Maxio.Sidecar do
       acl_canned: e["acl_canned"] || "private",
       acl_grants: e["acl_grants"] || %{"grants" => []},
       tags: e["tags"] || %{},
+      object_lock_mode: e["object_lock_mode"],
+      object_lock_retain_until: parse_datetime(e["object_lock_retain_until"]),
+      object_lock_legal_hold: e["object_lock_legal_hold"],
       sse_algorithm: get_in(e, ["sse", "algo"]),
       sse_envelope: e["sse"] && e["sse"]["envelope"],
       version_id: e["version_id"],
@@ -240,6 +250,9 @@ defmodule Maxio.Sidecar do
       acl_canned: e["acl_canned"] || "private",
       acl_grants: e["acl_grants"] || %{"grants" => []},
       tags: e["tags"] || %{},
+      object_lock_mode: e["object_lock_mode"],
+      object_lock_retain_until: parse_datetime(e["object_lock_retain_until"]),
+      object_lock_legal_hold: e["object_lock_legal_hold"],
       sse_algorithm: get_in(e, ["sse", "algo"]),
       # SSE-S3/-C 的封装信封（含 wrapped DEK）。必须随读视图携带——否则 sidecar 读权威下
       # 加密对象 GET 会拿到 sse_algorithm="AES256" 却缺信封，解密时 unwrap_dek(nil) 炸（铁律 3）。
@@ -258,5 +271,21 @@ defmodule Maxio.Sidecar do
   end
 
   defp sort_key(e), do: {e["modtime"] || 0, e["generation"] || 0, e["version_id"] || ""}
+  defp datetime_to_iso8601(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+  defp datetime_to_iso8601(nil), do: nil
+  defp datetime_to_iso8601(value), do: value
+
+  defp parse_datetime(nil), do: nil
+  defp parse_datetime(%DateTime{} = dt), do: dt
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> dt
+      _other -> nil
+    end
+  end
+
+  defp parse_datetime(_value), do: nil
+
   defp now_ns, do: System.os_time(:nanosecond)
 end

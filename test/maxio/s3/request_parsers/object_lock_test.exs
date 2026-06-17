@@ -98,4 +98,44 @@ defmodule Maxio.S3.RequestParsers.ObjectLockTest do
       assert {:error, :malformed_xml} = ObjectLock.parse(xml)
     end
   end
+
+  test "parses object retention XML" do
+    assert {:ok,
+            %{
+              object_lock_mode: "GOVERNANCE",
+              object_lock_retain_until: ~U[2030-01-02 03:04:05Z]
+            }} =
+             ObjectLock.parse_retention("""
+             <Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+               <Mode>GOVERNANCE</Mode>
+               <RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate>
+             </Retention>
+             """)
+  end
+
+  test "parses object legal hold XML" do
+    assert {:ok, %{object_lock_legal_hold: "ON"}} =
+             ObjectLock.parse_legal_hold("""
+             <LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+               <Status>ON</Status>
+             </LegalHold>
+             """)
+  end
+
+  test "rejects invalid object retention and legal hold shapes" do
+    assert {:error, :malformed_xml} =
+             ObjectLock.parse_retention("""
+             <Retention><Mode>GOVERNANCE</Mode></Retention>
+             """)
+
+    assert {:error, :malformed_xml} =
+             ObjectLock.parse_retention("""
+             <Retention><Mode>LEGAL</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>
+             """)
+
+    assert {:error, :malformed_xml} =
+             ObjectLock.parse_legal_hold("""
+             <LegalHold><Status>MAYBE</Status></LegalHold>
+             """)
+  end
 end

@@ -34,6 +34,9 @@ defmodule Maxio.Objects do
     :tags,
     :sse_algorithm,
     :sse_envelope,
+    :object_lock_mode,
+    :object_lock_retain_until,
+    :object_lock_legal_hold,
     :is_latest,
     :is_delete_marker,
     :synced_at,
@@ -89,6 +92,7 @@ defmodule Maxio.Objects do
           index_generation: Map.get(attrs, :generation, 0)
         }
         |> Map.merge(SystemHeaders.take(attrs))
+        |> Map.merge(object_lock_attrs(attrs))
         |> Map.merge(placement_attrs(attrs))
 
       Repo.transaction(fn ->
@@ -114,6 +118,9 @@ defmodule Maxio.Objects do
                  :acl_grants,
                  :sse_algorithm,
                  :sse_envelope,
+                 :object_lock_mode,
+                 :object_lock_retain_until,
+                 :object_lock_legal_hold,
                  :placement_set_id,
                  :placement_pool_id,
                  :placement_topology_hash,
@@ -405,6 +412,9 @@ defmodule Maxio.Objects do
           :tags,
           :sse_algorithm,
           :sse_envelope,
+          :object_lock_mode,
+          :object_lock_retain_until,
+          :object_lock_legal_hold,
           :placement_set_id,
           :placement_pool_id,
           :placement_topology_hash
@@ -446,6 +456,9 @@ defmodule Maxio.Objects do
                     :acl_grants,
                     :sse_algorithm,
                     :sse_envelope,
+                    :object_lock_mode,
+                    :object_lock_retain_until,
+                    :object_lock_legal_hold,
                     :placement_set_id,
                     :placement_pool_id,
                     :placement_topology_hash,
@@ -699,8 +712,35 @@ defmodule Maxio.Objects do
       (row.acl_grants || %{"grants" => []}) != attrs.acl_grants or
       row.sse_algorithm != attrs.sse_algorithm or
       row.sse_envelope != attrs.sse_envelope or
+      row.object_lock_mode != attrs.object_lock_mode or
+      compare_datetime(row.object_lock_retain_until, attrs.object_lock_retain_until) or
+      row.object_lock_legal_hold != attrs.object_lock_legal_hold or
       row.is_latest != attrs.is_latest or
       row.is_delete_marker != attrs.is_delete_marker
+  end
+
+  @doc "更新对象版本的 Object Lock retention/legal-hold 元数据。version_id=nil 表示当前版本。"
+  @spec put_object_lock(String.t(), String.t(), String.t() | nil, map(), non_neg_integer() | nil) ::
+          {:ok, Object.t()} | {:error, :not_found}
+  def put_object_lock(bucket_name, key, version_id, attrs, generation \\ nil) do
+    fetch =
+      if version_id,
+        do: get_version(bucket_name, key, version_id),
+        else: get_metadata(bucket_name, key)
+
+    case fetch do
+      {:ok, %Object{} = obj} ->
+        obj =
+          obj
+          |> Object.changeset(attrs |> object_lock_attrs() |> maybe_put_generation(generation))
+          |> Repo.update!()
+
+        Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
+        {:ok, obj}
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
   end
 
   # sidecar 版本 entry 的 generation（缺失/非整数 → 0，与 Sidecar 排序键同兜底）。
@@ -710,6 +750,26 @@ defmodule Maxio.Objects do
   defp placement_attrs(attrs) do
     Map.take(attrs, [:placement_set_id, :placement_pool_id, :placement_topology_hash])
   end
+
+  defp object_lock_attrs(attrs) do
+    Map.take(attrs, [
+      :object_lock_mode,
+      :object_lock_retain_until,
+      :object_lock_legal_hold
+    ])
+  end
+
+  defp maybe_put_generation(attrs, generation) when is_integer(generation) and generation >= 0,
+    do: Map.put(attrs, :index_generation, generation)
+
+  defp maybe_put_generation(attrs, _generation), do: attrs
+
+  defp compare_datetime(nil, nil), do: false
+
+  defp compare_datetime(%DateTime{} = left, %DateTime{} = right),
+    do: DateTime.compare(left, right) != :eq
+
+  defp compare_datetime(left, right), do: left != right
 
   defp where_expected(query, field, nil) do
     where(query, [o], is_nil(field(o, ^field)))

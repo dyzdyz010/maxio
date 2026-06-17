@@ -669,7 +669,10 @@ defmodule Maxio.Storage.FS do
       acl_canned: Map.get(om, :acl_canned, "private"),
       acl_grants: Map.get(om, :acl_grants, %{"grants" => []}),
       storage_class: Map.get(om, :storage_class, "STANDARD"),
-      user_metadata: Map.get(om, :user_metadata, %{})
+      user_metadata: Map.get(om, :user_metadata, %{}),
+      object_lock_mode: Map.get(om, :object_lock_mode),
+      object_lock_retain_until: Map.get(om, :object_lock_retain_until),
+      object_lock_legal_hold: Map.get(om, :object_lock_legal_hold)
     ]
   end
 

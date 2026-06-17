@@ -130,4 +130,8 @@ defmodule Maxio.S3.Handlers do
 
   def dispatch(:put_bucket_object_lock_configuration, conn), do: ObjectLock.put(conn)
   def dispatch(:get_bucket_object_lock_configuration, conn), do: ObjectLock.get(conn)
+  def dispatch(:put_object_retention, conn), do: ObjectLock.put_retention(conn)
+  def dispatch(:get_object_retention, conn), do: ObjectLock.get_retention(conn)
+  def dispatch(:put_object_legal_hold, conn), do: ObjectLock.put_legal_hold(conn)
+  def dispatch(:get_object_legal_hold, conn), do: ObjectLock.get_legal_hold(conn)
 end

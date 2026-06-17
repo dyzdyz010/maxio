@@ -27,6 +27,9 @@ defmodule Maxio.Objects.Object do
     field :tags, :map, default: %{}
     field :sse_algorithm, :string
     field :sse_envelope, :map
+    field :object_lock_mode, :string
+    field :object_lock_retain_until, :utc_datetime_usec
+    field :object_lock_legal_hold, :string
     field :placement_set_id, :integer
     field :placement_pool_id, :integer
     field :placement_topology_hash, :string
@@ -62,6 +65,9 @@ defmodule Maxio.Objects.Object do
     :tags,
     :sse_algorithm,
     :sse_envelope,
+    :object_lock_mode,
+    :object_lock_retain_until,
+    :object_lock_legal_hold,
     :placement_set_id,
     :placement_pool_id,
     :placement_topology_hash,

@@ -247,6 +247,24 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:error, :method_not_allowed} =
              Dispatcher.resolve(:object, "GET", keys(["object-lock"]))
 
+    assert {:ok, :put_object_retention} =
+             Dispatcher.resolve(:object, "PUT", keys(["retention"]))
+
+    assert {:ok, :get_object_retention} =
+             Dispatcher.resolve(:object, "GET", keys(["retention"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:bucket, "GET", keys(["retention"]))
+
+    assert {:ok, :put_object_legal_hold} =
+             Dispatcher.resolve(:object, "PUT", keys(["legal-hold"]))
+
+    assert {:ok, :get_object_legal_hold} =
+             Dispatcher.resolve(:object, "GET", keys(["legal-hold"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:bucket, "GET", keys(["legal-hold"]))
+
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))
   end

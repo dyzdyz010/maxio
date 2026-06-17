@@ -100,6 +100,10 @@ defmodule Maxio.Policy.ActionMapTest do
     assert ActionMap.for_action(:get_object) == {"s3:GetObject", :object}
     assert ActionMap.for_action(:head_object) == {"s3:GetObject", :object}
     assert ActionMap.for_action(:get_object_attributes) == {"s3:GetObjectAttributes", :object}
+    assert ActionMap.for_action(:put_object_retention) == {"s3:PutObjectRetention", :object}
+    assert ActionMap.for_action(:get_object_retention) == {"s3:GetObjectRetention", :object}
+    assert ActionMap.for_action(:put_object_legal_hold) == {"s3:PutObjectLegalHold", :object}
+    assert ActionMap.for_action(:get_object_legal_hold) == {"s3:GetObjectLegalHold", :object}
     assert ActionMap.for_action(:upload_part) == {"s3:PutObject", :object}
     assert ActionMap.for_action(:list_parts) == {"s3:ListMultipartUploadParts", :object}
   end

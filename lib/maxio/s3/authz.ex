@@ -230,6 +230,16 @@ defmodule Maxio.S3.Authz do
           conditions
         )
 
+        maybe_authorize_bypass_governance(
+          conn,
+          action,
+          bucket,
+          key,
+          principal,
+          authenticated?,
+          conditions
+        )
+
         :ok
 
       {:deny, reason} ->
@@ -428,6 +438,18 @@ defmodule Maxio.S3.Authz do
       else: "s3:GetObjectAttributes"
   end
 
+  defp effective_required_action(:get_object_retention, _required_action, conn) do
+    if version_request?(request_version_id(conn)),
+      do: "s3:GetObjectVersion",
+      else: "s3:GetObjectRetention"
+  end
+
+  defp effective_required_action(:get_object_legal_hold, _required_action, conn) do
+    if version_request?(request_version_id(conn)),
+      do: "s3:GetObjectVersion",
+      else: "s3:GetObjectLegalHold"
+  end
+
   defp effective_required_action(_action, required_action, _conn), do: required_action
 
   defp version_acl_request?(nil), do: false
@@ -543,6 +565,11 @@ defmodule Maxio.S3.Authz do
       "x-amz-server-side-encryption"
     )
     |> maybe_put_header(conn, "s3:x-amz-copy-source", "x-amz-copy-source")
+    |> maybe_put_header(
+      conn,
+      "s3:object-lock-remaining-retention-days",
+      "x-amz-object-lock-retain-until-date"
+    )
   end
 
   defp put_inventory_optional_fields_condition(conds, []), do: conds
@@ -872,6 +899,43 @@ defmodule Maxio.S3.Authz do
   end
 
   defp maybe_authorize_create_bucket_object_lock(_conn, _action, _bucket, _p, _a, _c), do: :ok
+
+  defp maybe_authorize_bypass_governance(
+         conn,
+         action,
+         bucket,
+         key,
+         principal,
+         authenticated?,
+         conditions
+       )
+       when action in [:put_object_retention, :delete_object] and is_binary(bucket) and
+              is_binary(key) do
+    if bypass_governance_header?(conn) do
+      authorize_additional_action!(
+        conn,
+        :bypass_governance_retention,
+        "s3:BypassGovernanceRetention",
+        :object,
+        bucket,
+        key,
+        principal,
+        authenticated?,
+        conditions
+      )
+    else
+      :ok
+    end
+  end
+
+  defp maybe_authorize_bypass_governance(_conn, _action, _bucket, _key, _p, _a, _c), do: :ok
+
+  defp bypass_governance_header?(conn) do
+    case get_req_header(conn, "x-amz-bypass-governance-retention") do
+      [value] -> value |> String.trim() |> String.downcase() == "true"
+      _other -> false
+    end
+  end
 
   defp create_bucket_object_lock_enabled?(conn) do
     case get_req_header(conn, "x-amz-bucket-object-lock-enabled") do

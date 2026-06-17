@@ -21,6 +21,7 @@ defmodule Maxio.S3.Handlers.Object do
     SSE,
     StorageClass,
     SystemHeaders,
+    ObjectLock,
     XML
   }
 
@@ -66,6 +67,9 @@ defmodule Maxio.S3.Handlers.Object do
         do: Maxio.Versioning.VersionId.generate(),
         else: "null"
 
+    :ok = ObjectLock.validate_object_lock_upload_headers!(conn)
+    object_lock_attrs = object_lock_attrs_for_write!(conn, bucket)
+
     user_metadata = parse_user_metadata(conn)
     :ok = Maxio.Metadata.validate_size!(user_metadata)
 
@@ -91,6 +95,8 @@ defmodule Maxio.S3.Handlers.Object do
     # PutObject body/checksum state is created only after static validation and object lock.
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        :ok = reject_locked_null_overwrite!(bucket, key, version_id, conn)
+
         {body_stream, get_trailers, discard_trailers} =
           BodyReader.stream_with_trailers(conn, payload_mode)
 
@@ -121,7 +127,8 @@ defmodule Maxio.S3.Handlers.Object do
               sse_envelope,
               user_metadata,
               visible_size,
-              acl_input
+              acl_input,
+              object_lock_attrs
             )
 
           before_object_commit = fn %{size: stored_size, sha256: sha256} ->
@@ -171,6 +178,7 @@ defmodule Maxio.S3.Handlers.Object do
                       sse_envelope: sse_envelope
                     }
                     |> Map.merge(system_headers)
+                    |> Map.merge(object_lock_attrs)
                     |> Map.merge(Placement.attrs_from_result(write_result))
 
                   {commit_metadata(bucket, key, version_id, attrs), checksum}
@@ -550,6 +558,13 @@ defmodule Maxio.S3.Handlers.Object do
     # ——尤其 :write=:sidecar 下 Storage.delete_version 直接以 versionId 构造盘路径）。
     :ok = validate_version_id!(bucket, key, version_id)
     versioning = bucket_meta.versioning
+    principal = conn.assigns[:principal]
+    authenticated? = principal != :anonymous
+    conditions = Maxio.S3.Authz.conditions_for(conn, authenticated?)
+    owner? = Maxio.S3.Authz.owner?(principal, bucket)
+
+    delete_opts =
+      object_lock_delete_opts(conn, bucket, key, principal, authenticated?, owner?, conditions)
 
     cond do
       version_id != nil ->
@@ -558,7 +573,7 @@ defmodule Maxio.S3.Handlers.Object do
         # 永久删除指定版本（含 delete marker）。ROUTE B fidelity：按写权威分流的单一提交路径
         # commit_version_delete（:sidecar → 盘上 quorum 删除即权威提交，quorum 不足 503 绝不 204；
         # :pg → PG 删行权威先行），与 DeleteObjects 的 do_delete_one 共用。幂等：不存在也 204。
-        %{was_delete_marker: dm?} = commit_version_delete(bucket, key, version_id)
+        %{was_delete_marker: dm?} = commit_version_delete(bucket, key, version_id, delete_opts)
         Log.info("delete object version", action: :delete_object, bucket: bucket, key: key)
 
         conn
@@ -585,6 +600,7 @@ defmodule Maxio.S3.Handlers.Object do
         # Unversioned：真删（删 null 行 + 字节）。B1-1：元数据 + 字节删除纳入同一对象锁，
         # 避免与并发同 key PUT 的提交 seam 交错（获锁失败 -> 503 RequestTimeout，铁律 3）。
         case Maxio.Lock.with_object_lock({bucket, key}, fn ->
+               :ok = reject_locked_version_delete!(bucket, key, "null", delete_opts)
                storage_opts = storage_opts_for_current(bucket, key)
                :ok = Objects.delete_metadata(bucket, key)
                _ = Storage.delete(bucket, key, "null", storage_opts)
@@ -638,7 +654,18 @@ defmodule Maxio.S3.Handlers.Object do
              owner?,
              conditions
            ) do
-          case delete_one(bucket, obj, versioning) do
+          delete_opts =
+            object_lock_delete_opts(
+              conn,
+              bucket,
+              obj.key,
+              principal,
+              authenticated?,
+              owner?,
+              conditions
+            )
+
+          case delete_one(bucket, obj, versioning, delete_opts) do
             {:ok, entry} -> {[entry | dacc], eacc}
             {:error, err} -> {dacc, [err | eacc]}
           end
@@ -680,8 +707,8 @@ defmodule Maxio.S3.Handlers.Object do
   # deleted_entry_map 字段：:key 必有；:version_id / :delete_marker / :delete_marker_version_id 可选。
   # S3 DeleteObjects 的失败是 per-key 的（回 <Error>），单 key 出错绝不让整批 500（铁律 3：不静默、
   # 不连坐丢成功项）。故底层 DB/Storage 抛错时降级为该 key 的结构化 <Error> 条目并打日志。
-  defp delete_one(bucket, %{key: key, version_id: version_id}, versioning) do
-    do_delete_one(bucket, key, version_id, versioning)
+  defp delete_one(bucket, %{key: key, version_id: version_id}, versioning, delete_opts) do
+    do_delete_one(bucket, key, version_id, versioning, delete_opts)
   rescue
     err ->
       s3err = as_s3_error(err)
@@ -699,7 +726,7 @@ defmodule Maxio.S3.Handlers.Object do
       {:error, %{key: key, version_id: version_id, code: s3err.code, message: s3err.message}}
   end
 
-  defp do_delete_one(bucket, key, version_id, versioning) do
+  defp do_delete_one(bucket, key, version_id, versioning, delete_opts) do
     cond do
       version_id != nil ->
         # B6-2a（修 B5-4 的 Code 偏离）：批量删除的 per-key 畸形 versionId → 该 key
@@ -718,7 +745,7 @@ defmodule Maxio.S3.Handlers.Object do
         # 永久删指定版本（含 delete marker）。幂等：删不存在的版本也算成功。ROUTE B fidelity：
         # 与单删 delete/1 同一 commit_version_delete 提交路径（:sidecar 写权威下盘上 quorum 删除
         # 即权威提交；quorum 不足上抛 SlowDownWrite，由 delete_one 的 rescue 降为该 key 的 <Error>）。
-        %{was_delete_marker: dm?} = commit_version_delete(bucket, key, version_id)
+        %{was_delete_marker: dm?} = commit_version_delete(bucket, key, version_id, delete_opts)
         {:ok, %{key: key, version_id: version_id, delete_marker: dm?}}
 
       versioning in ["Enabled", "Suspended"] ->
@@ -729,6 +756,7 @@ defmodule Maxio.S3.Handlers.Object do
 
       true ->
         # 未版本化桶 → 硬删（删 null 行 + 字节）。缺失 key 也算成功（S3 语义）。
+        :ok = reject_locked_version_delete!(bucket, key, "null", delete_opts)
         storage_opts = storage_opts_for_current(bucket, key)
         :ok = Objects.delete_metadata(bucket, key)
         _ = Storage.delete(bucket, key, "null", storage_opts)
@@ -804,6 +832,8 @@ defmodule Maxio.S3.Handlers.Object do
     :ok = PublicAccessBlock.reject_public_acl_write!(dest_bucket, acl_input)
     target_sse = SSE.resolve_target!(conn.req_headers, dest_bucket)
     SSE.reject_copy_source_customer_headers!(conn.req_headers)
+    :ok = ObjectLock.validate_object_lock_upload_headers!(conn)
+    object_lock_attrs = object_lock_attrs_for_write!(conn, dest_bucket)
 
     # 源对象按真实版本解析（默认 current/latest，?versionId= 选特定版本），并经 ObjectMeta
     # 统一读权威入口分流：:pg 默认行为不变；:read=:sidecar 时 CopyObject 继承的是盘上权威元数据。
@@ -889,6 +919,8 @@ defmodule Maxio.S3.Handlers.Object do
     dest_version_id =
       if dest_versioning == "Enabled", do: Maxio.Versioning.VersionId.generate(), else: "null"
 
+    :ok = reject_locked_null_overwrite!(dest_bucket, dest_key, dest_version_id, conn)
+
     # B1-1：目标提交 seam（目标字节写 + Objects.put_version_with_id）纳入「目标对象锁」单点。
     # 源读（含自拷贝先写临时 key）在锁外完成 —— 仅目标 dest_key 持目标锁，绝不在源读上持目标锁，
     # 避免跨 key 死锁 + :global.trans 非重入死等（铁律 2：锁是请求编排关注点）。
@@ -924,8 +956,11 @@ defmodule Maxio.S3.Handlers.Object do
             user_metadata: meta_map
           }
           |> Map.merge(SystemHeaders.to_object_meta(system_headers))
+          |> Map.merge(object_lock_attrs)
 
         Maxio.Lock.with_object_lock({dest_bucket, dest_key}, fn ->
+          :ok = reject_locked_null_overwrite!(dest_bucket, dest_key, dest_version_id, conn)
+
           {_stored_size, etag, write_result} =
             case Storage.put(dest_bucket, dest_key, dest_version_id, copy_stream,
                    object_meta: dest_object_meta
@@ -958,6 +993,7 @@ defmodule Maxio.S3.Handlers.Object do
                 sse_envelope: target_sse_envelope
               }
               |> Map.merge(system_headers)
+              |> Map.merge(object_lock_attrs)
               |> Map.merge(Placement.attrs_from_result(write_result)),
               :copy_object
             )
@@ -1109,6 +1145,131 @@ defmodule Maxio.S3.Handlers.Object do
     end
   end
 
+  defp object_lock_attrs_for_write!(conn, bucket) do
+    attrs = ObjectLock.request_object_lock_attrs(conn, bucket, now(conn))
+
+    if attrs != %{} do
+      :ok = require_object_lock_write_bucket!(bucket)
+    end
+
+    attrs
+  end
+
+  defp require_object_lock_write_bucket!(bucket) do
+    case Buckets.lookup(bucket) do
+      {:ok, %{versioning: "Enabled"}} ->
+        if ObjectLock.bucket_enabled?(bucket) do
+          :ok
+        else
+          raise Error.new(:invalid_request,
+                  message: "Object Lock headers require a bucket with Object Lock enabled",
+                  resource: "/" <> bucket
+                )
+        end
+
+      {:ok, _bucket} ->
+        raise Error.new(:invalid_bucket_state,
+                message: "Object Lock protected objects require bucket versioning to be enabled",
+                resource: "/" <> bucket
+              )
+
+      {:error, :not_found} ->
+        raise Error.new(:no_such_bucket, resource: "/" <> bucket)
+    end
+  end
+
+  defp reject_locked_null_overwrite!(_bucket, _key, version_id, _conn) when version_id != "null",
+    do: :ok
+
+  defp reject_locked_null_overwrite!(bucket, key, "null", conn) do
+    reject_locked_version_delete!(bucket, key, "null", object_lock_delete_opts(conn))
+  end
+
+  defp object_lock_delete_opts(conn) do
+    [now: now(conn), bypass_governance?: bypass_governance_header?(conn)]
+  end
+
+  defp object_lock_delete_opts(conn, bucket, key, principal, authenticated?, owner?, conditions) do
+    [
+      now: now(conn),
+      bypass_governance?:
+        bypass_governance_header?(conn) and
+          bypass_governance_authorized?(
+            bucket,
+            key,
+            principal,
+            authenticated?,
+            owner?,
+            conditions
+          )
+    ]
+  end
+
+  defp bypass_governance_authorized?(
+         bucket,
+         key,
+         principal,
+         authenticated?,
+         owner?,
+         conditions
+       ) do
+    resource = Maxio.Policy.Arn.object_arn(bucket, key)
+    action = "s3:BypassGovernanceRetention"
+
+    statements = Maxio.S3.Authz.object_statements(bucket, key, principal)
+
+    ctx = %Maxio.Policy.RequestContext{
+      principal: principal,
+      authenticated?: authenticated?,
+      owner?: owner?,
+      action: action,
+      resource: resource,
+      conditions: conditions
+    }
+
+    case Maxio.Policy.Evaluator.evaluate(ctx, statements) do
+      :allow -> Maxio.S3.Authz.session_policy_allows?(principal, action, resource, conditions)
+      {:deny, _reason} -> false
+    end
+  end
+
+  defp reject_locked_version_delete!(bucket, key, version_id, opts) do
+    case Maxio.ObjectMeta.get(bucket, key, version_id, []) do
+      %Objects.Object{is_delete_marker: true} ->
+        :ok
+
+      %Objects.Object{} = object ->
+        if ObjectLock.locked?(object, opts) do
+          raise Error.new(:access_denied, resource: "/#{bucket}/#{key}")
+        end
+
+        :ok
+
+      {:error, :not_found} ->
+        :ok
+
+      {:error, :read_quorum} ->
+        Log.warn("object lock delete check unavailable: sidecar read_quorum unmet",
+          action: :delete_object,
+          bucket: bucket,
+          key: key,
+          version_id: version_id,
+          reason: :read_quorum
+        )
+
+        raise Error.new(:slow_down_read, resource: "/#{bucket}/#{key}")
+    end
+  end
+
+  defp bypass_governance_header?(conn) do
+    case get_req_header(conn, "x-amz-bypass-governance-retention") do
+      [value] -> value |> String.trim() |> String.downcase() == "true"
+      _other -> false
+    end
+  end
+
+  defp now(conn), do: conn.private[:maxio_now] || DateTime.utc_now()
+
   defp raise_storage_write_error(reason, bucket, key)
        when reason in [:write_quorum, :rename_busy],
        do: raise(Error.new(:slow_down_write, resource: "/#{bucket}/#{key}"))
@@ -1227,9 +1388,11 @@ defmodule Maxio.S3.Handlers.Object do
   #
   # 幂等：版本不存在（盘上全端点显式 missing / PG 无行）也回 204（对齐 AWS）。
   # 获锁失败 → 503 RequestTimeout；盘 quorum 不足 → 503 SlowDownWrite（铁律 3）。
-  defp commit_version_delete(bucket, key, version_id) do
+  defp commit_version_delete(bucket, key, version_id, delete_opts) do
     result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        :ok = reject_locked_version_delete!(bucket, key, version_id, delete_opts)
+
         case Maxio.ObjectMeta.authoritative_source(:write) do
           :sidecar -> commit_version_delete_sidecar(bucket, key, version_id)
           _pg -> commit_version_delete_pg(bucket, key, version_id)
@@ -1443,6 +1606,9 @@ defmodule Maxio.S3.Handlers.Object do
       tags: Map.get(attrs, :tags, %{}),
       sse_algorithm: Map.get(attrs, :sse_algorithm),
       sse_envelope: Map.get(attrs, :sse_envelope),
+      object_lock_mode: Map.get(attrs, :object_lock_mode),
+      object_lock_retain_until: Map.get(attrs, :object_lock_retain_until),
+      object_lock_legal_hold: Map.get(attrs, :object_lock_legal_hold),
       placement_set_id: Map.get(attrs, :placement_set_id),
       placement_pool_id: Map.get(attrs, :placement_pool_id),
       placement_topology_hash: Map.get(attrs, :placement_topology_hash),
@@ -1543,7 +1709,8 @@ defmodule Maxio.S3.Handlers.Object do
          sse_envelope,
          user_metadata,
          visible_size,
-         acl_input
+         acl_input,
+         object_lock_attrs
        ) do
     %{
       size: visible_size,
@@ -1559,6 +1726,7 @@ defmodule Maxio.S3.Handlers.Object do
       sse: sse_meta(sse_requested, sse_envelope),
       user_metadata: user_metadata
     }
+    |> Map.merge(object_lock_attrs)
   end
 
   # sse 字段：未加密 → nil；SSE-S3 → %{"algo" => "AES256", "envelope" => 信封}（信封含 wrapped DEK）。
@@ -1789,6 +1957,7 @@ defmodule Maxio.S3.Handlers.Object do
     |> SystemHeaders.put_response_headers(object)
     |> put_user_metadata_headers(object)
     |> maybe_tagging_count(object)
+    |> put_object_lock_headers(object)
   end
 
   defp maybe_put_storage_class(conn, %{storage_class: storage_class})
@@ -1818,6 +1987,29 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   defp maybe_tagging_count(conn, _object), do: conn
+
+  defp put_object_lock_headers(conn, object) do
+    conn
+    |> maybe_put_object_lock_mode(object)
+    |> maybe_put_object_lock_retain_until(object)
+    |> maybe_put_object_lock_legal_hold(object)
+  end
+
+  defp maybe_put_object_lock_mode(conn, %{object_lock_mode: mode}) when is_binary(mode),
+    do: put_resp_header(conn, "x-amz-object-lock-mode", mode)
+
+  defp maybe_put_object_lock_mode(conn, _object), do: conn
+
+  defp maybe_put_object_lock_retain_until(conn, %{object_lock_retain_until: %DateTime{} = dt}),
+    do: put_resp_header(conn, "x-amz-object-lock-retain-until-date", DateTime.to_iso8601(dt))
+
+  defp maybe_put_object_lock_retain_until(conn, _object), do: conn
+
+  defp maybe_put_object_lock_legal_hold(conn, %{object_lock_legal_hold: status})
+       when is_binary(status),
+       do: put_resp_header(conn, "x-amz-object-lock-legal-hold", status)
+
+  defp maybe_put_object_lock_legal_hold(conn, _object), do: conn
 
   # Range: bytes=a-b | bytes=a- | bytes=-suffix → {first,last} | nil | :full | :invalid
   # 多区间（含逗号）对齐 S3 返回完整 200（不实现 multipart/byteranges）→ :full。
