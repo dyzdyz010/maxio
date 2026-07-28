@@ -31,7 +31,64 @@ defmodule Maxio.Cluster.ReplacementWorkflowTest do
     assert report.drive_health_before.heal_required == 1
     assert report.drive_health_after.heal_required == 1
     assert report.next_action == "mix maxio.replacement.workflow --heal --rebalance-if-needed"
+    assert report.gate_status == "blocked"
+    assert "fresh_drive_heal_scheduler_disabled" in report.blockers
+    assert report.warnings == []
     assert DriveHealth.heal_required?(endpoint)
+  end
+
+  test "ready automation with no remaining workflow action gates ok" do
+    assert {:ok, report} =
+             Workflow.run(
+               snapshot_fun: fn -> [] end,
+               latest_job_fun: fn -> nil end,
+               automation_profile_opts: ready_automation_profile_opts()
+             )
+
+    assert report.status == :audit
+    assert report.gate_status == "ok"
+    assert report.workflow_blockers == []
+    assert report.blockers == []
+    assert report.warnings == []
+    assert report.next_action == "none"
+  end
+
+  test "ready automation with a remaining workflow action gates attention" do
+    endpoint = {Node.self(), Path.join(System.tmp_dir!(), "replacement-workflow-action")}
+
+    _ =
+      DriveHealth.record_probe(endpoint, {:error, :unavailable},
+        now_ms: 0,
+        offline_after_ms: 0,
+        set_id: 0,
+        set_write_available?: true
+      )
+
+    _ = DriveHealth.record_probe(endpoint, :ok, now_ms: 1, offline_after_ms: 0, set_id: 0)
+
+    assert {:ok, report} =
+             Workflow.run(
+               latest_job_fun: fn -> nil end,
+               automation_profile_opts: ready_automation_profile_opts()
+             )
+
+    assert report.gate_status == "attention"
+    assert report.blockers == []
+    assert report.warnings == ["replacement_workflow_next_action_required"]
+    assert report.next_action == "mix maxio.replacement.workflow --heal --rebalance-if-needed"
+  end
+
+  test "automation warnings gate attention without operation blockers" do
+    assert {:ok, report} =
+             Workflow.run(
+               snapshot_fun: fn -> [] end,
+               latest_job_fun: fn -> nil end,
+               automation_profile_opts: attention_automation_profile_opts()
+             )
+
+    assert report.gate_status == "attention"
+    assert report.blockers == []
+    assert "fresh_drive_heal_inline_advance_closure_disabled" in report.warnings
   end
 
   test "explicit workflow delegates same-run rebalance enqueue advance and closure opts" do
@@ -201,5 +258,48 @@ defmodule Maxio.Cluster.ReplacementWorkflowTest do
     assert {:error, :advance_requires_heal} = Workflow.run(verify_closure: true)
     assert {:error, :rebalance_requires_heal} = Workflow.run(rebalance_if_needed: true)
     assert {:error, {:invalid_advance_steps, 0}} = Workflow.run(heal: true, advance_steps: 0)
+  end
+
+  defp ready_automation_profile_opts do
+    [
+      fresh_drive_heal_scheduler: [
+        enabled: true,
+        probe_drive_health: true,
+        auto_rebalance_after_heal: true,
+        auto_advance_rebalance_after_heal: false,
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      rebalance_scheduler: [
+        enabled: true,
+        auto_source_cleanup: true,
+        auto_rebalance_closure: true,
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      scheduler_ledger: [enabled: true]
+    ]
+  end
+
+  defp attention_automation_profile_opts do
+    [
+      fresh_drive_heal_scheduler: [
+        enabled: true,
+        probe_drive_health: true,
+        auto_rebalance_after_heal: true,
+        auto_advance_rebalance_after_heal: true,
+        rebalance_advance_opts: [auto_rebalance_closure: false],
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      rebalance_scheduler: [
+        enabled: true,
+        auto_source_cleanup: true,
+        auto_rebalance_closure: true,
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      scheduler_ledger: [enabled: true]
+    ]
   end
 end

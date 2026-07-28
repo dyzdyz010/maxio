@@ -41,6 +41,19 @@ defmodule Maxio.STS.View do
     XML.encode(root)
   end
 
+  @spec get_access_key_info_response(String.t(), String.t() | nil) :: iodata()
+  def get_access_key_info_response(account_id, request_id) when is_binary(account_id) do
+    root =
+      element("GetAccessKeyInfoResponse", [{"xmlns", @namespace}], [
+        element("GetAccessKeyInfoResult", [], [
+          element("Account", [], characters(account_id))
+        ]),
+        response_metadata(request_id)
+      ])
+
+    XML.encode(root)
+  end
+
   @spec assume_role_response(map(), String.t() | nil) :: iodata()
   def assume_role_response(session, request_id) when is_map(session) do
     result_children =
@@ -63,6 +76,34 @@ defmodule Maxio.STS.View do
     root =
       element("AssumeRoleResponse", [{"xmlns", @namespace}], [
         element("AssumeRoleResult", [], result_children),
+        response_metadata(request_id)
+      ])
+
+    XML.encode(root)
+  end
+
+  @spec assume_role_with_web_identity_response(map(), String.t() | nil) :: iodata()
+  def assume_role_with_web_identity_response(session, request_id) when is_map(session) do
+    result_children =
+      [
+        element("SubjectFromWebIdentityToken", [], characters(session.web_identity_subject)),
+        element("Audience", [], characters(session.web_identity_audience)),
+        element("Provider", [], characters(session.web_identity_provider)),
+        element("AssumedRoleUser", [], [
+          element("AssumedRoleId", [], characters(session.assumed_role_id)),
+          element("Arn", [], characters(session.assumed_role_arn))
+        ]),
+        element("Credentials", [], [
+          element("AccessKeyId", [], characters(session.access_key_id)),
+          element("SecretAccessKey", [], characters(session.secret_key)),
+          element("SessionToken", [], characters(session.session_token)),
+          element("Expiration", [], characters(XML.iso8601(session.expires_at)))
+        ])
+      ] ++ source_identity_elements(session)
+
+    root =
+      element("AssumeRoleWithWebIdentityResponse", [{"xmlns", @namespace}], [
+        element("AssumeRoleWithWebIdentityResult", [], result_children),
         response_metadata(request_id)
       ])
 

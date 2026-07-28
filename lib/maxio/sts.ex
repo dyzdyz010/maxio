@@ -12,7 +12,8 @@ defmodule Maxio.STS do
 
   alias Maxio.Auth.SessionToken
   alias Maxio.Cluster.Notify
-  alias Maxio.IAM.{AccessKey, STSSession}
+  alias Maxio.IAM
+  alias Maxio.IAM.{AccessKey, STSSession, STSSessionSecret}
   alias Maxio.Policy.{Evaluator, RequestContext, Statement, Store}
   alias Maxio.Repo
   alias Maxio.Tags
@@ -24,6 +25,12 @@ defmodule Maxio.STS do
   @role_chaining_max_duration_seconds 3_600
   @max_session_policy_plaintext_bytes 2_048
   @max_managed_session_policies 10
+  @source_identity_claim "https://aws.amazon.com/source_identity"
+  @web_identity_tags_claim "https://aws.amazon.com/tags"
+  @web_identity_flat_principal_tag_prefix "https://aws.amazon.com/tags/principal_tags/"
+  @web_identity_flat_transitive_tag_keys_claim "https://aws.amazon.com/tags/transitive_tag_keys"
+  @source_identity_pattern ~r/\A(?!aws:)[A-Za-z0-9_+=,.@-]{2,64}\z/i
+  @local_account_id "000000000000"
 
   @doc """
   Issues a temporary session credential from an active long-term access key.
@@ -52,33 +59,35 @@ defmodule Maxio.STS do
       session_name = Keyword.get(opts, :session_name) || default_session_name()
       tags = issuer.tags || %{}
 
-      attrs = %{
-        access_key_id: access_key_id,
-        secret_key: secret_key,
-        session_token_sha256: SessionToken.hash(session_token),
-        issuer_access_key_id: issuer.access_key_id,
-        principal_arn: issuer.principal_arn,
-        principal_type: issuer.type,
-        session_name: session_name,
-        status: "active",
-        issued_at: now,
-        expires_at: expires_at,
-        tags: tags,
-        mfa_authenticated: Keyword.get(opts, :mfa_authenticated, false),
-        mfa_serial_hash: Keyword.get(opts, :mfa_serial_hash)
-      }
+      with {:ok, stored_secret} <- STSSessionSecret.wrap(secret_key, access_key_id) do
+        attrs = %{
+          access_key_id: access_key_id,
+          secret_key: stored_secret,
+          session_token_sha256: SessionToken.hash(session_token),
+          issuer_access_key_id: issuer.access_key_id,
+          principal_arn: issuer.principal_arn,
+          principal_type: issuer.type,
+          session_name: session_name,
+          status: "active",
+          issued_at: now,
+          expires_at: expires_at,
+          tags: tags,
+          mfa_authenticated: Keyword.get(opts, :mfa_authenticated, false),
+          mfa_serial_hash: Keyword.get(opts, :mfa_serial_hash)
+        }
 
-      case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
-        {:ok, session} ->
-          Notify.broadcast({:iam_changed, session.access_key_id})
+        case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
+          {:ok, session} ->
+            Notify.broadcast({:iam_changed, session.access_key_id})
 
-          {:ok,
-           session
-           |> public_session()
-           |> Map.merge(%{secret_key: secret_key, session_token: session_token})}
+            {:ok,
+             session
+             |> public_session()
+             |> Map.merge(%{secret_key: secret_key, session_token: session_token})}
 
-        {:error, changeset} ->
-          {:error, sanitize_changeset_errors(changeset)}
+          {:error, changeset} ->
+            {:error, sanitize_changeset_errors(changeset)}
+        end
       end
     end
   end
@@ -134,47 +143,137 @@ defmodule Maxio.STS do
       secret_key = Keyword.get(opts, :secret_key) || gen_secret_key()
       session_token = Keyword.get(opts, :session_token) || gen_session_token()
 
-      attrs = %{
-        access_key_id: access_key_id,
-        secret_key: secret_key,
-        session_token_sha256: SessionToken.hash(session_token),
-        issuer_access_key_id: issuer_access_key_id,
-        principal_arn: role_arn,
-        principal_type: "assumed_role",
-        session_name: session_name,
-        status: "active",
-        issued_at: now,
-        expires_at: expires_at,
-        tags: merged_session_tags(role, tag_state.session_tags),
-        transitive_tag_keys: tag_state.transitive_tag_keys,
-        session_policy: session_policy,
-        source_identity: source_identity,
-        mfa_authenticated: mfa_context.present?,
-        mfa_serial_hash: Map.get(mfa_context, :serial_hash)
-      }
+      with {:ok, stored_secret} <- STSSessionSecret.wrap(secret_key, access_key_id) do
+        attrs = %{
+          access_key_id: access_key_id,
+          secret_key: stored_secret,
+          session_token_sha256: SessionToken.hash(session_token),
+          issuer_access_key_id: issuer_access_key_id,
+          principal_arn: role_arn,
+          principal_type: "assumed_role",
+          session_name: session_name,
+          status: "active",
+          issued_at: now,
+          expires_at: expires_at,
+          tags: merged_session_tags(role, tag_state.session_tags),
+          transitive_tag_keys: tag_state.transitive_tag_keys,
+          session_policy: session_policy,
+          source_identity: source_identity,
+          mfa_authenticated: mfa_context.present?,
+          mfa_serial_hash: Map.get(mfa_context, :serial_hash)
+        }
 
-      case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
-        {:ok, session} ->
-          Notify.broadcast({:iam_changed, session.access_key_id})
+        case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
+          {:ok, session} ->
+            Notify.broadcast({:iam_changed, session.access_key_id})
 
-          {:ok,
-           session
-           |> public_session()
-           |> Map.merge(%{
-             secret_key: secret_key,
-             session_token: session_token,
-             role_arn: role_arn,
-             assumed_role_arn: assumed_role_arn(role_arn, session_name),
-             assumed_role_id: assumed_role_id(role, session_name)
-           })}
+            {:ok,
+             session
+             |> public_session()
+             |> Map.merge(%{
+               secret_key: secret_key,
+               session_token: session_token,
+               role_arn: role_arn,
+               assumed_role_arn: assumed_role_arn(role_arn, session_name),
+               assumed_role_id: assumed_role_id(role, session_name)
+             })}
 
-        {:error, changeset} ->
-          {:error, sanitize_changeset_errors(changeset)}
+          {:error, changeset} ->
+            {:error, sanitize_changeset_errors(changeset)}
+        end
       end
     end
   end
 
   def assume_role(_caller_principal, _role, _opts), do: {:error, :invalid_assume_role_request}
+
+  @doc """
+  Issues temporary credentials for an IAM role after verifying an OIDC web
+  identity token and evaluating the role trust policy.
+
+  The web identity token authenticates a federated principal identified by the
+  OIDC provider ARN. There is no caller access-key identity policy to evaluate;
+  authorization is entirely token verification plus the role trust policy.
+  """
+  @spec assume_role_with_web_identity(map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def assume_role_with_web_identity(role, web_identity, opts \\ [])
+
+  def assume_role_with_web_identity(role, web_identity, opts)
+      when is_map(role) and is_map(web_identity) do
+    with {:ok, role_arn} <- role_field(role, :role_arn),
+         {:ok, web_identity} <- normalize_web_identity(web_identity),
+         {:ok, session_name} <- session_name(opts),
+         {:ok, source_identity} <- web_identity_source_identity(web_identity),
+         {:ok, session_tags, transitive_tag_keys} <- web_identity_session_tag_state(web_identity),
+         {:ok, session_policy} <- session_policy(opts),
+         opts =
+           opts
+           |> Keyword.put(:source_identity, source_identity)
+           |> Keyword.put(:session_tags, session_tags)
+           |> Keyword.put(:transitive_tag_keys, transitive_tag_keys)
+           |> Keyword.put(:tag_session_required?, session_tags != [])
+           |> Keyword.put(:session_policy, session_policy),
+         {:ok, duration_seconds} <-
+           assume_role_duration_seconds(opts, role_max_session_duration(role), %{
+             type: :federated
+           }),
+         :ok <- web_identity_trust_policy_allows?(role, web_identity, session_name, opts),
+         :ok <- pre_issue(opts),
+         {:ok, access_key_id} <- session_access_key_id(opts) do
+      now = utc_now()
+      expires_at = DateTime.add(now, duration_seconds, :second)
+      secret_key = Keyword.get(opts, :secret_key) || gen_secret_key()
+      session_token = Keyword.get(opts, :session_token) || gen_session_token()
+
+      with {:ok, stored_secret} <- STSSessionSecret.wrap(secret_key, access_key_id) do
+        attrs = %{
+          access_key_id: access_key_id,
+          secret_key: stored_secret,
+          session_token_sha256: SessionToken.hash(session_token),
+          issuer_access_key_id: nil,
+          principal_arn: role_arn,
+          principal_type: "assumed_role",
+          session_name: session_name,
+          status: "active",
+          issued_at: now,
+          expires_at: expires_at,
+          tags: merged_session_tags(role, session_tags),
+          transitive_tag_keys: transitive_tag_keys,
+          session_policy: session_policy,
+          source_identity: source_identity,
+          web_identity_provider_arn: web_identity.provider_arn,
+          web_identity_subject_sha256: web_identity.subject_sha256,
+          web_identity_audience: web_identity.audience
+        }
+
+        case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
+          {:ok, session} ->
+            Notify.broadcast({:iam_changed, session.access_key_id})
+
+            {:ok,
+             session
+             |> public_session()
+             |> Map.merge(%{
+               secret_key: secret_key,
+               session_token: session_token,
+               role_arn: role_arn,
+               assumed_role_arn: assumed_role_arn(role_arn, session_name),
+               assumed_role_id: assumed_role_id(role, session_name),
+               web_identity_subject: web_identity.subject,
+               web_identity_audience: web_identity.audience,
+               web_identity_provider: web_identity.provider,
+               web_identity_provider_arn: web_identity.provider_arn
+             })}
+
+          {:error, changeset} ->
+            {:error, sanitize_changeset_errors(changeset)}
+        end
+      end
+    end
+  end
+
+  def assume_role_with_web_identity(_role, _web_identity, _opts),
+    do: {:error, :invalid_assume_role_with_web_identity_request}
 
   @doc "Lists STS sessions without exposing secret keys or token hashes."
   @spec list_sessions(keyword()) :: [map()]
@@ -216,6 +315,39 @@ defmodule Maxio.STS do
 
   def revoke_session(_access_key_id), do: {:error, :invalid_access_key_id}
 
+  @doc """
+  Returns the local account id for an existing long-term or temporary access key.
+
+  This mirrors AWS STS `GetAccessKeyInfo`: it identifies the owning account and
+  intentionally does not expose key status, principal ARN, secret material, or
+  session-token validity.
+  """
+  @spec access_key_account_id(String.t()) :: {:ok, String.t()} | {:error, term()}
+  def access_key_account_id(access_key_id)
+      when is_binary(access_key_id) and access_key_id != "" do
+    cond do
+      Repo.exists?(from a in AccessKey, where: a.access_key_id == ^access_key_id) ->
+        {:ok, account_id()}
+
+      Repo.exists?(from s in STSSession, where: s.access_key_id == ^access_key_id) ->
+        {:ok, account_id()}
+
+      true ->
+        {:error, :access_key_not_found}
+    end
+  end
+
+  def access_key_account_id(_access_key_id), do: {:error, :invalid_access_key_id}
+
+  @doc "Returns the configured local single-account STS account id."
+  @spec account_id() :: String.t()
+  def account_id do
+    :maxio
+    |> Application.get_env(:sts, [])
+    |> Keyword.get(:account_id, @local_account_id)
+    |> to_string()
+  end
+
   @spec public_session(STSSession.t()) :: map()
   def public_session(%STSSession{} = session) do
     %{
@@ -235,6 +367,9 @@ defmodule Maxio.STS do
       source_identity: session.source_identity,
       mfa_authenticated: session.mfa_authenticated,
       mfa_serial_hash: session.mfa_serial_hash,
+      web_identity_provider_arn: session.web_identity_provider_arn,
+      web_identity_subject_sha256: session.web_identity_subject_sha256,
+      web_identity_audience: session.web_identity_audience,
       inserted_at: session.inserted_at,
       updated_at: session.updated_at
     }
@@ -250,9 +385,28 @@ defmodule Maxio.STS do
   defp fetch_active_issuer(access_key_id) do
     case Repo.get_by(AccessKey, access_key_id: access_key_id, status: "active") do
       nil -> {:error, :issuer_access_key_not_found}
-      %AccessKey{} = access_key -> {:ok, access_key}
+      %AccessKey{} = access_key -> validate_active_issuer(access_key)
     end
   end
+
+  defp validate_active_issuer(
+         %AccessKey{type: "root", principal_arn: "arn:aws:iam:::root"} =
+           access_key
+       ),
+       do: {:ok, access_key}
+
+  defp validate_active_issuer(
+         %AccessKey{type: "iam_user", principal_arn: principal_arn} =
+           access_key
+       ) do
+    if IAM.iam_user_principal_usable?(principal_arn, access_key.access_key_id) do
+      {:ok, access_key}
+    else
+      {:error, :issuer_access_key_not_found}
+    end
+  end
+
+  defp validate_active_issuer(%AccessKey{}), do: {:error, :issuer_access_key_not_found}
 
   defp duration_seconds(opts, principal_type) do
     duration = Keyword.get(opts, :duration_seconds, @default_duration_seconds)
@@ -365,6 +519,119 @@ defmodule Maxio.STS do
     end
   end
 
+  defp web_identity_trust_policy_allows?(role, web_identity, session_name, opts) do
+    with {:ok, role_arn} <- role_field(role, :role_arn),
+         {:ok, trust_policy} <- role_field(role, :trust_policy),
+         {:ok, trust_json} <- Jason.encode(trust_policy),
+         {:ok, statements} <- Statement.parse_trust_policy(trust_json, role_arn) do
+      federated_principal = web_identity_principal(web_identity)
+
+      ctx = %RequestContext{
+        principal: federated_principal,
+        authenticated?: true,
+        owner?: false,
+        action: "sts:AssumeRoleWithWebIdentity",
+        resource: role_arn,
+        conditions:
+          web_identity_request_conditions(
+            opts,
+            session_name,
+            role,
+            web_identity,
+            federated_principal
+          )
+      }
+
+      case Evaluator.evaluate(ctx, statements) do
+        :allow ->
+          with :ok <-
+                 set_source_identity_allows?(ctx, statements, Keyword.get(opts, :source_identity)) do
+            tag_session_allows?(
+              ctx,
+              statements,
+              Keyword.get(opts, :tag_session_required?, false)
+            )
+          end
+
+        {:deny, reason} ->
+          {:error, {:assume_role_with_web_identity_denied, reason}}
+      end
+    else
+      _other -> {:error, :malformed_trust_policy}
+    end
+  end
+
+  defp normalize_web_identity(web_identity) do
+    with {:ok, issuer} <- web_identity_string_field(web_identity, :issuer),
+         {:ok, issuer_host_path} <- web_identity_string_field(web_identity, :issuer_host_path),
+         {:ok, derived_issuer_host_path} <- Maxio.STS.WebIdentity.issuer_host_path(issuer),
+         :ok <- web_identity_issuer_host_path_matches?(issuer_host_path, derived_issuer_host_path),
+         {:ok, provider_arn} <- web_identity_string_field(web_identity, :provider_arn),
+         :ok <- web_identity_provider_arn_matches?(provider_arn, issuer_host_path),
+         {:ok, provider} <- web_identity_string_field(web_identity, :provider),
+         {:ok, subject} <- web_identity_string_field(web_identity, :subject),
+         {:ok, subject_sha256} <- web_identity_string_field(web_identity, :subject_sha256),
+         :ok <- web_identity_subject_hash_matches?(subject_sha256, subject),
+         {:ok, audience} <- web_identity_string_field(web_identity, :audience),
+         {:ok, audiences} <- web_identity_audiences_field(web_identity) do
+      {:ok,
+       %{
+         issuer: issuer,
+         issuer_host_path: issuer_host_path,
+         provider_arn: provider_arn,
+         provider: provider,
+         subject: subject,
+         subject_sha256: subject_sha256,
+         audience: audience,
+         audiences: audiences,
+         claims: web_identity_field(web_identity, :claims) || %{}
+       }}
+    else
+      _other -> {:error, :invalid_web_identity}
+    end
+  end
+
+  defp web_identity_string_field(web_identity, key) do
+    case web_identity_field(web_identity, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _other -> {:error, :invalid_web_identity}
+    end
+  end
+
+  defp web_identity_audiences_field(web_identity) do
+    case web_identity_field(web_identity, :audiences) do
+      audiences when is_list(audiences) and audiences != [] ->
+        if Enum.all?(audiences, &(is_binary(&1) and &1 != "")) do
+          {:ok, audiences}
+        else
+          {:error, :invalid_web_identity}
+        end
+
+      _other ->
+        {:error, :invalid_web_identity}
+    end
+  end
+
+  defp web_identity_issuer_host_path_matches?(issuer_host_path, issuer_host_path), do: :ok
+
+  defp web_identity_issuer_host_path_matches?(_configured, _derived),
+    do: {:error, :invalid_web_identity}
+
+  defp web_identity_provider_arn_matches?(provider_arn, issuer_host_path) do
+    case Maxio.STS.WebIdentity.oidc_provider_arn("https://#{issuer_host_path}") do
+      {:ok, ^provider_arn} -> :ok
+      _other -> {:error, :invalid_web_identity}
+    end
+  end
+
+  defp web_identity_subject_hash_matches?(subject_sha256, subject) do
+    if subject_sha256 == sha256_hex(subject), do: :ok, else: {:error, :invalid_web_identity}
+  end
+
+  defp web_identity_field(web_identity, key) do
+    Map.get(web_identity, key) || Map.get(web_identity, Atom.to_string(key))
+  end
+
   defp trust_policy_no_explicit_deny?(%RequestContext{} = ctx, statements) do
     account_ctx = local_account_context(ctx)
 
@@ -428,11 +695,16 @@ defmodule Maxio.STS do
          session_name,
          opts
        ) do
-    case evaluate_caller_identity_policy(caller_principal, role, role_arn, session_name, opts,
+    case caller_identity_or_boundary_explicit_deny(
+           caller_principal,
+           role,
+           role_arn,
+           session_name,
+           opts,
            action: "sts:AssumeRole"
          ) do
-      {:deny, :explicit_deny} -> {:error, {:caller_assume_role_denied, :explicit_deny}}
-      _result -> :ok
+      {:deny, reason} -> {:error, {:caller_assume_role_denied, reason}}
+      :ok -> :ok
     end
   end
 
@@ -490,7 +762,13 @@ defmodule Maxio.STS do
         )
     }
 
-    Evaluator.evaluate(ctx, Store.principal_policies(caller_principal))
+    case Evaluator.evaluate(ctx, Store.principal_policies(caller_principal)) do
+      :allow ->
+        enforce_caller_permissions_boundary(ctx, caller_principal)
+
+      {:deny, reason} ->
+        {:deny, reason}
+    end
   end
 
   defp caller_set_source_identity_allows?(caller_principal, role, role_arn, session_name, opts) do
@@ -504,25 +782,74 @@ defmodule Maxio.STS do
         :ok
 
       true ->
-        ctx = %RequestContext{
-          principal: caller_principal,
-          authenticated?: true,
-          owner?: false,
-          action: "sts:SetSourceIdentity",
-          resource: role_arn,
-          conditions:
-            assume_role_request_conditions(
-              opts,
-              session_name,
-              source_identity,
-              role,
-              caller_principal
-            )
-        }
-
-        case Evaluator.evaluate(ctx, Store.principal_policies(caller_principal)) do
+        case evaluate_caller_identity_policy(caller_principal, role, role_arn, session_name, opts,
+               action: "sts:SetSourceIdentity"
+             ) do
           :allow -> :ok
           {:deny, reason} -> {:error, {:caller_set_source_identity_denied, reason}}
+        end
+    end
+  end
+
+  defp enforce_caller_permissions_boundary(ctx, caller_principal) do
+    case Store.principal_permissions_boundary(caller_principal) do
+      :none ->
+        :allow
+
+      :invalid ->
+        {:deny, :permissions_boundary}
+
+      {:ok, statements} ->
+        case Evaluator.evaluate(ctx, statements) do
+          :allow -> :allow
+          {:deny, :explicit_deny} -> {:deny, :explicit_deny}
+          {:deny, _reason} -> {:deny, :permissions_boundary}
+        end
+    end
+  end
+
+  defp caller_identity_or_boundary_explicit_deny(
+         caller_principal,
+         role,
+         role_arn,
+         session_name,
+         opts,
+         action: action
+       ) do
+    ctx = %RequestContext{
+      principal: caller_principal,
+      authenticated?: true,
+      owner?: false,
+      action: action,
+      resource: role_arn,
+      conditions:
+        assume_role_request_conditions(
+          opts,
+          session_name,
+          Keyword.get(opts, :source_identity),
+          role,
+          caller_principal
+        )
+    }
+
+    case Evaluator.evaluate(ctx, Store.principal_policies(caller_principal)) do
+      {:deny, :explicit_deny} -> {:deny, :explicit_deny}
+      _result -> caller_permissions_boundary_explicit_deny(ctx, caller_principal)
+    end
+  end
+
+  defp caller_permissions_boundary_explicit_deny(ctx, caller_principal) do
+    case Store.principal_permissions_boundary(caller_principal) do
+      :none ->
+        :ok
+
+      :invalid ->
+        {:deny, :permissions_boundary}
+
+      {:ok, statements} ->
+        case Evaluator.evaluate(ctx, statements) do
+          {:deny, :explicit_deny} -> {:deny, :explicit_deny}
+          _result -> :ok
         end
     end
   end
@@ -566,6 +893,29 @@ defmodule Maxio.STS do
     |> put_principal_context(caller_principal)
     |> put_principal_tag_conditions(caller_principal)
     |> Map.put("sts:RoleSessionName", session_name)
+  end
+
+  defp web_identity_request_conditions(
+         opts,
+         session_name,
+         role,
+         web_identity,
+         federated_principal
+       ) do
+    issuer_prefix = web_identity.issuer_host_path
+
+    opts
+    |> request_envelope_conditions()
+    |> maybe_put_condition("sts:SourceIdentity", Keyword.get(opts, :source_identity))
+    |> maybe_put_condition("aws:SourceIdentity", Keyword.get(opts, :source_identity))
+    |> put_session_tag_conditions(Keyword.get(opts, :session_tags, []))
+    |> put_transitive_tag_key_conditions(Keyword.get(opts, :transitive_tag_keys, []))
+    |> put_resource_tag_conditions(role)
+    |> put_principal_context(federated_principal)
+    |> Map.put("sts:RoleSessionName", session_name)
+    |> Map.put("#{issuer_prefix}:sub", web_identity.subject)
+    |> Map.put("#{issuer_prefix}:aud", web_identity.audiences)
+    |> Map.put("#{issuer_prefix}:iss", web_identity.issuer)
   end
 
   defp request_envelope_conditions(opts) do
@@ -619,6 +969,12 @@ defmodule Maxio.STS do
     |> maybe_put_condition("aws:username", username_from_arn(arn))
   end
 
+  defp put_principal_context(conditions, %{type: :federated, arn: arn}) do
+    conditions
+    |> Map.put("aws:PrincipalType", "Federated")
+    |> maybe_put_condition("aws:FederatedProvider", arn)
+  end
+
   defp put_principal_context(conditions, %{type: type, access_key: access_key}) do
     conditions
     |> Map.put("aws:PrincipalType", type |> to_string() |> Macro.camelize())
@@ -642,6 +998,143 @@ defmodule Maxio.STS do
   end
 
   defp username_from_arn(_arn), do: nil
+
+  defp web_identity_principal(web_identity) do
+    %{
+      type: :federated,
+      arn: web_identity.provider_arn,
+      subject: web_identity.subject,
+      audience: web_identity.audience,
+      provider: web_identity.provider
+    }
+  end
+
+  defp web_identity_source_identity(%{claims: claims}) when is_map(claims) do
+    case Map.get(claims, @source_identity_claim) do
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) ->
+        if Regex.match?(@source_identity_pattern, value) do
+          {:ok, value}
+        else
+          {:error, :invalid_source_identity}
+        end
+
+      _other ->
+        {:error, :invalid_source_identity}
+    end
+  end
+
+  defp web_identity_source_identity(_web_identity), do: {:error, :invalid_web_identity}
+
+  defp web_identity_session_tag_state(%{claims: claims}) when is_map(claims) do
+    with {:ok, nested_tags, nested_transitive_keys} <- nested_web_identity_session_tags(claims),
+         {:ok, flat_tags} <- flat_web_identity_session_tags(claims),
+         {:ok, flat_transitive_keys} <- flat_web_identity_transitive_tag_keys(claims),
+         session_tags = nested_tags ++ flat_tags,
+         :ok <- validate_session_tags(session_tags),
+         {:ok, transitive_tag_keys} <-
+           transitive_tag_keys(
+             [transitive_tag_keys: nested_transitive_keys ++ flat_transitive_keys],
+             session_tags
+           ) do
+      {:ok, session_tags, transitive_tag_keys}
+    else
+      {:error, :invalid_transitive_tag_keys} -> {:error, :invalid_transitive_tag_keys}
+      _error -> {:error, :invalid_session_tags}
+    end
+  end
+
+  defp web_identity_session_tag_state(_web_identity), do: {:error, :invalid_web_identity}
+
+  defp nested_web_identity_session_tags(claims) do
+    case Map.get(claims, @web_identity_tags_claim) do
+      nil ->
+        {:ok, [], []}
+
+      %{} = tag_claim ->
+        with {:ok, tags} <- nested_web_identity_principal_tags(tag_claim),
+             {:ok, transitive_keys} <- nested_web_identity_transitive_tag_keys(tag_claim) do
+          {:ok, tags, transitive_keys}
+        end
+
+      _other ->
+        {:error, :invalid_session_tags}
+    end
+  end
+
+  defp nested_web_identity_principal_tags(tag_claim) do
+    case Map.get(tag_claim, "principal_tags") || Map.get(tag_claim, :principal_tags) do
+      nil ->
+        {:ok, []}
+
+      %{} = principal_tags ->
+        Enum.reduce_while(principal_tags, {:ok, []}, fn {key, raw_value}, {:ok, acc} ->
+          with true <- is_binary(key) and key != "",
+               {:ok, value} <- nested_web_identity_tag_value(raw_value) do
+            {:cont, {:ok, acc ++ [{key, value}]}}
+          else
+            _error -> {:halt, {:error, :invalid_session_tags}}
+          end
+        end)
+
+      _other ->
+        {:error, :invalid_session_tags}
+    end
+  end
+
+  defp nested_web_identity_tag_value(value) when is_binary(value), do: {:ok, value}
+
+  defp nested_web_identity_tag_value([value]) when is_binary(value), do: {:ok, value}
+
+  defp nested_web_identity_tag_value(_value), do: {:error, :invalid_session_tags}
+
+  defp nested_web_identity_transitive_tag_keys(tag_claim) do
+    case Map.get(tag_claim, "transitive_tag_keys") || Map.get(tag_claim, :transitive_tag_keys) do
+      nil ->
+        {:ok, []}
+
+      keys when is_list(keys) ->
+        if Enum.all?(keys, &is_binary/1),
+          do: {:ok, keys},
+          else: {:error, :invalid_transitive_tag_keys}
+
+      _other ->
+        {:error, :invalid_transitive_tag_keys}
+    end
+  end
+
+  defp flat_web_identity_session_tags(claims) do
+    Enum.reduce_while(claims, {:ok, []}, fn {key, value}, {:ok, acc} ->
+      if is_binary(key) and String.starts_with?(key, @web_identity_flat_principal_tag_prefix) do
+        tag_key = String.replace_prefix(key, @web_identity_flat_principal_tag_prefix, "")
+
+        if tag_key != "" and is_binary(value) do
+          {:cont, {:ok, acc ++ [{tag_key, value}]}}
+        else
+          {:halt, {:error, :invalid_session_tags}}
+        end
+      else
+        {:cont, {:ok, acc}}
+      end
+    end)
+  end
+
+  defp flat_web_identity_transitive_tag_keys(claims) do
+    case Map.get(claims, @web_identity_flat_transitive_tag_keys_claim) do
+      nil ->
+        {:ok, []}
+
+      keys when is_list(keys) ->
+        if Enum.all?(keys, &is_binary/1),
+          do: {:ok, keys},
+          else: {:error, :invalid_transitive_tag_keys}
+
+      _other ->
+        {:error, :invalid_transitive_tag_keys}
+    end
+  end
 
   defp source_identity_present?(value), do: is_binary(value) and value != ""
 

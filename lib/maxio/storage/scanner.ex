@@ -62,7 +62,7 @@ defmodule Maxio.Storage.Scanner do
   alias Maxio.{Buckets, Listing, Lock, MetaReconcile, ObjectMeta, Objects, Repo}
   alias Maxio.Cluster.{DriveHealth, Paths, Router, Topology, Transport}
   alias Maxio.Objects.Object
-  alias Maxio.S3.Log
+  alias Maxio.S3.{Log, NotificationDelivery, NotificationRetainedLedger}
   alias Maxio.Storage.Erasure.Config
 
   @count_keys [
@@ -71,6 +71,12 @@ defmodule Maxio.Storage.Scanner do
     :gc,
     :skipped,
     :divergent,
+    :notification_replayed,
+    :notification_replay_failed,
+    :notification_retained_scanned,
+    :notification_retained_pruned,
+    :notification_retained_aborted,
+    :notification_retained_ambiguous,
     :orphan_shards,
     :orphan_bytes,
     :orphan_cleaned,
@@ -86,6 +92,12 @@ defmodule Maxio.Storage.Scanner do
           gc: non_neg_integer(),
           skipped: non_neg_integer(),
           divergent: non_neg_integer(),
+          notification_replayed: non_neg_integer(),
+          notification_replay_failed: non_neg_integer(),
+          notification_retained_scanned: non_neg_integer(),
+          notification_retained_pruned: non_neg_integer(),
+          notification_retained_aborted: non_neg_integer(),
+          notification_retained_ambiguous: non_neg_integer(),
           orphan_shards: non_neg_integer(),
           orphan_bytes: non_neg_integer(),
           orphan_cleaned: non_neg_integer(),
@@ -210,7 +222,13 @@ defmodule Maxio.Storage.Scanner do
         Log.info(
           "scanner round complete: buckets=#{report.buckets} scanned=#{report.scanned} " <>
             "upserted=#{report.upserted} gc=#{report.gc} skipped=#{report.skipped} " <>
-            "divergent=#{report.divergent} orphan_shards=#{report.orphan_shards} " <>
+            "divergent=#{report.divergent} notification_replayed=#{report.notification_replayed} " <>
+            "notification_replay_failed=#{report.notification_replay_failed} " <>
+            "notification_retained_scanned=#{report.notification_retained_scanned} " <>
+            "notification_retained_pruned=#{report.notification_retained_pruned} " <>
+            "notification_retained_aborted=#{report.notification_retained_aborted} " <>
+            "notification_retained_ambiguous=#{report.notification_retained_ambiguous} " <>
+            "orphan_shards=#{report.orphan_shards} " <>
             "orphan_bytes=#{report.orphan_bytes} orphan_cleaned=#{report.orphan_cleaned} " <>
             "orphan_cleaned_bytes=#{report.orphan_cleaned_bytes} dry_run=#{report.dry_run}",
           action: :reconcile_index
@@ -245,11 +263,13 @@ defmodule Maxio.Storage.Scanner do
 
   # 单桶一轮：forward（盘 → PG）+ reverse-GC（PG → 盘）。单桶异常绝不炸整轮（记日志计零续下桶）。
   defp scan_bucket(bucket, batch_size, dry_run, opts) do
+    retained_counts = retained_notification_pass(bucket, dry_run, opts)
     {forward_counts, seen} = forward_pass(bucket, batch_size, dry_run, opts)
     reverse_counts = reverse_pass(bucket, batch_size, dry_run, seen, opts)
     orphan_counts = orphan_shard_pass(bucket, dry_run, opts)
 
-    forward_counts
+    retained_counts
+    |> merge_counts(forward_counts)
     |> merge_counts(reverse_counts)
     |> merge_counts(orphan_counts)
   rescue
@@ -270,6 +290,18 @@ defmodule Maxio.Storage.Scanner do
       )
 
       zero_counts()
+  end
+
+  defp retained_notification_pass(bucket, dry_run, opts) do
+    summary = NotificationRetainedLedger.replay_bucket(bucket, dry_run, opts)
+
+    zero_counts()
+    |> Map.put(:notification_replayed, summary.replayed)
+    |> Map.put(:notification_replay_failed, summary.failed)
+    |> Map.put(:notification_retained_scanned, summary.scanned)
+    |> Map.put(:notification_retained_pruned, summary.pruned)
+    |> Map.put(:notification_retained_aborted, summary.aborted)
+    |> Map.put(:notification_retained_ambiguous, summary.ambiguous)
   end
 
   # ── orphan shard 只读取证：盘上有 part.0 但缺可见 sidecar，或 delete-marker 版本残留 part.0 ──
@@ -881,6 +913,7 @@ defmodule Maxio.Storage.Scanner do
     case MetaReconcile.reconcile(copies, read_quorum(opts), {:version, vid}) do
       {:ok, entry, _divergent} ->
         entry = Map.put(entry, "is_latest", latest?)
+        counts = replay_notification_ledger(bucket, key, vid, entry, dry_run, counts)
 
         case row_state(bucket, key, vid, entry) do
           :in_sync ->
@@ -951,7 +984,88 @@ defmodule Maxio.Storage.Scanner do
     end
   end
 
+  defp replay_notification_ledger(bucket, key, vid, entry, true = _dry_run, counts) do
+    ledger = notification_ledger(bucket, key, vid, entry)
+
+    case ledger do
+      [] ->
+        counts
+
+      :invalid ->
+        bump(counts, :notification_replay_failed)
+
+      ledger ->
+        Log.info(
+          "scanner dry-run: would replay sidecar notification ledger",
+          bucket: bucket,
+          key: key,
+          action: :bucket_notification_delivery,
+          reason: "version_id=#{vid} entries=#{length(ledger)} dry_run=true"
+        )
+
+        Map.update!(counts, :notification_replayed, &(&1 + length(ledger)))
+    end
+  end
+
+  defp replay_notification_ledger(bucket, key, vid, entry, false = _dry_run, counts) do
+    ledger = notification_ledger(bucket, key, vid, entry)
+
+    case ledger do
+      [] ->
+        counts
+
+      :invalid ->
+        bump(counts, :notification_replay_failed)
+
+      ledger ->
+        try do
+          _ = NotificationDelivery.replay_sidecar_ledger(ledger)
+
+          Log.info(
+            "scanner: sidecar notification ledger replayed",
+            bucket: bucket,
+            key: key,
+            action: :bucket_notification_delivery,
+            reason: "version_id=#{vid} entries=#{length(ledger)}"
+          )
+
+          Map.update!(counts, :notification_replayed, &(&1 + length(ledger)))
+        rescue
+          err ->
+            Log.error(
+              "scanner: sidecar notification ledger replay failed",
+              bucket: bucket,
+              key: key,
+              action: :bucket_notification_delivery,
+              reason: "version_id=#{vid} error=#{inspect(err)}"
+            )
+
+            Map.update!(counts, :notification_replay_failed, &(&1 + length(ledger)))
+        end
+    end
+  end
+
   # ── reverse-GC：PG keyset 分页 → forward 未见过的行逐端点探针 → 全可达全 missing 才删 ──
+
+  defp notification_ledger(_bucket, _key, _vid, %{"notification_outbox" => ledger})
+       when is_list(ledger),
+       do: ledger
+
+  defp notification_ledger(_bucket, _key, _vid, %{"notification_outbox" => nil}), do: []
+
+  defp notification_ledger(bucket, key, vid, %{"notification_outbox" => ledger}) do
+    Log.error(
+      "scanner: sidecar notification ledger invalid (left for operator repair)",
+      bucket: bucket,
+      key: key,
+      action: :bucket_notification_delivery,
+      reason: "version_id=#{vid} notification_outbox=#{inspect(ledger, limit: 10)}"
+    )
+
+    :invalid
+  end
+
+  defp notification_ledger(_bucket, _key, _vid, _entry), do: []
 
   defp reverse_pass(bucket, batch_size, dry_run, seen, opts) do
     do_reverse(bucket, nil, batch_size, dry_run, seen, opts, zero_counts())

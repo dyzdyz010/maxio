@@ -120,11 +120,13 @@ defmodule Maxio.Cluster.SchedulerLiveRehearsal do
 
     args = evidence_args(config)
     command = command_string([config.mix_cmd | args])
-    {output, exit_status} = command_runner.(config.mix_cmd, args, stderr_to_stdout: true)
+    {output, exit_status} = run_command(command_runner, config.mix_cmd, args)
     evidence = extract_json(output)
 
     artifact = %{
       "version" => 1,
+      "evidence_kind" => "scheduler_live_rehearsal",
+      "scenario" => "scheduler_evidence_rehearsal",
       "generated_at" => now_fun.() |> DateTime.to_iso8601(),
       "git_sha" => git_sha_fun.(),
       "scheduler" => config.scheduler,
@@ -207,6 +209,12 @@ defmodule Maxio.Cluster.SchedulerLiveRehearsal do
     end
   rescue
     _error -> nil
+  end
+
+  defp run_command(command_runner, mix_cmd, args) do
+    command_runner.(mix_cmd, args, stderr_to_stdout: true)
+  rescue
+    error -> {Exception.message(error), nil}
   end
 
   defp write_artifact!(path, artifact) do

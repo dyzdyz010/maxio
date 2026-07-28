@@ -65,6 +65,34 @@ defmodule Maxio.Cluster.Replacement.AutomationProfile do
     }
   end
 
+  @doc """
+  Explicit local rehearsal readiness config.
+
+  This is not a production default. It exists so bounded operator rehearsals can
+  prove the replacement workflow/gate path without changing deployment config or
+  starting destructive scheduler work.
+  """
+  def rehearsal_ready_opts do
+    [
+      fresh_drive_heal_scheduler: [
+        enabled: true,
+        probe_drive_health: true,
+        auto_rebalance_after_heal: true,
+        auto_advance_rebalance_after_heal: false,
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      rebalance_scheduler: [
+        enabled: true,
+        auto_source_cleanup: true,
+        auto_rebalance_closure: true,
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      scheduler_ledger: [enabled: true]
+    ]
+  end
+
   defp config(opts, key) do
     opts
     |> Keyword.get(key, Application.get_env(:maxio, key, []))

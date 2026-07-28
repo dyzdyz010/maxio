@@ -79,6 +79,43 @@ defmodule Mix.Tasks.MaxioRebalancePhysicalPurgeTest do
     assert decoded["retention_elapsed?"] == true
   end
 
+  test "preflight json reports required secure erase evidence blocker when missing" do
+    {topology, base} = topology()
+    on_exit(fn -> File.rm_rf(base) end)
+    :persistent_term.put(@topology_key, topology)
+
+    {job, _bucket, _apply_report} =
+      verified_empty_decommission!("physical-purge-preflight-secure-missing", topology)
+
+    assert {:ok, quarantine} =
+             PhysicalRemoval.apply(job.id,
+               confirm_job_id: job.id,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    output =
+      capture_io(fn ->
+        PhysicalPurgePreflight.run([
+          "--job-id",
+          job.id,
+          "--retention-hours",
+          "0",
+          "--require-secure-erase-evidence",
+          "--json"
+        ])
+      end)
+
+    decoded = Jason.decode!(output)
+    assert decoded["status"] == "blocked"
+    assert decoded["quarantine_id"] == quarantine.quarantine_id
+    assert decoded["secure_erase_evidence"]["status"] == "missing"
+
+    assert ["secure_erase_evidence_invalid", "secure_erase_evidence_missing"] in decoded[
+             "blockers"
+           ]
+  end
+
   test "json output reports purged quarantine roots" do
     {topology, base} = topology()
     on_exit(fn -> File.rm_rf(base) end)
@@ -123,6 +160,98 @@ defmodule Mix.Tasks.MaxioRebalancePhysicalPurgeTest do
       refute File.exists?(Path.join(drive, bucket))
       assert File.exists?(Path.join(drive, ".maxio-physical-purge.json"))
     end
+  end
+
+  test "json purge accepts required secure erase evidence file" do
+    {topology, base} = topology()
+    on_exit(fn -> File.rm_rf(base) end)
+    :persistent_term.put(@topology_key, topology)
+
+    {job, _bucket, _apply_report} =
+      verified_empty_decommission!("physical-purge-secure-cli", topology)
+
+    assert {:ok, quarantine} =
+             PhysicalRemoval.apply(job.id,
+               confirm_job_id: job.id,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    evidence_path = Path.join(base, "secure-erase-evidence.json")
+    File.write!(evidence_path, Jason.encode!(secure_erase_evidence(job, quarantine, topology)))
+
+    output =
+      capture_io(fn ->
+        PhysicalPurge.run([
+          "--job-id",
+          job.id,
+          "--confirm-job-id",
+          job.id,
+          "--confirm-quarantine-id",
+          quarantine.quarantine_id,
+          "--retention-hours",
+          "0",
+          "--require-secure-erase-evidence",
+          "--secure-erase-evidence",
+          evidence_path,
+          "--json"
+        ])
+      end)
+
+    decoded = Jason.decode!(output)
+    assert decoded["status"] == "purged"
+    assert decoded["secure_erase_evidence"]["status"] == "ok"
+    assert decoded["secure_erase_evidence"]["secure_erase_gate"] == true
+    refute inspect(decoded) =~ "SERIAL-SECRET"
+    refute inspect(decoded) =~ "WWID-SECRET"
+    refute inspect(decoded) =~ "RAW-EVIDENCE-ID"
+
+    assert {:ok, updated} = Jobs.get(job.id)
+    assert updated.physical_removal_purge_results["secure_erase_evidence"]["status"] == "ok"
+    refute inspect(updated.physical_removal_purge_results) =~ "RAW-EVIDENCE-ID"
+  end
+
+  test "json purge rejects required missing secure erase evidence file before deletion" do
+    {topology, base} = topology()
+    on_exit(fn -> File.rm_rf(base) end)
+    :persistent_term.put(@topology_key, topology)
+
+    {job, _bucket, _apply_report} =
+      verified_empty_decommission!("physical-purge-secure-cli-missing", topology)
+
+    assert {:ok, quarantine} =
+             PhysicalRemoval.apply(job.id,
+               confirm_job_id: job.id,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    missing_path = Path.join(base, "missing-secure-erase-evidence.json")
+
+    assert_raise Mix.Error, ~r/secure_erase_evidence/, fn ->
+      PhysicalPurge.run([
+        "--job-id",
+        job.id,
+        "--confirm-job-id",
+        job.id,
+        "--confirm-quarantine-id",
+        quarantine.quarantine_id,
+        "--retention-hours",
+        "0",
+        "--require-secure-erase-evidence",
+        "--secure-erase-evidence",
+        missing_path,
+        "--json"
+      ])
+    end
+
+    for {_node, drive} <- Topology.endpoints_from(topology, 0) do
+      assert File.dir?(Path.join([drive, ".maxio-removal-quarantine", quarantine.quarantine_id]))
+      refute File.exists?(Path.join(drive, ".maxio-physical-purge.json"))
+    end
+
+    assert {:ok, unchanged} = Jobs.get(job.id)
+    assert unchanged.physical_removal_purge_status == "not_started"
   end
 
   defp verified_empty_decommission!(prefix, topology) do
@@ -184,6 +313,32 @@ defmodule Mix.Tasks.MaxioRebalancePhysicalPurgeTest do
 
     "#{prefix}-#{suffix}"
   end
+
+  defp secure_erase_evidence(job, quarantine, topology) do
+    %{
+      "version" => 1,
+      "method" => "cryptographic_erase",
+      "issued_at" => "2026-07-04T00:00:00Z",
+      "operator" => "ops@example.test",
+      "job_id" => job.id,
+      "quarantine_id" => quarantine.quarantine_id,
+      "manifest_hash" => quarantine.manifest_hash,
+      "endpoints" =>
+        topology
+        |> Topology.endpoints_from(0)
+        |> Enum.map(fn {node, drive} ->
+          %{
+            "node" => Atom.to_string(node),
+            "drive" => drive,
+            "evidence_id" => "RAW-EVIDENCE-ID-#{Path.basename(drive)}",
+            "serial_hash" => sha256("SERIAL-SECRET-#{Path.basename(drive)}"),
+            "wwid_hash" => sha256("WWID-SECRET-#{Path.basename(drive)}")
+          }
+        end)
+    }
+  end
+
+  defp sha256(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   defp restore_topology(:__maxio_no_topology__),
     do: :persistent_term.erase(@topology_key)

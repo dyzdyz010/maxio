@@ -18,6 +18,17 @@ defmodule Maxio.Application do
           {Phoenix.PubSub, name: Maxio.PubSub},
           # M8 live-IO 自适应限流：本节点 S3 handler in-flight 计数器，由长期进程持有 ETS。
           Maxio.S3.InFlight,
+          Maxio.S3.NotificationDelivery.Scheduler,
+          Maxio.S3.ReplicationDelivery.Scheduler,
+          Maxio.S3.Inventory.Scheduler,
+          Maxio.IAM.SigningSecretRotation.Scheduler,
+          Maxio.IAM.OIDCProviderRefresh.Scheduler,
+          Maxio.Console.DirectMultipartUpload.Scheduler,
+          # ObjectMutation Phase 1 B6：journal 收敛 recovery scheduler（实现计划决策点 1：
+          # correctness 组件而非可选优化，生产默认 enabled——PG-commit-后-kill 的 finalize、
+          # metadata-前-kill 的旧字节恢复都依赖它兜底；test.exs 显式关闭，测试用
+          # start_supervised! + run_now 同步驱动）。
+          Maxio.ObjectMutation.Recovery.Scheduler,
           Maxio.Cluster.DriveIO,
           Maxio.Cluster.DriveDeviceIO,
           Maxio.Cluster.PressureAggregator,
@@ -67,7 +78,16 @@ defmodule Maxio.Application do
         do: [],
         else: [{Cluster.Supervisor, [topologies, [name: Maxio.Cluster.ClusterSupervisor]]}]
 
-    libcluster ++ [Maxio.Cluster.Topology, Maxio.Cluster.ShardServer, Maxio.Cluster.LockServer]
+    libcluster ++
+      [
+        Maxio.Cluster.Topology,
+        # ObjectMutation B1：节点本地 epoch 串行执行器（per-endpoint CAS 原子性 +
+        # Windows 两步 rename 窗口不可见的落点；ShardServer epoch 原语委托它执行）。
+        {PartitionSupervisor,
+         child_spec: Maxio.Storage.EpochStore.Worker, name: Maxio.Storage.EpochStore},
+        Maxio.Cluster.ShardServer,
+        Maxio.Cluster.LockServer
+      ]
   end
 
   # 诚实暴露仍未完成的高级特性（铁律 3：绝不假装已生效）。
@@ -81,11 +101,68 @@ defmodule Maxio.Application do
         "lifecycle background scheduler disabled by default (enable config :maxio, :lifecycle_scheduler or run mix maxio.lifecycle.run); "
       end
 
+    notification_scheduler =
+      if Application.get_env(:maxio, :notification_delivery_scheduler, [])[:enabled] do
+        "bucket notification outbox scheduler enabled for retry drains; "
+      else
+        "bucket notification outbox scheduler disabled by default (enable config :maxio, :notification_delivery_scheduler or run mix maxio.notification.drain); "
+      end
+
+    replication_scheduler =
+      if Application.get_env(:maxio, :replication_delivery_scheduler, [])[:enabled] do
+        "bucket replication outbox scheduler enabled for retry drains; "
+      else
+        "bucket replication outbox scheduler disabled by default (enable config :maxio, :replication_delivery_scheduler or run mix maxio.replication.drain); "
+      end
+
+    inventory_scheduler =
+      if Application.get_env(:maxio, :inventory_report_scheduler, [])[:enabled] do
+        "inventory report scheduler enabled for due InventoryConfiguration reports; "
+      else
+        "inventory report scheduler disabled by default (enable config :maxio, :inventory_report_scheduler or run mix maxio.inventory.schedule); "
+      end
+
+    object_mutation_recovery =
+      if Application.get_env(:maxio, :object_mutation_recovery_scheduler, [])[:enabled] do
+        "object mutation recovery scheduler enabled (correctness component: journal-driven crash convergence for protocol PutObject); "
+      else
+        "object mutation recovery scheduler DISABLED (correctness component -- crashed protocol PutObject journals will not converge; enable config :maxio, :object_mutation_recovery_scheduler or drain via Maxio.ObjectMutation.Recovery.drain/1); "
+      end
+
+    direct_multipart_pruner =
+      if Application.get_env(:maxio, :console_direct_multipart_pruner, [])[:enabled] do
+        "console direct multipart prune scheduler enabled for unfinished MPU maintenance; "
+      else
+        "console direct multipart prune scheduler disabled by default (enable config :maxio, :console_direct_multipart_pruner or run mix maxio.console.direct_multipart.prune); "
+      end
+
+    iam_secret_rotation =
+      if Application.get_env(:maxio, :iam_signing_secret_rotation, [])[:enabled] do
+        "iam signing secret rotation scheduler enabled (actual writes require confirm_rotation: true); "
+      else
+        "iam signing secret rotation scheduler disabled by default (enable config :maxio, :iam_signing_secret_rotation or run mix maxio.iam.rotate_secret_key); "
+      end
+
+    oidc_jwks_refresh =
+      if Application.get_env(:maxio, :iam_oidc_provider_jwks_refresh, [])[:enabled] do
+        "iam oidc provider jwks refresh scheduler enabled (actual writes require confirm_refresh: true); "
+      else
+        "iam oidc provider jwks refresh scheduler disabled by default (enable config :maxio, :iam_oidc_provider_jwks_refresh or run mix maxio.iam.oidc.refresh_jwks); "
+      end
+
     Logger.info(
       "maxio deferred: " <>
         lifecycle_scheduler <>
-        "lifecycle transition actions remain no-op; SSE-S3 uses single static master key " <>
-        "(no rotation/KMS); MFA Delete requires configured verifier; SSE-C/SSE-KMS return 501"
+        notification_scheduler <>
+        replication_scheduler <>
+        inventory_scheduler <>
+        object_mutation_recovery <>
+        direct_multipart_pruner <>
+        iam_secret_rotation <>
+        oidc_jwks_refresh <>
+        "lifecycle transition actions remain no-op; SSE-S3 uses single static master key; " <>
+        "SSE-KMS uses local provider/wrapping key (no rotation/external KMS); " <>
+        "MFA Delete requires configured verifier; SSE-C and SSE-KMS object/copy/multipart paths supported; DSSE-KMS returns 501"
     )
   end
 

@@ -1,33 +1,30 @@
 defmodule Mix.Tasks.Maxio.ReconcileIndex do
-  @shortdoc "手动触发一轮派生索引 reconcile（盘上 sidecar 权威 ↔ PG 派生索引）"
+  @shortdoc "Run one derived-index reconcile scanner pass"
   @moduledoc """
-  ROUTE B B5-2 —— 派生索引 reconcile / reverse-GC CLI（铁律 4：CLI + 结构化日志，无 GUI 可调试）。
+  Run one scanner pass that reconciles disk sidecar authority into the derived
+  Postgres object index and performs guarded reverse-GC / orphan-shard evidence.
 
-      mix maxio.reconcile_index                    # 真实一轮（与 scanner 周期轮同一实现）
-      mix maxio.reconcile_index --dry-run          # 只报告（would-计数）绝不写 PG
-      mix maxio.reconcile_index --bucket <name>    # 仅扫指定桶（可与 --dry-run 组合）
-      mix maxio.reconcile_index --force            # 写权威非 :sidecar 时仍强制执行（危险，见下）
+      mix maxio.reconcile_index
+      mix maxio.reconcile_index --dry-run
+      mix maxio.reconcile_index --bucket photos --json
       mix maxio.reconcile_index --cleanup-orphan-shards --orphan-cleanup-min-age-ms 172800000
+      mix maxio.reconcile_index --json --fail-on-attention
 
-  **写权威前置条件（安全闸）**：reconcile 以「盘上 sidecar = 写权威」为前提，仅在
-  `config :maxio, :authoritative_source` 的 `write: :sidecar` 下有意义。默认 `:pg` 权威下
-  PG 才是事实来源，而 PG-only delete marker（B5-0 之前的全部存量 marker；`:pg` 模式下
-  best-effort 盘上 marker 写失败的 marker）盘上**没有** sidecar：跑一轮会把被 marker 遮蔽的
-  旧版本重新置 latest（**已删对象复活**）并把权威 marker 行当孤儿 reverse-GC 掉。故本任务在
-  写权威非 `:sidecar` 时拒绝执行（status=authority_mismatch 零计数），**含 --dry-run**
-  （其 would-计数同样基于错误的盘权威假设，纯误导）；仅显式 `--force` 越闸——你必须明确接受
-  以盘为权威重写 PG 索引的全部后果。
+  The scanner is safe by default:
 
-  报告字段：scanned（盘上检视的版本数）/ upserted（缺行/stale 收敛）/ gc（孤儿行删除）/
-  skipped（端点不可达跳过 + 写失败留待下轮）/ divergent（quorum 仲裁失败，绝不写）/
-  orphan_shards/orphan_bytes（盘上残留 part.0 取证）/ orphan_cleaned/orphan_cleaned_bytes。
-  orphan shard 清理默认关闭；`--cleanup-orphan-shards` 显式开启真实删除，仍要求 sidecar 写权威、
-  全端点可达、对象锁、二次探针、年龄门和 per-run 删除上限；`--orphan-cleanup-dry-run`
-  只计 would-clean 且保留字节。全局 `--dry-run` 会把清理降级为 dry-run。
-  逐对象动作的结构化日志（action: :reconcile_index / :reverse_gc）随轮输出。
-  无分布式拓扑且非 FS 后端 → status=no_topology 安全 no-op（盘上枚举需要拓扑端点）；
-  FS 后端无需拓扑配置——B6-2 起 `run_once` 自动注入合成单端点 topology
-  （`{Node.self(), data_dir}`，quorum=1），FS 单机同样可 reconcile。
+  * it refuses to run unless `authoritative_source(:write) == :sidecar`, unless
+    `--force` is passed;
+  * orphan shard cleanup is disabled unless `--cleanup-orphan-shards` is passed;
+  * `--dry-run` reports what would happen without writing PG rows or deleting
+    orphan shard bytes;
+  * non-FS backends without a topology return a no-op `no_topology` report.
+
+  `--json` emits a machine-readable evidence report. `gate_status=blocked`
+  means the scanner did not run (`authority_mismatch` / `no_topology`).
+  `gate_status=attention` means the scanner ran but found drift, skipped probes,
+  divergent sidecars, notification replay problems, retained-ledger ambiguity,
+  orphan shards, or dry-run would-change evidence. Gates are reporting-only
+  unless `--fail-on-blocked` or `--fail-on-attention` is explicitly passed.
   """
   use Mix.Task
 
@@ -42,17 +39,15 @@ defmodule Mix.Tasks.Maxio.ReconcileIndex do
           cleanup_orphan_shards: :boolean,
           orphan_cleanup_dry_run: :boolean,
           orphan_cleanup_min_age_ms: :integer,
-          orphan_cleanup_max_deletes: :integer
+          orphan_cleanup_max_deletes: :integer,
+          fail_on_blocked: :boolean,
+          fail_on_attention: :boolean,
+          json: :boolean
         ]
       )
 
     if rest != [] or invalid != [] do
-      Mix.raise(
-        "usage: mix maxio.reconcile_index [--dry-run] [--bucket <name>] [--force] " <>
-          "[--cleanup-orphan-shards] [--orphan-cleanup-dry-run] " <>
-          "[--orphan-cleanup-min-age-ms <ms>] [--orphan-cleanup-max-deletes <n>] " <>
-          "(unexpected: #{inspect(rest ++ Enum.map(invalid, &elem(&1, 0)))})"
-      )
+      Mix.raise("#{usage()} (unexpected: #{inspect(rest ++ Enum.map(invalid, &elem(&1, 0)))})")
     end
 
     Mix.Task.run("app.start")
@@ -68,30 +63,140 @@ defmodule Mix.Tasks.Maxio.ReconcileIndex do
         orphan_cleanup_max_deletes: Keyword.get(opts, :orphan_cleanup_max_deletes)
       )
 
+    view = report_view(report)
+    print_or_json(view, opts)
+    fail_if_needed!(view, opts)
+  end
+
+  defp usage do
+    "usage: mix maxio.reconcile_index [--dry-run] [--bucket <name>] [--force] " <>
+      "[--cleanup-orphan-shards] [--orphan-cleanup-dry-run] " <>
+      "[--orphan-cleanup-min-age-ms <ms>] [--orphan-cleanup-max-deletes <n>] " <>
+      "[--fail-on-blocked] [--fail-on-attention] [--json]"
+  end
+
+  defp print_or_json(view, opts) do
+    if Keyword.get(opts, :json, false) do
+      IO.puts(Jason.encode!(view))
+    else
+      print_text(view)
+    end
+  end
+
+  defp print_text(view) do
     IO.puts(
-      "[maxio reconcile_index] status=#{report.status} dry_run=#{report.dry_run} " <>
-        "buckets=#{report.buckets} scanned=#{report.scanned} upserted=#{report.upserted} " <>
-        "gc=#{report.gc} skipped=#{report.skipped} divergent=#{report.divergent} " <>
-        "orphan_shards=#{report.orphan_shards} orphan_bytes=#{report.orphan_bytes} " <>
-        "orphan_cleaned=#{report.orphan_cleaned} " <>
-        "orphan_cleaned_bytes=#{report.orphan_cleaned_bytes}"
+      "[maxio reconcile_index] status=#{view["status"]} " <>
+        "gate_status=#{view["gate_status"]} dry_run=#{view["dry_run"]} " <>
+        "buckets=#{view["buckets"]} scanned=#{view["scanned"]} " <>
+        "upserted=#{view["upserted"]} gc=#{view["gc"]} skipped=#{view["skipped"]} " <>
+        "divergent=#{view["divergent"]} " <>
+        "notification_replayed=#{view["notification_replayed"]} " <>
+        "notification_replay_failed=#{view["notification_replay_failed"]} " <>
+        "notification_retained_scanned=#{view["notification_retained_scanned"]} " <>
+        "notification_retained_pruned=#{view["notification_retained_pruned"]} " <>
+        "notification_retained_aborted=#{view["notification_retained_aborted"]} " <>
+        "notification_retained_ambiguous=#{view["notification_retained_ambiguous"]} " <>
+        "orphan_shards=#{view["orphan_shards"]} orphan_bytes=#{view["orphan_bytes"]} " <>
+        "orphan_cleaned=#{view["orphan_cleaned"]} " <>
+        "orphan_cleaned_bytes=#{view["orphan_cleaned_bytes"]} " <>
+        "blockers=#{length(view["blockers"])} warnings=#{length(view["warnings"])}"
     )
 
-    if report.status == :no_topology do
+    Enum.each(view["blockers"], fn blocker ->
+      IO.puts("[maxio reconcile_index.blocker] reason=#{blocker}")
+    end)
+
+    Enum.each(view["warnings"], fn warning ->
+      IO.puts("[maxio reconcile_index.warning] reason=#{warning}")
+    end)
+
+    if view["status"] == "no_topology" do
       IO.puts(
-        "[maxio reconcile_index] no distributed topology configured — nothing scanned " <>
-          "(reconcile requires Maxio.Cluster.Topology for non-FS backends; FS 后端会自动" <>
-          "注入合成单端点 topology，B6-2)"
+        "[maxio reconcile_index] no distributed topology configured - nothing scanned " <>
+          "(reconcile requires Maxio.Cluster.Topology for non-FS backends; FS injects " <>
+          "a synthetic single-endpoint topology)"
       )
     end
 
-    if report.status == :authority_mismatch do
+    if view["status"] == "authority_mismatch" do
       IO.puts(
-        "[maxio reconcile_index] refused: authoritative_source(:write) != :sidecar — disk is " <>
+        "[maxio reconcile_index] refused: authoritative_source(:write) != :sidecar - disk is " <>
           "NOT the write authority. Reconciling PG from disk under :pg authority would " <>
           "resurrect objects deleted via PG-only delete markers and reverse-GC authoritative " <>
           "rows. Rerun with --force only if you explicitly accept disk as the authority."
       )
     end
   end
+
+  defp report_view(report) do
+    blockers = blockers(report)
+    warnings = warnings(report)
+
+    gate_status =
+      cond do
+        blockers != [] -> "blocked"
+        warnings != [] -> "attention"
+        true -> "ok"
+      end
+
+    %{
+      "status" => Atom.to_string(report.status),
+      "gate_status" => gate_status,
+      "dry_run" => report.dry_run,
+      "buckets" => report.buckets,
+      "scanned" => report.scanned,
+      "upserted" => report.upserted,
+      "gc" => report.gc,
+      "skipped" => report.skipped,
+      "divergent" => report.divergent,
+      "notification_replayed" => report.notification_replayed,
+      "notification_replay_failed" => report.notification_replay_failed,
+      "notification_retained_scanned" => report.notification_retained_scanned,
+      "notification_retained_pruned" => report.notification_retained_pruned,
+      "notification_retained_aborted" => report.notification_retained_aborted,
+      "notification_retained_ambiguous" => report.notification_retained_ambiguous,
+      "orphan_shards" => report.orphan_shards,
+      "orphan_bytes" => report.orphan_bytes,
+      "orphan_cleaned" => report.orphan_cleaned,
+      "orphan_cleaned_bytes" => report.orphan_cleaned_bytes,
+      "blockers" => blockers,
+      "warnings" => warnings
+    }
+  end
+
+  defp blockers(%{status: :ok}), do: []
+  defp blockers(%{status: status}), do: [Atom.to_string(status)]
+
+  defp warnings(%{status: status}) when status != :ok, do: []
+
+  defp warnings(report) do
+    []
+    |> maybe_warn(report.dry_run and report.upserted > 0, "dry_run_would_reconcile")
+    |> maybe_warn(report.dry_run and report.gc > 0, "dry_run_would_reverse_gc")
+    |> maybe_warn(report.upserted > 0, "derived_index_reconciled")
+    |> maybe_warn(report.gc > 0, "reverse_gc_deleted")
+    |> maybe_warn(report.skipped > 0, "endpoint_or_probe_skipped")
+    |> maybe_warn(report.divergent > 0, "sidecar_quorum_divergent")
+    |> maybe_warn(report.notification_replay_failed > 0, "notification_replay_failed")
+    |> maybe_warn(report.notification_retained_aborted > 0, "notification_retained_aborted")
+    |> maybe_warn(report.notification_retained_ambiguous > 0, "notification_retained_ambiguous")
+    |> maybe_warn(report.orphan_shards > 0, "orphan_shards_detected")
+  end
+
+  defp maybe_warn(warnings, true, warning), do: [warning | warnings]
+  defp maybe_warn(warnings, false, _warning), do: warnings
+
+  defp fail_if_needed!(%{"gate_status" => "blocked"}, opts) do
+    if Keyword.get(opts, :fail_on_blocked, false) or Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("reconcile_index blocked")
+    end
+  end
+
+  defp fail_if_needed!(%{"gate_status" => "attention"}, opts) do
+    if Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("reconcile_index attention")
+    end
+  end
+
+  defp fail_if_needed!(_view, _opts), do: :ok
 end

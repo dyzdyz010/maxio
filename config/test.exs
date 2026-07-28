@@ -1,5 +1,23 @@
 import Config
 
+pgport =
+  case System.get_env("PGPORT") do
+    nil ->
+      5432
+
+    "" ->
+      5432
+
+    value ->
+      case Integer.parse(value) do
+        {port, ""} when port in 1..65_535 ->
+          port
+
+        _other ->
+          raise "PGPORT must be an integer TCP port in 1..65535, got: #{inspect(value)}"
+      end
+  end
+
 # Configure your database
 #
 # The MIX_TEST_PARTITION environment variable can be used
@@ -9,6 +27,7 @@ config :maxio, Maxio.Repo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
+  port: pgport,
   database: "maxio_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2
@@ -54,3 +73,8 @@ config :maxio, :durability, fsync: false
 
 # M8-3 scrubber test runs are explicit; background scheduling remains disabled.
 config :maxio, :scrubber, enabled: false, initial_delay_ms: 0, page_size: 50
+
+# ObjectMutation recovery scheduler：test 关闭全局调度（避免全局 scheduler 在测试事务外
+# 扫 journal，R1）；测试用 start_supervised!({Recovery.Scheduler, name: nil, ...}) + run_now
+# 同步驱动。
+config :maxio, :object_mutation_recovery_scheduler, enabled: false

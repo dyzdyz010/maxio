@@ -20,6 +20,7 @@ defmodule Mix.Tasks.Maxio.Drive.DeviceIoTest do
       )
 
     on_exit(fn ->
+      resume_drive_device_io()
       restore_env(previous_env)
       DriveDeviceIO.reset()
       Mix.Task.reenable(@task)
@@ -64,15 +65,35 @@ defmodule Mix.Tasks.Maxio.Drive.DeviceIoTest do
 
   test "cached summary-only suppresses per-drive rows", %{base: base} do
     drive = Path.join(base, "d1")
+    owner = Process.whereis(DriveDeviceIO)
+    parent = self()
 
-    _ =
-      DriveDeviceIO.sample_local_drive(drive,
-        provider: fn ^drive -> {:ok, %{device_id: "cached-dev", queue_depth: 1}} end,
-        now_ms: System.monotonic_time(:millisecond)
-      )
+    :ok = :sys.suspend(owner)
 
-    output = run_task(["--cached", "--summary-only"])
+    output =
+      try do
+        :sys.replace_state(owner, fn state ->
+          _ =
+            DriveDeviceIO.sample_local_drive(drive,
+              provider: fn ^drive ->
+                send(parent, {:drive_device_io_cache_writer, self()})
+                {:ok, %{device_id: "cached-dev", queue_depth: 1}}
+              end,
+              now_ms: System.monotonic_time(:millisecond)
+            )
 
+          state
+        end)
+
+        assert_receive {:drive_device_io_cache_writer, writer}
+        assert writer == owner
+
+        run_task(["--cached", "--summary-only"])
+      after
+        :ok = :sys.resume(owner)
+      end
+
+    assert %{enabled?: true} = :sys.get_state(owner)
     assert output =~ "[maxio drive.device_io] status=ok sample_status=ok mode=cached"
     assert output =~ "pressure=1"
     refute output =~ "[maxio drive.device_io.sample]"
@@ -102,6 +123,15 @@ defmodule Mix.Tasks.Maxio.Drive.DeviceIoTest do
   defp run_task(args) do
     Mix.Task.reenable(@task)
     capture_io(fn -> DeviceIo.run(args) end)
+  end
+
+  defp resume_drive_device_io do
+    case Process.whereis(DriveDeviceIO) do
+      nil -> :ok
+      pid -> :sys.resume(pid)
+    end
+  catch
+    :exit, _reason -> :ok
   end
 
   defp restore_env(nil), do: Application.delete_env(:maxio, :drive_device_io)

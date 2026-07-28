@@ -111,8 +111,7 @@ defmodule Maxio.Cluster.FreshDriveHeal.SchedulerTest do
         end
       )
 
-    send(pid, :run)
-    _ = :sys.get_state(pid)
+    assert {:error, {:backoff_active, _until}} = Scheduler.run_scheduled_now(pid, [])
 
     refute_receive :runner_called, 20
     assert %{last_skip_reason: {:backoff_active, _until}} = Scheduler.status(pid)
@@ -121,14 +120,14 @@ defmodule Maxio.Cluster.FreshDriveHeal.SchedulerTest do
              SchedulerRuns.state(:fresh_drive_heal)
   end
 
-  test "scheduled run records a result and reschedules" do
+  test "run_scheduled_now records a scheduled result" do
     parent = self()
 
     pid =
       start_scheduler!(
-        enabled: true,
-        initial_delay_ms: 0,
+        enabled: false,
         interval_ms: 60_000,
+        probe_drive_health: false,
         scheduler_ledger: [enabled: false],
         runner: fn opts ->
           send(parent, {:scheduled_runner, opts})
@@ -136,9 +135,9 @@ defmodule Maxio.Cluster.FreshDriveHeal.SchedulerTest do
         end
       )
 
+    assert {:ok, %{status: :ok}} = Scheduler.run_scheduled_now(pid, [])
     assert_receive {:scheduled_runner, _opts}, 1_000
-    _ = :sys.get_state(pid)
-    assert %{scheduled?: true, last_result: %{status: :ok}} = Scheduler.status(pid)
+    assert %{scheduled?: false, last_result: %{status: :ok}} = Scheduler.status(pid)
   end
 
   test "runner crash is captured and scheduler remains callable" do

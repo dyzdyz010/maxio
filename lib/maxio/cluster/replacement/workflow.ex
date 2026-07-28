@@ -88,10 +88,23 @@ defmodule Maxio.Cluster.Replacement.Workflow do
       job_id = workflow_job_id(heal) || fallback_rebalance_job_id(heal, opts)
       rebalance_workflow = maybe_rebalance_workflow(job_id, opts)
 
+      status = overall_status(probe, heal, rebalance_workflow, opts)
+      phase = phase(probe, heal, opts)
+
+      automation_profile =
+        AutomationProfile.status(Keyword.get(opts, :automation_profile_opts, []))
+
+      workflow_blockers = blockers(probe, heal, rebalance_workflow)
+      next_action = next_action(before, after_probe, heal, rebalance_workflow, opts)
+      gate_blockers = gate_blockers(status, workflow_blockers, automation_profile)
+      gate_warnings = gate_warnings(gate_blockers, next_action, automation_profile)
+
       report =
         %{
-          status: overall_status(probe, heal, rebalance_workflow, opts),
-          phase: phase(probe, heal, opts),
+          status: status,
+          phase: phase,
+          gate_status: gate_status(gate_blockers, gate_warnings),
+          rehearsal_ready?: Keyword.get(opts, :rehearsal_ready?, false),
           mutating?: mutating?(opts),
           probe: probe,
           drive_health_before: before,
@@ -100,11 +113,12 @@ defmodule Maxio.Cluster.Replacement.Workflow do
           rebalance_enqueue: Map.get(heal, :rebalance_enqueue, not_requested()),
           rebalance_advance: Map.get(heal, :rebalance_advance, not_requested()),
           rebalance_workflow: rebalance_workflow,
-          automation_profile:
-            AutomationProfile.status(Keyword.get(opts, :automation_profile_opts, [])),
+          automation_profile: automation_profile,
           job_id: job_id,
-          blockers: blockers(probe, heal, rebalance_workflow),
-          next_action: next_action(before, after_probe, heal, rebalance_workflow, opts)
+          workflow_blockers: workflow_blockers,
+          blockers: gate_blockers,
+          warnings: gate_warnings,
+          next_action: next_action
         }
 
       {:ok, report}
@@ -320,6 +334,27 @@ defmodule Maxio.Cluster.Replacement.Workflow do
     |> append_blockers(Map.get(workflow, :blockers))
   end
 
+  defp gate_blockers(status, workflow_blockers, automation_profile) do
+    []
+    |> maybe_block(status in [:blocked, :failed], "replacement_workflow_status_#{status}")
+    |> append_blockers(workflow_blockers)
+    |> append_blockers(Map.get(automation_profile, :blockers))
+    |> normalize_gate_items()
+  end
+
+  defp gate_warnings([_ | _], _next_action, _automation_profile), do: []
+
+  defp gate_warnings([], next_action, automation_profile) do
+    []
+    |> append_blockers(Map.get(automation_profile, :warnings))
+    |> maybe_block(next_action not in [nil, "none"], "replacement_workflow_next_action_required")
+    |> normalize_gate_items()
+  end
+
+  defp gate_status([_ | _], _warnings), do: "blocked"
+  defp gate_status([], [_ | _]), do: "attention"
+  defp gate_status([], []), do: "ok"
+
   defp rebalance_advance_job_mismatch?(%{
          rebalance_enqueue: %{status: :created, kind: "rebalance", job_id: enqueue_id},
          rebalance_advance: %{job_id: advance_id}
@@ -464,6 +499,17 @@ defmodule Maxio.Cluster.Replacement.Workflow do
 
   defp append_blockers(blockers, values) when is_list(values), do: values ++ blockers
   defp append_blockers(blockers, _values), do: blockers
+
+  defp normalize_gate_items(items) do
+    items
+    |> Enum.map(&normalize_gate_item/1)
+    |> Enum.uniq()
+    |> Enum.reverse()
+  end
+
+  defp normalize_gate_item(value) when is_binary(value), do: value
+  defp normalize_gate_item(value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_gate_item(value), do: inspect(value)
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)

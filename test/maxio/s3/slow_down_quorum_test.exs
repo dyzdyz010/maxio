@@ -67,7 +67,33 @@ defmodule Maxio.S3.SlowDownQuorumTest do
     @impl true
     def put_delete_marker(b, k, v, eo, o), do: Maxio.Storage.FS.put_delete_marker(b, k, v, eo, o)
     @impl true
-    def delete_version(b, k, v, o), do: Maxio.Storage.FS.delete_version(b, k, v, o)
+    def delete_version(b, k, v, o) do
+      case injected_reason() do
+        nil -> Maxio.Storage.FS.delete_version(b, k, v, o)
+        reason -> {:error, reason}
+      end
+    end
+
+    @impl true
+    def put_notification_ledgers(b, k, e, o),
+      do: Maxio.Storage.FS.put_notification_ledgers(b, k, e, o)
+
+    @impl true
+    def list_notification_ledgers(b, k, o),
+      do: Maxio.Storage.FS.list_notification_ledgers(b, k, o)
+
+    @impl true
+    def delete_notification_ledgers(b, k, ids, o),
+      do: Maxio.Storage.FS.delete_notification_ledgers(b, k, ids, o)
+
+    @impl true
+    def claim_epoch(t, tok, op, o), do: Maxio.Storage.FS.claim_epoch(t, tok, op, o)
+    @impl true
+    def current_epoch(t, o), do: Maxio.Storage.FS.current_epoch(t, o)
+    @impl true
+    def restore_if_current(ctx, o), do: Maxio.Storage.FS.restore_if_current(ctx, o)
+    @impl true
+    def finalize_if_current(ctx, o), do: Maxio.Storage.FS.finalize_if_current(ctx, o)
   end
 
   setup do
@@ -77,10 +103,12 @@ defmodule Maxio.S3.SlowDownQuorumTest do
     Application.put_env(:maxio, :s3, Keyword.put(prev_s3, :data_dir, @data_dir))
 
     prev_backend = Application.get_env(:maxio, :storage_backend)
+    prev_authoritative_source = Application.get_env(:maxio, :authoritative_source)
 
     on_exit(fn ->
       Application.put_env(:maxio, :s3, prev_s3)
       Application.put_env(:maxio, :storage_backend, prev_backend)
+      restore_env(:authoritative_source, prev_authoritative_source)
       Application.delete_env(:maxio, :slow_down_inject)
       File.rm_rf(@data_dir)
     end)
@@ -89,6 +117,8 @@ defmodule Maxio.S3.SlowDownQuorumTest do
   end
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
+  defp restore_env(key, nil), do: Application.delete_env(:maxio, key)
+  defp restore_env(key, value), do: Application.put_env(:maxio, key, value)
 
   defp use_failing_backend(reason) do
     Application.put_env(:maxio, :slow_down_inject, reason)
@@ -172,6 +202,39 @@ defmodule Maxio.S3.SlowDownQuorumTest do
 
       assert conn.status == 500
       assert conn.resp_body =~ "<Code>InternalError</Code>"
+    end
+  end
+
+  describe "DeleteObject sidecar current-version commit errors -> 503 SlowDownWrite" do
+    test "current null delete_version write_quorum fails before PG index deletion" do
+      bucket = "sd-current-delete"
+      key = "obj.txt"
+
+      Application.put_env(:maxio, :authoritative_source, read: :pg, list: :pg, write: :sidecar)
+
+      SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+      put =
+        SigV4Request.signed_conn(:put, "/#{bucket}/#{key}", body: "survives")
+        |> call()
+
+      assert put.status == 200
+
+      use_failing_backend(:write_quorum)
+
+      conn =
+        SigV4Request.signed_conn(:delete, "/#{bucket}/#{key}")
+        |> call()
+
+      assert conn.status == 503
+      assert conn.resp_body =~ "<Code>SlowDownWrite</Code>"
+
+      get =
+        SigV4Request.signed_conn(:get, "/#{bucket}/#{key}")
+        |> call()
+
+      assert get.status == 200
+      assert get.resp_body == "survives"
     end
   end
 

@@ -1,5 +1,8 @@
 defmodule Maxio.S3.DeleteObjectsAuthzTest do
   use Maxio.DataCase, async: false
+  alias Maxio.Auth.CredentialStore
+  alias Maxio.IAM
+  alias Maxio.Policy.Store
   alias Maxio.Test.SigV4Request
   alias Maxio.S3.Endpoint
 
@@ -20,6 +23,16 @@ defmodule Maxio.S3.DeleteObjectsAuthzTest do
   end
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
+
+  defp unique_access_key(prefix) do
+    suffix =
+      [System.unique_integer([:positive]), System.monotonic_time()]
+      |> :erlang.phash2()
+      |> Integer.to_string(36)
+      |> String.upcase()
+
+    "AKIA" <> prefix <> suffix
+  end
 
   test "对象级 s3:DeleteObject 策略授权匿名批删（桶 ARN 策略不再是唯一可行写法）" do
     SigV4Request.signed_conn(:put, "/doa1") |> call()
@@ -99,5 +112,86 @@ defmodule Maxio.S3.DeleteObjectsAuthzTest do
 
     g = SigV4Request.signed_conn(:get, "/doa4/k.txt") |> call()
     assert g.status == 404
+  end
+
+  test "owner（root signed）批删逐 key 遵守显式 Deny" do
+    SigV4Request.signed_conn(:put, "/doa5") |> call()
+    SigV4Request.signed_conn(:put, "/doa5/k.txt", body: "x") |> call()
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::doa5/k.txt"}]})
+
+    SigV4Request.signed_conn(:put, "/doa5", query: %{"policy" => ""}, body: policy) |> call()
+
+    body = ~s(<Delete><Object><Key>k.txt</Key></Object></Delete>)
+    res = SigV4Request.signed_conn(:post, "/doa5", query: %{"delete" => ""}, body: body) |> call()
+
+    assert res.status == 200
+    assert res.resp_body =~ "<Key>k.txt</Key>"
+    assert res.resp_body =~ "AccessDenied"
+    refute res.resp_body =~ "<Deleted><Key>k.txt</Key></Deleted>"
+
+    g = SigV4Request.signed_conn(:get, "/doa5/k.txt") |> call()
+    assert g.status == 200
+    assert g.resp_body == "x"
+  end
+
+  test "DeleteObjects per-key auth enforces permissions boundary explicit deny" do
+    bucket = "doa-boundary"
+    key = "k.txt"
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    SigV4Request.signed_conn(:put, "/#{bucket}/#{key}", body: "x") |> call()
+
+    user_name = "delete-boundary-#{System.unique_integer([:positive])}"
+    access_key = unique_access_key("DELOBJ")
+    secret = "delete-boundary-secret-123456"
+
+    assert {:ok, user} = IAM.create_user(name: user_name)
+
+    assert :ok =
+             CredentialStore.put_access_key(%{
+               access_key: access_key,
+               secret_key: secret,
+               principal: %{type: :iam_user, access_key: access_key, arn: user.user_arn}
+             })
+
+    identity_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    boundary_policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":["arn:aws:s3:::#{bucket}","arn:aws:s3:::#{bucket}/*"]},{"Effect":"Deny","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::#{bucket}/#{key}"}]})
+
+    assert :ok = Store.put_principal_policy(user.user_arn, "allow-delete-object", identity_policy)
+
+    assert {:ok, boundary} =
+             IAM.create_managed_policy(
+               name: "delete-boundary-#{System.unique_integer([:positive])}",
+               path: "/authz/",
+               policy: boundary_policy
+             )
+
+    assert {:ok, _user} =
+             IAM.put_user_permissions_boundary_strict(user.user_name, boundary.policy_arn)
+
+    body = ~s(<Delete><Object><Key>#{key}</Key></Object></Delete>)
+
+    res =
+      SigV4Request.signed_conn(:post, "/#{bucket}",
+        query: %{"delete" => ""},
+        access_key: access_key,
+        secret: secret,
+        body: body
+      )
+      |> call()
+
+    assert res.status == 200
+    assert res.resp_body =~ "<Key>#{key}</Key>"
+    assert res.resp_body =~ "AccessDenied"
+    refute res.resp_body =~ "<Deleted><Key>#{key}</Key></Deleted>"
+
+    still_there = SigV4Request.signed_conn(:get, "/#{bucket}/#{key}") |> call()
+    assert still_there.status == 200
+    assert still_there.resp_body == "x"
   end
 end

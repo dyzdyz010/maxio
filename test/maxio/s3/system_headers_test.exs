@@ -13,6 +13,7 @@ defmodule Maxio.S3.SystemHeadersTest do
 
   @data_dir Path.join(System.tmp_dir!(), "maxio_system_headers_test")
   @expires "Wed, 21 Oct 2037 07:28:00 GMT"
+  @redirect "/redirect-target.html"
 
   setup do
     File.rm_rf(@data_dir)
@@ -55,6 +56,7 @@ defmodule Maxio.S3.SystemHeadersTest do
     assert obj.content_disposition == ~s(attachment; filename="report.txt")
     assert obj.cache_control == "max-age=60"
     assert obj.expires == @expires
+    assert obj.website_redirect_location == @redirect
     assert obj.metadata == %{}
 
     head = SigV4Request.signed_conn(:head, "/sh-put/k.txt") |> call()
@@ -120,6 +122,95 @@ defmodule Maxio.S3.SystemHeadersTest do
     assert get_resp_header(head, "content-encoding") == []
     assert get_resp_header(head, "content-disposition") == []
     assert get_resp_header(head, "expires") == []
+    assert get_resp_header(head, "x-amz-website-redirect-location") == []
+  end
+
+  test "CopyObject metadata-directive COPY does not copy website redirect unless requested" do
+    SigV4Request.signed_conn(:put, "/sh-redirect-copy") |> call()
+
+    SigV4Request.signed_conn(:put, "/sh-redirect-copy/src.txt",
+      body: "source",
+      headers: system_headers()
+    )
+    |> call()
+
+    copy_without_redirect =
+      SigV4Request.signed_conn(:put, "/sh-redirect-copy/no-redirect.txt",
+        headers: [
+          {"x-amz-copy-source", "/sh-redirect-copy/src.txt"},
+          {"x-amz-metadata-directive", "COPY"}
+        ]
+      )
+      |> call()
+
+    assert copy_without_redirect.status == 200
+
+    head_without_redirect =
+      SigV4Request.signed_conn(:head, "/sh-redirect-copy/no-redirect.txt") |> call()
+
+    assert head_without_redirect.status == 200
+    assert get_resp_header(head_without_redirect, "cache-control") == ["max-age=60"]
+    assert get_resp_header(head_without_redirect, "x-amz-website-redirect-location") == []
+
+    explicit_redirect = "/explicit-target.html"
+
+    copy_with_redirect =
+      SigV4Request.signed_conn(:put, "/sh-redirect-copy/with-redirect.txt",
+        headers: [
+          {"x-amz-copy-source", "/sh-redirect-copy/src.txt"},
+          {"x-amz-metadata-directive", "COPY"},
+          {"x-amz-website-redirect-location", explicit_redirect}
+        ]
+      )
+      |> call()
+
+    assert copy_with_redirect.status == 200
+
+    head_with_redirect =
+      SigV4Request.signed_conn(:head, "/sh-redirect-copy/with-redirect.txt") |> call()
+
+    assert head_with_redirect.status == 200
+    assert get_resp_header(head_with_redirect, "cache-control") == ["max-age=60"]
+
+    assert get_resp_header(head_with_redirect, "x-amz-website-redirect-location") == [
+             explicit_redirect
+           ]
+  end
+
+  test "CopyObject same-key guard treats website redirect changes as object changes" do
+    SigV4Request.signed_conn(:put, "/sh-self-redirect") |> call()
+
+    SigV4Request.signed_conn(:put, "/sh-self-redirect/k.txt",
+      body: "source",
+      headers: system_headers()
+    )
+    |> call()
+
+    no_change =
+      SigV4Request.signed_conn(:put, "/sh-self-redirect/k.txt",
+        headers: [{"x-amz-copy-source", "/sh-self-redirect/k.txt"}]
+      )
+      |> call()
+
+    assert no_change.status == 400
+    assert no_change.resp_body =~ "<Code>InvalidRequest</Code>"
+
+    changed_redirect = "/changed-target.html"
+
+    changed =
+      SigV4Request.signed_conn(:put, "/sh-self-redirect/k.txt",
+        headers: [
+          {"x-amz-copy-source", "/sh-self-redirect/k.txt"},
+          {"x-amz-website-redirect-location", changed_redirect}
+        ]
+      )
+      |> call()
+
+    assert changed.status == 200
+
+    head = SigV4Request.signed_conn(:head, "/sh-self-redirect/k.txt") |> call()
+    assert head.status == 200
+    assert get_resp_header(head, "x-amz-website-redirect-location") == [changed_redirect]
   end
 
   test "CopyObject rejects invalid metadata and tagging directives before target commit" do
@@ -218,6 +309,13 @@ defmodule Maxio.S3.SystemHeadersTest do
     head = SigV4Request.signed_conn(:head, "/sh-mpu/mp.bin") |> call()
     assert head.status == 200
     assert_system_headers(head)
+
+    :ok = Objects.delete_metadata("sh-mpu", "mp.bin")
+    Application.put_env(:maxio, :authoritative_source, read: :sidecar, list: :sidecar)
+
+    sidecar_head = SigV4Request.signed_conn(:head, "/sh-mpu/mp.bin") |> call()
+    assert sidecar_head.status == 200
+    assert_system_headers(sidecar_head)
   end
 
   test "aws-chunked PutObject does not persist transfer Content-Encoding as object metadata" do
@@ -260,7 +358,8 @@ defmodule Maxio.S3.SystemHeadersTest do
       {"content-encoding", "gzip"},
       {"content-disposition", ~s(attachment; filename="report.txt")},
       {"cache-control", "max-age=60"},
-      {"expires", @expires}
+      {"expires", @expires},
+      {"x-amz-website-redirect-location", @redirect}
     ]
   end
 
@@ -269,6 +368,7 @@ defmodule Maxio.S3.SystemHeadersTest do
     assert get_resp_header(conn, "content-disposition") == [~s(attachment; filename="report.txt")]
     assert get_resp_header(conn, "cache-control") == ["max-age=60"]
     assert get_resp_header(conn, "expires") == [@expires]
+    assert get_resp_header(conn, "x-amz-website-redirect-location") == [@redirect]
   end
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))

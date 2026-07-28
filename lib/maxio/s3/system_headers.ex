@@ -10,7 +10,8 @@ defmodule Maxio.S3.SystemHeaders do
     {"content-encoding", :content_encoding},
     {"content-disposition", :content_disposition},
     {"cache-control", :cache_control},
-    {"expires", :expires}
+    {"expires", :expires},
+    {"x-amz-website-redirect-location", :website_redirect_location}
   ]
 
   @fields Enum.map(@headers, fn {_header, field} -> field end)

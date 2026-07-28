@@ -46,6 +46,8 @@ AGENTS.md §4.1 要求职责永远 subagent 级隔离、严禁一个 agent 同�
 
 声明"完成/修复/通过"前，必须由独立 `verifier`/`code-reviewer` 跑验证命令（`mix compile --warnings-as-errors`、`mix test`、aws-cli e2e）并收集证据；失败则继续迭代。
 
+验证必须按批次收口：开发过程中不得每个小功能点都跑完整 `mix precommit`，应先用聚焦 `mix test` / `mix compile --warnings-as-errors` / 必要的 `mix format --check-formatted` 快速反馈，多个相关功能点合并为一个 coherent batch 后再独立复审、更新 STATUS，并在批次收口或最终交付时跑一次完整 `mix precommit`。
+
 ## 本机工具链速记（Windows，详见 STATUS.md）
 
 - Elixir 1.20 / OTP 28 在 `C:\Users\dyz\Documents\dev\usr\Elixir\bin`；mix/phx_new/hex 已装；docker/git 可用；psql 不在 PATH（用 `docker exec maxio-db psql ...`）。

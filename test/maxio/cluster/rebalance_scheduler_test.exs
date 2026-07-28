@@ -203,14 +203,13 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
     assert %{last_result: nil, last_skip_reason: :boom} = Scheduler.status(pid)
   end
 
-  test "enabled scheduler runs once and reschedules", ctx do
+  test "run_scheduled_now runs one scheduled scheduler pass", ctx do
     parent = self()
     {:ok, _job} = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
 
     pid =
       start_scheduler!(
-        enabled: true,
-        initial_delay_ms: 0,
+        enabled: false,
         interval_ms: 60_000,
         topology: ctx.topology,
         destination_set_id: 1,
@@ -220,11 +219,13 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
         end
       )
 
+    assert {:ok, %{phase: :copy, scheduler: true, status: :partial}} =
+             Scheduler.run_scheduled_now(pid, [])
+
     assert_receive {:scheduled_copy_runner, _job_id, opts}, 1_000
     assert Keyword.fetch!(opts, :destination_set_id) == 1
-    _ = :sys.get_state(pid)
 
-    assert %{scheduled?: true, last_result: %{phase: :copy, status: :partial}} =
+    assert %{scheduled?: false, last_result: %{phase: :copy, status: :partial}} =
              Scheduler.status(pid)
   end
 

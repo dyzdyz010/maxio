@@ -8,6 +8,7 @@ defmodule Maxio.STS.QueryAPITest do
   alias Maxio.IAM
   alias Maxio.IAM.{STSSession, TOTP}
   alias Maxio.S3.Endpoint
+  alias Maxio.STS
   alias Maxio.Test.SigV4Request
 
   @account_id "000000000000"
@@ -93,19 +94,127 @@ defmodule Maxio.STS.QueryAPITest do
     refute response.resp_body =~ "<ListAllMyBucketsResult"
   end
 
-  test "unsupported STS action does not fall through to S3 ListBuckets" do
+  test "signed GetAccessKeyInfo returns the account for an existing access key" do
     response =
-      signed_sts_conn(%{"Action" => "GetAccessKeyInfo"})
+      signed_sts_conn(%{
+        "Action" => "GetAccessKeyInfo",
+        "AccessKeyId" => SigV4Request.access_key()
+      })
       |> call()
 
-    assert response.status == 400
-    assert response.resp_body =~ "<Code>InvalidAction</Code>"
+    assert response.status == 200
+    assert response.resp_body =~ "<GetAccessKeyInfoResponse"
+    assert xml_value(response.resp_body, "Account") == @account_id
     refute response.resp_body =~ "<ListAllMyBucketsResult"
   end
 
-  test "unsupported POST form action does not fall through to S3 ListBuckets" do
+  test "presigned GetAccessKeyInfo returns the account for an existing access key" do
     response =
-      signed_sts_form_conn(%{"Action" => "GetAccessKeyInfo"})
+      SigV4Request.presigned_conn(:get, "/",
+        service: "sts",
+        query:
+          base_query(%{
+            "Action" => "GetAccessKeyInfo",
+            "AccessKeyId" => SigV4Request.access_key()
+          })
+      )
+      |> call()
+
+    assert response.status == 200
+    assert response.resp_body =~ "<GetAccessKeyInfoResponse"
+    assert xml_value(response.resp_body, "Account") == @account_id
+    refute response.resp_body =~ "<ListAllMyBucketsResult"
+  end
+
+  test "GetAccessKeyInfo accepts the configured local root access key exception" do
+    original_s3 = Application.fetch_env!(:maxio, :s3)
+
+    Application.put_env(
+      :maxio,
+      :s3,
+      Keyword.merge(original_s3, root_user: "minioadmin", root_password: "minioadmin")
+    )
+
+    on_exit(fn -> Application.put_env(:maxio, :s3, original_s3) end)
+    IAM.bootstrap_root()
+
+    response =
+      signed_sts_conn(
+        %{
+          "Action" => "GetAccessKeyInfo",
+          "AccessKeyId" => "minioadmin"
+        },
+        access_key: "minioadmin",
+        secret: "minioadmin"
+      )
+      |> call()
+
+    assert response.status == 200
+    assert response.resp_body =~ "<GetAccessKeyInfoResponse"
+    assert xml_value(response.resp_body, "Account") == @account_id
+    refute response.resp_body =~ "<ListAllMyBucketsResult"
+  end
+
+  test "POST form GetAccessKeyInfo returns the account for temporary credentials" do
+    {:ok, session} =
+      STS.issue_session(
+        issuer_access_key_id: SigV4Request.access_key(),
+        session_access_key_id: unique_session_ak("INFOSESSION"),
+        secret_key: "session-secret",
+        session_token: "session-token",
+        duration_seconds: 900
+      )
+
+    response =
+      signed_sts_form_conn(%{
+        "Action" => "GetAccessKeyInfo",
+        "AccessKeyId" => session.access_key_id
+      })
+      |> call()
+
+    assert response.status == 200
+    assert response.resp_body =~ "<GetAccessKeyInfoResponse"
+    assert xml_value(response.resp_body, "Account") == @account_id
+    refute response.resp_body =~ "SecretAccessKey"
+    refute response.resp_body =~ "SessionToken"
+  end
+
+  test "GetAccessKeyInfo validates access key parameters without S3 fallback" do
+    missing =
+      signed_sts_conn(%{"Action" => "GetAccessKeyInfo"})
+      |> call()
+
+    assert missing.status == 400
+    assert missing.resp_body =~ "<Code>InvalidParameterValue</Code>"
+    assert missing.resp_body =~ "AccessKeyId is required"
+
+    invalid =
+      signed_sts_conn(%{
+        "Action" => "GetAccessKeyInfo",
+        "AccessKeyId" => "AKIAINVALID-KEY123"
+      })
+      |> call()
+
+    assert invalid.status == 400
+    assert invalid.resp_body =~ "<Code>InvalidParameterValue</Code>"
+    assert invalid.resp_body =~ "AccessKeyId is invalid"
+    refute invalid.resp_body =~ "<ListAllMyBucketsResult"
+
+    not_found =
+      signed_sts_conn(%{
+        "Action" => "GetAccessKeyInfo",
+        "AccessKeyId" => unique_access_key("MISSINGINFO")
+      })
+      |> call()
+
+    assert not_found.status == 403
+    assert not_found.resp_body =~ "<Code>InvalidClientTokenId</Code>"
+    refute not_found.resp_body =~ "<ListAllMyBucketsResult"
+  end
+
+  test "unsupported STS action does not fall through to S3 ListBuckets" do
+    response =
+      signed_sts_conn(%{"Action" => "DecodeAuthorizationMessage"})
       |> call()
 
     assert response.status == 400
@@ -448,6 +557,482 @@ defmodule Maxio.STS.QueryAPITest do
 
     assert get_object.status == 200
     assert get_object.resp_body == "from-role"
+  end
+
+  test "AssumeRole uses role inline policy written through IAM Query API" do
+    bucket = unique_bucket("iamqueryroleinline")
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    {:ok, role} = create_trusted_role("query-inline")
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::#{bucket}/*"}})
+
+    put_policy =
+      SigV4Request.signed_conn(:get, "/",
+        service: "iam",
+        query: %{
+          "Action" => "PutRolePolicy",
+          "Version" => "2010-05-08",
+          "RoleName" => role.role_name,
+          "PolicyName" => "query-inline-rw",
+          "PolicyDocument" => policy
+        }
+      )
+      |> call()
+
+    assert put_policy.status == 200
+    assert put_policy.resp_body =~ "<PutRolePolicyResponse"
+
+    response =
+      signed_assume_role_conn(role, "query-inline-session", %{"DurationSeconds" => "900"})
+      |> call()
+
+    assert response.status == 200
+    credentials = credentials_from(response.resp_body)
+
+    put_object =
+      SigV4Request.signed_conn(:put, "/#{bucket}/query-role.txt",
+        body: "from-query-role-policy",
+        access_key: credentials.access_key,
+        secret: credentials.secret_key,
+        session_token: credentials.session_token
+      )
+      |> call()
+
+    assert put_object.status == 200
+
+    get_object =
+      SigV4Request.signed_conn(:get, "/#{bucket}/query-role.txt",
+        access_key: credentials.access_key,
+        secret: credentials.secret_key,
+        session_token: credentials.session_token
+      )
+      |> call()
+
+    assert get_object.status == 200
+    assert get_object.resp_body == "from-query-role-policy"
+  end
+
+  test "unsigned AssumeRoleWithWebIdentity returns role credentials usable by S3 role policy" do
+    bucket = unique_bucket("webid")
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    issuer = "https://oidc.example.test/tenant"
+    subject = "system:serviceaccount:maxio:writer"
+    audience = "sts.amazonaws.com"
+
+    with_web_identity_provider(issuer, [audience], fn jwk, _provider ->
+      {:ok, role} = create_web_identity_role("webid-writer", issuer, subject, audience)
+
+      policy =
+        ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::#{bucket}/*"}})
+
+      assert :ok = IAM.put_principal_policy(role.role_arn, "object-rw", policy)
+
+      token = web_identity_token(jwk, issuer, subject, audience)
+
+      response =
+        web_identity_conn(role, "webid-session", token)
+        |> call()
+
+      assert response.status == 200
+      assert response.resp_body =~ "<AssumeRoleWithWebIdentityResponse"
+
+      assert response.resp_body =~
+               "<SubjectFromWebIdentityToken>#{subject}</SubjectFromWebIdentityToken>"
+
+      assert response.resp_body =~ "<Audience>#{audience}</Audience>"
+      assert response.resp_body =~ "<Provider>#{issuer}</Provider>"
+      assert xml_value(response.resp_body, "Arn") == assumed_role_arn(role, "webid-session")
+
+      credentials = credentials_from(response.resp_body)
+      persisted = Repo.get_by!(STSSession, access_key_id: credentials.access_key)
+      assert persisted.issuer_access_key_id == nil
+
+      assert persisted.web_identity_provider_arn ==
+               elem(STS.WebIdentity.oidc_provider_arn(issuer), 1)
+
+      assert persisted.web_identity_audience == audience
+      assert persisted.web_identity_subject_sha256 == sha256_hex(subject)
+
+      put_object =
+        SigV4Request.signed_conn(:put, "/#{bucket}/webid.txt",
+          body: "from-webid",
+          access_key: credentials.access_key,
+          secret: credentials.secret_key,
+          session_token: credentials.session_token
+        )
+        |> call()
+
+      assert put_object.status == 200
+
+      get_object =
+        SigV4Request.signed_conn(:get, "/#{bucket}/webid.txt",
+          access_key: credentials.access_key,
+          secret: credentials.secret_key,
+          session_token: credentials.session_token
+        )
+        |> call()
+
+      assert get_object.status == 200
+      assert get_object.resp_body == "from-webid"
+    end)
+  end
+
+  test "unsigned POST form AssumeRoleWithWebIdentity succeeds without weakening other STS POST actions" do
+    issuer = "https://post.oidc.example.test"
+    subject = "post-subject"
+    audience = "sts.amazonaws.com"
+
+    with_web_identity_provider(issuer, [audience], fn jwk, _provider ->
+      {:ok, role} = create_web_identity_role("webid-post", issuer, subject, audience)
+      token = web_identity_token(jwk, issuer, subject, audience)
+
+      response =
+        web_identity_form_conn(role, "webid-post-session", token)
+        |> call()
+
+      assert response.status == 200
+      assert response.resp_body =~ "<AssumeRoleWithWebIdentityResponse"
+      assert credentials_from(response.resp_body).session_token != ""
+
+      unsigned_get_session_token =
+        SigV4Request.anon_conn(:post, "/",
+          body: form_body(%{"DurationSeconds" => "900"}),
+          headers: [{"content-type", "application/x-www-form-urlencoded"}]
+        )
+        |> call()
+
+      assert unsigned_get_session_token.status == 403
+      assert unsigned_get_session_token.resp_body =~ "header SigV4"
+    end)
+  end
+
+  test "AssumeRoleWithWebIdentity fails closed for invalid token and trust policy claims" do
+    issuer = "https://claims.oidc.example.test/team"
+    subject = "allowed-subject"
+    audience = "sts.amazonaws.com"
+
+    with_web_identity_provider(issuer, [audience], fn jwk, _provider ->
+      {:ok, role} = create_web_identity_role("webid-claims", issuer, subject, audience)
+      before_count = Repo.aggregate(STSSession, :count)
+
+      bad_signature =
+        web_identity_conn(
+          role,
+          "bad-signature",
+          web_identity_token(JOSE.JWK.from_oct("other-secret"), issuer, subject, audience)
+        )
+        |> call()
+
+      assert bad_signature.status == 400
+      assert bad_signature.resp_body =~ "<Code>InvalidIdentityToken</Code>"
+
+      wrong_audience =
+        web_identity_conn(
+          role,
+          "wrong-audience",
+          web_identity_token(jwk, issuer, subject, "other-client")
+        )
+        |> call()
+
+      assert wrong_audience.status == 403
+      assert wrong_audience.resp_body =~ "<Code>IDPRejectedClaim</Code>"
+
+      wrong_subject =
+        web_identity_conn(
+          role,
+          "wrong-subject",
+          web_identity_token(jwk, issuer, "other-subject", audience)
+        )
+        |> call()
+
+      assert wrong_subject.status == 403
+      assert wrong_subject.resp_body =~ "<Code>AccessDenied</Code>"
+
+      expired =
+        web_identity_conn(
+          role,
+          "expired-token",
+          web_identity_token(jwk, issuer, subject, audience, expires_in: -600)
+        )
+        |> call()
+
+      assert expired.status == 400
+      assert expired.resp_body =~ "<Code>ExpiredToken</Code>"
+
+      assert Repo.aggregate(STSSession, :count) == before_count
+    end)
+  end
+
+  test "AssumeRoleWithWebIdentity rejects unsupported AssumeRole-only parameters" do
+    issuer = "https://params.oidc.example.test"
+    subject = "subject"
+    audience = "sts.amazonaws.com"
+
+    with_web_identity_provider(issuer, [audience], fn jwk, _provider ->
+      {:ok, role} = create_web_identity_role("webid-params", issuer, subject, audience)
+      token = web_identity_token(jwk, issuer, subject, audience)
+
+      for {params, message} <- [
+            {%{"ExternalId" => "tenant"}, "ExternalId"},
+            {%{"SourceIdentity" => "pipeline"}, "SourceIdentity"},
+            {%{"Tags.member.1.Key" => "team", "Tags.member.1.Value" => "platform"}, "Tags"},
+            {%{"TransitiveTagKeys.member.1" => "team"}, "TransitiveTagKeys"},
+            {%{"SerialNumber" => "arn:aws:iam:::mfa/root", "TokenCode" => "123456"},
+             "SerialNumber"},
+            {%{"ProvidedContexts.member.1.ProviderArn" => "arn:aws:iam:::contextProvider/test"},
+             "ProvidedContexts"},
+            {%{"ProviderId" => "www.amazon.com"}, "ProviderId"}
+          ] do
+        response =
+          web_identity_conn(role, "webid-params", token, params)
+          |> call()
+
+        assert response.status == 400
+        assert response.resp_body =~ "<Code>InvalidParameterValue</Code>"
+        assert response.resp_body =~ message
+      end
+    end)
+  end
+
+  test "AssumeRoleWithWebIdentity rejects invalid JWT SourceIdentity and tag claim shapes" do
+    issuer = "https://invalid-claims.oidc.example.test/tenant"
+    subject = "invalid-claims-subject"
+    audience = "sts.amazonaws.com"
+
+    with_web_identity_provider(issuer, [audience], fn jwk, _provider ->
+      {:ok, role} = create_web_identity_role("webid-invalid-claims", issuer, subject, audience)
+
+      invalid_claim_sets = [
+        %{"https://aws.amazon.com/source_identity" => "aws:reserved"},
+        %{"https://aws.amazon.com/source_identity" => 123},
+        %{"https://aws.amazon.com/source_identity" => "bad value"},
+        %{
+          "https://aws.amazon.com/tags" => %{
+            "principal_tags" => %{"team" => ["platform"]}
+          },
+          "https://aws.amazon.com/tags/principal_tags/TEAM" => "security"
+        },
+        %{
+          "https://aws.amazon.com/tags" => %{
+            "principal_tags" => %{"team" => ["platform", "security"]}
+          }
+        },
+        %{"https://aws.amazon.com/tags/principal_tags/team" => ["platform"]},
+        %{
+          "https://aws.amazon.com/tags" => %{
+            "principal_tags" => %{"team" => ["platform"]},
+            "transitive_tag_keys" => ["team", "TEAM"]
+          }
+        }
+      ]
+
+      for claims <- invalid_claim_sets do
+        before_count = Repo.aggregate(STSSession, :count)
+        token = web_identity_token(jwk, issuer, subject, audience, claims: claims)
+
+        response =
+          web_identity_conn(role, "webid-invalid-claims", token)
+          |> call()
+
+        assert response.status == 400
+        assert response.resp_body =~ "<Code>InvalidIdentityToken</Code>"
+        assert Repo.aggregate(STSSession, :count) == before_count
+      end
+    end)
+  end
+
+  test "AssumeRoleWithWebIdentity maps JWT SourceIdentity into trust policy and S3 authz" do
+    bucket = unique_bucket("webid-source")
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    issuer = "https://source.oidc.example.test/tenant"
+    subject = "source-subject"
+    audience = "sts.amazonaws.com"
+
+    with_web_identity_provider(issuer, [audience], fn jwk, _provider ->
+      {:ok, provider_arn} = STS.WebIdentity.oidc_provider_arn(issuer)
+      {:ok, issuer_host_path} = STS.WebIdentity.issuer_host_path(issuer)
+
+      source_claims = %{"https://aws.amazon.com/source_identity" => "build+pipeline"}
+      token = web_identity_token(jwk, issuer, subject, audience, claims: source_claims)
+
+      {:ok, denied_role} =
+        create_role("webid-source-denied", %{
+          "Version" => "2012-10-17",
+          "Statement" => %{
+            "Effect" => "Allow",
+            "Principal" => %{"Federated" => provider_arn},
+            "Action" => "sts:AssumeRoleWithWebIdentity",
+            "Condition" => %{
+              "StringEquals" => %{
+                "#{issuer_host_path}:sub" => subject,
+                "#{issuer_host_path}:aud" => audience,
+                "sts:SourceIdentity" => "build+pipeline"
+              }
+            }
+          }
+        })
+
+      before_count = Repo.aggregate(STSSession, :count)
+
+      denied =
+        web_identity_conn(denied_role, "webid-source-denied", token)
+        |> call()
+
+      assert denied.status == 403
+      assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+      assert denied.resp_body =~ "Cannot set SourceIdentity"
+      assert Repo.aggregate(STSSession, :count) == before_count
+
+      {:ok, role} =
+        create_role("webid-source", %{
+          "Version" => "2012-10-17",
+          "Statement" => %{
+            "Effect" => "Allow",
+            "Principal" => %{"Federated" => provider_arn},
+            "Action" => ["sts:AssumeRoleWithWebIdentity", "sts:SetSourceIdentity"],
+            "Condition" => %{
+              "StringEquals" => %{
+                "#{issuer_host_path}:sub" => subject,
+                "#{issuer_host_path}:aud" => audience,
+                "sts:SourceIdentity" => "build+pipeline"
+              }
+            }
+          }
+        })
+
+      policy =
+        ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::#{bucket}/*","Condition":{"StringEquals":{"aws:SourceIdentity":"build+pipeline"}}}})
+
+      assert :ok = IAM.put_principal_policy(role.role_arn, "webid-source-put", policy)
+
+      response =
+        web_identity_conn(role, "webid-source", token)
+        |> call()
+
+      assert response.status == 200
+      assert response.resp_body =~ "<SourceIdentity>build+pipeline</SourceIdentity>"
+
+      credentials = credentials_from(response.resp_body)
+      persisted = Repo.get_by!(STSSession, access_key_id: credentials.access_key)
+      assert persisted.source_identity == "build+pipeline"
+
+      allowed =
+        SigV4Request.signed_conn(:put, "/#{bucket}/allowed.txt",
+          body: "source",
+          access_key: credentials.access_key,
+          secret: credentials.secret_key,
+          session_token: credentials.session_token
+        )
+        |> call()
+
+      assert allowed.status == 200
+    end)
+  end
+
+  test "AssumeRoleWithWebIdentity maps nested JWT session tags and transitive keys" do
+    bucket = unique_bucket("webid-tags")
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    issuer = "https://tags.oidc.example.test/tenant"
+    subject = "tag-subject"
+    audience = "sts.amazonaws.com"
+
+    with_web_identity_provider(issuer, [audience], fn jwk, _provider ->
+      {:ok, provider_arn} = STS.WebIdentity.oidc_provider_arn(issuer)
+      {:ok, issuer_host_path} = STS.WebIdentity.issuer_host_path(issuer)
+
+      tag_claims = %{
+        "https://aws.amazon.com/tags" => %{
+          "principal_tags" => %{"team" => ["platform"]},
+          "transitive_tag_keys" => ["team"]
+        }
+      }
+
+      token = web_identity_token(jwk, issuer, subject, audience, claims: tag_claims)
+
+      {:ok, denied_role} =
+        create_role("webid-tags-denied", %{
+          "Version" => "2012-10-17",
+          "Statement" => %{
+            "Effect" => "Allow",
+            "Principal" => %{"Federated" => provider_arn},
+            "Action" => "sts:AssumeRoleWithWebIdentity",
+            "Condition" => %{
+              "StringEquals" => %{
+                "#{issuer_host_path}:sub" => subject,
+                "#{issuer_host_path}:aud" => audience,
+                "aws:RequestTag/team" => "platform"
+              }
+            }
+          }
+        })
+
+      before_count = Repo.aggregate(STSSession, :count)
+
+      denied =
+        web_identity_conn(denied_role, "webid-tags-denied", token)
+        |> call()
+
+      assert denied.status == 403
+      assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+      assert denied.resp_body =~ "Cannot tag the requested role session"
+      assert Repo.aggregate(STSSession, :count) == before_count
+
+      {:ok, role} =
+        IAM.create_role(
+          role_name: unique_role("webid-tags"),
+          tags: %{"project" => "storage", "team" => "role-team"},
+          trust_policy: %{
+            "Version" => "2012-10-17",
+            "Statement" => %{
+              "Effect" => "Allow",
+              "Principal" => %{"Federated" => provider_arn},
+              "Action" => ["sts:AssumeRoleWithWebIdentity", "sts:TagSession"],
+              "Condition" => %{
+                "StringEquals" => %{
+                  "#{issuer_host_path}:sub" => subject,
+                  "#{issuer_host_path}:aud" => audience,
+                  "aws:RequestTag/team" => "platform",
+                  "aws:ResourceTag/project" => "storage",
+                  "sts:TransitiveTagKeys" => "team"
+                },
+                "ForAllValues:StringEquals" => %{"aws:TagKeys" => ["team"]}
+              }
+            }
+          }
+        )
+
+      policy =
+        ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::#{bucket}/*","Condition":{"StringEquals":{"aws:PrincipalTag/team":"platform","aws:PrincipalTag/project":"storage"}}}})
+
+      assert :ok = IAM.put_principal_policy(role.role_arn, "webid-tags-put", policy)
+
+      response =
+        web_identity_conn(role, "webid-tags", token)
+        |> call()
+
+      assert response.status == 200
+      credentials = credentials_from(response.resp_body)
+
+      persisted = Repo.get_by!(STSSession, access_key_id: credentials.access_key)
+      assert persisted.tags == %{"project" => "storage", "team" => "platform"}
+      assert persisted.transitive_tag_keys == ["team"]
+
+      allowed =
+        SigV4Request.signed_conn(:put, "/#{bucket}/allowed.txt",
+          body: "tagged",
+          access_key: credentials.access_key,
+          secret: credentials.secret_key,
+          session_token: credentials.session_token
+        )
+        |> call()
+
+      assert allowed.status == 200
+    end)
   end
 
   test "AssumeRole inline session policy intersects role policy and is persisted" do
@@ -2189,6 +2774,20 @@ defmodule Maxio.STS.QueryAPITest do
     SigV4Request.signed_conn(:post, "/", sign_opts)
   end
 
+  defp web_identity_conn(role, session_name, token, extra_query \\ %{}) do
+    query =
+      web_identity_query(role, session_name, token, extra_query)
+
+    SigV4Request.anon_conn(:get, "/", query: query)
+  end
+
+  defp web_identity_form_conn(role, session_name, token, extra_form \\ %{}) do
+    SigV4Request.anon_conn(:post, "/",
+      body: URI.encode_query(web_identity_query(role, session_name, token, extra_form)),
+      headers: [{"content-type", "application/x-www-form-urlencoded; charset=utf-8"}]
+    )
+  end
+
   defp base_query(extra \\ %{}) do
     Map.merge(%{"Action" => "GetSessionToken", "Version" => "2011-06-15"}, extra)
   end
@@ -2207,6 +2806,20 @@ defmodule Maxio.STS.QueryAPITest do
     )
   end
 
+  defp web_identity_query(role, session_name, token, extra) do
+    Map.merge(
+      %{
+        "Action" => "AssumeRoleWithWebIdentity",
+        "Version" => "2011-06-15",
+        "RoleArn" => role.role_arn,
+        "RoleSessionName" => session_name,
+        "WebIdentityToken" => token,
+        "DurationSeconds" => "900"
+      },
+      extra
+    )
+  end
+
   defp create_trusted_role(prefix) do
     create_role(prefix, %{
       "Version" => "2012-10-17",
@@ -2214,6 +2827,26 @@ defmodule Maxio.STS.QueryAPITest do
         "Effect" => "Allow",
         "Principal" => %{"AWS" => IAM.root_principal_arn()},
         "Action" => "sts:AssumeRole"
+      }
+    })
+  end
+
+  defp create_web_identity_role(prefix, issuer, subject, audience) do
+    {:ok, provider_arn} = STS.WebIdentity.oidc_provider_arn(issuer)
+    {:ok, issuer_host_path} = STS.WebIdentity.issuer_host_path(issuer)
+
+    create_role(prefix, %{
+      "Version" => "2012-10-17",
+      "Statement" => %{
+        "Effect" => "Allow",
+        "Principal" => %{"Federated" => provider_arn},
+        "Action" => "sts:AssumeRoleWithWebIdentity",
+        "Condition" => %{
+          "StringEquals" => %{
+            "#{issuer_host_path}:sub" => subject,
+            "#{issuer_host_path}:aud" => audience
+          }
+        }
       }
     })
   end
@@ -2248,6 +2881,52 @@ defmodule Maxio.STS.QueryAPITest do
 
   defp assumed_role_arn(role, session_name) do
     "arn:aws:sts:::assumed-role/#{role.role_name}/#{session_name}"
+  end
+
+  defp with_web_identity_provider(issuer, audiences, fun) do
+    jwk = JOSE.JWK.from_oct("web-identity-secret-#{System.unique_integer([:positive])}")
+    previous = Application.get_env(:maxio, :web_identity_providers, :__unset__)
+
+    provider = %{
+      issuer: issuer,
+      audiences: audiences,
+      jwks: [jwk],
+      allowed_algs: ["HS256"]
+    }
+
+    try do
+      Application.put_env(:maxio, :web_identity_providers, [provider])
+      fun.(jwk, provider)
+    after
+      case previous do
+        :__unset__ -> Application.delete_env(:maxio, :web_identity_providers)
+        value -> Application.put_env(:maxio, :web_identity_providers, value)
+      end
+    end
+  end
+
+  defp web_identity_token(jwk, issuer, subject, audience, opts \\ []) do
+    now =
+      opts
+      |> Keyword.get(:now, DateTime.utc_now())
+      |> DateTime.to_unix()
+
+    expires_in = Keyword.get(opts, :expires_in, 3_600)
+
+    claims =
+      %{
+        "iss" => issuer,
+        "sub" => subject,
+        "aud" => audience,
+        "iat" => now,
+        "exp" => now + expires_in
+      }
+      |> Map.merge(Keyword.get(opts, :claims, %{}))
+
+    jwk
+    |> JOSE.JWT.sign(%{"alg" => "HS256", "kid" => "maxio-test"}, claims)
+    |> JOSE.JWS.compact()
+    |> elem(1)
   end
 
   defp managed_policy_arn(name), do: "arn:aws:iam:::policy/#{unique_role(name)}"
@@ -2306,5 +2985,7 @@ defmodule Maxio.STS.QueryAPITest do
 
   defp unique_bucket(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
   defp unique_access_key(prefix), do: "AKIA#{prefix}#{System.unique_integer([:positive])}"
+  defp unique_session_ak(prefix), do: "ASIA#{prefix}#{System.unique_integer([:positive])}"
   defp unique_role(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
+  defp sha256_hex(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 end

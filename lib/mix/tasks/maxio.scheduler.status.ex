@@ -9,6 +9,7 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
       mix maxio.scheduler.status --state-only --json
       mix maxio.scheduler.status --cadence --since-minutes 120 --json
       mix maxio.scheduler.status --rollups --rollup-limit 24 --json
+      mix maxio.scheduler.status --cadence --fail-on-blocked --json
   """
 
   use Mix.Task
@@ -30,6 +31,8 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
           since_minutes: :integer,
           expected_interval_ms: :integer,
           stale_after_ms: :integer,
+          fail_on_blocked: :boolean,
+          fail_on_attention: :boolean,
           json: :boolean
         ]
       )
@@ -41,7 +44,8 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
         "usage: mix maxio.scheduler.status [--scheduler fresh_drive_heal|rebalance] " <>
           "[--trigger manual|scheduled] [--runs N] [--state-only] [--rollups] " <>
           "[--rollup-limit N] [--cadence] [--since-minutes N] " <>
-          "[--expected-interval-ms N] [--stale-after-ms N] [--json] " <>
+          "[--expected-interval-ms N] [--stale-after-ms N] " <>
+          "[--fail-on-blocked] [--fail-on-attention] [--json] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
     end
@@ -54,7 +58,7 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
     validate_positive_int!(opts, :expected_interval_ms, "--expected-interval-ms")
     validate_positive_int!(opts, :stale_after_ms, "--stale-after-ms")
 
-    Mix.Task.run("app.start")
+    ensure_repo_started!()
 
     states =
       opts
@@ -99,7 +103,10 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
         report
       end
 
+    report = put_gate(report)
+
     print_or_json(report, opts)
+    fail_if_needed!(report, opts)
   end
 
   defp print_or_json(report, opts) do
@@ -111,11 +118,15 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
   end
 
   defp print_text(%{states: [], runs: [], rollups: []} = report) do
+    print_summary(report)
     IO.puts("[maxio scheduler.status] status=not_started schedulers=0 runs=0")
+    print_gate_items(report)
     print_cadence_reports(report)
   end
 
   defp print_text(%{states: states, runs: runs, rollups: rollups} = report) do
+    print_summary(report)
+
     Enum.each(states, fn state ->
       IO.puts(
         "[maxio scheduler.status] scheduler=#{state.scheduler} status=#{state.status} " <>
@@ -137,7 +148,32 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
     end)
 
     Enum.each(rollups, &print_rollup/1)
+    print_gate_items(report)
     print_cadence_reports(report)
+  end
+
+  defp print_summary(report) do
+    IO.puts(
+      "[maxio scheduler.status.summary] gate_status=#{report.gate_status} " <>
+        "states=#{length(report.states)} runs=#{length(report.runs)} " <>
+        "rollups=#{length(report.rollups)} blockers=#{length(report.blockers)} " <>
+        "warnings=#{length(report.warnings)}"
+    )
+  end
+
+  defp print_gate_items(report) do
+    Enum.each(report.blockers, &print_gate_item(:blocker, &1))
+    Enum.each(report.warnings, &print_gate_item(:warning, &1))
+  end
+
+  defp print_gate_item(kind, item) do
+    fields =
+      item
+      |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+      |> Enum.map(fn {key, value} -> "#{key}=#{format_value(value)}" end)
+      |> Enum.join(" ")
+
+    IO.puts("[maxio scheduler.status.#{kind}] #{fields}")
   end
 
   defp print_rollup(rollup) do
@@ -196,6 +232,205 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
     |> maybe_put(:trigger, Keyword.get(opts, :trigger))
   end
 
+  defp put_gate(report) do
+    blockers = gate_blockers(report)
+    warnings = gate_warnings(report)
+
+    report
+    |> Map.put(:gate_status, gate_status(blockers, warnings))
+    |> Map.put(:blockers, blockers)
+    |> Map.put(:warnings, warnings)
+  end
+
+  defp gate_blockers(report) do
+    report.states
+    |> Enum.flat_map(&state_blocker/1)
+    |> Kernel.++(cadence_blockers(Map.get(report, :cadence)))
+  end
+
+  defp gate_warnings(report) do
+    []
+    |> Kernel.++(Enum.flat_map(report.states, &state_warning/1))
+    |> Kernel.++(Enum.flat_map(report.runs, &run_warning/1))
+    |> Kernel.++(Enum.flat_map(report.rollups, &rollup_warning/1))
+    |> Kernel.++(cadence_warnings(Map.get(report, :cadence)))
+  end
+
+  defp state_blocker(%{alert_status: "alert"} = state) do
+    [
+      %{
+        scope: "state",
+        scheduler: state.scheduler,
+        reason: "scheduler_state_alert",
+        status: state.status,
+        alert_status: state.alert_status,
+        last_run_id: state.last_run_id
+      }
+    ]
+  end
+
+  defp state_blocker(%{status: status} = state) when status in ["blocked", "failed"] do
+    [
+      %{
+        scope: "state",
+        scheduler: state.scheduler,
+        reason: "scheduler_state_blocked",
+        status: state.status,
+        alert_status: state.alert_status,
+        last_run_id: state.last_run_id
+      }
+    ]
+  end
+
+  defp state_blocker(_state), do: []
+
+  defp state_warning(%{status: status} = state) when status in ["blocked", "failed"] do
+    if state_blocker(state) == [] do
+      [
+        %{
+          scope: "state",
+          scheduler: state.scheduler,
+          reason: "scheduler_state_problem",
+          status: state.status,
+          alert_status: state.alert_status,
+          last_run_id: state.last_run_id
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  defp state_warning(%{alert_status: "warning"} = state) do
+    [
+      %{
+        scope: "state",
+        scheduler: state.scheduler,
+        reason: "scheduler_state_warning",
+        status: state.status,
+        alert_status: state.alert_status,
+        consecutive_failures: state.consecutive_failures
+      }
+    ]
+  end
+
+  defp state_warning(%{consecutive_failures: failures} = state)
+       when is_integer(failures) and failures > 0 do
+    [
+      %{
+        scope: "state",
+        scheduler: state.scheduler,
+        reason: "scheduler_state_failures_seen",
+        status: state.status,
+        consecutive_failures: failures
+      }
+    ]
+  end
+
+  defp state_warning(_state), do: []
+
+  defp run_warning(%{status: status} = run) when status in ["blocked", "failed"] do
+    [
+      %{
+        scope: "run",
+        scheduler: run.scheduler,
+        reason: "recent_problem_run",
+        run_id: run.id,
+        trigger: run.trigger,
+        status: run.status,
+        phase: run.phase,
+        job_id: run.job_id
+      }
+    ]
+  end
+
+  defp run_warning(_run), do: []
+
+  defp rollup_warning(rollup) do
+    problem_count = Map.get(rollup, :blocked_count, 0) + Map.get(rollup, :failed_count, 0)
+
+    if problem_count > 0 do
+      [
+        %{
+          scope: "rollup",
+          scheduler: rollup.scheduler,
+          reason: "rollup_problem_runs_seen",
+          trigger: rollup.trigger,
+          rollup_id: Map.get(rollup, :id),
+          blocked_count: Map.get(rollup, :blocked_count, 0),
+          failed_count: Map.get(rollup, :failed_count, 0)
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  defp cadence_blockers(%{reports: reports}) do
+    reports
+    |> Enum.reject(&(&1.health == "ok"))
+    |> Enum.map(fn cadence ->
+      %{
+        scope: "cadence",
+        scheduler: cadence.scheduler,
+        reason: "scheduler_cadence_not_healthy",
+        health: cadence.health,
+        cadence_reason: cadence.reason,
+        state_status: cadence.state_status,
+        alert_status: cadence.alert_status
+      }
+    end)
+  end
+
+  defp cadence_blockers(_cadence), do: []
+
+  defp cadence_warnings(%{reports: reports}) do
+    Enum.flat_map(reports, fn cadence ->
+      []
+      |> maybe_gate_warning(
+        cadence.blocked_scheduled_runs > 0,
+        %{
+          scope: "cadence",
+          scheduler: cadence.scheduler,
+          reason: "blocked_scheduled_runs_seen",
+          count: cadence.blocked_scheduled_runs
+        }
+      )
+      |> maybe_gate_warning(
+        cadence.failed_scheduled_runs > 0,
+        %{
+          scope: "cadence",
+          scheduler: cadence.scheduler,
+          reason: "failed_scheduled_runs_seen",
+          count: cadence.failed_scheduled_runs
+        }
+      )
+    end)
+  end
+
+  defp cadence_warnings(_cadence), do: []
+
+  defp maybe_gate_warning(items, true, item), do: [item | items]
+  defp maybe_gate_warning(items, false, _item), do: items
+
+  defp gate_status([_ | _], _warnings), do: "blocked"
+  defp gate_status([], [_ | _]), do: "attention"
+  defp gate_status([], []), do: "ok"
+
+  defp fail_if_needed!(%{gate_status: "blocked"}, opts) do
+    if Keyword.get(opts, :fail_on_blocked, false) or Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("scheduler status blocked")
+    end
+  end
+
+  defp fail_if_needed!(%{gate_status: "attention"}, opts) do
+    if Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("scheduler status attention")
+    end
+  end
+
+  defp fail_if_needed!(_report, _opts), do: :ok
+
   defp validate_scheduler!(nil), do: :ok
   defp validate_scheduler!("fresh_drive_heal"), do: :ok
   defp validate_scheduler!("rebalance"), do: :ok
@@ -243,8 +478,33 @@ defmodule Mix.Tasks.Maxio.Scheduler.Status do
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp format_value(nil), do: "nil"
+  defp format_value(values) when is_list(values), do: format_list(values)
   defp format_value(value), do: to_string(value)
 
   defp format_list(values) when is_list(values), do: Enum.join(values, ",")
   defp format_list(_values), do: ""
+
+  defp ensure_repo_started! do
+    ensure_started!(:ecto_sql)
+    ensure_started!(:postgrex)
+
+    case Process.whereis(Maxio.Repo) do
+      nil ->
+        case Maxio.Repo.start_link() do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+          {:error, reason} -> Mix.raise("failed to start Maxio.Repo: #{inspect(reason)}")
+        end
+
+      _pid ->
+        :ok
+    end
+  end
+
+  defp ensure_started!(application) do
+    case Application.ensure_all_started(application) do
+      {:ok, _apps} -> :ok
+      {:error, {app, reason}} -> Mix.raise("failed to start #{inspect(app)}: #{inspect(reason)}")
+    end
+  end
 end

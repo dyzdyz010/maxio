@@ -229,10 +229,10 @@ defmodule Maxio.S3.MetricsE2ETest do
              BucketConfigs.get("metricsbad", :metrics)
   end
 
-  test "checksum trailers and aws-chunked XML bodies are rejected" do
+  test "checksum trailers and aws-chunked XML bodies are validated" do
     assert create_bucket("metricschunked").status == 200
 
-    trailer =
+    plain_trailer =
       put_metrics("metricschunked", "entire", @entire,
         headers: [
           {"x-amz-sdk-checksum-algorithm", "SHA256"},
@@ -240,18 +240,37 @@ defmodule Maxio.S3.MetricsE2ETest do
         ]
       )
 
-    assert trailer.status == 501
-    assert trailer.resp_body =~ "NotImplemented"
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "InvalidRequest"
 
-    conn =
+    bad =
       SigV4Request.signed_chunked_conn(:put, "/metricschunked", @entire,
-        query: %{"metrics" => "", "id" => "entire"}
+        query: %{"metrics" => "", "id" => "entire"},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", :crypto.hash(:sha256, "different") |> Base.encode64()}
+        ]
       )
+      |> call()
 
-    rejected = call(conn)
-    assert rejected.status == 501
-    assert rejected.resp_body =~ "NotImplemented"
+    assert bad.status == 400
+    assert bad.resp_body =~ "BadDigest"
     assert BucketConfigs.get("metricschunked", :metrics) == :none
+
+    ok =
+      SigV4Request.signed_chunked_conn(:put, "/metricschunked", @entire,
+        query: %{"metrics" => "", "id" => "entire"},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", :crypto.hash(:sha256, @entire) |> Base.encode64()}
+        ]
+      )
+      |> call()
+
+    assert ok.status == 200
+
+    assert {:ok, %{"Configurations" => [%{"Id" => "entire"}]}} =
+             BucketConfigs.get("metricschunked", :metrics)
   end
 
   test "expected bucket owner missing bucket and method boundaries are enforced" do

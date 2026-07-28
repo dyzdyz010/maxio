@@ -1,5 +1,5 @@
 defmodule Maxio.BucketConfigs.BucketConfig do
-  @moduledoc "桶高级特性配置 schema（每桶一行：cors/lifecycle/encryption/public_access_block/ownership_controls 各一 jsonb）。"
+  @moduledoc "桶高级特性配置 schema（每桶一行：cors/lifecycle/encryption/quota 等各一 jsonb）。"
   use Ecto.Schema
   import Ecto.Changeset
 
@@ -24,6 +24,7 @@ defmodule Maxio.BucketConfigs.BucketConfig do
     field :inventory, :map
     field :replication, :map
     field :object_lock, :map
+    field :quota, :map
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -44,7 +45,8 @@ defmodule Maxio.BucketConfigs.BucketConfig do
     :analytics,
     :inventory,
     :replication,
-    :object_lock
+    :object_lock,
+    :quota
   ]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()

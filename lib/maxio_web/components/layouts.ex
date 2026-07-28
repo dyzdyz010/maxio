@@ -60,6 +60,85 @@ defmodule MaxioWeb.Layouts do
             icon="hero-key"
             label="Access Keys"
           />
+          <.nav_link id="nav-users" navigate={~p"/users"} icon="hero-user" label="Users" />
+          <.nav_link
+            id="nav-groups"
+            navigate={~p"/groups"}
+            icon="hero-user-group"
+            label="Groups"
+          />
+          <.nav_link
+            id="nav-roles"
+            navigate={~p"/roles"}
+            icon="hero-identification"
+            label="Roles"
+          />
+          <.nav_link
+            id="nav-idp"
+            navigate={~p"/idp"}
+            icon="hero-globe-alt"
+            label="Identity Providers"
+          />
+          <.nav_link
+            id="nav-sts-sessions"
+            navigate={~p"/sts-sessions"}
+            icon="hero-clock"
+            label="STS Sessions"
+          />
+          <.nav_link
+            id="nav-ops-cluster"
+            navigate={~p"/ops/cluster"}
+            icon="hero-server-stack"
+            label="Ops Cluster"
+          />
+          <.nav_link
+            id="nav-ops-compat"
+            navigate={~p"/ops/compat"}
+            icon="hero-command-line"
+            label="Ops Compat"
+          />
+          <.nav_link
+            id="nav-ops-gate"
+            navigate={~p"/ops/gate"}
+            icon="hero-shield-check"
+            label="Ops Gate"
+          />
+          <.nav_link
+            id="nav-ops-observability"
+            navigate={~p"/ops/observability"}
+            icon="hero-chart-bar-square"
+            label="Ops Observability"
+          />
+          <.nav_link
+            id="nav-ops-rebalance"
+            navigate={~p"/ops/rebalance"}
+            icon="hero-arrow-path"
+            label="Ops Rebalance"
+          />
+          <.nav_link
+            id="nav-ops-recovery"
+            navigate={~p"/ops/recovery"}
+            icon="hero-lifebuoy"
+            label="Ops Recovery"
+          />
+          <.nav_link
+            id="nav-ops-replacement"
+            navigate={~p"/ops/replacement"}
+            icon="hero-arrow-path-rounded-square"
+            label="Ops Replacement"
+          />
+          <.nav_link
+            id="nav-ops-scan"
+            navigate={~p"/ops/scan"}
+            icon="hero-magnifying-glass-circle"
+            label="Ops Scan"
+          />
+          <.nav_link
+            id="nav-ops-upgrade"
+            navigate={~p"/ops/upgrade"}
+            icon="hero-rocket-launch"
+            label="Ops Upgrade"
+          />
         </nav>
 
         <div class="px-3 py-3 border-t border-base-300 text-xs text-base-content/50">

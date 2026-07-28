@@ -9,7 +9,7 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
   """
 
   alias Maxio.Cluster.{Lock, Topology, Transport}
-  alias Maxio.Cluster.Rebalance.{Job, Jobs, TopologyMutation}
+  alias Maxio.Cluster.Rebalance.{Job, Jobs, SecureEraseEvidence, TopologyMutation}
   alias Maxio.S3.Log
 
   @default_retention_seconds 7 * 24 * 60 * 60
@@ -27,6 +27,7 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
           blockers: [term()],
           endpoint_results: [map()],
           physical_removal_preflight: map() | nil,
+          secure_erase_evidence: map(),
           purge: false
         }
 
@@ -44,6 +45,7 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
           bytes_deleted: non_neg_integer(),
           markers_written: non_neg_integer(),
           errors: non_neg_integer(),
+          secure_erase_evidence: map(),
           preflight: preflight_report(),
           results: map(),
           job: map()
@@ -182,6 +184,9 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
         [:physical_removal_preflight_blocked | List.wrap(Map.get(physical_preflight, :blockers))]
       end
 
+    {secure_erase_blockers, secure_erase_evidence} =
+      secure_erase_evidence(job, physical_preflight, opts)
+
     {endpoint_blockers, endpoint_results} =
       if base_blockers == [] and physical_blockers == [] do
         endpoint_preflight(
@@ -194,7 +199,7 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
         {[], []}
       end
 
-    blockers = base_blockers ++ physical_blockers ++ endpoint_blockers
+    blockers = base_blockers ++ physical_blockers ++ secure_erase_blockers ++ endpoint_blockers
 
     status =
       cond do
@@ -216,6 +221,7 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
       blockers: blockers,
       endpoint_results: endpoint_results,
       physical_removal_preflight: physical_preflight,
+      secure_erase_evidence: secure_erase_evidence,
       purge: false
     }
 
@@ -289,8 +295,8 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
       end
     end)
     |> case do
-      {:ok, endpoints} -> {:ok, results(marker, Enum.reverse(endpoints))}
-      {:error, reason, endpoints} -> {:error, reason, results(marker, endpoints)}
+      {:ok, endpoints} -> {:ok, results(marker, Enum.reverse(endpoints), preflight)}
+      {:error, reason, endpoints} -> {:error, reason, results(marker, endpoints, preflight)}
     end
   end
 
@@ -363,15 +369,17 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
       "manifest_hash" => job.physical_removal_manifest_hash,
       "retention_seconds" => preflight.retention_seconds,
       "retention_until" => iso8601(preflight.retention_until),
+      "secure_erase_evidence" => preflight.secure_erase_evidence,
       "endpoints" => preflight.endpoint_results
     }
   end
 
-  defp results(marker, endpoints) do
+  defp results(marker, endpoints, preflight) do
     %{
       "status" => if(Enum.all?(endpoints, &(&1["status"] == "ok")), do: "ok", else: "error"),
       "quarantine_id" => marker["quarantine_id"],
       "manifest_hash" => marker["manifest_hash"],
+      "secure_erase_evidence" => preflight.secure_erase_evidence,
       "endpoints" => endpoints
     }
   end
@@ -402,6 +410,7 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
       bytes_deleted: summary.bytes_deleted,
       markers_written: summary.markers_written,
       errors: summary.errors,
+      secure_erase_evidence: secure_erase_evidence_from_results(results, preflight),
       preflight: preflight,
       results: results,
       job: Jobs.to_view(job)
@@ -449,6 +458,45 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
       errors: 0
     }
 
+  defp secure_erase_evidence(job, physical_preflight, opts) do
+    preflight_context = %{
+      quarantine_id: job.physical_removal_quarantine_id,
+      manifest_hash: job.physical_removal_manifest_hash,
+      physical_removal_preflight: physical_preflight
+    }
+
+    case SecureEraseEvidence.prepare(job, preflight_context, opts) do
+      {:ok, evidence} ->
+        {[], evidence}
+
+      {:error, reason, evidence} ->
+        {[{:secure_erase_evidence_invalid, reason}], evidence}
+    end
+  end
+
+  defp secure_erase_evidence_from_results(results, preflight) when is_map(results) do
+    case Map.get(results, "secure_erase_evidence") || Map.get(results, :secure_erase_evidence) do
+      %{} = evidence -> evidence
+      _other -> Map.get(preflight, :secure_erase_evidence, default_secure_erase_evidence())
+    end
+  end
+
+  defp secure_erase_evidence_from_results(_results, preflight),
+    do: Map.get(preflight, :secure_erase_evidence, default_secure_erase_evidence())
+
+  defp default_secure_erase_evidence do
+    %{
+      "enabled" => false,
+      "required" => false,
+      "status" => "not_collected",
+      "secure_erase_gate" => false,
+      "destructive_gate?" => false,
+      "endpoints" => 0,
+      "errors" => [],
+      "samples" => []
+    }
+  end
+
   defp integer_value(%{} = map, key) do
     value = Map.get(map, key, Map.get(map, atom_counter_key(key), 0))
     if is_integer(value), do: value, else: 0
@@ -491,7 +539,8 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
       action: :rebalance_physical_purge_preflight,
       reason:
         "job_id=#{report.job_id} status=#{report.status} blockers=#{inspect(report.blockers)} " <>
-          "quarantine_id=#{report.quarantine_id} retention_elapsed?=#{report.retention_elapsed?} purge=false"
+          "quarantine_id=#{report.quarantine_id} retention_elapsed?=#{report.retention_elapsed?} " <>
+          "secure_erase_evidence_status=#{report.secure_erase_evidence["status"]} purge=false"
     )
   end
 
@@ -502,6 +551,7 @@ defmodule Maxio.Cluster.Rebalance.PhysicalPurge do
         "job_id=#{report.job_id} status=#{report.status} quarantine_id=#{report.quarantine_id} " <>
           "roots_deleted=#{report.roots_deleted} files_deleted=#{report.files_deleted} " <>
           "dirs_deleted=#{report.dirs_deleted} bytes_deleted=#{report.bytes_deleted} " <>
+          "secure_erase_evidence_status=#{report.secure_erase_evidence["status"]} " <>
           "physical_removal=quarantine_hard_delete topology_mutation=false deployment_config_mutation=false"
     )
   end

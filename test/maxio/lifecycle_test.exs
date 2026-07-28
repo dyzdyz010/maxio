@@ -492,7 +492,7 @@ defmodule Maxio.LifecycleTest do
     assert transitioned.storage_class == "GLACIER"
     assert DateTime.compare(transitioned.updated_at, v1_written_at) == :eq
     assert retained.storage_class == "STANDARD"
-    assert_version_status("lcnct", "doc.txt", v1, 200)
+    assert_version_status("lcnct", "doc.txt", v1, 403)
     assert_version_status("lcnct", "doc.txt", v2, 200)
   end
 

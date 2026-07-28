@@ -12,6 +12,7 @@ defmodule Maxio.S3.Authz do
     4. 构造 RequestContext（含 owner?/authenticated?）→ Evaluator.evaluate。
        :allow → :ok；{:deny, _} → raise AccessDenied(403)。
   owner? 判定（单租户）：principal.type == :root，或 principal 的 arn == 资源所属桶 owner。
+  显式 Deny 优先于 owner 隐式允许；bucket policy 管理动作保留 root 逃生特例。
 
   绝不缓冲对象 body（铁律 4）：本关卡只读 conn 元信息（assigns/headers/query），不 read_body。
   CopyObject/UploadPartCopy（带 x-amz-copy-source）：额外对源对象做一次 s3:GetObject 授权。
@@ -22,6 +23,11 @@ defmodule Maxio.S3.Authz do
   alias Maxio.S3.{CopySource, Error, Log, OwnershipControls, PublicAccessBlock}
 
   @max_keys_limit 1000
+  @root_bucket_policy_recovery_actions ~w(
+    s3:GetBucketPolicy
+    s3:PutBucketPolicy
+    s3:DeleteBucketPolicy
+  )
 
   @spec authorize(Plug.Conn.t(), atom()) :: :ok
   # PutObjectTagging 的 s3:RequestObjectTag* 条件键来自 bounded XML body。
@@ -51,10 +57,15 @@ defmodule Maxio.S3.Authz do
           String.t() | nil,
           [{String.t(), String.t()}]
         ) :: :ok
-  def authorize_put_object_tagging(conn, bucket, key, _version_id, tags) do
+  def authorize_put_object_tagging(conn, bucket, key, version_id, tags) do
     principal = conn.assigns[:principal]
     authenticated? = principal != :anonymous
-    required_action = "s3:PutObjectTagging"
+
+    required_action =
+      if version_request?(version_id),
+        do: "s3:PutObjectVersionTagging",
+        else: "s3:PutObjectTagging"
+
     resource = resource_arn(:object, bucket, key)
 
     conditions =
@@ -62,7 +73,8 @@ defmodule Maxio.S3.Authz do
       |> extract_conditions(authenticated?, :put_object_tagging)
       |> put_request_object_tag_conditions(tags)
 
-    statements = gather_statements(:object, bucket, key, principal, conn, :put_object_tagging)
+    statement_groups =
+      statement_groups(:object, bucket, key, principal, conn, :put_object_tagging)
 
     ctx = %RequestContext{
       principal: principal,
@@ -73,12 +85,12 @@ defmodule Maxio.S3.Authz do
       conditions: conditions
     }
 
-    case Evaluator.evaluate(ctx, statements) do
+    case evaluate_authorization(ctx, statement_groups, principal) do
       :allow ->
         authorize_session_policy!(conn, principal, required_action, resource, conditions)
 
       {:deny, reason} ->
-        deny(conn, :put_object_tagging, required_action, resource, reason)
+        deny(conn, :put_object_tagging, required_action, resource, reason, ctx, statement_groups)
     end
   end
 
@@ -99,8 +111,8 @@ defmodule Maxio.S3.Authz do
       |> extract_conditions(authenticated?, :put_bucket_inventory_configuration)
       |> put_inventory_optional_fields_condition(optional_fields)
 
-    statements =
-      gather_statements(
+    statement_groups =
+      statement_groups(
         :bucket,
         bucket,
         nil,
@@ -118,12 +130,20 @@ defmodule Maxio.S3.Authz do
       conditions: conditions
     }
 
-    case Evaluator.evaluate(ctx, statements) do
+    case evaluate_authorization(ctx, statement_groups, principal) do
       :allow ->
         authorize_session_policy!(conn, principal, required_action, resource, conditions)
 
       {:deny, reason} ->
-        deny(conn, :put_bucket_inventory_configuration, required_action, resource, reason)
+        deny(
+          conn,
+          :put_bucket_inventory_configuration,
+          required_action,
+          resource,
+          reason,
+          ctx,
+          statement_groups
+        )
     end
   end
 
@@ -150,18 +170,40 @@ defmodule Maxio.S3.Authz do
       conditions: conditions
     }
 
-    result = Evaluator.evaluate(ctx, Store.principal_policies(principal))
+    result =
+      evaluate_authorization(
+        ctx,
+        %{resource: [], identity: Store.principal_policies(principal)},
+        principal
+      )
 
     cond do
       result == {:deny, :explicit_deny} ->
-        deny(conn, :iam_pass_role, required_action, role_arn, :explicit_deny)
+        deny(
+          conn,
+          :iam_pass_role,
+          required_action,
+          role_arn,
+          :explicit_deny,
+          ctx,
+          %{resource: [], identity: Store.principal_policies(principal)}
+        )
 
       result == :allow or match?(%{type: :root}, principal) ->
         authorize_session_policy!(conn, principal, required_action, role_arn, conditions)
 
       match?({:deny, _reason}, result) ->
         {:deny, reason} = result
-        deny(conn, :iam_pass_role, required_action, role_arn, reason)
+
+        deny(
+          conn,
+          :iam_pass_role,
+          required_action,
+          role_arn,
+          reason,
+          ctx,
+          %{resource: [], identity: Store.principal_policies(principal)}
+        )
     end
   end
 
@@ -175,7 +217,7 @@ defmodule Maxio.S3.Authz do
     resource = resource_arn(level, bucket, key)
     conditions = extract_conditions(conn, authenticated?, action)
 
-    statements = gather_statements(level, bucket, key, principal, conn, action)
+    statement_groups = statement_groups(level, bucket, key, principal, conn, action)
 
     ctx = %RequestContext{
       principal: principal,
@@ -186,7 +228,7 @@ defmodule Maxio.S3.Authz do
       conditions: conditions
     }
 
-    case Evaluator.evaluate(ctx, statements) do
+    case evaluate_authorization(ctx, statement_groups, principal) do
       :allow ->
         authorize_session_policy!(conn, principal, required_action, resource, conditions)
 
@@ -240,10 +282,23 @@ defmodule Maxio.S3.Authz do
           conditions
         )
 
+        log_authz_decision(
+          conn,
+          :info,
+          action,
+          required_action,
+          resource,
+          :allow,
+          :allowed,
+          ctx,
+          statement_groups,
+          principal
+        )
+
         :ok
 
       {:deny, reason} ->
-        deny(conn, action, required_action, resource, reason)
+        deny(conn, action, required_action, resource, reason, ctx, statement_groups)
     end
   end
 
@@ -263,6 +318,174 @@ defmodule Maxio.S3.Authz do
         ]
   def object_statements(bucket, key, principal),
     do: gather_statements(:object, bucket, key, principal, nil, nil)
+
+  @doc """
+  供 handler 旁路（DeleteObjects、ObjectLock governance bypass 等）复用对象级授权。
+
+  该入口与普通单请求授权共用 `statement_groups -> evaluate_authorization`，
+  因此会一致处理显式 Deny、owner 隐式允许、资源策略直授 IAM user、permissions
+  boundary 与 session policy。
+  """
+  @spec object_action_allowed?(
+          String.t(),
+          String.t(),
+          String.t(),
+          map() | :anonymous,
+          boolean(),
+          boolean(),
+          map()
+        ) :: boolean()
+  def object_action_allowed?(
+        bucket,
+        key,
+        action,
+        principal,
+        authenticated?,
+        owner?,
+        conditions
+      )
+      when is_binary(action) do
+    resource = resource_arn(:object, bucket, key)
+    statement_groups = statement_groups(:object, bucket, key, principal, nil, nil)
+
+    ctx = %RequestContext{
+      principal: principal,
+      authenticated?: authenticated?,
+      owner?: owner?,
+      action: action,
+      resource: resource,
+      conditions: conditions
+    }
+
+    case evaluate_authorization(ctx, statement_groups, principal) do
+      :allow -> session_policy_allows?(principal, action, resource, conditions)
+      {:deny, _reason} -> false
+    end
+  end
+
+  defp evaluate_authorization(
+         %RequestContext{owner?: true, action: action},
+         _statement_groups,
+         %{type: :root}
+       )
+       when action in @root_bucket_policy_recovery_actions,
+       do: :allow
+
+  defp evaluate_authorization(%RequestContext{} = ctx, statement_groups, principal) do
+    case Evaluator.evaluate(ctx, all_statements(statement_groups)) do
+      {:deny, :explicit_deny} ->
+        {:deny, :explicit_deny}
+
+      _result ->
+        if identity_or_resource_allows?(ctx, statement_groups) do
+          enforce_permissions_boundary(ctx, statement_groups, principal)
+        else
+          {:deny, :implicit_deny}
+        end
+    end
+  end
+
+  defp identity_or_resource_allows?(%RequestContext{} = ctx, statement_groups) do
+    eval_ctx = without_owner_shortcut(ctx)
+
+    ctx.owner? or
+      Evaluator.evaluate(eval_ctx, Map.get(statement_groups, :identity, [])) == :allow or
+      Evaluator.evaluate(eval_ctx, Map.get(statement_groups, :resource, [])) == :allow
+  end
+
+  defp enforce_permissions_boundary(
+         %RequestContext{owner?: true, action: action},
+         _statement_groups,
+         %{type: :root}
+       )
+       when action in @root_bucket_policy_recovery_actions,
+       do: :allow
+
+  defp enforce_permissions_boundary(
+         %RequestContext{owner?: true} = ctx,
+         statement_groups,
+         principal
+       ) do
+    case permissions_boundary_result(principal, ctx) do
+      :none ->
+        :allow
+
+      :invalid ->
+        {:deny, :permissions_boundary}
+
+      :allow ->
+        :allow
+
+      {:deny, :explicit_deny} ->
+        {:deny, :explicit_deny}
+
+      {:deny, :implicit_deny} ->
+        if iam_user_principal?(principal) do
+          :allow
+        else
+          ctx
+          |> without_owner_shortcut()
+          |> Evaluator.evaluate(Map.get(statement_groups, :identity, []))
+          |> deny_reason_for_boundary()
+        end
+    end
+  end
+
+  defp enforce_permissions_boundary(ctx, statement_groups, principal) do
+    identity_result =
+      ctx
+      |> without_owner_shortcut()
+      |> Evaluator.evaluate(Map.get(statement_groups, :identity, []))
+
+    resource_result =
+      ctx
+      |> without_owner_shortcut()
+      |> Evaluator.evaluate(Map.get(statement_groups, :resource, []))
+
+    case permissions_boundary_result(principal, ctx) do
+      :none ->
+        :allow
+
+      :invalid ->
+        {:deny, :permissions_boundary}
+
+      :allow ->
+        :allow
+
+      {:deny, :explicit_deny} ->
+        {:deny, :explicit_deny}
+
+      {:deny, :implicit_deny} ->
+        if resource_result == :allow and iam_user_principal?(principal) do
+          :allow
+        else
+          deny_reason_for_boundary(identity_result)
+        end
+    end
+  end
+
+  defp permissions_boundary_result(principal, ctx) do
+    case Store.principal_permissions_boundary(principal) do
+      :none ->
+        :none
+
+      :invalid ->
+        :invalid
+
+      {:ok, statements} ->
+        ctx
+        |> without_owner_shortcut()
+        |> Evaluator.evaluate(statements)
+    end
+  end
+
+  defp deny_reason_for_boundary(:allow), do: {:deny, :permissions_boundary}
+  defp deny_reason_for_boundary({:deny, _reason}), do: {:deny, :permissions_boundary}
+
+  defp without_owner_shortcut(%RequestContext{} = ctx), do: %{ctx | owner?: false}
+
+  defp iam_user_principal?(%{type: :iam_user}), do: true
+  defp iam_user_principal?(_principal), do: false
 
   @doc """
   Evaluates inline AssumeRole session policy as a permissions boundary.
@@ -352,10 +575,16 @@ defmodule Maxio.S3.Authz do
   defp resource_arn(:object, bucket, key), do: Arn.object_arn(bucket, key)
 
   # ── statement 合并：bucket policy + canned ACL 派生 + identity policy（按真实 principal）──
-  defp gather_statements(:account, _bucket, _key, principal, _conn, _action),
-    do: Store.principal_policies(principal)
+  defp gather_statements(level, bucket, key, principal, conn, action) do
+    level
+    |> statement_groups(bucket, key, principal, conn, action)
+    |> all_statements()
+  end
 
-  defp gather_statements(level, bucket, key, principal, conn, _action) when is_binary(bucket) do
+  defp statement_groups(:account, _bucket, _key, principal, _conn, _action),
+    do: %{resource: [], identity: Store.principal_policies(principal)}
+
+  defp statement_groups(level, bucket, key, principal, conn, _action) when is_binary(bucket) do
     policy_stmts =
       PublicAccessBlock.effective_bucket_policy_statements(
         bucket,
@@ -363,10 +592,13 @@ defmodule Maxio.S3.Authz do
       )
 
     acl_stmts = acl_statements(level, bucket, key, conn)
-    policy_stmts ++ acl_stmts ++ Store.principal_policies(principal)
+    %{resource: policy_stmts ++ acl_stmts, identity: Store.principal_policies(principal)}
   end
 
-  defp gather_statements(_level, _bucket, _key, _principal, _conn, _action), do: []
+  defp statement_groups(_level, _bucket, _key, _principal, _conn, _action),
+    do: %{resource: [], identity: []}
+
+  defp all_statements(%{resource: resource, identity: identity}), do: resource ++ identity
 
   # 桶级动作看桶 ACL；对象级动作看对象 ACL（对象不存在则空——put 路径对象尚未建，靠 policy/owner）。
   defp acl_statements(:bucket, bucket, _key, _conn) do
@@ -420,6 +652,18 @@ defmodule Maxio.S3.Authz do
       else: "s3:GetObjectAcl"
   end
 
+  defp effective_required_action(:get_object_tagging, _required_action, conn) do
+    if version_request?(request_version_id(conn)),
+      do: "s3:GetObjectVersionTagging",
+      else: "s3:GetObjectTagging"
+  end
+
+  defp effective_required_action(:delete_object_tagging, _required_action, conn) do
+    if version_request?(request_version_id(conn)),
+      do: "s3:DeleteObjectVersionTagging",
+      else: "s3:DeleteObjectTagging"
+  end
+
   defp effective_required_action(:put_object_acl, _required_action, conn) do
     if version_acl_request?(request_version_id(conn)),
       do: "s3:PutObjectVersionAcl",
@@ -436,18 +680,6 @@ defmodule Maxio.S3.Authz do
     if version_request?(request_version_id(conn)),
       do: "s3:GetObjectVersionAttributes",
       else: "s3:GetObjectAttributes"
-  end
-
-  defp effective_required_action(:get_object_retention, _required_action, conn) do
-    if version_request?(request_version_id(conn)),
-      do: "s3:GetObjectVersion",
-      else: "s3:GetObjectRetention"
-  end
-
-  defp effective_required_action(:get_object_legal_hold, _required_action, conn) do
-    if version_request?(request_version_id(conn)),
-      do: "s3:GetObjectVersion",
-      else: "s3:GetObjectLegalHold"
   end
 
   defp effective_required_action(_action, required_action, _conn), do: required_action
@@ -499,29 +731,52 @@ defmodule Maxio.S3.Authz do
   defp principal_arn(%{arn: arn}) when is_binary(arn), do: arn
   defp principal_arn(_principal), do: nil
 
-  defp put_principal_context(conds, :anonymous),
-    do: Map.put(conds, "aws:PrincipalType", "Anonymous")
+  defp put_principal_context(conds, :anonymous) do
+    conds
+    |> Map.put("aws:PrincipalType", "Anonymous")
+    |> Map.put("aws:PrincipalAccount", principal_account_id(:anonymous))
+  end
 
-  defp put_principal_context(conds, %{type: :root, access_key: access_key}) do
+  defp put_principal_context(conds, %{type: :root, access_key: access_key} = principal) do
     conds
     |> Map.put("aws:PrincipalType", "Account")
+    |> maybe_put("aws:PrincipalAccount", principal_account_id(principal))
     |> maybe_put("aws:userid", access_key)
   end
 
-  defp put_principal_context(conds, %{type: :iam_user, access_key: access_key, arn: arn}) do
+  defp put_principal_context(
+         conds,
+         %{type: :iam_user, access_key: access_key, arn: arn} = principal
+       ) do
     conds
     |> Map.put("aws:PrincipalType", "User")
+    |> maybe_put("aws:PrincipalAccount", principal_account_id(principal))
     |> maybe_put("aws:userid", access_key)
     |> maybe_put("aws:username", username_from_arn(arn))
   end
 
-  defp put_principal_context(conds, %{type: type, access_key: access_key}) do
+  defp put_principal_context(conds, %{type: type, access_key: access_key} = principal) do
     conds
     |> Map.put("aws:PrincipalType", type |> to_string() |> Macro.camelize())
+    |> maybe_put("aws:PrincipalAccount", principal_account_id(principal))
     |> maybe_put("aws:userid", access_key)
   end
 
   defp put_principal_context(conds, _principal), do: conds
+
+  defp principal_account_id(:anonymous), do: "anonymous"
+
+  defp principal_account_id(%{arn: arn}) when is_binary(arn), do: arn_account_id(arn)
+
+  defp principal_account_id(_principal), do: nil
+
+  defp arn_account_id(arn) when is_binary(arn) do
+    case String.split(arn, ":", parts: 6) do
+      ["arn", _partition, "iam", _region, "", _resource] -> "local"
+      ["arn", _partition, "iam", _region, account_id, _resource] -> account_id
+      _other -> nil
+    end
+  end
 
   defp put_principal_tag_conditions(conds, %{tags: tags}),
     do: put_tag_conditions(conds, ["aws:PrincipalTag"], tags)
@@ -543,10 +798,16 @@ defmodule Maxio.S3.Authz do
 
   defp put_mfa_context(conds, _principal), do: conds
 
-  defp username_from_arn("arn:aws:iam:::user/" <> path) do
-    path
-    |> String.split("/", trim: true)
-    |> List.last()
+  defp username_from_arn(arn) when is_binary(arn) do
+    case String.split(arn, ":", parts: 6) do
+      ["arn", _partition, "iam", _region, _account_id, "user/" <> path] ->
+        path
+        |> String.split("/", trim: true)
+        |> List.last()
+
+      _other ->
+        nil
+    end
   end
 
   defp username_from_arn(_arn), do: nil
@@ -694,6 +955,7 @@ defmodule Maxio.S3.Authz do
        when action in [
               :get_object,
               :head_object,
+              :select_object_content,
               :get_object_attributes,
               :get_object_tagging,
               :put_object_tagging,
@@ -956,7 +1218,7 @@ defmodule Maxio.S3.Authz do
          conditions
        ) do
     resource = resource_arn(level, bucket, key)
-    statements = gather_statements(level, bucket, key, principal, conn, denied_action)
+    statement_groups = statement_groups(level, bucket, key, principal, conn, denied_action)
 
     ctx = %RequestContext{
       principal: principal,
@@ -967,12 +1229,12 @@ defmodule Maxio.S3.Authz do
       conditions: conditions
     }
 
-    case Evaluator.evaluate(ctx, statements) do
+    case evaluate_authorization(ctx, statement_groups, principal) do
       :allow ->
         authorize_session_policy!(conn, principal, required_action, resource, conditions)
 
       {:deny, reason} ->
-        deny(conn, denied_action, required_action, resource, reason)
+        deny(conn, denied_action, required_action, resource, reason, ctx, statement_groups)
     end
   end
 
@@ -1027,8 +1289,8 @@ defmodule Maxio.S3.Authz do
         %{bucket: src_bucket, key: src_key, version_id: src_version_id} = CopySource.parse!(raw)
         resource = Arn.object_arn(src_bucket, src_key)
 
-        statements =
-          gather_statements(
+        statement_groups =
+          statement_groups(
             :object,
             src_bucket,
             src_key,
@@ -1049,7 +1311,7 @@ defmodule Maxio.S3.Authz do
           conditions: source_conditions
         }
 
-        case Evaluator.evaluate(ctx, statements) do
+        case evaluate_authorization(ctx, statement_groups, principal) do
           :allow ->
             authorize_session_policy!(
               conn,
@@ -1065,7 +1327,9 @@ defmodule Maxio.S3.Authz do
               copy_source_denied_action(action),
               copy_source_action(src_version_id),
               resource,
-              reason
+              reason,
+              ctx,
+              statement_groups
             )
         end
     end
@@ -1084,7 +1348,9 @@ defmodule Maxio.S3.Authz do
     key = conn.assigns[:s3_key]
     version_id = request_version_id(conn)
     resource = Arn.object_arn(bucket, key)
-    statements = gather_statements(:object, bucket, key, principal, conn, :get_object_attributes)
+
+    statement_groups =
+      statement_groups(:object, bucket, key, principal, conn, :get_object_attributes)
 
     ctx = %RequestContext{
       principal: principal,
@@ -1095,7 +1361,7 @@ defmodule Maxio.S3.Authz do
       conditions: conditions
     }
 
-    case Evaluator.evaluate(ctx, statements) do
+    case evaluate_authorization(ctx, statement_groups, principal) do
       :allow ->
         authorize_session_policy!(
           conn,
@@ -1111,7 +1377,9 @@ defmodule Maxio.S3.Authz do
           :get_object_attributes_read,
           object_attributes_read_action(version_id),
           resource,
-          reason
+          reason,
+          ctx,
+          statement_groups
         )
     end
   end
@@ -1160,17 +1428,114 @@ defmodule Maxio.S3.Authz do
   defp tag_condition_key?(_key), do: false
 
   # ── 拒绝（绝不静默，铁律 3）──
-  defp deny(conn, action, required_action, resource, reason) do
-    Log.warn("authz denied",
+  defp deny(conn, action, required_action, resource, reason, ctx \\ nil, statement_groups \\ nil) do
+    log_authz_decision(
+      conn,
+      :warning,
+      action,
+      required_action,
+      resource,
+      :deny,
+      reason,
+      ctx,
+      statement_groups,
+      conn.assigns[:principal]
+    )
+
+    raise Error.new(:access_denied, resource: resource)
+  end
+
+  defp log_authz_decision(
+         conn,
+         level,
+         action,
+         required_action,
+         resource,
+         decision,
+         reason,
+         ctx,
+         statement_groups,
+         principal
+       ) do
+    metadata = [
+      request_id: request_id(conn),
       action: action,
+      required_action: required_action,
+      resource: resource,
+      decision: decision,
       reason: reason,
       bucket: conn.assigns[:s3_bucket],
       key: conn.assigns[:s3_key],
-      code: "AccessDenied",
-      status: 403
-    )
+      principal_arn: principal_arn(principal),
+      principal_type: principal_type(principal),
+      account_id: account_id(principal),
+      authenticated: principal != :anonymous,
+      owner: owner_context(ctx),
+      policy_source: policy_source(ctx, statement_groups, reason),
+      auth_type: auth_type(conn),
+      code: if(decision == :deny, do: "AccessDenied", else: nil),
+      status: if(decision == :deny, do: 403, else: 200)
+    ]
 
-    _ = required_action
-    raise Error.new(:access_denied, resource: resource)
+    case level do
+      :info -> Log.info("authz decision", metadata)
+      :warning -> Log.warn("authz denied", metadata)
+    end
+  end
+
+  defp request_id(conn) do
+    conn
+    |> get_resp_header("x-request-id")
+    |> List.first()
+    |> case do
+      nil -> conn |> get_req_header("x-request-id") |> List.first()
+      request_id -> request_id
+    end
+  end
+
+  defp auth_type(conn) do
+    conn.assigns[:auth_type] ||
+      case conn.assigns[:sigv4_signed_request] do
+        %{auth_type: auth_type} -> auth_type
+        _other -> nil
+      end
+  end
+
+  defp principal_type(:anonymous), do: :anonymous
+  defp principal_type(%{type: type}), do: type
+  defp principal_type(_principal), do: nil
+
+  defp account_id(%{arn: arn}) when is_binary(arn), do: arn_account_id(arn)
+
+  defp account_id(_principal), do: nil
+
+  defp owner_context(%RequestContext{owner?: owner?}), do: owner?
+  defp owner_context(_ctx), do: nil
+
+  defp policy_source(_ctx, _statement_groups, :explicit_deny), do: "explicit_deny"
+  defp policy_source(_ctx, _statement_groups, :permissions_boundary), do: "permissions_boundary"
+  defp policy_source(_ctx, _statement_groups, :session_policy), do: "session_policy"
+  defp policy_source(_ctx, _statement_groups, :implicit_deny), do: "none"
+  defp policy_source(%RequestContext{owner?: true}, _statement_groups, _reason), do: "owner"
+
+  defp policy_source(%RequestContext{} = ctx, statement_groups, _reason)
+       when is_map(statement_groups) do
+    eval_ctx = without_owner_shortcut(ctx)
+
+    [
+      policy_source_part("identity", eval_ctx, Map.get(statement_groups, :identity, [])),
+      policy_source_part("resource", eval_ctx, Map.get(statement_groups, :resource, []))
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> "none"
+      sources -> Enum.join(sources, ",")
+    end
+  end
+
+  defp policy_source(_ctx, _statement_groups, _reason), do: "unknown"
+
+  defp policy_source_part(source, ctx, statements) do
+    if Evaluator.evaluate(ctx, statements) == :allow, do: source
   end
 end

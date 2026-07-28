@@ -49,6 +49,23 @@ defmodule Mix.Tasks.MaxioReplacementAutomationStatusTest do
     assert decoded["next_action"] == "none"
   end
 
+  test "rehearsal-ready command injects a local ready profile without scheduler env" do
+    put_scheduler_env([], [], enabled: false)
+
+    decoded =
+      capture_io(fn -> AutomationStatus.run(["--json", "--rehearsal-ready"]) end)
+      |> Jason.decode!()
+
+    assert decoded["status"] == "ready"
+    assert decoded["ready?"] == true
+    assert decoded["blockers"] == []
+    assert decoded["warnings"] == []
+    assert decoded["checks"]["fresh_drive_heal_scheduler"]["enabled"] == true
+    assert decoded["checks"]["rebalance_scheduler"]["enabled"] == true
+    assert decoded["checks"]["fresh_drive_heal_scheduler"]["ledger_enabled"] == true
+    assert decoded["checks"]["rebalance_scheduler"]["ledger_enabled"] == true
+  end
+
   test "fail-on-blocked prints JSON before returning a non-zero gate" do
     put_scheduler_env([], [], enabled: true)
 
@@ -102,7 +119,7 @@ defmodule Mix.Tasks.MaxioReplacementAutomationStatusTest do
     on_exit(fn -> File.rm(script_path) end)
 
     {cmd, args} = mix_run_no_start_script(script_path)
-    {output, status} = System.cmd(cmd, args, env: [{"MIX_ENV", "test"}], stderr_to_stdout: true)
+    {output, status} = System.cmd(cmd, args, env: mix_test_env(), stderr_to_stdout: true)
 
     assert status == 0, output
     assert output =~ "FRESH_SCHEDULER=nil"
@@ -128,6 +145,17 @@ defmodule Mix.Tasks.MaxioReplacementAutomationStatusTest do
     case :os.type() do
       {:win32, _} -> {"cmd", ["/c", "mix", "run", "--no-start", script_path]}
       _other -> {System.find_executable("mix") || "mix", ["run", "--no-start", script_path]}
+    end
+  end
+
+  defp mix_test_env do
+    [{"MIX_ENV", "test"}] ++ inherited_elixir_erl_options()
+  end
+
+  defp inherited_elixir_erl_options do
+    case System.get_env("ELIXIR_ERL_OPTIONS") do
+      nil -> []
+      value -> [{"ELIXIR_ERL_OPTIONS", value}]
     end
   end
 end

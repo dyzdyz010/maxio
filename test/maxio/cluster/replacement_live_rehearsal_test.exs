@@ -36,6 +36,8 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsalTest do
     assert "--json" in args
 
     artifact = artifact_path |> File.read!() |> Jason.decode!()
+    assert artifact["evidence_kind"] == "replacement_live_rehearsal"
+    assert artifact["scenario"] == "replacement_workflow_rehearsal"
     assert artifact["generated_at"] == "2026-06-14T13:00:00Z"
     assert artifact["git_sha"] == "test-sha"
     assert artifact["workflow_exit_status"] == 0
@@ -145,6 +147,24 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsalTest do
     assert artifact["dry_run?"] == true
     assert artifact["allow_dry_run_success?"] == true
     assert artifact["gate"]["status"] == "ok"
+  end
+
+  test "rehearsal-ready is passed to workflow and recorded in the artifact" do
+    artifact_path = artifact_path("rehearsal-ready")
+
+    {:ok, result} =
+      run_rehearsal(clear_workflow(), 0, artifact_path, extra_args: ["--rehearsal-ready"])
+
+    assert result.exit_code == 0
+    assert result.stdout =~ "rehearsal_ready=true"
+
+    assert_received {:workflow_args, args, [stderr_to_stdout: true]}
+    assert "--rehearsal-ready" in args
+
+    artifact = artifact_path |> File.read!() |> Jason.decode!()
+    assert artifact["rehearsal_ready?"] == true
+    assert artifact["command"] =~ "--rehearsal-ready"
+    assert artifact["bundle_gate"]["status"] == "ok"
   end
 
   test "required scheduler evidence is included in the artifact and participates in the gate" do
@@ -314,6 +334,59 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsalTest do
 
     assert result.exit_code == 64
     assert result.stderr =~ "scheduler evidence options require --require-scheduler-evidence"
+  end
+
+  test "workflow command exceptions still write a fail-closed artifact" do
+    artifact_path = artifact_path("workflow-command-exception")
+
+    runner = fn "fake-mix", ["maxio.replacement.workflow" | _], _opts ->
+      raise "workflow boom"
+    end
+
+    {:error, result} =
+      ReplacementLiveRehearsal.run(base_args(artifact_path),
+        command_runner: runner,
+        git_sha_fun: fn -> "test-sha" end,
+        now_fun: fn -> @now end
+      )
+
+    assert result.exit_code == 1
+    assert result.stderr =~ "gate failed"
+
+    artifact = artifact_path |> File.read!() |> Jason.decode!()
+    assert artifact["workflow_exit_status"] == nil
+    assert artifact["replacement_workflow"] == nil
+    assert artifact["gate"]["reason"] == "workflow_json_unparseable"
+    assert artifact["bundle_gate"]["reason"] == "workflow_json_unparseable"
+    assert artifact["raw_output"] =~ "workflow boom"
+  end
+
+  test "scheduler evidence command exceptions are archived and block the bundle" do
+    artifact_path = artifact_path("scheduler-evidence-command-exception")
+
+    runner = fn
+      "fake-mix", ["maxio.replacement.workflow" | _], _opts ->
+        {Jason.encode!(clear_workflow()) <> "\n", 0}
+
+      "fake-mix", ["maxio.scheduler.evidence" | _], _opts ->
+        raise "evidence boom"
+    end
+
+    {:error, result} =
+      ReplacementLiveRehearsal.run(base_args(artifact_path) ++ ["--require-scheduler-evidence"],
+        command_runner: runner,
+        git_sha_fun: fn -> "test-sha" end,
+        now_fun: fn -> @now end
+      )
+
+    assert result.exit_code == 1
+
+    artifact = artifact_path |> File.read!() |> Jason.decode!()
+    assert artifact["scheduler_evidence_exit_status"] == nil
+    assert artifact["scheduler_evidence"] == nil
+    assert artifact["scheduler_evidence_raw_output"] =~ "evidence boom"
+    assert artifact["scheduler_evidence_gate"]["reason"] == "scheduler_evidence_json_unparseable"
+    assert artifact["bundle_gate"]["reason"] == "scheduler_evidence_json_unparseable"
   end
 
   defp run_rehearsal(workflow, exit_status, artifact_path, opts \\ []) do

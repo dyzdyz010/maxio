@@ -1,7 +1,9 @@
 defmodule Maxio.S3.VersioningObjectTest do
   use Maxio.DataCase, async: false
 
+  import Ecto.Query
   import Plug.Conn
+  alias Maxio.{Objects.Object, Repo}
   alias Maxio.Test.SigV4Request
   alias Maxio.S3.Endpoint
 
@@ -22,6 +24,20 @@ defmodule Maxio.S3.VersioningObjectTest do
   end
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
+
+  defp touch_version(bucket, key, version_id, at) do
+    from(o in Object,
+      where: o.bucket_name == ^bucket and o.key == ^key and o.version_id == ^version_id
+    )
+    |> Repo.update_all(set: [inserted_at: at, updated_at: at])
+  end
+
+  defp set_index_generation(bucket, key, version_id, generation) do
+    from(o in Object,
+      where: o.bucket_name == ^bucket and o.key == ^key and o.version_id == ^version_id
+    )
+    |> Repo.update_all(set: [index_generation: generation])
+  end
 
   defp enable_versioning(bucket) do
     body = ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
@@ -88,6 +104,8 @@ defmodule Maxio.S3.VersioningObjectTest do
     enable_versioning("perv")
     p1 = SigV4Request.signed_conn(:put, "/perv/k.txt", body: "alive") |> call()
     [vid1] = get_resp_header(p1, "x-amz-version-id")
+    written_at = ~U[2026-06-28 00:00:00.000000Z]
+    touch_version("perv", "k.txt", vid1, written_at)
 
     del = SigV4Request.signed_conn(:delete, "/perv/k.txt") |> call()
     [dm_vid] = get_resp_header(del, "x-amz-version-id")
@@ -102,6 +120,56 @@ defmodule Maxio.S3.VersioningObjectTest do
     assert get.status == 200
     assert get.resp_body == "alive"
     assert get_resp_header(get, "x-amz-version-id") == [vid1]
+    {:ok, restored} = Maxio.Objects.get_version("perv", "k.txt", vid1)
+    assert DateTime.compare(restored.updated_at, written_at) == :eq
+  end
+
+  test "Enabled：删除 latest ULID 后按写入时间提升，不把历史 null 当最新" do
+    bucket = "mixpromote"
+    key = "k.txt"
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    legacy = SigV4Request.signed_conn(:put, "/#{bucket}/#{key}", body: "legacy-null") |> call()
+    assert legacy.status == 200
+    assert get_resp_header(legacy, "x-amz-version-id") == []
+
+    assert enable_versioning(bucket).status == 200
+
+    p1 = SigV4Request.signed_conn(:put, "/#{bucket}/#{key}", body: "version-one") |> call()
+    [vid1] = get_resp_header(p1, "x-amz-version-id")
+
+    p2 = SigV4Request.signed_conn(:put, "/#{bucket}/#{key}", body: "version-two") |> call()
+    [vid2] = get_resp_header(p2, "x-amz-version-id")
+
+    assert vid1 != "null"
+    assert vid2 != "null"
+    assert vid2 != vid1
+
+    base = ~U[2026-06-28 00:00:00.000000Z]
+    touch_version(bucket, key, "null", base)
+    # 同一时间戳下也不能让历史 "null" 因字典序压过正常 ULID 版本。
+    touch_version(bucket, key, vid1, base)
+    touch_version(bucket, key, vid2, DateTime.add(base, 1, :second))
+    set_index_generation(bucket, key, "null", 1)
+    :ok = Maxio.Objects.put_tags(bucket, key, [{"edited", "yes"}], "null")
+
+    del =
+      SigV4Request.signed_conn(:delete, "/#{bucket}/#{key}", query: %{"versionId" => vid2})
+      |> call()
+
+    assert del.status == 204
+
+    current = SigV4Request.signed_conn(:get, "/#{bucket}/#{key}") |> call()
+    assert current.status == 200
+    assert current.resp_body == "version-one"
+    assert get_resp_header(current, "x-amz-version-id") == [vid1]
+
+    null_version =
+      SigV4Request.signed_conn(:get, "/#{bucket}/#{key}", query: %{"versionId" => "null"})
+      |> call()
+
+    assert null_version.status == 200
+    assert null_version.resp_body == "legacy-null"
   end
 
   test "Suspended：DELETE 插入 null delete marker（替换 null 版本）；GET → 404" do
@@ -159,5 +227,25 @@ defmodule Maxio.S3.VersioningObjectTest do
     get = SigV4Request.signed_conn(:get, "/mark/k.txt", query: %{"versionId" => dm_vid}) |> call()
     assert get.status == 405
     assert get_resp_header(get, "x-amz-delete-marker") == ["true"]
+    assert get_resp_header(get, "allow") == ["DELETE"]
+    assert [_] = get_resp_header(get, "last-modified")
+  end
+
+  test "Enabled：HEAD ?versionId 指向 delete marker → 405 + Allow DELETE" do
+    SigV4Request.signed_conn(:put, "/headmark") |> call()
+    enable_versioning("headmark")
+    SigV4Request.signed_conn(:put, "/headmark/k.txt", body: "x") |> call()
+    del = SigV4Request.signed_conn(:delete, "/headmark/k.txt") |> call()
+    [dm_vid] = get_resp_header(del, "x-amz-version-id")
+
+    head =
+      SigV4Request.signed_conn(:head, "/headmark/k.txt", query: %{"versionId" => dm_vid})
+      |> call()
+
+    assert head.status == 405
+    assert head.resp_body == ""
+    assert get_resp_header(head, "x-amz-delete-marker") == ["true"]
+    assert get_resp_header(head, "allow") == ["DELETE"]
+    assert [_] = get_resp_header(head, "last-modified")
   end
 end

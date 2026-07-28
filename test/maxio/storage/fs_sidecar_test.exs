@@ -138,6 +138,7 @@ defmodule Maxio.Storage.FSSidecarTest do
         end)
 
       assert log =~ "legacy single-file layout object replaced"
+      assert length(Regex.scan(~r/legacy single-file layout object replaced/, log)) == 1
       assert File.dir?(legacy)
       assert File.read!(Path.join(legacy, "part.0")) == "new bytes"
       assert File.regular?(Path.join(legacy, "meta.json"))
@@ -164,6 +165,7 @@ defmodule Maxio.Storage.FSSidecarTest do
         end)
 
       assert log =~ "legacy single-file layout object replaced"
+      assert length(Regex.scan(~r/legacy single-file layout object replaced/, log)) == 1
       assert log =~ "legacy single-file layout restored"
       assert File.regular?(legacy)
       assert File.read!(legacy) == "old bytes stay"
@@ -171,6 +173,15 @@ defmodule Maxio.Storage.FSSidecarTest do
 
       {:ok, stream} = FS.get("b", "replace-fail", "null", nil, opts(dir))
       assert IO.iodata_to_binary(Enum.to_list(stream)) == "old bytes stay"
+    end
+
+    test "put 新对象不误报 legacy_layout_replace 日志", %{dir: dir} do
+      log =
+        capture_log(fn ->
+          assert {:ok, _} = FS.put("b", "brand-new", "null", ["new bytes"], opts(dir))
+        end)
+
+      refute log =~ "legacy single-file layout object replaced"
     end
   end
 

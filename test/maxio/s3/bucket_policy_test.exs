@@ -4,6 +4,7 @@ defmodule Maxio.S3.BucketPolicyTest do
   import Plug.Conn
   alias Maxio.Test.SigV4Request
   alias Maxio.S3.Endpoint
+  alias Maxio.Policy.Store
 
   @data_dir Path.join(System.tmp_dir!(), "maxio_policy_test")
   @policy ~s({"Version":"2012-10-17","Statement":[{"Sid":"P","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::polb/*"}]})
@@ -23,6 +24,12 @@ defmodule Maxio.S3.BucketPolicyTest do
   end
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
+
+  defp policy(bucket, sid) do
+    ~s({"Version":"2012-10-17","Statement":[{"Sid":"#{sid}","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::#{bucket}/*"}]})
+  end
+
+  defp checksum_b64(algorithm, body), do: :crypto.hash(algorithm, body) |> Base.encode64()
 
   test "PutBucketPolicy 204 → GetBucketPolicy 200 JSON → DeleteBucketPolicy 204" do
     SigV4Request.signed_conn(:put, "/polb") |> call()
@@ -49,6 +56,107 @@ defmodule Maxio.S3.BucketPolicyTest do
     get2 = SigV4Request.signed_conn(:get, "/polb", query: %{"policy" => ""}) |> call()
     assert get2.status == 404
     assert get2.resp_body =~ "NoSuchBucketPolicy"
+  end
+
+  test "Put/Get/DeleteBucketPolicy validate checksums, trailers, and expected owner" do
+    bucket = "polchecksum"
+    initial = policy(bucket, "Initial")
+    updated = policy(bucket, "Updated")
+    trailer_update = policy(bucket, "Trailer")
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    good_header =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"policy" => ""},
+        body: initial,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", checksum_b64(:sha256, initial)}
+        ]
+      )
+      |> call()
+
+    assert good_header.status == 204
+    assert {:ok, stored} = Store.get_bucket_policy(bucket)
+    assert stored =~ "Initial"
+
+    bad_header =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"policy" => ""},
+        body: updated,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", checksum_b64(:sha256, "different")}
+        ]
+      )
+      |> call()
+
+    assert bad_header.status == 400
+    assert bad_header.resp_body =~ "<Code>BadDigest</Code>"
+    assert {:ok, stored} = Store.get_bucket_policy(bucket)
+    assert stored =~ "Initial"
+
+    plain_trailer =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"policy" => ""},
+        body: updated,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-trailer", "x-amz-checksum-sha256"}
+        ]
+      )
+      |> call()
+
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "<Code>InvalidRequest</Code>"
+    assert {:ok, stored} = Store.get_bucket_policy(bucket)
+    assert stored =~ "Initial"
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/#{bucket}", trailer_update,
+        query: %{"policy" => ""},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [{"x-amz-checksum-sha256", checksum_b64(:sha256, trailer_update)}]
+      )
+      |> call()
+
+    assert ok_trailer.status == 204
+    assert {:ok, stored} = Store.get_bucket_policy(bucket)
+    assert stored =~ "Trailer"
+
+    wrong_put =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"policy" => ""},
+        body: updated,
+        headers: [{"x-amz-expected-bucket-owner", "111111111111"}]
+      )
+      |> call()
+
+    assert wrong_put.status == 403
+    assert wrong_put.resp_body =~ "<Code>AccessDenied</Code>"
+    assert {:ok, stored} = Store.get_bucket_policy(bucket)
+    assert stored =~ "Trailer"
+
+    wrong_get =
+      SigV4Request.signed_conn(:get, "/#{bucket}",
+        query: %{"policy" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "111111111111"}]
+      )
+      |> call()
+
+    assert wrong_get.status == 403
+
+    wrong_delete =
+      SigV4Request.signed_conn(:delete, "/#{bucket}",
+        query: %{"policy" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "111111111111"}]
+      )
+      |> call()
+
+    assert wrong_delete.status == 403
+    assert {:ok, stored} = Store.get_bucket_policy(bucket)
+    assert stored =~ "Trailer"
   end
 
   test "GetBucketPolicy 无 policy → 404 NoSuchBucketPolicy" do

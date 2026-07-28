@@ -2,29 +2,25 @@ defmodule Maxio.S3.Handlers.Inventory do
   @moduledoc """
   ?inventory handler for Bucket Inventory configuration APIs.
 
-  This stores the inventory control-plane document only. Inventory report
-  generation is a separate feature.
+  This stores the inventory control-plane document. Report objects are produced
+  by the explicit local runner in `Maxio.S3.Inventory.Report`.
   """
   import Plug.Conn
 
   alias Maxio.Buckets
-  alias Maxio.S3.{Authz, Checksum, Error, Inventory, Log}
+  alias Maxio.S3.{Authz, ControlBody, Error, ExpectedBucketOwner, Inventory, Log}
   alias Maxio.S3.RequestParsers.Inventory, as: Parser
   alias Maxio.S3.Views.Inventory, as: View
 
   @limit 131_072
-  @local_account_id "000000000000"
 
   @spec put(Plug.Conn.t()) :: Plug.Conn.t()
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     id = inventory_id!(conn)
-    :ok = reject_streaming_body!(conn)
-    :ok = reject_checksum_trailers!(conn)
-    {conn, xml} = read_small_body!(conn)
-    :ok = validate_checksums!(conn, xml)
+    {conn, xml} = read_xml_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, config} ->
@@ -43,8 +39,7 @@ defmodule Maxio.S3.Handlers.Inventory do
               action: :put_bucket_inventory_configuration,
               bucket: bucket,
               inventory_id: id,
-              optional_fields: Inventory.optional_fields(config),
-              report_generation_implemented?: false
+              optional_fields: Inventory.optional_fields(config)
             )
 
             send_resp(conn, 200, "")
@@ -62,7 +57,7 @@ defmodule Maxio.S3.Handlers.Inventory do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     id = inventory_id!(conn)
 
     case Inventory.get_config(bucket, id) do
@@ -80,7 +75,7 @@ defmodule Maxio.S3.Handlers.Inventory do
   def delete(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     id = inventory_id!(conn)
     :ok = Inventory.delete_config(bucket, id)
 
@@ -97,7 +92,7 @@ defmodule Maxio.S3.Handlers.Inventory do
   def list(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     page = Inventory.list_configs(bucket, Map.get(conn.query_params || %{}, "continuation-token"))
 
     conn
@@ -131,72 +126,7 @@ defmodule Maxio.S3.Handlers.Inventory do
     end
   end
 
-  defp verify_expected_bucket_owner!(conn, bucket) do
-    case get_req_header(conn, "x-amz-expected-bucket-owner") do
-      [] ->
-        :ok
-
-      [owner] ->
-        if owner == account_id() do
-          :ok
-        else
-          raise Error.new(:access_denied, resource: "/" <> bucket)
-        end
-
-      _multiple ->
-        raise Error.new(:access_denied, resource: "/" <> bucket)
-    end
-  end
-
-  defp account_id do
-    :maxio
-    |> Application.get_env(:sts, [])
-    |> Keyword.get(:account_id, @local_account_id)
-    |> to_string()
-  end
-
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "InventoryConfiguration exceeds 128KB")
-
-      {:error, _reason} ->
-        raise Error.new(:malformed_xml)
-    end
-  end
-
-  defp reject_streaming_body!(conn) do
-    if conn.assigns[:payload_mode] == :streaming do
-      raise Error.new(:not_implemented,
-              message: "Bucket Inventory aws-chunked XML bodies are not implemented",
-              resource: "/" <> conn.assigns.s3_bucket
-            )
-    end
-
-    :ok
-  end
-
-  defp validate_checksums!(conn, body) do
-    checksum = Checksum.from_conn!(conn)
-    {stream, get_context, _discard_context} = Checksum.wrap_stream([body], checksum)
-    _ = Enum.to_list(stream)
-    checksum = get_context.()
-    checksum.verify!.()
-  end
-
-  defp reject_checksum_trailers!(conn) do
-    case get_req_header(conn, "x-amz-trailer") do
-      [] ->
-        :ok
-
-      _trailers ->
-        raise Error.new(:not_implemented,
-                message: "Bucket Inventory checksum trailers are not implemented",
-                resource: "/" <> conn.assigns.s3_bucket
-              )
-    end
+  defp read_xml_body!(conn) do
+    ControlBody.read_and_verify!(conn, @limit, "InventoryConfiguration exceeds 128KB")
   end
 end

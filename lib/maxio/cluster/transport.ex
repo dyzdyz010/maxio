@@ -40,6 +40,24 @@ defmodule Maxio.Cluster.Transport do
   # 节点宕机/超时/远端异常 -> {:error, :unavailable}（铁律 3：结构化降级，绝不上抛炸列举路径）。
   @callback list_dir(node(), String.t(), keyword()) ::
               {:ok, [%{name: String.t(), object?: boolean()}]} | {:error, term()}
+
+  # ── ObjectMutation per-endpoint 原语（协议 §3.2/§3.3，Phase 1 B4）──
+  # 把 B1 落在 ShardServer 的 epoch 原语寻址到端点 {node, drive_root}；请求/响应均为可
+  # erpc 序列化的纯数据（epoch payload / request map，形状见 ShardServer 同名函数）。
+  # 节点宕机/超时/远端异常 -> {:error, :unavailable}（铁律 3：quorum 编排在后端，绝不上抛）。
+  @callback read_epoch(node(), String.t(), map()) ::
+              {:ok, map()} | {:ok, :absent} | {:error, term()}
+  @callback cas_epoch(node(), String.t(), map()) :: {:ok, :applied} | {:error, term()}
+  @callback restore_mutation(node(), String.t(), map()) ::
+              {:ok, :restored} | {:ok, :superseded} | {:error, term()}
+  @callback finalize_mutation(node(), String.t(), map()) ::
+              {:ok, :finalized} | {:ok, :superseded} | {:error, term()}
+  # durable backup manifest 写原语（协议 §3.2）：Distributed 的协议化 publish 必须把每端点
+  # manifest 落在**该端点 drive** 上并 fsync（先于该盘任何 destructive IO）；既有原语无法
+  # 表达（put_sidecar 固定 meta.json 文件名且无 fsync 语义）。request 形状见
+  # ShardServer.put_mutation_manifest/3。
+  @callback put_mutation_manifest(node(), String.t(), map()) :: :ok | {:error, term()}
+
   @callback probe_drive(node(), String.t()) :: :ok | {:error, term()}
   @callback probe_drive_identity(node(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   @callback drive_hardware_evidence(node(), String.t(), keyword()) ::
@@ -164,6 +182,31 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def list_dir(node, drive_dir, opts) do
     call(node, :list_dir, [drive_dir, opts], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def read_epoch(node, drive_root, target) do
+    call(node, :read_epoch, [drive_root, target], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def cas_epoch(node, drive_root, request) do
+    call(node, :cas_epoch, [drive_root, request], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def restore_mutation(node, drive_root, request) do
+    call(node, :restore_mutation, [drive_root, request], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def finalize_mutation(node, drive_root, request) do
+    call(node, :finalize_mutation, [drive_root, request], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def put_mutation_manifest(node, drive_root, request) do
+    call(node, :put_mutation_manifest, [drive_root, request], fn -> {:error, :unavailable} end)
   end
 
   @impl true

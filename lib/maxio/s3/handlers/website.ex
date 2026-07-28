@@ -8,7 +8,7 @@ defmodule Maxio.S3.Handlers.Website do
   import Plug.Conn
 
   alias Maxio.{Buckets, BucketConfigs}
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{ControlBody, Error, ExpectedBucketOwner, Log}
   alias Maxio.S3.RequestParsers.Website, as: Parser
   alias Maxio.S3.Views.Website, as: View
 
@@ -19,7 +19,8 @@ defmodule Maxio.S3.Handlers.Website do
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    {conn, xml} = read_small_body!(conn)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
+    {conn, xml} = read_xml_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, config} ->
@@ -44,6 +45,7 @@ defmodule Maxio.S3.Handlers.Website do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
 
     case BucketConfigs.get(bucket, :website) do
       {:ok, config} ->
@@ -60,6 +62,7 @@ defmodule Maxio.S3.Handlers.Website do
   def delete(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     :ok = BucketConfigs.delete(bucket, :website)
 
     Log.info("delete bucket website", action: :delete_bucket_website, bucket: bucket)
@@ -220,16 +223,9 @@ defmodule Maxio.S3.Handlers.Website do
     end
   end
 
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "WebsiteConfiguration exceeds 128KB")
-
-      {:error, _reason} ->
-        raise Error.new(:malformed_xml)
-    end
+  defp read_xml_body!(conn) do
+    ControlBody.read_and_verify!(conn, @limit, "WebsiteConfiguration exceeds 128KB",
+      require_integrity: :content_md5
+    )
   end
 end

@@ -2,8 +2,11 @@ defmodule Maxio.S3.IntegrationTest do
   use Maxio.DataCase, async: false
 
   import Plug.Conn
+  alias Maxio.Auth.SigV4.Presigner
   alias Maxio.Test.SigV4Request
   alias Maxio.S3.Endpoint
+  alias Maxio.Cluster.{Paths, ShardServer}
+  alias Maxio.Cluster.Transport.InProcess
 
   @data_dir Path.join(System.tmp_dir!(), "maxio_int_test")
 
@@ -23,6 +26,103 @@ defmodule Maxio.S3.IntegrationTest do
   end
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
+  defp checksum_b64(algorithm, body), do: :crypto.hash(algorithm, body) |> Base.encode64()
+
+  defp lock_resource(bucket, key) do
+    parent = self()
+    resource = {bucket, key}
+
+    pid =
+      spawn(fn ->
+        {:ok, lease} = Maxio.Cluster.Lock.acquire(resource, nodes: [Node.self()], refresh: false)
+        send(parent, {:locked, self()})
+
+        receive do
+          :release -> Maxio.Cluster.Lock.release(lease)
+        end
+      end)
+
+    assert_receive {:locked, ^pid}
+    on_exit(fn -> send(pid, :release) end)
+    pid
+  end
+
+  defp with_sidecar_read_quorum_env(fun) do
+    InProcess.setup!()
+
+    prev_auth = Application.get_env(:maxio, :authoritative_source)
+    prev_tx = Application.get_env(:maxio, :shard_transport)
+    prev_ec = Application.get_env(:maxio, :erasure)
+
+    prev_topology =
+      try do
+        {:ok, :persistent_term.get({Maxio.Cluster.Topology, :topology})}
+      rescue
+        ArgumentError -> :error
+      end
+
+    Application.put_env(:maxio, :authoritative_source, read: :sidecar, list: :pg, write: :pg)
+    Application.put_env(:maxio, :shard_transport, InProcess)
+
+    Application.put_env(:maxio, :erasure,
+      drives: ["d0", "d1", "d2"],
+      data_shards: 2,
+      parity_shards: 1,
+      block_size: 1024
+    )
+
+    eps =
+      for i <- 0..2,
+          do:
+            {:"objcondrq#{i}",
+             Path.join(
+               System.tmp_dir!(),
+               "obj_cond_rq_#{i}_#{System.unique_integer([:positive])}"
+             )}
+
+    topo = %{
+      data_shards: 2,
+      parity_shards: 1,
+      block_size: 1024,
+      sets: %{0 => %{id: 0, endpoints: eps}},
+      set_ids: [0]
+    }
+
+    :persistent_term.put({Maxio.Cluster.Topology, :topology}, topo)
+
+    on_exit(fn ->
+      case prev_topology do
+        {:ok, topology} -> :persistent_term.put({Maxio.Cluster.Topology, :topology}, topology)
+        :error -> :persistent_term.erase({Maxio.Cluster.Topology, :topology})
+      end
+
+      restore_env(:authoritative_source, prev_auth)
+      restore_env(:shard_transport, prev_tx)
+      restore_env(:erasure, prev_ec)
+      Enum.each(eps, fn {_node, dir} -> File.rm_rf(dir) end)
+    end)
+
+    fun.(eps)
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:maxio, key)
+  defp restore_env(key, value), do: Application.put_env(:maxio, key, value)
+
+  defp call_presigned_url(url, now, method \\ :get, body \\ "") do
+    uri = URI.parse(url)
+
+    Plug.Test.conn(method, uri.path <> "?" <> uri.query, body)
+    |> Map.put(:host, uri.host)
+    |> Map.put(:port, uri.port || 80)
+    |> put_private(:maxio_now, now)
+    |> call()
+  end
+
+  defp put_single_sidecar!(eps, bucket, key, object_meta) do
+    [{_node, drive} | _] = eps
+    {:ok, rel} = Paths.object_rel(bucket, key, "null")
+    ShardServer.put_sidecar(Path.join(drive, rel), object_meta)
+  end
 
   test "CreateBucket → 200 + Location 头" do
     conn = SigV4Request.signed_conn(:put, "/mybucket") |> call()
@@ -61,6 +161,233 @@ defmodule Maxio.S3.IntegrationTest do
     assert get.resp_body == body
     assert get_resp_header(get, "content-type") == ["text/plain"]
     assert get_resp_header(get, "etag") == [expected_etag]
+  end
+
+  test "GetObject/HeadObject 签名请求支持 response header override" do
+    SigV4Request.signed_conn(:put, "/override") |> call()
+
+    SigV4Request.signed_conn(:put, "/override/report.bin",
+      body: "report",
+      headers: [
+        {"content-type", "application/octet-stream"},
+        {"cache-control", "max-age=60"},
+        {"content-disposition", "inline"}
+      ]
+    )
+    |> call()
+
+    overrides = %{
+      "response-cache-control" => "no-store",
+      "response-content-disposition" => "attachment",
+      "response-content-encoding" => "identity",
+      "response-content-language" => "zh-CN",
+      "response-content-type" => "text/plain",
+      "response-expires" => "2037-10-21T07:28:00Z"
+    }
+
+    get = SigV4Request.signed_conn(:get, "/override/report.bin", query: overrides) |> call()
+
+    assert get.status == 200
+    assert get.resp_body == "report"
+    assert get_resp_header(get, "cache-control") == ["no-store"]
+    assert get_resp_header(get, "content-disposition") == ["attachment"]
+    assert get_resp_header(get, "content-encoding") == ["identity"]
+    assert get_resp_header(get, "content-language") == ["zh-CN"]
+    assert get_resp_header(get, "content-type") == ["text/plain"]
+    assert get_resp_header(get, "expires") == ["2037-10-21T07:28:00Z"]
+
+    head =
+      SigV4Request.signed_conn(:head, "/override/report.bin",
+        query: %{"response-content-type" => "text/csv"}
+      )
+      |> call()
+
+    assert head.status == 200
+    assert head.resp_body == ""
+    assert get_resp_header(head, "content-type") == ["text/csv"]
+    assert get_resp_header(head, "content-length") == ["6"]
+  end
+
+  test "production presigner generated GET URL is accepted by S3 endpoint" do
+    now = DateTime.utc_now()
+    SigV4Request.signed_conn(:put, "/presign") |> call()
+    SigV4Request.signed_conn(:put, "/presign/shared.txt", body: "share me") |> call()
+
+    assert {:ok, url} =
+             Presigner.presign_url(
+               :get,
+               "http://localhost",
+               "/presign/shared.txt",
+               %{
+                 access_key: SigV4Request.access_key(),
+                 secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+               },
+               now: now,
+               region: "us-east-1",
+               expires: 300
+             )
+
+    conn = call_presigned_url(url, now)
+
+    assert conn.status == 200
+    assert conn.resp_body == "share me"
+  end
+
+  test "production presigner generated PUT URL is accepted by S3 endpoint" do
+    now = ~U[2026-06-28 04:00:00Z]
+    SigV4Request.signed_conn(:put, "/presignput") |> call()
+
+    assert {:ok, url} =
+             Presigner.presign_url(
+               :put,
+               "http://localhost:9900",
+               "/presignput/upload.txt",
+               %{
+                 access_key: SigV4Request.access_key(),
+                 secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+               },
+               now: now,
+               region: "us-east-1",
+               expires: 300
+             )
+
+    put = call_presigned_url(url, now, :put, "uploaded with put")
+    assert put.status == 200
+    assert get_resp_header(put, "etag") != []
+
+    get = SigV4Request.signed_conn(:get, "/presignput/upload.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "uploaded with put"
+
+    wrong_method = call_presigned_url(url, now, :get)
+    assert wrong_method.status == 403
+    assert wrong_method.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
+  end
+
+  test "production presigned GET URL expires and tampering is rejected" do
+    now = ~U[2026-06-28 01:00:00Z]
+    SigV4Request.signed_conn(:put, "/presignbad") |> call()
+    SigV4Request.signed_conn(:put, "/presignbad/shared.txt", body: "share me") |> call()
+
+    assert {:ok, url} =
+             Presigner.presign_url(
+               :get,
+               "http://localhost:9900",
+               "/presignbad/shared.txt",
+               %{
+                 access_key: SigV4Request.access_key(),
+                 secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+               },
+               now: now,
+               region: "us-east-1",
+               expires: 60
+             )
+
+    valid = call_presigned_url(url, now)
+    assert valid.status == 200
+    assert valid.resp_body == "share me"
+
+    expired = call_presigned_url(url, DateTime.add(now, 61, :second))
+    assert expired.status == 403
+    assert expired.resp_body =~ "<Code>AccessDenied</Code>"
+    assert expired.resp_body =~ "Request has expired"
+
+    tampered = String.replace(url, "shared.txt", "other.txt")
+    rejected = call_presigned_url(tampered, now)
+    assert rejected.status == 403
+    assert rejected.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
+  end
+
+  test "production presigned GET URL can target a specific version" do
+    now = ~U[2026-06-28 02:00:00Z]
+    SigV4Request.signed_conn(:put, "/presignver") |> call()
+
+    versioning_xml =
+      ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
+
+    SigV4Request.signed_conn(:put, "/presignver",
+      query: %{"versioning" => ""},
+      body: versioning_xml
+    )
+    |> call()
+
+    put_v1 = SigV4Request.signed_conn(:put, "/presignver/shared.txt", body: "first") |> call()
+    assert [version_1] = get_resp_header(put_v1, "x-amz-version-id")
+
+    put_v2 = SigV4Request.signed_conn(:put, "/presignver/shared.txt", body: "second") |> call()
+    assert [version_2] = get_resp_header(put_v2, "x-amz-version-id")
+    assert version_1 != version_2
+
+    assert {:ok, url} =
+             Presigner.presign_url(
+               :get,
+               "http://localhost:9900",
+               "/presignver/shared.txt",
+               %{
+                 access_key: SigV4Request.access_key(),
+                 secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+               },
+               now: now,
+               region: "us-east-1",
+               expires: 300,
+               query: %{"versionId" => version_1}
+             )
+
+    old_version = call_presigned_url(url, now)
+    assert old_version.status == 200
+    assert old_version.resp_body == "first"
+    assert get_resp_header(old_version, "x-amz-version-id") == [version_1]
+
+    tampered = String.replace(url, "versionId=#{version_1}", "versionId=#{version_2}")
+    rejected = call_presigned_url(tampered, now)
+    assert rejected.status == 403
+    assert rejected.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
+  end
+
+  test "production presigned GET URL signs response header overrides" do
+    now = ~U[2026-06-28 03:00:00Z]
+    SigV4Request.signed_conn(:put, "/presignoverride") |> call()
+
+    SigV4Request.signed_conn(:put, "/presignoverride/shared.txt",
+      body: "share me",
+      headers: [{"content-type", "application/octet-stream"}]
+    )
+    |> call()
+
+    assert {:ok, url} =
+             Presigner.presign_url(
+               :get,
+               "http://localhost:9900",
+               "/presignoverride/shared.txt",
+               %{
+                 access_key: SigV4Request.access_key(),
+                 secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+               },
+               now: now,
+               region: "us-east-1",
+               expires: 300,
+               query: %{
+                 "response-cache-control" => "max-age=3600",
+                 "response-content-disposition" => ~s(attachment; filename="shared.txt"),
+                 "response-content-type" => "text/plain"
+               }
+             )
+
+    valid = call_presigned_url(url, now)
+    assert valid.status == 200
+    assert valid.resp_body == "share me"
+    assert get_resp_header(valid, "cache-control") == ["max-age=3600"]
+
+    assert get_resp_header(valid, "content-disposition") == [
+             ~s(attachment; filename="shared.txt")
+           ]
+
+    assert get_resp_header(valid, "content-type") == ["text/plain"]
+
+    tampered = String.replace(url, "max-age%3D3600", "max-age%3D0")
+    rejected = call_presigned_url(tampered, now)
+    assert rejected.status == 403
+    assert rejected.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
   end
 
   test "GetObject Range → 206 + Content-Range + 区间内容" do
@@ -407,6 +734,82 @@ defmodule Maxio.S3.IntegrationTest do
     refute del.resp_body =~ "<Deleted>"
   end
 
+  test "DeleteObjects requires Content-MD5 and validates checksum trailers before deleting" do
+    SigV4Request.signed_conn(:put, "/delchecksum") |> call()
+    SigV4Request.signed_conn(:put, "/delchecksum/a", body: "1") |> call()
+    SigV4Request.signed_conn(:put, "/delchecksum/b", body: "2") |> call()
+    SigV4Request.signed_conn(:put, "/delchecksum/c", body: "3") |> call()
+
+    xml = "<Delete><Object><Key>a</Key></Object><Object><Key>b</Key></Object></Delete>"
+
+    missing_md5 =
+      SigV4Request.signed_conn(:post, "/delchecksum",
+        query: %{"delete" => ""},
+        body: xml,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", checksum_b64(:sha256, xml)}
+        ],
+        auto_content_md5: false
+      )
+      |> call()
+
+    assert missing_md5.status == 400
+    assert missing_md5.resp_body =~ "<Code>MissingSecurityHeader</Code>"
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/a") |> call()).status == 200
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/b") |> call()).status == 200
+
+    bad_md5 =
+      SigV4Request.signed_conn(:post, "/delchecksum",
+        query: %{"delete" => ""},
+        body: xml,
+        headers: [{"content-md5", checksum_b64(:md5, "different")}],
+        auto_content_md5: false
+      )
+      |> call()
+
+    assert bad_md5.status == 400
+    assert bad_md5.resp_body =~ "<Code>BadDigest</Code>"
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/a") |> call()).status == 200
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/b") |> call()).status == 200
+
+    bad_trailer =
+      SigV4Request.signed_chunked_conn(:post, "/delchecksum", xml,
+        query: %{"delete" => ""},
+        headers: [
+          {"content-md5", checksum_b64(:md5, xml)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"}
+        ],
+        trailer_headers: [{"x-amz-checksum-sha256", checksum_b64(:sha256, "different")}],
+        auto_content_md5: false
+      )
+      |> call()
+
+    assert bad_trailer.status == 400
+    assert bad_trailer.resp_body =~ "<Code>BadDigest</Code>"
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/a") |> call()).status == 200
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/b") |> call()).status == 200
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:post, "/delchecksum", xml,
+        query: %{"delete" => ""},
+        headers: [
+          {"content-md5", checksum_b64(:md5, xml)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"}
+        ],
+        trailer_headers: [{"x-amz-checksum-sha256", checksum_b64(:sha256, xml)}],
+        auto_content_md5: false
+      )
+      |> call()
+
+    assert ok_trailer.status == 200
+    assert ok_trailer.resp_body =~ "<Deleted><Key>a</Key></Deleted>"
+    assert ok_trailer.resp_body =~ "<Deleted><Key>b</Key></Deleted>"
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/a") |> call()).status == 404
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/b") |> call()).status == 404
+    assert (SigV4Request.signed_conn(:head, "/delchecksum/c") |> call()).status == 200
+  end
+
   test "DeleteObjects 超过 1000 key → 400 MalformedXML" do
     SigV4Request.signed_conn(:put, "/bigdel") |> call()
 
@@ -447,6 +850,76 @@ defmodule Maxio.S3.IntegrationTest do
 
     assert get.status == 412
     assert get.resp_body =~ "<Code>PreconditionFailed</Code>"
+  end
+
+  test "PutObject If-None-Match star prevents overwrites and allows absent targets" do
+    SigV4Request.signed_conn(:put, "/putcondnone") |> call()
+    SigV4Request.signed_conn(:put, "/putcondnone/existing.txt", body: "old") |> call()
+
+    rejected =
+      SigV4Request.signed_conn(:put, "/putcondnone/existing.txt",
+        body: "new",
+        headers: [{"if-none-match", "*"}]
+      )
+      |> call()
+
+    assert rejected.status == 412
+    assert rejected.resp_body =~ "<Code>PreconditionFailed</Code>"
+
+    unchanged = SigV4Request.signed_conn(:get, "/putcondnone/existing.txt") |> call()
+    assert unchanged.status == 200
+    assert unchanged.resp_body == "old"
+
+    accepted =
+      SigV4Request.signed_conn(:put, "/putcondnone/fresh.txt",
+        body: "fresh",
+        headers: [{"if-none-match", "*"}]
+      )
+      |> call()
+
+    assert accepted.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/putcondnone/fresh.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "fresh"
+  end
+
+  test "PutObject If-Match requires the current target ETag" do
+    SigV4Request.signed_conn(:put, "/putcondmatch") |> call()
+    put = SigV4Request.signed_conn(:put, "/putcondmatch/object.txt", body: "old") |> call()
+    [etag] = get_resp_header(put, "etag")
+
+    rejected =
+      SigV4Request.signed_conn(:put, "/putcondmatch/object.txt",
+        body: "bad",
+        headers: [{"if-match", "\"wrong\""}]
+      )
+      |> call()
+
+    assert rejected.status == 412
+
+    missing =
+      SigV4Request.signed_conn(:put, "/putcondmatch/missing.txt",
+        body: "bad",
+        headers: [{"if-match", etag}]
+      )
+      |> call()
+
+    assert missing.status == 404
+    assert missing.resp_body =~ "<Code>NoSuchKey</Code>"
+
+    accepted =
+      SigV4Request.signed_conn(:put, "/putcondmatch/object.txt",
+        body: "new",
+        headers: [{"if-match", etag}]
+      )
+      |> call()
+
+    assert accepted.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/putcondmatch/object.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "new"
   end
 
   test "多区间 Range（含逗号）→ 完整 200（对齐 S3，不实现 multipart/byteranges）" do
@@ -510,6 +983,240 @@ defmodule Maxio.S3.IntegrationTest do
       |> call()
 
     assert copy.status == 412
+  end
+
+  test "CopyObject If-None-Match star prevents target overwrites" do
+    SigV4Request.signed_conn(:put, "/copycondnone") |> call()
+    SigV4Request.signed_conn(:put, "/copycondnone/src.txt", body: "source") |> call()
+    SigV4Request.signed_conn(:put, "/copycondnone/existing.txt", body: "old") |> call()
+
+    rejected =
+      SigV4Request.signed_conn(:put, "/copycondnone/existing.txt",
+        headers: [
+          {"x-amz-copy-source", "/copycondnone/src.txt"},
+          {"if-none-match", "*"}
+        ]
+      )
+      |> call()
+
+    assert rejected.status == 412
+    assert rejected.resp_body =~ "<Code>PreconditionFailed</Code>"
+
+    unchanged = SigV4Request.signed_conn(:get, "/copycondnone/existing.txt") |> call()
+    assert unchanged.status == 200
+    assert unchanged.resp_body == "old"
+
+    accepted =
+      SigV4Request.signed_conn(:put, "/copycondnone/fresh.txt",
+        headers: [
+          {"x-amz-copy-source", "/copycondnone/src.txt"},
+          {"if-none-match", "*"}
+        ]
+      )
+      |> call()
+
+    assert accepted.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/copycondnone/fresh.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "source"
+  end
+
+  test "CopyObject If-Match requires the current target ETag" do
+    SigV4Request.signed_conn(:put, "/copycondmatch") |> call()
+    SigV4Request.signed_conn(:put, "/copycondmatch/src.txt", body: "source") |> call()
+    put = SigV4Request.signed_conn(:put, "/copycondmatch/dst.txt", body: "old") |> call()
+    [etag] = get_resp_header(put, "etag")
+
+    rejected =
+      SigV4Request.signed_conn(:put, "/copycondmatch/dst.txt",
+        headers: [
+          {"x-amz-copy-source", "/copycondmatch/src.txt"},
+          {"if-match", "\"wrong\""}
+        ]
+      )
+      |> call()
+
+    assert rejected.status == 412
+
+    missing =
+      SigV4Request.signed_conn(:put, "/copycondmatch/missing.txt",
+        headers: [
+          {"x-amz-copy-source", "/copycondmatch/src.txt"},
+          {"if-match", etag}
+        ]
+      )
+      |> call()
+
+    assert missing.status == 404
+    assert missing.resp_body =~ "<Code>NoSuchKey</Code>"
+
+    accepted =
+      SigV4Request.signed_conn(:put, "/copycondmatch/dst.txt",
+        headers: [
+          {"x-amz-copy-source", "/copycondmatch/src.txt"},
+          {"if-match", etag}
+        ]
+      )
+      |> call()
+
+    assert accepted.status == 200
+
+    get = SigV4Request.signed_conn(:get, "/copycondmatch/dst.txt") |> call()
+    assert get.status == 200
+    assert get.resp_body == "source"
+  end
+
+  test "conditional writes treat current delete markers as absent" do
+    SigV4Request.signed_conn(:put, "/condmarker") |> call()
+
+    versioning_xml =
+      ~s(<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>)
+
+    SigV4Request.signed_conn(:put, "/condmarker",
+      query: %{"versioning" => ""},
+      body: versioning_xml
+    )
+    |> call()
+
+    SigV4Request.signed_conn(:put, "/condmarker/src.txt", body: "source") |> call()
+    SigV4Request.signed_conn(:put, "/condmarker/dst.txt", body: "old") |> call()
+    delete = SigV4Request.signed_conn(:delete, "/condmarker/dst.txt") |> call()
+    assert delete.status == 204
+
+    put =
+      SigV4Request.signed_conn(:put, "/condmarker/dst.txt",
+        body: "new",
+        headers: [{"if-none-match", "*"}]
+      )
+      |> call()
+
+    assert put.status == 200
+
+    SigV4Request.signed_conn(:delete, "/condmarker/dst.txt") |> call()
+
+    copy =
+      SigV4Request.signed_conn(:put, "/condmarker/dst.txt",
+        headers: [
+          {"x-amz-copy-source", "/condmarker/src.txt"},
+          {"if-match", "\"old\""}
+        ]
+      )
+      |> call()
+
+    assert copy.status == 404
+    assert copy.resp_body =~ "<Code>NoSuchKey</Code>"
+  end
+
+  test "PutObject and CopyObject conditional lock conflicts map to ConditionalRequestConflict" do
+    SigV4Request.signed_conn(:put, "/condlock") |> call()
+    SigV4Request.signed_conn(:put, "/condlock/src.txt", body: "source") |> call()
+
+    put_lock = lock_resource("condlock", "put.txt")
+
+    put =
+      SigV4Request.signed_conn(:put, "/condlock/put.txt",
+        body: "new",
+        headers: [{"if-none-match", "*"}]
+      )
+      |> call()
+
+    assert put.status == 409
+    assert put.resp_body =~ "<Code>ConditionalRequestConflict</Code>"
+
+    ref = Process.monitor(put_lock)
+    send(put_lock, :release)
+    assert_receive {:DOWN, ^ref, :process, ^put_lock, :normal}
+
+    copy_lock = lock_resource("condlock", "copy.txt")
+
+    copy =
+      SigV4Request.signed_conn(:put, "/condlock/copy.txt",
+        headers: [
+          {"x-amz-copy-source", "/condlock/src.txt"},
+          {"if-none-match", "*"}
+        ]
+      )
+      |> call()
+
+    assert copy.status == 409
+    assert copy.resp_body =~ "<Code>ConditionalRequestConflict</Code>"
+
+    ref = Process.monitor(copy_lock)
+    send(copy_lock, :release)
+    assert_receive {:DOWN, ^ref, :process, ^copy_lock, :normal}
+  end
+
+  test "PutObject conditional target read quorum failure maps to SlowDownRead" do
+    with_sidecar_read_quorum_env(fn eps ->
+      bucket = "putcondrq"
+      key = "object.bin"
+
+      SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+      put_single_sidecar!(eps, bucket, key, %{
+        "format" => "maxio/2",
+        "versions" => [
+          %{
+            "version_id" => "null",
+            "type" => "object",
+            "is_latest" => true,
+            "modtime" => 5,
+            "generation" => 0,
+            "etag" => "\"old\"",
+            "size" => 3,
+            "content_type" => "text/plain"
+          }
+        ]
+      })
+
+      rejected =
+        SigV4Request.signed_conn(:put, "/#{bucket}/#{key}",
+          body: "new",
+          headers: [{"if-none-match", "*"}]
+        )
+        |> call()
+
+      assert rejected.status == 503
+      assert rejected.resp_body =~ "<Code>SlowDownRead</Code>"
+    end)
+  end
+
+  test "CopyObject conditional target read quorum is checked before source lookup" do
+    with_sidecar_read_quorum_env(fn eps ->
+      bucket = "copycondrq"
+      key = "dst.txt"
+
+      SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+      put_single_sidecar!(eps, bucket, key, %{
+        "format" => "maxio/2",
+        "versions" => [
+          %{
+            "version_id" => "null",
+            "type" => "object",
+            "is_latest" => true,
+            "modtime" => 5,
+            "generation" => 0,
+            "etag" => "\"old\"",
+            "size" => 3,
+            "content_type" => "text/plain"
+          }
+        ]
+      })
+
+      rejected =
+        SigV4Request.signed_conn(:put, "/#{bucket}/#{key}",
+          headers: [
+            {"x-amz-copy-source", "/#{bucket}/missing-source.txt"},
+            {"if-none-match", "*"}
+          ]
+        )
+        |> call()
+
+      assert rejected.status == 503
+      assert rejected.resp_body =~ "<Code>SlowDownRead</Code>"
+    end)
   end
 
   test "CopyObject source delete-marker version returns structured 400" do

@@ -162,6 +162,36 @@ defmodule Maxio.S3.RequestParsers.ReplicationTest do
              """)
   end
 
+  test "parses official empty Filter as all-object V2 rule" do
+    assert Replication.parse("""
+           <ReplicationConfiguration>
+             <Role>arn:aws:iam::000000000000:role/replication</Role>
+             <Rule>
+               <ID>all-v2</ID>
+               <Priority>1</Priority>
+               <Status>Enabled</Status>
+               <Filter></Filter>
+               <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+               <Destination><Bucket>arn:aws:s3:::replica-dest</Bucket></Destination>
+             </Rule>
+           </ReplicationConfiguration>
+           """) ==
+             {:ok,
+              %{
+                "Role" => "arn:aws:iam::000000000000:role/replication",
+                "Rules" => [
+                  %{
+                    "ID" => "all-v2",
+                    "Priority" => 1,
+                    "Status" => "Enabled",
+                    "Filter" => %{},
+                    "DeleteMarkerReplication" => %{"Status" => "Enabled"},
+                    "Destination" => %{"Bucket" => "arn:aws:s3:::replica-dest"}
+                  }
+                ]
+              }}
+  end
+
   test "rejects invalid required fields duplicate fields wrong root and unknown elements" do
     for xml <- [
           "<ReplicationConfiguration />",
@@ -226,7 +256,112 @@ defmodule Maxio.S3.RequestParsers.ReplicationTest do
             <Rule><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket><ReplicationTime><Status>Enabled</Status><Time><Minutes>10</Minutes></Time></ReplicationTime><Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics></Destination></Rule>
           </ReplicationConfiguration>
           """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Role>arn:aws:iam::000000000000:role/other</Role>
+            <Rule><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><ID>a</ID><ID>b</ID><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            text
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role><Value>arn:aws:iam::000000000000:role/replication</Value></Role>
+            <Rule><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Id>bad</Id><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket><StorageClass>standard_ia</StorageClass></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
           "<Wrapper><ReplicationConfiguration /></Wrapper>"
+        ] do
+      assert {:error, :malformed_xml} = Replication.parse(xml)
+    end
+  end
+
+  test "rejects invalid filters and replication cross-field combinations" do
+    for xml <- [
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Priority>1</Priority><Filter><Prefix>a</Prefix><Tag><Key>env</Key><Value>prod</Value></Tag></Filter><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Priority>1</Priority><Filter><And><Prefix>a</Prefix></And></Filter><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Priority>1</Priority><Filter><And><Tag><Key>env</Key><Value>prod</Value></Tag><Tag><Key>env</Key><Value>stage</Value></Tag></And></Filter><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Priority>1</Priority><Filter><Tag><Key>env</Key></Tag></Filter><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Priority>1</Priority><Filter><Tag><Key>env</Key><Value>prod</Value></Tag></Filter><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Prefix></Prefix><SourceSelectionCriteria><SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects></SourceSelectionCriteria><Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Priority>1</Priority><Filter></Filter><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria><Destination><Bucket>arn:aws:s3:::dest</Bucket><EncryptionConfiguration><ReplicaKmsKeyID>arn:aws:kms:us-east-1:000000000000:key/1</ReplicaKmsKeyID></EncryptionConfiguration></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Prefix></Prefix><SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria><Destination><Bucket>arn:aws:s3:::dest</Bucket><EncryptionConfiguration><ReplicaKmsKeyID>arn:aws:kms:us-east-1:000000000000:key/1</ReplicaKmsKeyID></EncryptionConfiguration></Destination></Rule>
+          </ReplicationConfiguration>
+          """,
+          """
+          <ReplicationConfiguration>
+            <Role>arn:aws:iam::000000000000:role/replication</Role>
+            <Rule><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::dest</Bucket><AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation></Destination></Rule>
+          </ReplicationConfiguration>
+          """
         ] do
       assert {:error, :malformed_xml} = Replication.parse(xml)
     end

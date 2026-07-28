@@ -10,7 +10,8 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
   import Ecto.Query
 
   alias Maxio.Auth.SessionToken
-  alias Maxio.IAM.{AccessKey, STSSession}
+  alias Maxio.IAM
+  alias Maxio.IAM.{AccessKey, AccessKeySecret, STSSession, STSSessionSecret}
   alias Maxio.Policy.Statement
   alias Maxio.Repo
 
@@ -24,10 +25,21 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
         get_session_secret(access_key, opts)
 
       %AccessKey{} = row ->
-        if session_token?(Keyword.get(opts, :session_token)) do
-          {:error, :invalid_token}
-        else
-          {:ok, %{secret_key: row.secret_key, principal: access_key_principal(row)}}
+        cond do
+          session_token?(Keyword.get(opts, :session_token)) ->
+            {:error, :invalid_token}
+
+          not access_key_principal_usable?(row) ->
+            :error
+
+          true ->
+            case AccessKeySecret.unwrap(row.secret_key, row.access_key_id) do
+              {:ok, secret_key} ->
+                {:ok, %{secret_key: secret_key, principal: access_key_principal(row)}}
+
+              {:error, _reason} ->
+                :error
+            end
         end
     end
   end
@@ -47,22 +59,25 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
       |> Map.get(:tags, Map.get(principal, :tags, %{}))
       |> normalize_tags()
 
-    %AccessKey{}
-    |> AccessKey.changeset(%{
-      access_key_id: ak,
-      secret_key: sk,
-      principal_arn: arn,
-      type: type,
-      status: "active",
-      tags: tags
-    })
-    |> Repo.insert(
-      on_conflict: {:replace, [:secret_key, :principal_arn, :type, :status, :tags, :updated_at]},
-      conflict_target: :access_key_id
-    )
-    |> case do
-      {:ok, _} -> :ok
-      {:error, cs} -> {:error, cs}
+    with {:ok, stored_secret} <- AccessKeySecret.wrap(sk, ak) do
+      %AccessKey{}
+      |> AccessKey.changeset(%{
+        access_key_id: ak,
+        secret_key: stored_secret,
+        principal_arn: arn,
+        type: type,
+        status: "active",
+        tags: tags
+      })
+      |> Repo.insert(
+        on_conflict:
+          {:replace, [:secret_key, :principal_arn, :type, :status, :tags, :updated_at]},
+        conflict_target: :access_key_id
+      )
+      |> case do
+        {:ok, _} -> :ok
+        {:error, cs} -> {:error, cs}
+      end
     end
   end
 
@@ -103,8 +118,17 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
           not SessionToken.verify(Keyword.get(opts, :session_token), row.session_token_sha256) ->
             {:error, :invalid_token}
 
+          not session_principal_usable?(row, now) ->
+            {:error, :invalid_token}
+
           true ->
-            {:ok, %{secret_key: row.secret_key, principal: session_principal(row)}}
+            case STSSessionSecret.unwrap(row.secret_key, row.access_key_id) do
+              {:ok, secret_key} ->
+                {:ok, %{secret_key: secret_key, principal: session_principal(row)}}
+
+              {:error, _reason} ->
+                {:error, :invalid_token}
+            end
         end
     end
   end
@@ -116,6 +140,86 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
       arn: row.principal_arn,
       tags: row.tags || %{}
     }
+  end
+
+  defp access_key_principal_usable?(%AccessKey{
+         type: "root",
+         principal_arn: "arn:aws:iam:::root"
+       }),
+       do: true
+
+  defp access_key_principal_usable?(%AccessKey{
+         type: "iam_user",
+         principal_arn: principal_arn,
+         access_key_id: access_key_id
+       }) do
+    IAM.iam_user_principal_usable?(principal_arn, access_key_id)
+  end
+
+  defp access_key_principal_usable?(%AccessKey{}), do: false
+
+  defp session_principal_usable?(%STSSession{} = row, now) do
+    session_own_principal_usable?(row) and
+      session_issuer_usable?(row, now, MapSet.new([row.access_key_id]))
+  end
+
+  defp session_issuer_usable?(
+         %STSSession{principal_type: "assumed_role", web_identity_provider_arn: provider_arn},
+         _now,
+         _seen
+       )
+       when is_binary(provider_arn) and provider_arn != "",
+       do: true
+
+  defp session_issuer_usable?(%STSSession{issuer_access_key_id: issuer_access_key_id}, now, seen) do
+    session_issuer_access_key_usable?(issuer_access_key_id, now, seen)
+  end
+
+  defp session_own_principal_usable?(%STSSession{
+         principal_type: "root",
+         principal_arn: "arn:aws:iam:::root"
+       }),
+       do: true
+
+  defp session_own_principal_usable?(%STSSession{
+         principal_type: "iam_user",
+         principal_arn: principal_arn,
+         issuer_access_key_id: issuer_access_key_id
+       }) do
+    IAM.iam_user_principal_usable?(principal_arn, issuer_access_key_id)
+  end
+
+  defp session_own_principal_usable?(%STSSession{principal_type: "assumed_role"}), do: true
+  defp session_own_principal_usable?(%STSSession{}), do: false
+
+  defp session_issuer_access_key_usable?(issuer_access_key_id, now, seen) do
+    cond do
+      not is_binary(issuer_access_key_id) or issuer_access_key_id == "" ->
+        false
+
+      MapSet.member?(seen, issuer_access_key_id) ->
+        false
+
+      true ->
+        case Repo.get_by(AccessKey, access_key_id: issuer_access_key_id, status: "active") do
+          %AccessKey{} = access_key ->
+            access_key_principal_usable?(access_key)
+
+          nil ->
+            session_issuer_session_usable?(issuer_access_key_id, now, seen)
+        end
+    end
+  end
+
+  defp session_issuer_session_usable?(issuer_access_key_id, now, seen) do
+    case Repo.get_by(STSSession, access_key_id: issuer_access_key_id) do
+      %STSSession{status: "active"} = session ->
+        session_own_principal_usable?(session) and
+          session_issuer_usable?(session, now, MapSet.put(seen, issuer_access_key_id))
+
+      _other ->
+        false
+    end
   end
 
   defp session_principal(%STSSession{principal_type: "assumed_role"} = row) do

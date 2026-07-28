@@ -1,150 +1,114 @@
 defmodule Maxio.S3.RequestParsers.Notification do
-  @moduledoc "PutBucketNotificationConfiguration NotificationConfiguration XML parser."
-  @behaviour Saxy.Handler
+  @moduledoc """
+  Strict PutBucketNotificationConfiguration NotificationConfiguration XML parser.
+
+  The parser owns XML shape, duplicate-field, and scalar syntax validation. The
+  `Maxio.S3.Notification` domain module still owns cross-destination semantics
+  and stores the normalized configuration contract used by S3 handlers and
+  Console JSON callers.
+  """
 
   alias Maxio.S3.Notification
+  alias Maxio.S3.RequestParsers.XMLTree
 
   @unset {:__maxio_notification_unset__, []}
 
   @spec parse(binary()) :: {:ok, map()} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    case Saxy.parse_string(xml, __MODULE__, %{stack: [], root: nil, invalid?: false}) do
-      {:ok, %{root: {"NotificationConfiguration", _attrs, children}, invalid?: false}} ->
-        build_config(children)
-
-      _other ->
-        {:error, :malformed_xml}
-    end
-  end
-
-  @impl true
-  def handle_event(:start_document, _prolog, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:start_element, {name, attrs}, state) do
-    tag = local(name)
-    attrs = Enum.map(attrs, fn {name, value} -> {local(name), value} end)
-    {:ok, %{state | stack: [{tag, attrs, []} | state.stack]}}
-  end
-
-  @impl true
-  def handle_event(:characters, chars, state) do
-    {:ok, append_child(state, {:text, chars})}
-  end
-
-  @impl true
-  def handle_event(:end_element, name, %{stack: [{tag, attrs, children} | rest]} = state) do
-    if local(name) == tag do
-      node = {tag, attrs, Enum.reverse(children)}
-
-      case rest do
-        [] ->
-          {:ok, %{state | root: node, stack: []}}
-
-        [{parent_tag, parent_attrs, parent_children} | parent_rest] ->
-          stack = [{parent_tag, parent_attrs, [node | parent_children]} | parent_rest]
-          {:ok, %{state | stack: stack}}
-      end
+    with {:ok, {"NotificationConfiguration", _attrs, children}} <- XMLTree.parse(xml),
+         {:ok, config} <- parse_config(children),
+         {:ok, config} <- Notification.validate_client_config(config) do
+      {:ok, config}
     else
-      {:ok, %{state | invalid?: true}}
+      _other -> {:error, :malformed_xml}
     end
   end
 
-  def handle_event(:end_element, _name, state), do: {:ok, %{state | invalid?: true}}
-
-  @impl true
-  def handle_event(:end_document, _data, state), do: {:ok, state}
-
-  defp append_child(%{stack: []} = state, _child), do: %{state | invalid?: true}
-
-  defp append_child(%{stack: [{tag, attrs, children} | rest]} = state, child) do
-    %{state | stack: [{tag, attrs, [child | children]} | rest]}
-  end
-
-  defp build_config(children) do
+  defp parse_config(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, Notification.empty()}, fn
-      {"TopicConfiguration", _attrs, children}, {:ok, config} ->
-        put_destination(config, "TopicConfigurations", "Topic", children)
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, Notification.empty(), false}, fn
+      {"TopicConfiguration", _attrs, children}, {:ok, config, event_bridge_seen?} ->
+        put_destination(config, event_bridge_seen?, "TopicConfigurations", "Topic", children)
 
-      {"QueueConfiguration", _attrs, children}, {:ok, config} ->
-        put_destination(config, "QueueConfigurations", "Queue", children)
+      {"QueueConfiguration", _attrs, children}, {:ok, config, event_bridge_seen?} ->
+        put_destination(config, event_bridge_seen?, "QueueConfigurations", "Queue", children)
 
-      {"CloudFunctionConfiguration", _attrs, children}, {:ok, config} ->
-        put_destination(config, "LambdaFunctionConfigurations", "LambdaFunction", children)
+      {"CloudFunctionConfiguration", _attrs, children}, {:ok, config, event_bridge_seen?} ->
+        put_destination(
+          config,
+          event_bridge_seen?,
+          "LambdaFunctionConfigurations",
+          "LambdaFunction",
+          children
+        )
 
-      {"EventBridgeConfiguration", _attrs, []}, {:ok, config} ->
-        if is_nil(config["EventBridgeConfiguration"]) do
-          {:cont, {:ok, Map.put(config, "EventBridgeConfiguration", %{})}}
+      {"EventBridgeConfiguration", _attrs, children}, {:ok, config, false} ->
+        if XMLTree.structural_children(children) == [] do
+          {:cont, {:ok, Map.put(config, "EventBridgeConfiguration", %{}), true}}
         else
-          {:halt, {:error, :malformed_xml}}
+          {:halt, :error}
         end
 
       _other, _acc ->
-        {:halt, {:error, :malformed_xml}}
+        {:halt, :error}
     end)
     |> case do
-      {:ok, config} -> Notification.validate_client_config(config)
-      error -> error
-    end
-    |> case do
-      {:ok, config} -> {:ok, config}
-      {:error, :malformed_xml} -> {:error, :malformed_xml}
+      {:ok, config, _event_bridge_seen?} -> {:ok, config}
+      :error -> :error
     end
   end
 
-  defp put_destination(config, list_key, destination_key, children) do
+  defp put_destination(config, event_bridge_seen?, list_key, destination_key, children) do
     case parse_destination(destination_key, children) do
       {:ok, destination} ->
-        config = Map.update!(config, list_key, &(&1 ++ [destination]))
-        {:cont, {:ok, config}}
+        {:cont, {:ok, Map.update!(config, list_key, &(&1 ++ [destination])), event_bridge_seen?}}
 
       :error ->
-        {:halt, {:error, :malformed_xml}}
+        {:halt, :error}
     end
   end
 
   defp parse_destination(destination_key, children) do
-    Enum.reduce_while(
-      structural_children(children),
-      {:ok, %{destination_key => @unset, "Events" => [], "Id" => @unset, "Filter" => @unset}},
-      fn
-        {"Id", _attrs, children}, {:ok, dest} ->
-          put_once(dest, "Id", optional_text(children))
+    initial = %{
+      destination_key => @unset,
+      "Events" => [],
+      "Id" => @unset,
+      "Filter" => @unset
+    }
 
-        {^destination_key, _attrs, children}, {:ok, dest} ->
-          put_once(dest, destination_key, required_text(children))
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, initial, MapSet.new()}, fn
+      {"Id", _attrs, children}, {:ok, destination, events_seen} ->
+        put_once_destination(destination, events_seen, "Id", optional_text(children))
 
-        {"CloudFunction", _attrs, children}, {:ok, dest}
-        when destination_key == "LambdaFunction" ->
-          put_once(dest, destination_key, required_text(children))
+      {^destination_key, _attrs, children}, {:ok, destination, events_seen} ->
+        put_once_destination(destination, events_seen, destination_key, required_text(children))
 
-        {"Event", _attrs, children}, {:ok, dest} ->
-          case required_text(children) do
-            {:ok, event} -> {:cont, {:ok, Map.update!(dest, "Events", &(&1 ++ [event]))}}
-            :error -> {:halt, :error}
-          end
+      {"CloudFunction", _attrs, children}, {:ok, destination, events_seen}
+      when destination_key == "LambdaFunction" ->
+        put_once_destination(destination, events_seen, destination_key, required_text(children))
 
-        {"Filter", _attrs, children}, {:ok, dest} ->
-          with {:ok, filter} <- parse_filter(children),
-               {:cont, {:ok, dest}} <- put_once(dest, "Filter", {:ok, filter}) do
-            {:cont, {:ok, dest}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"Event", _attrs, children}, {:ok, destination, events_seen} ->
+        put_event(destination, events_seen, children)
 
-        _other, _acc ->
-          {:halt, :error}
-      end
-    )
+      {"Filter", _attrs, children}, {:ok, destination, events_seen} ->
+        with {:ok, filter} <- parse_filter(children) do
+          put_once_destination(destination, events_seen, "Filter", {:ok, filter})
+        else
+          _other -> {:halt, :error}
+        end
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
     |> case do
-      {:ok, dest} ->
-        dest = normalize_unset_fields(dest)
+      {:ok, destination, _events_seen} ->
+        destination = normalize_unset_fields(destination)
 
-        if is_binary(dest[destination_key]) and dest["Events"] != [] and
-             Enum.all?(dest["Events"], &Notification.known_event?/1) do
-          {:ok, dest}
+        if is_binary(destination[destination_key]) and destination["Events"] != [] do
+          {:ok, destination}
         else
           :error
         end
@@ -154,34 +118,49 @@ defmodule Maxio.S3.RequestParsers.Notification do
     end
   end
 
-  defp parse_filter(children), do: do_parse_filter(structural_children(children))
-
-  defp do_parse_filter([{"S3Key", _attrs, children}]) do
-    rules =
-      children
-      |> structural_children()
-      |> Enum.reduce_while({:ok, []}, fn
-        {"FilterRule", _attrs, rule_children}, {:ok, rules} ->
-          case parse_filter_rule(rule_children) do
-            {:ok, rule} -> {:cont, {:ok, rules ++ [rule]}}
-            :error -> {:halt, :error}
-          end
-
-        _other, _acc ->
-          {:halt, :error}
-      end)
-
-    case rules do
-      {:ok, rules} -> {:ok, %{"S3Key" => %{"FilterRules" => rules}}}
-      :error -> :error
+  defp put_event(destination, events_seen, children) do
+    with {:ok, event} <- required_text(children),
+         true <- Notification.known_event?(event),
+         false <- MapSet.member?(events_seen, event) do
+      {:cont,
+       {:ok, Map.update!(destination, "Events", &(&1 ++ [event])), MapSet.put(events_seen, event)}}
+    else
+      _other -> {:halt, :error}
     end
   end
 
-  defp do_parse_filter(_children), do: :error
+  defp parse_filter(children) do
+    case XMLTree.structural_children(children) do
+      [{"S3Key", _attrs, children}] ->
+        parse_s3_key_filter(children)
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_s3_key_filter(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, []}, fn
+      {"FilterRule", _attrs, children}, {:ok, rules} ->
+        case parse_filter_rule(children) do
+          {:ok, rule} -> {:cont, {:ok, rules ++ [rule]}}
+          :error -> {:halt, :error}
+        end
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, rules} when rules != [] -> {:ok, %{"S3Key" => %{"FilterRules" => rules}}}
+      _other -> :error
+    end
+  end
 
   defp parse_filter_rule(children) do
     children
-    |> structural_children()
+    |> XMLTree.structural_children()
     |> Enum.reduce_while({:ok, %{"Name" => @unset, "Value" => @unset}}, fn
       {"Name", _attrs, children}, {:ok, rule} ->
         put_once(rule, "Name", required_text(children))
@@ -216,53 +195,39 @@ defmodule Maxio.S3.RequestParsers.Notification do
     end)
   end
 
+  defp put_once_destination(map, events_seen, key, {:ok, value}) do
+    case put_once_value(map, key, value) do
+      {:ok, map} -> {:cont, {:ok, map, events_seen}}
+      :error -> {:halt, :error}
+    end
+  end
+
+  defp put_once_destination(_map, _events_seen, _key, :error), do: {:halt, :error}
+
   defp put_once(map, key, {:ok, value}) do
-    if Map.fetch!(map, key) == @unset do
-      {:cont, {:ok, Map.put(map, key, value)}}
-    else
-      {:halt, :error}
+    case put_once_value(map, key, value) do
+      {:ok, map} -> {:cont, {:ok, map}}
+      :error -> {:halt, :error}
     end
   end
 
   defp put_once(_map, _key, :error), do: {:halt, :error}
 
-  defp required_text(children) do
-    case text(children) do
-      {:ok, ""} -> :error
-      other -> other
-    end
-  end
-
-  defp optional_text(children) do
-    case text(children) do
-      {:ok, ""} -> {:ok, nil}
-      other -> other
-    end
-  end
-
-  defp text([]), do: {:ok, ""}
-
-  defp text(children) when is_list(children) do
-    if Enum.all?(children, &match?({:text, value} when is_binary(value), &1)) do
-      {:ok, children |> Enum.map(fn {:text, value} -> value end) |> Enum.join()}
+  defp put_once_value(map, key, value) do
+    if Map.fetch!(map, key) == @unset do
+      {:ok, Map.put(map, key, value)}
     else
       :error
     end
   end
 
-  defp structural_children(children) do
-    Enum.reject(children, fn
-      {:text, value} -> String.trim(value) == ""
-      _node -> false
-    end)
-  end
+  defp text(children), do: XMLTree.text(children)
+  defp required_text(children), do: XMLTree.required_text(children, trim: true)
 
-  defp local({_namespace, name}), do: local(name)
-
-  defp local(name) do
-    case String.split(to_string(name), ":") do
-      [_namespace, local] -> local
-      [local] -> local
+  defp optional_text(children) do
+    case XMLTree.text(children, trim: true) do
+      {:ok, ""} -> {:ok, nil}
+      other -> other
     end
   end
 end

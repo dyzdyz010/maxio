@@ -78,6 +78,12 @@ defmodule Maxio.S3.RequestParsers.ObjectLockTest do
           """
           <ObjectLockConfiguration>
             <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+            <Rule><DefaultRetention><Mode>governance</Mode><Days>1</Days></DefaultRetention></Rule>
+          </ObjectLockConfiguration>
+          """,
+          """
+          <ObjectLockConfiguration>
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>
             <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>0</Days></DefaultRetention></Rule>
           </ObjectLockConfiguration>
           """,
@@ -91,6 +97,48 @@ defmodule Maxio.S3.RequestParsers.ObjectLockTest do
           <ObjectLockConfiguration>
             <ObjectLockEnabled>Enabled</ObjectLockEnabled>
             <Unknown />
+          </ObjectLockConfiguration>
+          """,
+          """
+          <ObjectLockConfiguration>
+            text
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+          </ObjectLockConfiguration>
+          """,
+          """
+          <ObjectLockConfiguration>
+            <ObjectLockEnabled><Value>Enabled</Value></ObjectLockEnabled>
+          </ObjectLockConfiguration>
+          """,
+          """
+          <ObjectLockConfiguration>
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+          </ObjectLockConfiguration>
+          """,
+          """
+          <ObjectLockConfiguration>
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+            <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule>
+            <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>2</Days></DefaultRetention></Rule>
+          </ObjectLockConfiguration>
+          """,
+          """
+          <ObjectLockConfiguration>
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+            <Rule>
+              <DefaultRetention>
+                <Mode>GOVERNANCE</Mode>
+                <Mode>COMPLIANCE</Mode>
+                <Days>1</Days>
+              </DefaultRetention>
+            </Rule>
+          </ObjectLockConfiguration>
+          """,
+          """
+          <ObjectLockConfiguration>
+            <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+            <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days></Days></DefaultRetention></Rule>
           </ObjectLockConfiguration>
           """,
           "<Wrapper><ObjectLockConfiguration /></Wrapper>"
@@ -123,19 +171,31 @@ defmodule Maxio.S3.RequestParsers.ObjectLockTest do
   end
 
   test "rejects invalid object retention and legal hold shapes" do
-    assert {:error, :malformed_xml} =
-             ObjectLock.parse_retention("""
-             <Retention><Mode>GOVERNANCE</Mode></Retention>
-             """)
+    for xml <- [
+          "<Retention><Mode>GOVERNANCE</Mode></Retention>",
+          "<Retention><Mode>LEGAL</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>",
+          "<Retention><Mode>governance</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>",
+          "<ObjectLockConfiguration><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></ObjectLockConfiguration>",
+          "<Retention><Mode></Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>",
+          "<Retention><Mode><Value>GOVERNANCE</Value></Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>",
+          "<Retention>text<Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>",
+          "<Retention><Mode>GOVERNANCE</Mode><Mode>COMPLIANCE</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>",
+          "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate><Unknown /></Retention>"
+        ] do
+      assert {:error, :malformed_xml} = ObjectLock.parse_retention(xml)
+    end
 
-    assert {:error, :malformed_xml} =
-             ObjectLock.parse_retention("""
-             <Retention><Mode>LEGAL</Mode><RetainUntilDate>2030-01-02T03:04:05Z</RetainUntilDate></Retention>
-             """)
-
-    assert {:error, :malformed_xml} =
-             ObjectLock.parse_legal_hold("""
-             <LegalHold><Status>MAYBE</Status></LegalHold>
-             """)
+    for xml <- [
+          "<LegalHold><Status>MAYBE</Status></LegalHold>",
+          "<LegalHold><Status>on</Status></LegalHold>",
+          "<Retention><Status>ON</Status></Retention>",
+          "<LegalHold><Status></Status></LegalHold>",
+          "<LegalHold><Status><Value>ON</Value></Status></LegalHold>",
+          "<LegalHold>text<Status>ON</Status></LegalHold>",
+          "<LegalHold><Status>ON</Status><Status>OFF</Status></LegalHold>",
+          "<LegalHold><Status>ON</Status><Unknown /></LegalHold>"
+        ] do
+      assert {:error, :malformed_xml} = ObjectLock.parse_legal_hold(xml)
+    end
   end
 end

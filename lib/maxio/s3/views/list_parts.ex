@@ -7,12 +7,15 @@ defmodule Maxio.S3.Views.ListParts do
   def render(data) do
     part_elems =
       Enum.map(data.parts, fn p ->
-        element("Part", [], [
-          element("PartNumber", [], characters(Integer.to_string(p.part_number))),
-          element("LastModified", [], characters(XML.iso8601(p.last_modified))),
-          element("ETag", [], characters(XML.quote_etag(p.etag))),
-          element("Size", [], characters(Integer.to_string(p.size)))
-        ])
+        children =
+          [
+            element("PartNumber", [], characters(Integer.to_string(p.part_number))),
+            element("LastModified", [], characters(XML.iso8601(p.last_modified))),
+            element("ETag", [], characters(XML.quote_etag(p.etag))),
+            element("Size", [], characters(Integer.to_string(p.size)))
+          ] ++ checksum_children(Map.get(p, :checksum, %{}))
+
+        element("Part", [], children)
       end)
 
     children =
@@ -41,5 +44,29 @@ defmodule Maxio.S3.Views.ListParts do
 
     root = element("ListPartsResult", [{"xmlns", XML.namespace()}], children)
     XML.encode(root)
+  end
+
+  defp checksum_children(checksum) when is_map(checksum) do
+    []
+    |> maybe_checksum_field(checksum, "ChecksumCRC32")
+    |> maybe_checksum_field(checksum, "ChecksumCRC32C")
+    |> maybe_checksum_field(checksum, "ChecksumCRC64NVME")
+    |> maybe_checksum_field(checksum, "ChecksumMD5")
+    |> maybe_checksum_field(checksum, "ChecksumSHA1")
+    |> maybe_checksum_field(checksum, "ChecksumSHA256")
+    |> maybe_checksum_field(checksum, "ChecksumSHA512")
+    |> maybe_checksum_field(checksum, "ChecksumXXHASH128")
+    |> maybe_checksum_field(checksum, "ChecksumXXHASH3")
+    |> maybe_checksum_field(checksum, "ChecksumXXHASH64")
+  end
+
+  defp maybe_checksum_field(children, checksum, name) do
+    case Map.get(checksum, name) do
+      value when is_binary(value) and value != "" ->
+        children ++ [element(name, [], characters(value))]
+
+      _ ->
+        children
+    end
   end
 end

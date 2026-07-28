@@ -37,12 +37,17 @@ defmodule Maxio.Cluster.Rebalance.Workflow do
     blockers = blockers(job, phase, runtime, deployment, rebalance_audit)
     set_retired? = retired_from_both_topologies?(job, runtime, deployment)
     pool_retired? = pool_retired?(job, runtime, deployment)
+    status = workflow_status(phase, blockers)
+    next_action = next_action(phase, job, blockers, rebalance_audit)
+    destructive_next_action? = destructive_phase?(phase)
+    warnings = warnings(status, next_action, destructive_next_action?, blockers)
 
     %{
-      status: workflow_status(phase, blockers),
+      status: status,
       phase: phase,
-      next_action: next_action(phase, job, blockers, rebalance_audit),
-      destructive_next_action?: destructive_phase?(phase),
+      gate_status: gate_status(blockers, warnings),
+      next_action: next_action,
+      destructive_next_action?: destructive_next_action?,
       job_id: job.id,
       job_kind: job.kind,
       target_set_id: job.target_set_id,
@@ -54,6 +59,7 @@ defmodule Maxio.Cluster.Rebalance.Workflow do
       rebalance_audit: rebalance_audit,
       rebalance_closure: persisted_rebalance_closure(job),
       blockers: blockers,
+      warnings: warnings,
       runtime_topology: runtime,
       deployment_topology: deployment,
       job: Jobs.to_view(job)
@@ -86,6 +92,22 @@ defmodule Maxio.Cluster.Rebalance.Workflow do
   defp workflow_status("rebalance_closure", []), do: "complete"
   defp workflow_status(_phase, []), do: "in_progress"
   defp workflow_status(_phase, _blockers), do: "blocked"
+
+  defp warnings(_status, _next_action, _destructive_next_action?, [_ | _]), do: []
+
+  defp warnings(status, next_action, destructive_next_action?, []) do
+    []
+    |> maybe_block(
+      status == "in_progress" and next_action not in [nil, "none"],
+      "workflow_next_action_required"
+    )
+    |> maybe_block(destructive_next_action?, "destructive_next_action_required")
+    |> Enum.reverse()
+  end
+
+  defp gate_status([_ | _], _warnings), do: "blocked"
+  defp gate_status([], [_ | _]), do: "attention"
+  defp gate_status([], []), do: "ok"
 
   @failure_blockers ~w(
     job_failed

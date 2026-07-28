@@ -46,6 +46,22 @@ defmodule Maxio.Cluster.ReplacementAutomationProfileTest do
     assert report.checks.scheduler_evidence == %{required?: false, status: :not_requested}
   end
 
+  test "rehearsal ready opts produce an explicit ready local profile" do
+    report = AutomationProfile.status(AutomationProfile.rehearsal_ready_opts())
+
+    assert report.status == :ready
+    assert report.ready?
+    assert report.blockers == []
+    assert report.warnings == []
+    assert report.next_action == "none"
+    assert report.checks.fresh_drive_heal_scheduler.enabled
+    assert report.checks.rebalance_scheduler.enabled
+    assert report.checks.fresh_drive_heal_scheduler.ledger_enabled
+    assert report.checks.rebalance_scheduler.ledger_enabled
+    refute report.checks.fresh_drive_heal_scheduler.run_opts.dry_run
+    refute report.checks.rebalance_scheduler.run_opts.dry_run
+  end
+
   test "scheduler evidence is opt-in and not called by default" do
     report =
       AutomationProfile.status(

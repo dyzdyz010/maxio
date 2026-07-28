@@ -1,5 +1,6 @@
 defmodule Maxio.S3.AuthzMatrixTest do
   use Maxio.DataCase, async: false
+  import ExUnit.CaptureLog
 
   alias Maxio.Test.SigV4Request
   alias Maxio.Auth.CredentialStore
@@ -9,6 +10,14 @@ defmodule Maxio.S3.AuthzMatrixTest do
   @alice_ak "AKIAALICEKEY00000001"
   @alice_secret "alicealicealicealicealicealice12"
   @alice_arn "arn:aws:iam:::user/" <> @alice_ak
+  @external_account "111122223333"
+  @external_ak "AKIACROSSACCOUNT0001"
+  @external_secret "externalexternalexternal1234"
+  @external_arn "arn:aws:iam::#{@external_account}:user/cross-alice"
+  @blocked_account "444455556666"
+  @blocked_ak "AKIACROSSACCOUNT0002"
+  @blocked_secret "blockedblockedblocked123456"
+  @blocked_arn "arn:aws:iam::#{@blocked_account}:user/cross-bob"
 
   setup do
     File.rm_rf(@data_dir)
@@ -28,6 +37,25 @@ defmodule Maxio.S3.AuthzMatrixTest do
           tags: %{"team" => "platform", "department" => "storage"}
         }
       })
+
+    Enum.each(
+      [
+        {@external_ak, @external_secret, @external_arn},
+        {@blocked_ak, @blocked_secret, @blocked_arn}
+      ],
+      fn {access_key, secret_key, arn} ->
+        :ok =
+          CredentialStore.put_access_key(%{
+            access_key: access_key,
+            secret_key: secret_key,
+            principal: %{
+              type: :iam_user,
+              access_key: access_key,
+              arn: arn
+            }
+          })
+      end
+    )
 
     on_exit(fn ->
       Application.put_env(:maxio, :s3, prev)
@@ -63,6 +91,22 @@ defmodule Maxio.S3.AuthzMatrixTest do
     )
   end
 
+  defp external(method, path, opts \\ []) do
+    SigV4Request.signed_conn(
+      method,
+      path,
+      Keyword.merge([access_key: @external_ak, secret: @external_secret], opts)
+    )
+  end
+
+  defp blocked_account(method, path, opts \\ []) do
+    SigV4Request.signed_conn(
+      method,
+      path,
+      Keyword.merge([access_key: @blocked_ak, secret: @blocked_secret], opts)
+    )
+  end
+
   test "认证非 owner 无 policy → 403（认证 ≠ 授权）" do
     # root 建桶（owner=root）
     SigV4Request.signed_conn(:put, "/mba") |> call()
@@ -71,6 +115,36 @@ defmodule Maxio.S3.AuthzMatrixTest do
     get = alice(:get, "/mba/o.txt", []) |> call()
     assert get.status == 403
     assert get.resp_body =~ "AccessDenied"
+  end
+
+  test "authz deny logs IAM governance metadata for operator evidence" do
+    SigV4Request.signed_conn(:put, "/mb-iamgov-deny") |> call()
+    SigV4Request.signed_conn(:put, "/mb-iamgov-deny/o.txt", body: "x") |> call()
+
+    log =
+      capture_log([level: :warning], fn ->
+        denied =
+          alice(:get, "/mb-iamgov-deny/o.txt", headers: [{"x-request-id", "req-iamgov-deny"}])
+          |> call()
+
+        assert denied.status == 403
+        assert denied.resp_body =~ "AccessDenied"
+      end)
+
+    assert log =~ "authz denied"
+    assert log =~ "request_id="
+    assert log =~ "action=get_object"
+    assert log =~ "required_action=s3:GetObject"
+    assert log =~ "resource=arn:aws:s3:::mb-iamgov-deny/o.txt"
+    assert log =~ "decision=deny"
+    assert log =~ "reason=implicit_deny"
+    assert log =~ "policy_source=none"
+    assert log =~ "principal_arn=#{@alice_arn}"
+    assert log =~ "principal_type=iam_user"
+    assert log =~ "account_id=local"
+    assert log =~ "authenticated=true"
+    assert log =~ "code=AccessDenied"
+    assert log =~ "status=403"
   end
 
   test "policy 命名该 principal arn → 放行" do
@@ -90,6 +164,88 @@ defmodule Maxio.S3.AuthzMatrixTest do
     get = alice(:get, "/mb2/o.txt", []) |> call()
     assert get.status == 200
     assert get.resp_body == "yes"
+  end
+
+  test "authz allow logs IAM governance metadata and matched policy source" do
+    original_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: original_level) end)
+
+    SigV4Request.signed_conn(:put, "/mb-iamgov-allow") |> call()
+    SigV4Request.signed_conn(:put, "/mb-iamgov-allow/o.txt", body: "yes") |> call()
+
+    pol =
+      ~s({"Statement":{"Effect":"Allow","Principal":{"AWS":"#{@alice_arn}"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::mb-iamgov-allow/*"}})
+
+    SigV4Request.signed_conn(:put, "/mb-iamgov-allow",
+      query: %{"policy" => ""},
+      body: pol,
+      headers: [{"content-type", "application/json"}]
+    )
+    |> call()
+
+    log =
+      capture_log([level: :info], fn ->
+        allowed =
+          alice(:get, "/mb-iamgov-allow/o.txt", headers: [{"x-request-id", "req-iamgov-allow"}])
+          |> call()
+
+        assert allowed.status == 200
+        assert allowed.resp_body == "yes"
+      end)
+
+    assert log =~ "authz decision"
+    assert log =~ "request_id="
+    assert log =~ "action=get_object"
+    assert log =~ "required_action=s3:GetObject"
+    assert log =~ "resource=arn:aws:s3:::mb-iamgov-allow/o.txt"
+    assert log =~ "decision=allow"
+    assert log =~ "reason=allowed"
+    assert log =~ "policy_source=resource"
+    assert log =~ "principal_arn=#{@alice_arn}"
+    assert log =~ "principal_type=iam_user"
+    assert log =~ "account_id=local"
+    assert log =~ "authenticated=true"
+    assert log =~ "status=200"
+  end
+
+  test "root owner data access still honors explicit deny while bucket policy recovery remains available" do
+    SigV4Request.signed_conn(:put, "/mb-root-explicit-deny") |> call()
+    SigV4Request.signed_conn(:put, "/mb-root-explicit-deny/o.txt", body: "blocked") |> call()
+
+    pol =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::mb-root-explicit-deny/*"},{"Effect":"Deny","Principal":"*","Action":"s3:DeleteBucketPolicy","Resource":"arn:aws:s3:::mb-root-explicit-deny"}]})
+
+    put_policy("mb-root-explicit-deny", pol)
+
+    log =
+      capture_log([level: :warning], fn ->
+        denied =
+          SigV4Request.signed_conn(:get, "/mb-root-explicit-deny/o.txt",
+            headers: [{"x-request-id", "req-root-explicit-deny"}]
+          )
+          |> call()
+
+        assert denied.status == 403
+        assert denied.resp_body =~ "AccessDenied"
+      end)
+
+    assert log =~ "reason=explicit_deny"
+    assert log =~ "policy_source=explicit_deny"
+    assert log =~ "owner=true"
+    assert log =~ "principal_type=root"
+
+    delete_policy =
+      SigV4Request.signed_conn(:delete, "/mb-root-explicit-deny", query: %{"policy" => ""})
+      |> call()
+
+    assert delete_policy.status == 204
+
+    allowed_after_recovery =
+      SigV4Request.signed_conn(:get, "/mb-root-explicit-deny/o.txt") |> call()
+
+    assert allowed_after_recovery.status == 200
+    assert allowed_after_recovery.resp_body == "blocked"
   end
 
   test "policy StringLike s3:prefix 限制 ListBucket" do
@@ -636,5 +792,57 @@ defmodule Maxio.S3.AuthzMatrixTest do
 
     copy = alice(:put, "/mb4/dst.txt", headers: [{"x-amz-copy-source", "/mb4/src.txt"}]) |> call()
     assert copy.status == 403
+  end
+
+  test "aws:PrincipalAccount gates cross-account and anonymous bucket policy access" do
+    SigV4Request.signed_conn(:put, "/mb-principal-account") |> call()
+
+    SigV4Request.signed_conn(:put, "/mb-principal-account/external.txt", body: "external")
+    |> call()
+
+    SigV4Request.signed_conn(:put, "/mb-principal-account/blocked.txt", body: "blocked")
+    |> call()
+
+    SigV4Request.signed_conn(:put, "/mb-principal-account/anonymous.txt", body: "anonymous")
+    |> call()
+
+    pol =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::mb-principal-account/external.txt","Condition":{"StringEquals":{"aws:PrincipalAccount":"#{@external_account}"}}},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::mb-principal-account/blocked.txt","Condition":{"StringEquals":{"aws:PrincipalAccount":"#{@external_account}"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::mb-principal-account/anonymous.txt","Condition":{"StringEquals":{"aws:PrincipalAccount":"anonymous"}}}]})
+
+    put_policy("mb-principal-account", pol)
+
+    allowed = external(:get, "/mb-principal-account/external.txt") |> call()
+    assert allowed.status == 200
+    assert allowed.resp_body == "external"
+
+    denied_other_account = blocked_account(:get, "/mb-principal-account/external.txt") |> call()
+    assert denied_other_account.status == 403
+
+    denied_anonymous =
+      SigV4Request.anon_conn(:get, "/mb-principal-account/external.txt") |> call()
+
+    assert denied_anonymous.status == 403
+
+    anonymous_allowed =
+      SigV4Request.anon_conn(:get, "/mb-principal-account/anonymous.txt") |> call()
+
+    assert anonymous_allowed.status == 200
+    assert anonymous_allowed.resp_body == "anonymous"
+
+    external_on_anonymous = external(:get, "/mb-principal-account/anonymous.txt") |> call()
+    assert external_on_anonymous.status == 403
+
+    log =
+      capture_log([level: :warning], fn ->
+        explicitly_denied = external(:get, "/mb-principal-account/blocked.txt") |> call()
+        assert explicitly_denied.status == 403
+      end)
+
+    assert log =~ "authz denied"
+    assert log =~ "reason=explicit_deny"
+    assert log =~ "policy_source=explicit_deny"
+    assert log =~ "principal_arn=#{@external_arn}"
+    assert log =~ "principal_type=iam_user"
+    assert log =~ "account_id=#{@external_account}"
   end
 end

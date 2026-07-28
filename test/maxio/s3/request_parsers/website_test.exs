@@ -101,6 +101,24 @@ defmodule Maxio.S3.RequestParsers.WebsiteTest do
     assert {:error, :malformed_xml} = Parser.parse(xml)
   end
 
+  test "rejects unknown duplicate misnested mixed text and nested leaf nodes" do
+    cases = [
+      ~s(<WebsiteConfiguration><Unknown>true</Unknown></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><IndexDocument><Suffix>home.html</Suffix></IndexDocument></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix><Suffix>home.html</Suffix></IndexDocument></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration><IndexDocument><Key>index.html</Key></IndexDocument></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration>text<IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration><IndexDocument><Suffix><Value>index.html</Value></Suffix></IndexDocument></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><RoutingRules><RoutingRule><Condition><Unknown>docs/</Unknown></Condition><Redirect><ReplaceKeyPrefixWith>documents/</ReplaceKeyPrefixWith></Redirect></RoutingRule></RoutingRules></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><RoutingRules><RoutingRule><Condition><KeyPrefixEquals>docs/</KeyPrefixEquals><KeyPrefixEquals>images/</KeyPrefixEquals></Condition><Redirect><ReplaceKeyPrefixWith>documents/</ReplaceKeyPrefixWith></Redirect></RoutingRule></RoutingRules></WebsiteConfiguration>),
+      ~s(<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><RoutingRules><RoutingRule><Redirect><HostName>example.com</HostName><HostName>backup.example.com</HostName></Redirect></RoutingRule></RoutingRules></WebsiteConfiguration>)
+    ]
+
+    for xml <- cases do
+      assert {:error, :malformed_xml} = Parser.parse(xml)
+    end
+  end
+
   test "validation rejects invalid website combinations" do
     redirect_with_index = %{
       "index_document" => %{"suffix" => "index.html"},

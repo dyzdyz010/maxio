@@ -16,6 +16,8 @@ defmodule Maxio.ObjectMeta do
   alias Maxio.Storage.Erasure.Config
   alias Maxio.S3.Log
 
+  @max_keys_limit 1000
+
   @doc """
   读/列/写的元数据权威来源（读 config，可经 opts 覆盖 for tests）。
 
@@ -66,10 +68,19 @@ defmodule Maxio.ObjectMeta do
       _ ->
         cond do
           Topology.configured?() -> nil
-          Maxio.Storage.backend() == Maxio.Storage.FS -> Maxio.Storage.FS.local_topology(opts)
+          local_topology_backend?() -> local_topology(opts)
           true -> nil
         end
     end
+  end
+
+  defp local_topology_backend? do
+    backend = Maxio.Storage.backend()
+    Code.ensure_loaded?(backend) and function_exported?(backend, :local_topology, 1)
+  end
+
+  defp local_topology(opts) do
+    Maxio.Storage.backend().local_topology(opts)
   end
 
   @doc """
@@ -133,6 +144,33 @@ defmodule Maxio.ObjectMeta do
     end
   end
 
+  @doc """
+  Reads the full object view used to validate a metadata mutation.
+
+  The read source is forced to the configured write authority. Sidecar writes
+  bypass the derived PG index and fail closed instead of falling back to a
+  potentially stale PG row.
+  """
+  @spec get_for_write(String.t(), String.t(), String.t() | nil, keyword()) ::
+          Objects.Object.t() | {:error, :not_found | :read_quorum}
+  def get_for_write(bucket, key, version_id \\ nil, opts \\ []) do
+    write_authority = authoritative_source(:write, opts)
+
+    authority_override =
+      case Keyword.get(opts, :authoritative_source) do
+        override when is_list(override) -> Keyword.put(override, :read, write_authority)
+        _other -> [read: write_authority]
+      end
+
+    opts =
+      opts
+      |> Keyword.put(:authoritative_source, authority_override)
+      |> Keyword.put(:read_prefer_index, false)
+      |> Keyword.put(:sidecar_pg_fallback?, false)
+
+    get(bucket, key, version_id, opts)
+  end
+
   # B5-1 —— PREFER 索引快路径：PG 命中即返回；miss → 盘上 sidecar 权威（现有路径）。
   # PG 异常（DB down 等）绝不让读失败——盘上才是权威，PG 仅派生索引快路径：降级 sidecar_read +
   # Log.warn（去 PG 读路径 SPOF，铁律 3 不静默）。
@@ -179,28 +217,22 @@ defmodule Maxio.ObjectMeta do
 
       if copies == [] do
         # endpoints_for / object_rel 失败（无拓扑 / 非法 key）→ 降级 PG fallback。
-        sidecar_unreachable_fallback(bucket, key, version_id)
+        sidecar_unreachable_fallback(bucket, key, version_id, opts)
       else
         reconcile_sidecar_read(bucket, key, version_id, eff_vid, target, copies, opts)
       end
     rescue
       e ->
-        Log.warn("read authority sidecar unreachable, falling back to PG index",
-          bucket: bucket,
-          key: key,
-          reason: inspect(e)
-        )
-
-        pg_read(bucket, key, version_id)
+        sidecar_unreachable_fallback(bucket, key, version_id, opts, inspect(e))
     catch
       kind, reason ->
-        Log.warn("read authority sidecar caught, falling back to PG index",
-          bucket: bucket,
-          key: key,
-          reason: inspect({kind, reason})
+        sidecar_unreachable_fallback(
+          bucket,
+          key,
+          version_id,
+          opts,
+          inspect({kind, reason})
         )
-
-        pg_read(bucket, key, version_id)
     end
   end
 
@@ -287,7 +319,10 @@ defmodule Maxio.ObjectMeta do
       content_disposition: view.content_disposition,
       cache_control: view.cache_control,
       expires: view.expires,
+      website_redirect_location: view.website_redirect_location,
       metadata: view.metadata,
+      checksum: view.checksum,
+      object_parts: view.object_parts,
       storage_class: view.storage_class,
       acl_canned: view.acl_canned,
       acl_grants: view.acl_grants,
@@ -297,6 +332,7 @@ defmodule Maxio.ObjectMeta do
       object_lock_legal_hold: view.object_lock_legal_hold,
       restore_status: view.restore_status,
       restore_expiry: view.restore_expiry,
+      replication_status: view.replication_status,
       sse_algorithm: view.sse_algorithm,
       # 信封从 sidecar 版本 entry 携带（Sidecar.to_view 读 e["sse"]["envelope"]）——绝不再硬编码 nil。
       # 否则 read=:sidecar 下 SSE-S3 对象 GET 会带 sse_algorithm="AES256" 却无信封，
@@ -319,15 +355,22 @@ defmodule Maxio.ObjectMeta do
   end
 
   # sidecar 路径完全不可达（无拓扑 / object_rel 非法）→ 降级 PG 索引兜底（best-effort），记 Log.warn。
-  defp sidecar_unreachable_fallback(bucket, key, version_id) do
-    Log.warn("read authority sidecar unreachable, falling back to PG index",
-      bucket: bucket,
-      key: key,
-      version_id: version_id
-    )
+  defp sidecar_unreachable_fallback(bucket, key, version_id, opts, reason \\ nil) do
+    metadata =
+      [bucket: bucket, key: key, version_id: version_id]
+      |> maybe_put_log_reason(reason)
 
-    pg_read(bucket, key, version_id)
+    if Keyword.get(opts, :sidecar_pg_fallback?, true) do
+      Log.warn("read authority sidecar unreachable, falling back to PG index", metadata)
+      pg_read(bucket, key, version_id)
+    else
+      Log.error("strict sidecar authority read unavailable", metadata)
+      {:error, :read_quorum}
+    end
   end
+
+  defp maybe_put_log_reason(metadata, nil), do: metadata
+  defp maybe_put_log_reason(metadata, reason), do: Keyword.put(metadata, :reason, reason)
 
   # PG 权威读：get_metadata/get_version 均返回 {:ok, %Object{}} | {:error, :not_found}，
   # 解包成裸 %Object{}（命中）或 {:error, :not_found}，供 handler/shadow 统一消费。
@@ -442,10 +485,13 @@ defmodule Maxio.ObjectMeta do
         field_diff(:content_disposition, pg.content_disposition, view.content_disposition),
         field_diff(:cache_control, pg.cache_control, view.cache_control),
         field_diff(:expires, pg.expires, view.expires),
+        field_diff(:checksum, pg.checksum || %{}, view.checksum || %{}),
+        field_diff(:object_parts, pg.object_parts || %{}, view.object_parts || %{}),
         field_diff(:is_delete_marker, pg.is_delete_marker, view.is_delete_marker),
         field_diff(:storage_class, pg.storage_class, view.storage_class),
         field_diff(:restore_status, pg.restore_status, view.restore_status),
         field_diff(:restore_expiry, pg.restore_expiry, view.restore_expiry),
+        field_diff(:replication_status, pg.replication_status, view.replication_status),
         field_diff(:acl_grants, pg.acl_grants, view.acl_grants)
       ]
       |> Enum.reject(&is_nil/1)
@@ -511,6 +557,195 @@ defmodule Maxio.ObjectMeta do
         res
     end
   end
+
+  @doc """
+  List object versions through the configured list authority.
+
+  The PG branch preserves the SQL implementation. The sidecar branch walks the
+  version tree, then reads each discovered version through `get/4`, so optional
+  metadata such as RestoreStatus is taken from the same authority as normal
+  sidecar LIST reads.
+  """
+  @spec list_versions(String.t(), map(), keyword()) :: map()
+  def list_versions(bucket, list_opts, opts \\ []) do
+    case authoritative_source(:list, opts) do
+      :sidecar ->
+        sidecar_list_versions(bucket, list_opts, opts)
+
+      _pg ->
+        Objects.list_object_versions(bucket, list_opts)
+    end
+  end
+
+  defp sidecar_list_versions(bucket, list_opts, opts) do
+    opts =
+      opts
+      |> put_effective_topology()
+      |> Keyword.put(:read_prefer_index, false)
+      |> Keyword.put(:authoritative_source, read: :sidecar, list: :sidecar, write: :sidecar)
+
+    prefix = Map.get(list_opts, :prefix, "") || ""
+    delimiter = Map.get(list_opts, :delimiter)
+    max_keys = normalize_version_max_keys(Map.get(list_opts, :max_keys, @max_keys_limit))
+    key_marker = Map.get(list_opts, :key_marker)
+    version_id_marker = Map.get(list_opts, :version_id_marker)
+
+    versions =
+      bucket
+      |> sidecar_version_candidates(opts)
+      |> Enum.filter(&String.starts_with?(&1.key, prefix))
+      |> apply_version_cursor(key_marker, version_id_marker)
+      |> Enum.sort_by(&{&1.key, version_sort_token(&1.version_id)})
+
+    {versions, common_prefixes, truncated, last_key, last_vid} =
+      collapse_sidecar_versions(versions, prefix, delimiter, max_keys)
+
+    %{
+      versions: versions,
+      common_prefixes: common_prefixes,
+      is_truncated: truncated,
+      next_key_marker: if(truncated, do: last_key, else: nil),
+      next_version_id_marker: if(truncated, do: last_vid, else: nil)
+    }
+  end
+
+  defp sidecar_version_candidates(bucket, opts) do
+    bucket
+    |> Maxio.Listing.scan_keys(opts)
+    |> Enum.flat_map(fn key ->
+      bucket
+      |> Maxio.Listing.version_ids(key, opts)
+      |> Enum.map(&{key, &1})
+    end)
+    |> Enum.uniq()
+    |> Enum.flat_map(fn {key, version_id} ->
+      case get(bucket, key, version_id, opts) do
+        %Objects.Object{} = object ->
+          [object]
+
+        {:error, :not_found} ->
+          []
+
+        {:error, reason} ->
+          Log.warn("sidecar list versions skipped unreadable version",
+            action: :list_object_versions,
+            bucket: bucket,
+            key: key,
+            version_id: version_id,
+            reason: inspect(reason)
+          )
+
+          []
+      end
+    end)
+  end
+
+  defp apply_version_cursor(versions, nil, _version_id_marker), do: versions
+
+  defp apply_version_cursor(versions, key_marker, nil) do
+    Enum.filter(versions, &(&1.key > key_marker))
+  end
+
+  defp apply_version_cursor(versions, key_marker, version_id_marker) do
+    Enum.filter(versions, fn object ->
+      object.key > key_marker or
+        (object.key == key_marker and object.version_id < version_id_marker)
+    end)
+  end
+
+  defp version_sort_token(version_id) when is_binary(version_id) do
+    version_id
+    |> String.to_charlist()
+    |> Enum.map(&(-&1))
+  end
+
+  defp version_sort_token(_version_id), do: []
+
+  defp collapse_sidecar_versions(candidates, prefix, delimiter, max_keys) do
+    do_collapse_sidecar_versions(
+      candidates,
+      prefix,
+      delimiter,
+      max_keys,
+      [],
+      MapSet.new(),
+      [],
+      nil,
+      nil
+    )
+  end
+
+  defp do_collapse_sidecar_versions([], _prefix, _delim, _max, vers, _seen, cps, lk, lv),
+    do: {Enum.reverse(vers), Enum.reverse(cps), false, lk, lv}
+
+  defp do_collapse_sidecar_versions(
+         [obj | rest],
+         prefix,
+         delimiter,
+         max,
+         vers,
+         seen,
+         cps,
+         _lk,
+         _lv
+       ) do
+    count = length(vers) + MapSet.size(seen)
+
+    if count >= max do
+      {last_key, last_vid} = previous_sidecar_version_token(vers, cps)
+      {Enum.reverse(vers), Enum.reverse(cps), true, last_key, last_vid}
+    else
+      case sidecar_common_prefix(obj.key, prefix, delimiter) do
+        nil ->
+          do_collapse_sidecar_versions(
+            rest,
+            prefix,
+            delimiter,
+            max,
+            [obj | vers],
+            seen,
+            cps,
+            obj.key,
+            obj.version_id
+          )
+
+        cp ->
+          if MapSet.member?(seen, cp) do
+            do_collapse_sidecar_versions(rest, prefix, delimiter, max, vers, seen, cps, cp, nil)
+          else
+            do_collapse_sidecar_versions(
+              rest,
+              prefix,
+              delimiter,
+              max,
+              vers,
+              MapSet.put(seen, cp),
+              [cp | cps],
+              cp,
+              nil
+            )
+          end
+      end
+    end
+  end
+
+  defp previous_sidecar_version_token([object | _], _cps), do: {object.key, object.version_id}
+  defp previous_sidecar_version_token([], [cp | _]), do: {cp, nil}
+  defp previous_sidecar_version_token([], []), do: {nil, nil}
+
+  defp sidecar_common_prefix(_key, _prefix, nil), do: nil
+
+  defp sidecar_common_prefix(key, prefix, delimiter) do
+    rest = String.replace_prefix(key, prefix, "")
+
+    case :binary.match(rest, delimiter) do
+      {pos, len} -> prefix <> binary_part(rest, 0, pos + len)
+      :nomatch -> nil
+    end
+  end
+
+  defp normalize_version_max_keys(n) when is_integer(n) and n > 0, do: min(n, @max_keys_limit)
+  defp normalize_version_max_keys(_), do: @max_keys_limit
 
   @doc """
   ROUTE B P3 —— ListObjectsV2 的 drive-walk shadow（best-effort，不翻 list 权威）。
@@ -670,7 +905,8 @@ defmodule Maxio.ObjectMeta do
 
           case transport.get_sidecar(node, dir) do
             {:ok, meta} -> %{node: node, drive: drive, meta: meta}
-            {:error, _} -> :missing
+            {:error, :enoent} -> :missing
+            {:error, reason} -> {:error, reason}
           end
         end)
 

@@ -7,9 +7,10 @@ defmodule Maxio.S3.Logging do
   """
 
   alias Maxio.BucketConfigs
+  alias Maxio.Policy.ACL
   alias Maxio.S3.Error
 
-  @permissions ~w(READ WRITE READ_ACP WRITE_ACP FULL_CONTROL)
+  @permissions ~w(READ WRITE FULL_CONTROL)
   @grantee_types ~w(CanonicalUser Group)
   @target_object_key_formats ~w(simple partitioned)
   @partition_date_sources ~w(EventTime DeliveryTime)
@@ -33,6 +34,24 @@ defmodule Maxio.S3.Logging do
 
   @spec valid_partition_date_source?(term()) :: boolean()
   def valid_partition_date_source?(source), do: source in @partition_date_sources
+
+  @spec target_grants_to_acl(term()) ::
+          {:ok, [map()]} | {:error, :unsupported_email | :invalid_grant | :too_many_grants}
+  def target_grants_to_acl(grants) when is_list(grants) do
+    grants
+    |> Enum.reduce_while({:ok, []}, fn grant, {:ok, acc} ->
+      case target_grant_to_acl(grant) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, normalized} -> ACL.normalize_grants(Enum.reverse(normalized))
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def target_grants_to_acl(_grants), do: {:error, :invalid_grant}
 
   @spec normalize(map()) :: map()
   def normalize(config) when is_map(config) do
@@ -100,10 +119,13 @@ defmodule Maxio.S3.Logging do
         invalid_stored!()
 
       true ->
+        target_grants = Enum.map(target_grants, &normalize_target_grant!/1)
+        :ok = validate_target_grants!(target_grants)
+
         %{
           "TargetBucket" => target_bucket,
           "TargetPrefix" => target_prefix,
-          "TargetGrants" => Enum.map(target_grants, &normalize_target_grant!/1),
+          "TargetGrants" => target_grants,
           "TargetObjectKeyFormat" => normalize_target_object_key_format(target_object_key_format)
         }
     end
@@ -146,6 +168,35 @@ defmodule Maxio.S3.Logging do
         invalid_stored!()
     end
   end
+
+  defp validate_target_grants!(grants) do
+    case target_grants_to_acl(grants) do
+      {:ok, _normalized} -> :ok
+      {:error, _reason} -> invalid_stored!()
+    end
+  end
+
+  defp target_grant_to_acl(%{
+         "Grantee" => %{"type" => "CanonicalUser", "ID" => id} = grantee,
+         "Permission" => permission
+       }) do
+    {:ok,
+     %{
+       "grantee" =>
+         %{"type" => "CanonicalUser", "id" => id}
+         |> maybe_put("display_name", Map.get(grantee, "DisplayName")),
+       "permission" => permission
+     }}
+  end
+
+  defp target_grant_to_acl(%{
+         "Grantee" => %{"type" => "Group", "URI" => uri},
+         "Permission" => permission
+       }) do
+    {:ok, %{"grantee" => %{"type" => "Group", "uri" => uri}, "permission" => permission}}
+  end
+
+  defp target_grant_to_acl(_grant), do: {:error, :invalid_grant}
 
   defp normalize_target_object_key_format(%{"type" => "partitioned"} = format) do
     %{

@@ -7,7 +7,7 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
   import Plug.Conn
   alias Maxio.Buckets
   alias Maxio.Policy.{Statement, Store}
-  alias Maxio.S3.{Error, Log, PublicAccessBlock}
+  alias Maxio.S3.{ControlBody, Error, ExpectedBucketOwner, Log, PublicAccessBlock}
 
   @policy_limit 1_048_576
 
@@ -15,6 +15,7 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     {conn, json} = read_small_body!(conn)
 
     # 语义校验：JSON 合法 + 策略结构合法（Version/Effect/Action/Resource/Principal）
@@ -47,6 +48,7 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
 
     case Store.get_bucket_policy(bucket) do
       {:ok, json} ->
@@ -65,6 +67,7 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
   def delete(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     :ok = Store.delete_bucket_policy(bucket)
     Log.info("delete bucket policy", action: :delete_bucket_policy, bucket: bucket)
     send_resp(conn, 204, "")
@@ -80,15 +83,8 @@ defmodule Maxio.S3.Handlers.BucketPolicy do
 
   # 小 JSON 整读（带上限，铁律 4）。
   defp read_small_body!(conn) do
-    case read_body(conn, length: @policy_limit, read_length: @policy_limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:entity_too_large, message: "Policy document too large")
-
-      {:error, _} ->
-        raise Error.new(:malformed_policy)
-    end
+    ControlBody.read_and_verify!(conn, @policy_limit, "Policy document too large",
+      too_large_error: :entity_too_large
+    )
   end
 end

@@ -83,4 +83,74 @@ defmodule Maxio.Storage do
   @spec delete_version(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def delete_version(bucket, key, version_id, opts \\ []),
     do: backend().delete_version(bucket, key, version_id, opts)
+
+  @doc """
+  Persist retained notification ledger entries outside object/version carriers.
+  See `Maxio.Storage.Backend.put_notification_ledgers/4`.
+  """
+  @spec put_notification_ledgers(String.t(), String.t(), [map()], keyword()) ::
+          :ok | {:error, term()}
+  def put_notification_ledgers(bucket, key, entries, opts \\ []),
+    do: backend().put_notification_ledgers(bucket, key, entries, opts)
+
+  @doc """
+  List retained notification ledgers for a key or a whole bucket.
+  See `Maxio.Storage.Backend.list_notification_ledgers/3`.
+  """
+  @spec list_notification_ledgers(String.t(), String.t() | :all, keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_notification_ledgers(bucket, key_filter, opts \\ []),
+    do: backend().list_notification_ledgers(bucket, key_filter, opts)
+
+  @doc """
+  Delete retained notification ledgers after replay/prune decisions.
+  See `Maxio.Storage.Backend.delete_notification_ledgers/4`.
+  """
+  @spec delete_notification_ledgers(String.t(), String.t(), [String.t()], keyword()) ::
+          :ok | {:error, term()}
+  def delete_notification_ledgers(bucket, key, ids, opts \\ []),
+    do: backend().delete_notification_ledgers(bucket, key, ids, opts)
+
+  # ── ObjectMutation epoch CAS 门面（协议 §3.3，Phase 1 B5 接线；转发到 backend）──
+
+  @doc """
+  以 quorum 语义 claim target 的 fencing epoch（per-endpoint CAS 仅接受严格更大 token）。
+  见 `Maxio.Storage.Backend.claim_epoch/4`。
+  """
+  @spec claim_epoch(
+          Maxio.Storage.ObjectEpoch.target(),
+          Maxio.Storage.ObjectEpoch.token(),
+          String.t(),
+          keyword()
+        ) ::
+          {:ok,
+           %{
+             :previous => Maxio.Storage.ObjectEpoch.t() | nil,
+             :endpoints_ok => non_neg_integer(),
+             optional(:placement_snapshot) => map()
+           }}
+          | {:error, term()}
+  def claim_epoch(target, token, operation, opts \\ []),
+    do: backend().claim_epoch(target, token, operation, opts)
+
+  @doc "quorum 读 target 当前 epoch（`:absent` 显式区分）。见 `Maxio.Storage.Backend.current_epoch/2`。"
+  @spec current_epoch(Maxio.Storage.ObjectEpoch.target(), keyword()) ::
+          {:ok, Maxio.Storage.ObjectEpoch.t() | :absent} | {:error, term()}
+  def current_epoch(target, opts \\ []), do: backend().current_epoch(target, opts)
+
+  @doc """
+  仅当 ctx.token 仍为当前 epoch 时恢复旧值；successor → `{:ok, :superseded}`。
+  见 `Maxio.Storage.Backend.restore_if_current/2`。
+  """
+  @spec restore_if_current(Maxio.Storage.MutationContext.t(), keyword()) ::
+          {:ok, :restored | :superseded} | {:error, term()}
+  def restore_if_current(ctx, opts \\ []), do: backend().restore_if_current(ctx, opts)
+
+  @doc """
+  仅当 ctx.token 仍为当前 epoch 时终结（epoch → committed + 丢弃 backup）；幂等。
+  见 `Maxio.Storage.Backend.finalize_if_current/2`。
+  """
+  @spec finalize_if_current(Maxio.Storage.MutationContext.t(), keyword()) ::
+          {:ok, :finalized | :superseded} | {:error, term()}
+  def finalize_if_current(ctx, opts \\ []), do: backend().finalize_if_current(ctx, opts)
 end

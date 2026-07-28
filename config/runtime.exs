@@ -28,11 +28,240 @@ if root_user = System.get_env("MAXIO_ROOT_USER") do
 end
 
 if root_password = System.get_env("MAXIO_ROOT_PASSWORD") do
+  if root_password == "" do
+    raise """
+    environment variable MAXIO_ROOT_PASSWORD must not be empty.
+    """
+  end
+
   config :maxio, :s3, root_password: root_password
 end
 
 if data_dir = System.get_env("MAXIO_DATA_DIR") do
   config :maxio, :s3, data_dir: data_dir
+end
+
+dev_sse_master_key = "bWF4aW8tc3NlLXMzLW1hc3Rlci1rZXktMzJieXRlcyE="
+dev_access_key_secret_key = "bWF4aW8tYWNjZXNzLWtleS1zZWNyZXQta2V5LTMyYiE="
+
+validate_prod_secret_env! = fn name, value, purpose ->
+  cond do
+    value in [nil, ""] ->
+      raise """
+      environment variable #{name} is missing.
+      Provide a base64-encoded 32 byte key for #{purpose}.
+      """
+
+    value == dev_sse_master_key ->
+      raise """
+      environment variable #{name} must not use the committed development SSE master key.
+      Generate a unique base64-encoded 32 byte key for production.
+      """
+
+    true ->
+      case Base.decode64(value) do
+        {:ok, raw} when byte_size(raw) == 32 ->
+          :ok
+
+        _other ->
+          raise """
+          environment variable #{name} must be a base64-encoded 32 byte key for #{purpose}.
+          """
+      end
+  end
+end
+
+sse_master_key = System.get_env("MAXIO_SSE_MASTER_KEY")
+kms_master_key = System.get_env("MAXIO_KMS_MASTER_KEY")
+access_key_secret_key = System.get_env("MAXIO_ACCESS_KEY_SECRET_KEY")
+access_key_secret_key_id = System.get_env("MAXIO_ACCESS_KEY_SECRET_KEY_ID", "local-default")
+access_key_secret_keyring = System.get_env("MAXIO_ACCESS_KEY_SECRET_KEYRING")
+access_key_secret_keyring_file = System.get_env("MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE")
+
+validate_access_key_secret_key_id! = fn name, key_id ->
+  cond do
+    not is_binary(key_id) or key_id == "" ->
+      raise """
+      environment variable #{name} must be a non-empty key id.
+      """
+
+    byte_size(key_id) > 128 or String.contains?(key_id, ["\0", "\r", "\n"]) ->
+      raise """
+      environment variable #{name} contains an invalid key id.
+      Use a stable printable id of at most 128 bytes.
+      """
+
+    true ->
+      :ok
+  end
+end
+
+decode_access_key_secret_keyring! = fn value ->
+  case value do
+    nil ->
+      %{}
+
+    "" ->
+      %{}
+
+    json ->
+      case Jason.decode(json) do
+        {:ok, decoded} when is_map(decoded) ->
+          decoded
+
+        _other ->
+          raise """
+          environment variable MAXIO_ACCESS_KEY_SECRET_KEYRING must be a JSON object mapping key ids to base64-encoded 32 byte keys.
+          """
+      end
+  end
+end
+
+validate_access_key_secret_keyring_file! = fn path ->
+  cond do
+    path in [nil, ""] ->
+      :ok
+
+    String.contains?(path, ["\0", "\r", "\n"]) ->
+      raise """
+      environment variable MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE contains an invalid path.
+      """
+
+    File.exists?(path) ->
+      case Jason.decode(File.read!(path)) do
+        {:ok, %{"current_key_id" => current_key_id, "keys" => keys}} when is_map(keys) ->
+          validate_access_key_secret_key_id!.(
+            "MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE current_key_id",
+            current_key_id
+          )
+
+          Enum.each(keys, fn {key_id, entry} ->
+            key_b64 =
+              case entry do
+                value when is_binary(value) -> value
+                %{"secret_key" => value} when is_binary(value) -> value
+                _other -> nil
+              end
+
+            validate_access_key_secret_key_id!.(
+              "MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE key",
+              key_id
+            )
+
+            validate_prod_secret_env!.(
+              "MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE[#{key_id}]",
+              key_b64,
+              "IAM access-key and STS session signing secret envelope read key"
+            )
+
+            if key_b64 == dev_access_key_secret_key do
+              raise """
+              environment variable MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE[#{key_id}] must not use the committed development access-key secret key.
+              Generate a unique base64-encoded 32 byte key for production.
+              """
+            end
+          end)
+
+        _other ->
+          raise """
+          environment variable MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE must point to a JSON keyring file with current_key_id and keys.
+          """
+      end
+
+    true ->
+      :ok
+  end
+end
+
+access_key_secret_keys = decode_access_key_secret_keyring!.(access_key_secret_keyring)
+
+if sse_master_key do
+  config :maxio, :sse, master_key: sse_master_key
+end
+
+if kms_master_key do
+  config :maxio, :kms, master_key: kms_master_key
+end
+
+if access_key_secret_key || access_key_secret_keyring || access_key_secret_keyring_file do
+  access_key_secret_keys =
+    if access_key_secret_key do
+      case Map.fetch(access_key_secret_keys, access_key_secret_key_id) do
+        {:ok, ^access_key_secret_key} ->
+          access_key_secret_keys
+
+        {:ok, _other_key} ->
+          raise """
+          environment variable MAXIO_ACCESS_KEY_SECRET_KEY conflicts with MAXIO_ACCESS_KEY_SECRET_KEYRING[#{access_key_secret_key_id}].
+          """
+
+        :error ->
+          Map.put(access_key_secret_keys, access_key_secret_key_id, access_key_secret_key)
+      end
+    else
+      access_key_secret_keys
+    end
+
+  config :maxio, :access_key_secret,
+    current_key_id: access_key_secret_key_id,
+    secret_key: access_key_secret_key,
+    keys: access_key_secret_keys,
+    keyring_file: access_key_secret_keyring_file
+end
+
+if kms_default_key_id = System.get_env("MAXIO_KMS_DEFAULT_KEY_ID") do
+  config :maxio, :kms, default_key_id: kms_default_key_id
+end
+
+if config_env() == :prod do
+  validate_prod_secret_env!.(
+    "MAXIO_SSE_MASTER_KEY",
+    sse_master_key,
+    "SSE-S3 local envelope wrapping"
+  )
+
+  validate_prod_secret_env!.(
+    "MAXIO_KMS_MASTER_KEY",
+    kms_master_key,
+    "the local SSE-KMS provider"
+  )
+
+  validate_prod_secret_env!.(
+    "MAXIO_ACCESS_KEY_SECRET_KEY",
+    access_key_secret_key,
+    "IAM access-key and STS session signing secret envelopes"
+  )
+
+  validate_access_key_secret_key_id!.(
+    "MAXIO_ACCESS_KEY_SECRET_KEY_ID",
+    access_key_secret_key_id
+  )
+
+  if access_key_secret_key == dev_access_key_secret_key do
+    raise """
+    environment variable MAXIO_ACCESS_KEY_SECRET_KEY must not use the committed development access-key secret key.
+    Generate a unique base64-encoded 32 byte key for production.
+    """
+  end
+
+  Enum.each(access_key_secret_keys, fn {key_id, key_b64} ->
+    validate_access_key_secret_key_id!.("MAXIO_ACCESS_KEY_SECRET_KEYRING key", key_id)
+
+    validate_prod_secret_env!.(
+      "MAXIO_ACCESS_KEY_SECRET_KEYRING[#{key_id}]",
+      key_b64,
+      "IAM access-key and STS session signing secret envelope read key"
+    )
+
+    if key_b64 == dev_access_key_secret_key do
+      raise """
+      environment variable MAXIO_ACCESS_KEY_SECRET_KEYRING[#{key_id}] must not use the committed development access-key secret key.
+      Generate a unique base64-encoded 32 byte key for production.
+      """
+    end
+  end)
+
+  validate_access_key_secret_keyring_file!.(access_key_secret_keyring_file)
 end
 
 if s3_port = System.get_env("MAXIO_S3_PORT") do
@@ -41,6 +270,18 @@ end
 
 if account_id = System.get_env("MAXIO_ACCOUNT_ID") do
   config :maxio, :sts, account_id: account_id
+end
+
+if web_identity_providers = System.get_env("MAXIO_WEB_IDENTITY_PROVIDERS") do
+  case Jason.decode(web_identity_providers) do
+    {:ok, providers} when is_list(providers) ->
+      config :maxio, :web_identity_providers, providers
+
+    _other ->
+      raise """
+      environment variable MAXIO_WEB_IDENTITY_PROVIDERS must be a JSON array of OIDC provider configs.
+      """
+  end
 end
 
 case System.get_env("MAXIO_MFA_SECRET_KEY") do

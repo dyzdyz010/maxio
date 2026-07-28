@@ -47,9 +47,46 @@ defmodule Maxio.S3.LogTest do
   end
 
   test "context/1 把 conn-like 关键字规整成 metadata keyword 列表" do
-    md = Log.context(request_id: "r", bucket: "b", key: "k", action: :list_objects_v2)
+    md =
+      Log.context(
+        request_id: "r",
+        bucket: "b",
+        key: "k",
+        action: :list_objects_v2,
+        required_action: "s3:ListBucket",
+        resource: "arn:aws:s3:::b",
+        decision: :allow,
+        policy_source: "identity",
+        principal_arn: "arn:aws:iam:::user/alice",
+        principal_type: :iam_user,
+        target_principal_arn: "arn:aws:iam:::user/bob",
+        user_name: "alice",
+        user_arn: "arn:aws:iam:::user/alice",
+        access_key_id: "AKIAEXAMPLE",
+        account_id: "local",
+        owner: false,
+        authenticated: true,
+        write_authority: ":sidecar",
+        matched_tasks: 1
+      )
+
     assert Keyword.get(md, :request_id) == "r"
     assert Keyword.get(md, :bucket) == "b"
     assert Keyword.get(md, :action) == :list_objects_v2
+    assert Keyword.get(md, :required_action) == "s3:ListBucket"
+    assert Keyword.get(md, :resource) == "arn:aws:s3:::b"
+    assert Keyword.get(md, :decision) == :allow
+    assert Keyword.get(md, :policy_source) == "identity"
+    assert Keyword.get(md, :principal_arn) == "arn:aws:iam:::user/alice"
+    assert Keyword.get(md, :principal_type) == :iam_user
+    assert Keyword.get(md, :target_principal_arn) == "arn:aws:iam:::user/bob"
+    assert Keyword.get(md, :user_name) == "alice"
+    assert Keyword.get(md, :user_arn) == "arn:aws:iam:::user/alice"
+    assert Keyword.get(md, :access_key_id) == "AKIAEXAMPLE"
+    assert Keyword.get(md, :account_id) == "local"
+    assert Keyword.get(md, :owner) == false
+    assert Keyword.get(md, :authenticated) == true
+    assert Keyword.get(md, :write_authority) == ":sidecar"
+    assert Keyword.get(md, :matched_tasks) == 1
   end
 end

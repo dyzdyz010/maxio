@@ -1,57 +1,80 @@
 defmodule Maxio.S3.RequestParsers.Tagging do
-  @moduledoc """
-  Put{Object,Bucket}Tagging 的 XML body 解析（saxy SAX）：Tagging>TagSet>Tag>(Key,Value)。
-  容忍命名空间前缀与 xmlns（accept with/without）。空 TagSet → []（删除语义）。
-  返回 {:ok, [{Key, Value}]} | {:error, :malformed_xml}。校验（数量/字符/aws:）由 Maxio.Tags.validate 另做。
-  """
-  @behaviour Saxy.Handler
+  @moduledoc "PutObjectTagging and PutBucketTagging Tagging XML parser."
+
+  alias Maxio.S3.RequestParsers.XMLTree
+
+  @unset {:__maxio_tagging_unset__, []}
 
   @spec parse(binary()) :: {:ok, [{String.t(), String.t()}]} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    init = %{tags: [], cur_key: nil, cur_val: nil, in: nil, text: nil}
+    case XMLTree.parse(xml) do
+      {:ok, {"Tagging", _attrs, children}} ->
+        parse_root(children)
 
-    case Saxy.parse_string(xml, __MODULE__, init) do
-      {:ok, %{tags: tags}} -> {:ok, Enum.reverse(tags)}
-      {:error, _} -> {:error, :malformed_xml}
+      _other ->
+        {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:start_document, _p, s), do: {:ok, s}
+  defp parse_root(children) do
+    case XMLTree.structural_children(children) do
+      [{"TagSet", _attrs, tag_children}] ->
+        parse_tag_set(tag_children)
 
-  @impl true
-  def handle_event(:start_element, {name, _attrs}, s) do
-    case local(name) do
-      "Tag" -> {:ok, %{s | cur_key: nil, cur_val: nil, in: nil}}
-      "Key" -> {:ok, %{s | in: :key, text: ""}}
-      "Value" -> {:ok, %{s | in: :val, text: ""}}
-      _ -> {:ok, %{s | in: nil}}
+      _other ->
+        {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:characters, c, %{text: t} = s) when is_binary(t),
-    do: {:ok, %{s | text: t <> c}}
+  defp parse_tag_set(children) do
+    children = XMLTree.structural_children(children)
 
-  def handle_event(:characters, _c, s), do: {:ok, s}
-
-  @impl true
-  def handle_event(:end_element, name, s) do
-    case local(name) do
-      "Key" -> {:ok, %{s | cur_key: s.text || "", in: nil, text: nil}}
-      "Value" -> {:ok, %{s | cur_val: s.text || "", in: nil, text: nil}}
-      "Tag" -> {:ok, %{s | tags: [{s.cur_key, s.cur_val} | s.tags], in: nil}}
-      _ -> {:ok, %{s | in: nil, text: nil}}
+    if Enum.all?(children, &match?({"Tag", _attrs, _children}, &1)) do
+      children
+      |> Enum.reduce_while({:ok, []}, fn {"Tag", _attrs, tag_children}, {:ok, tags} ->
+        case parse_tag(tag_children) do
+          {:ok, tag} -> {:cont, {:ok, tags ++ [tag]}}
+          :error -> {:halt, :error}
+        end
+      end)
+      |> case do
+        {:ok, tags} -> {:ok, tags}
+        :error -> {:error, :malformed_xml}
+      end
+    else
+      {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:end_document, _d, s), do: {:ok, s}
+  defp parse_tag(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{key: @unset, value: @unset}}, fn
+      {"Key", _attrs, children}, {:ok, tag} ->
+        put_once(tag, :key, XMLTree.text(children))
 
-  defp local(name) do
-    case String.split(name, ":") do
-      [_ns, l] -> l
-      [l] -> l
+      {"Value", _attrs, children}, {:ok, tag} ->
+        put_once(tag, :value, XMLTree.text(children))
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, %{key: key, value: value}} when key != @unset and value != @unset ->
+        {:ok, {key, value}}
+
+      _other ->
+        :error
     end
   end
+
+  defp put_once(map, key, {:ok, value}) do
+    if Map.fetch!(map, key) == @unset do
+      {:cont, {:ok, Map.put(map, key, value)}}
+    else
+      {:halt, :error}
+    end
+  end
+
+  defp put_once(_map, _key, :error), do: {:halt, :error}
 end

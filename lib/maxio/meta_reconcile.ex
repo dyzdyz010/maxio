@@ -24,7 +24,7 @@ defmodule Maxio.MetaReconcile do
 
   alias Maxio.Sidecar
 
-  @type copy :: %{node: term(), drive: String.t(), meta: map()} | :missing
+  @type copy :: %{node: term(), drive: String.t(), meta: map()} | :missing | {:error, term()}
   @type target :: :latest | {:version, String.t()}
 
   @doc """
@@ -79,6 +79,7 @@ defmodule Maxio.MetaReconcile do
   end
 
   defp entry_for(:missing, _target), do: nil
+  defp entry_for({:error, _reason}, _target), do: nil
   defp entry_for(%{meta: meta}, :latest), do: Sidecar.latest(meta)
   defp entry_for(%{meta: meta}, {:version, vid}), do: Sidecar.find_version(meta, vid)
 

@@ -1,9 +1,10 @@
 defmodule Maxio.S3.Views.ListBucket do
   @moduledoc """
   ListObjectsV2 响应 XML（ListBucketResult）。NextContinuationToken 仅截断时出现；
-  CommonPrefixes 仅有 delimiter 时出现。encoding-type=url 时对 Key/Prefix/Delimiter/StartAfter/
-  CommonPrefixes 做 percent-encode 并发 <EncodingType>url</EncodingType>（对齐 AWS：使含 XML 1.0
-  非法字节的 key 可被客户端正确 URL-decode 还原，铁律 5）。
+  ContinuationToken 仅请求带 continuation-token 时回显；CommonPrefixes 仅有 delimiter 时出现。
+  encoding-type=url 时对 Key/Prefix/Delimiter/StartAfter/CommonPrefixes 做 percent-encode 并发
+  <EncodingType>url</EncodingType>（对齐 AWS：使含 XML 1.0 非法字节的 key 可被客户端正确
+  URL-decode 还原，铁律 5）。
   """
   import Saxy.XML
   alias Maxio.S3.XML
@@ -22,6 +23,9 @@ defmodule Maxio.S3.Views.ListBucket do
       ]
       |> maybe(encoding_type_value(enc), fn e -> element("EncodingType", [], characters(e)) end)
       |> maybe(data.delimiter, fn d -> element("Delimiter", [], characters(encode(d, enc))) end)
+      |> maybe(data[:continuation_token], fn t ->
+        element("ContinuationToken", [], characters(t))
+      end)
       |> maybe(data.is_truncated && data.next_continuation_token, fn t ->
         element("NextContinuationToken", [], characters(t))
       end)
@@ -29,7 +33,11 @@ defmodule Maxio.S3.Views.ListBucket do
         element("StartAfter", [], characters(encode(s, enc)))
       end)
 
-    contents = Enum.map(data.objects, &content_elem(&1, enc))
+    contents =
+      Enum.map(
+        data.objects,
+        &content_elem(&1, enc, Map.get(data, :include_restore_status?, false))
+      )
 
     common =
       Enum.map(data.common_prefixes, fn cp ->
@@ -45,14 +53,18 @@ defmodule Maxio.S3.Views.ListBucket do
   # 富字段（LastModified/ETag/Size）缺失时用 S3-valid 兜底，绝不让 nil 把 XML 渲染炸成 500
   # （铁律 3）：drive-walk 列举源在盘上无对应 sidecar meta 时这些字段可能为 nil——此时按
   # AWS 语义给安全默认（LastModified=当前时刻、ETag 空引号、Size=0），返回合法 ListObjectsV2 XML。
-  defp content_elem(obj, enc) do
-    element("Contents", [], [
-      element("Key", [], characters(encode(obj.key, enc))),
-      element("LastModified", [], characters(XML.iso8601(last_modified(obj)))),
-      element("ETag", [], characters(XML.quote_etag(etag(obj)))),
-      element("Size", [], characters(Integer.to_string(size(obj)))),
-      element("StorageClass", [], characters(storage_class(obj)))
-    ])
+  defp content_elem(obj, enc, include_restore_status?) do
+    children =
+      [
+        element("Key", [], characters(encode(obj.key, enc))),
+        element("LastModified", [], characters(XML.iso8601(last_modified(obj)))),
+        element("ETag", [], characters(XML.quote_etag(etag(obj)))),
+        element("Size", [], characters(Integer.to_string(size(obj)))),
+        element("StorageClass", [], characters(storage_class(obj)))
+      ]
+      |> maybe_restore_status(obj, include_restore_status?)
+
+    element("Contents", [], children)
   end
 
   defp last_modified(%{last_modified: %DateTime{} = dt}), do: dt
@@ -66,6 +78,33 @@ defmodule Maxio.S3.Views.ListBucket do
 
   defp storage_class(%{storage_class: s}) when is_binary(s) and s != "", do: s
   defp storage_class(_), do: "STANDARD"
+
+  defp maybe_restore_status(children, _obj, false), do: children
+
+  defp maybe_restore_status(children, %{restore_status: "ongoing"}, true) do
+    children ++
+      [
+        element("RestoreStatus", [], [
+          element("IsRestoreInProgress", [], characters("true"))
+        ])
+      ]
+  end
+
+  defp maybe_restore_status(
+         children,
+         %{restore_status: "restored", restore_expiry: %DateTime{} = dt},
+         true
+       ) do
+    children ++
+      [
+        element("RestoreStatus", [], [
+          element("IsRestoreInProgress", [], characters("false")),
+          element("RestoreExpiryDate", [], characters(XML.iso8601(dt)))
+        ])
+      ]
+  end
+
+  defp maybe_restore_status(children, _obj, true), do: children
 
   # encoding-type=url → MinIO s3URLEncode（保留字面 '/' 与 '*'，空格→'+'，其余字节→%XX 大写）。
   # 用 Maxio.S3.URLEncode（与 SigV4 的 RFC3986 编码不同：S3 list 编码不转义 '/'，故 delimiter /

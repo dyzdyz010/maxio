@@ -13,6 +13,8 @@ defmodule Maxio.ObjectRestoreSidecar do
 
   @spec update(String.t(), String.t(), String.t(), map(), keyword()) :: update_result()
   def update(bucket, key, version_id, attrs, opts \\ []) when is_map(attrs) do
+    notification_outbox = Keyword.get(opts, :notification_outbox, [])
+
     Maxio.ObjectMetadataSidecar.update(
       bucket,
       key,
@@ -21,9 +23,19 @@ defmodule Maxio.ObjectRestoreSidecar do
         entry
         |> Map.put("restore_status", Map.get(attrs, :restore_status))
         |> Map.put("restore_expiry", datetime_to_iso8601(Map.get(attrs, :restore_expiry)))
+        |> append_notification_outbox(notification_outbox)
       end,
       opts
     )
+  end
+
+  defp append_notification_outbox(entry, []), do: entry
+
+  defp append_notification_outbox(entry, notification_outbox) when is_list(notification_outbox) do
+    Map.update(entry, "notification_outbox", notification_outbox, fn
+      existing when is_list(existing) -> existing ++ notification_outbox
+      _other -> notification_outbox
+    end)
   end
 
   defp datetime_to_iso8601(%DateTime{} = dt), do: DateTime.to_iso8601(dt)

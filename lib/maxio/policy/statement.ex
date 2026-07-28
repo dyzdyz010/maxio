@@ -17,7 +17,11 @@ defmodule Maxio.Policy.Statement do
   alias Maxio.Policy.{Arn, RequestContext, Variables}
 
   @type effect :: :allow | :deny
-  @type principals :: :any | {:aws, [String.t()]}
+  @type principals ::
+          :any
+          | {:aws, [String.t()]}
+          | {:federated, [String.t()]}
+          | {:mixed, %{optional(:aws | :federated | :other) => [String.t()]}}
   @type t :: %__MODULE__{
           sid: String.t() | nil,
           effect: effect(),
@@ -141,11 +145,43 @@ defmodule Maxio.Policy.Statement do
 
   # ── 内部 ──
   defp decode(json) do
-    case Jason.decode(json) do
-      {:ok, %{} = doc} -> {:ok, doc}
+    case Jason.decode(json, objects: :ordered_objects) do
+      {:ok, %Jason.OrderedObject{} = object} -> ordered_object_to_map(object)
       _ -> {:error, :malformed}
     end
   end
+
+  defp ordered_object_to_map(%Jason.OrderedObject{values: values}) do
+    keys = Enum.map(values, &elem(&1, 0))
+
+    if length(keys) == length(Enum.uniq(keys)) do
+      Enum.reduce_while(values, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+        case ordered_json_to_term(value) do
+          {:ok, converted} -> {:cont, {:ok, Map.put(acc, key, converted)}}
+          {:error, :malformed} -> {:halt, {:error, :malformed}}
+        end
+      end)
+    else
+      {:error, :malformed}
+    end
+  end
+
+  defp ordered_json_to_term(%Jason.OrderedObject{} = object), do: ordered_object_to_map(object)
+
+  defp ordered_json_to_term(list) when is_list(list) do
+    Enum.reduce_while(list, {:ok, []}, fn value, {:ok, acc} ->
+      case ordered_json_to_term(value) do
+        {:ok, converted} -> {:cont, {:ok, [converted | acc]}}
+        {:error, :malformed} -> {:halt, {:error, :malformed}}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      error -> error
+    end
+  end
+
+  defp ordered_json_to_term(value), do: {:ok, value}
 
   defp check_version(doc) do
     case Map.get(doc, "Version") do
@@ -184,7 +220,10 @@ defmodule Maxio.Policy.Statement do
         if Map.has_key?(stmt, "Principal") or Map.has_key?(stmt, "NotPrincipal") do
           {:halt, {:error, :malformed}}
         else
-          case from_json(Map.put(stmt, "Principal", "*"), variables_enabled?: variables_enabled?) do
+          case stmt
+               |> maybe_default_admin_resource()
+               |> Map.put("Principal", "*")
+               |> from_json(variables_enabled?: variables_enabled?) do
             {:ok, s} -> {:cont, {:ok, [s | acc]}}
             {:error, _} -> {:halt, {:error, :malformed}}
           end
@@ -230,6 +269,7 @@ defmodule Maxio.Policy.Statement do
 
   defp trust_action_name?(action) do
     Arn.glob_match?(action, "sts:AssumeRole", case_insensitive: true) or
+      Arn.glob_match?(action, "sts:AssumeRoleWithWebIdentity", case_insensitive: true) or
       Arn.glob_match?(action, "sts:SetSourceIdentity", case_insensitive: true) or
       Arn.glob_match?(action, "sts:TagSession", case_insensitive: true)
   end
@@ -237,6 +277,34 @@ defmodule Maxio.Policy.Statement do
   defp parse_effect("Allow"), do: {:ok, :allow}
   defp parse_effect("Deny"), do: {:ok, :deny}
   defp parse_effect(_), do: {:error, :malformed}
+
+  defp maybe_default_admin_resource(%{} = stmt) do
+    if admin_identity_action_without_resource?(stmt) do
+      Map.put(stmt, "Resource", "*")
+    else
+      stmt
+    end
+  end
+
+  defp admin_identity_action_without_resource?(stmt) do
+    not Map.has_key?(stmt, "Resource") and
+      not Map.has_key?(stmt, "NotResource") and
+      not Map.has_key?(stmt, "NotAction") and
+      admin_actions?(Map.get(stmt, "Action"))
+  end
+
+  defp admin_actions?(action) when is_binary(action), do: admin_action?(action)
+
+  defp admin_actions?(actions) when is_list(actions) and actions != [],
+    do: Enum.all?(actions, &admin_action?/1)
+
+  defp admin_actions?(_action), do: false
+
+  defp admin_action?(action) when is_binary(action) do
+    action |> String.downcase() |> String.starts_with?("admin:")
+  end
+
+  defp admin_action?(_action), do: false
 
   defp to_nonempty_list(v) when is_binary(v) and v != "", do: {:ok, [v]}
 
@@ -305,6 +373,11 @@ defmodule Maxio.Policy.Statement do
   end
 
   defp parse_principal("*"), do: {:ok, :any}
+
+  defp parse_principal(%{} = principal) when map_size(principal) > 1 do
+    parse_principal_category_map(principal)
+  end
+
   defp parse_principal(%{"AWS" => "*"}), do: {:ok, :any}
 
   defp parse_principal(%{"AWS" => aws}) when is_binary(aws) and aws != "",
@@ -315,6 +388,13 @@ defmodule Maxio.Policy.Statement do
       if "*" in list, do: {:ok, :any}, else: {:ok, {:aws, list}}
     else
       {:error, :malformed}
+    end
+  end
+
+  defp parse_principal(%{"Federated" => federated}) do
+    case principal_values(federated) do
+      {:ok, values} -> {:ok, {:federated, values}}
+      {:error, :malformed} -> {:error, :malformed}
     end
   end
 
@@ -348,6 +428,58 @@ defmodule Maxio.Policy.Statement do
   # 缺省 Principal：bucket policy（resource-based）必须显式 Principal → 判畸形。
   defp parse_principal(nil), do: {:error, :malformed}
   defp parse_principal(_), do: {:error, :malformed}
+
+  defp principal_values(value) when is_binary(value) and value != "", do: {:ok, [value]}
+
+  defp principal_values(list) when is_list(list) do
+    if list != [] and Enum.all?(list, &(is_binary(&1) and &1 != "")) do
+      {:ok, list}
+    else
+      {:error, :malformed}
+    end
+  end
+
+  defp principal_values(_value), do: {:error, :malformed}
+
+  defp parse_principal_category_map(principal) do
+    with {:ok, categories} <- principal_categories(principal) do
+      cond do
+        aws_wildcard?(categories) ->
+          {:ok, :any}
+
+        map_size(categories) == 1 and Map.has_key?(categories, :aws) ->
+          {:ok, {:aws, Map.fetch!(categories, :aws)}}
+
+        map_size(categories) == 1 and Map.has_key?(categories, :federated) ->
+          {:ok, {:federated, Map.fetch!(categories, :federated)}}
+
+        map_size(categories) > 0 ->
+          {:ok, {:mixed, categories}}
+
+        true ->
+          {:error, :malformed}
+      end
+    end
+  end
+
+  defp principal_categories(principal) do
+    Enum.reduce_while(principal, {:ok, %{}}, fn {type, value}, {:ok, acc} ->
+      with {:ok, category} <- principal_category(type),
+           {:ok, values} <- principal_values(value) do
+        {:cont, {:ok, Map.update(acc, category, values, &(&1 ++ values))}}
+      else
+        {:error, :malformed} -> {:halt, {:error, :malformed}}
+      end
+    end)
+  end
+
+  defp principal_category("AWS"), do: {:ok, :aws}
+  defp principal_category("Federated"), do: {:ok, :federated}
+  defp principal_category(type) when is_binary(type) and type != "", do: {:ok, :other}
+  defp principal_category(_type), do: {:error, :malformed}
+
+  defp aws_wildcard?(%{aws: values}), do: "*" in values
+  defp aws_wildcard?(_categories), do: false
 
   # Condition 校验（铁律 3/5，对齐 minio condition.UnmarshalJSON）：
   # 只拒绝**真正不存在于 AWS/MinIO** 的算子（不在 Maxio.Policy.Condition.known_operators/0 全量白名单内）

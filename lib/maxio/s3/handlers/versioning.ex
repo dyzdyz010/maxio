@@ -6,7 +6,7 @@ defmodule Maxio.S3.Handlers.Versioning do
   """
   import Plug.Conn
   alias Maxio.{BucketConfigs, Buckets}
-  alias Maxio.S3.{Error, Log, MFADelete}
+  alias Maxio.S3.{ControlBody, Error, ExpectedBucketOwner, Log, MFADelete}
   alias Maxio.S3.RequestParsers.VersioningConfiguration, as: Parser
   alias Maxio.S3.Views.VersioningConfiguration, as: View
 
@@ -16,6 +16,7 @@ defmodule Maxio.S3.Handlers.Versioning do
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     bucket_meta = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     {conn, xml} = read_small_body!(conn)
 
     case Parser.parse(xml) do
@@ -43,6 +44,7 @@ defmodule Maxio.S3.Handlers.Versioning do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     b = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     body = View.render(%{versioning: b.versioning, mfa_delete: b.mfa_delete})
 
     conn
@@ -73,15 +75,9 @@ defmodule Maxio.S3.Handlers.Versioning do
   defp reject_object_lock_versioning_suspend!(_bucket_meta, _status), do: :ok
 
   defp read_small_body!(conn) do
-    case read_body(conn, length: @xml_limit, read_length: @xml_limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:entity_too_large, message: "Versioning config too large")
-
-      {:error, _} ->
-        raise Error.new(:malformed_xml)
-    end
+    ControlBody.read_and_verify!(conn, @xml_limit, "Versioning config too large",
+      require_integrity: :content_md5,
+      too_large_error: :entity_too_large
+    )
   end
 end

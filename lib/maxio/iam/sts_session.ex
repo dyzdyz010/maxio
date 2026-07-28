@@ -2,8 +2,9 @@ defmodule Maxio.IAM.STSSession do
   @moduledoc """
   Persisted STS temporary credential metadata.
 
-  The plaintext session token is returned only at issuance time and is never
-  stored. `session_token_sha256` is intentionally excluded from Inspect output.
+  `secret_key` stores a local AES-GCM envelope for the temporary SigV4 signing
+  secret. The plaintext session token is returned only at issuance time and is
+  never stored. Secret fields are intentionally excluded from Inspect output.
   """
   use Ecto.Schema
   import Ecto.Changeset
@@ -31,6 +32,9 @@ defmodule Maxio.IAM.STSSession do
     field :source_identity, :string
     field :mfa_authenticated, :boolean, default: false
     field :mfa_serial_hash, :string
+    field :web_identity_provider_arn, :string
+    field :web_identity_subject_sha256, :string
+    field :web_identity_audience, :string
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -39,7 +43,6 @@ defmodule Maxio.IAM.STSSession do
     :access_key_id,
     :secret_key,
     :session_token_sha256,
-    :issuer_access_key_id,
     :principal_arn,
     :principal_type,
     :session_name,
@@ -54,7 +57,11 @@ defmodule Maxio.IAM.STSSession do
     :session_policy,
     :source_identity,
     :mfa_authenticated,
-    :mfa_serial_hash
+    :mfa_serial_hash,
+    :issuer_access_key_id,
+    :web_identity_provider_arn,
+    :web_identity_subject_sha256,
+    :web_identity_audience
   ]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
@@ -67,6 +74,20 @@ defmodule Maxio.IAM.STSSession do
     |> validate_format(:source_identity, ~r/\A(?!aws:)[A-Za-z0-9+=,.@_-]+\z/i)
     |> validate_inclusion(:principal_type, ["root", "iam_user", "assumed_role"])
     |> validate_inclusion(:status, ["active", "revoked"])
+    |> validate_issuer()
     |> unique_constraint(:access_key_id, name: :sts_sessions_access_key_id_index)
   end
+
+  defp validate_issuer(changeset) do
+    issuer_access_key_id = get_field(changeset, :issuer_access_key_id)
+    web_identity_provider_arn = get_field(changeset, :web_identity_provider_arn)
+
+    if present?(issuer_access_key_id) or present?(web_identity_provider_arn) do
+      changeset
+    else
+      add_error(changeset, :issuer_access_key_id, "or web_identity_provider_arn is required")
+    end
+  end
+
+  defp present?(value), do: is_binary(value) and value != ""
 end

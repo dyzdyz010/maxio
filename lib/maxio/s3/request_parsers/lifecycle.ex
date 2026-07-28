@@ -1,94 +1,47 @@
 defmodule Maxio.S3.RequestParsers.Lifecycle do
   @moduledoc """
-  PutBucketLifecycleConfiguration 的 XML body 解析（saxy SAX）。把每个 Rule 解析为通用嵌套 map
-  （保留结构以便忠实出站 round-trip）：%{id, status, filter, expiration, noncurrent_version_expiration,
-  abort_incomplete_multipart_upload, transition, noncurrent_version_transition}（缺省 nil）。
-  本解析器只抽取语义校验所需的关键字段（status / expiration days+date / expired_object_delete_marker /
-  filter prefix），其余结构性子元素以 raw 文本累积保留供出站。
-  为简化 round-trip：解析为「扁平字段 + 原始 prefix」结构，出站 view 据此重建标准 XML。
-  返回 {:ok, [rule_map]} | {:error, :malformed_xml}。语义校验由 handler 另做。
+  Strict PutBucketLifecycleConfiguration XML parser.
+
+  The public contract intentionally stays as the existing flat lifecycle rule
+  map consumed by the handler, view, and runner. XML shape that cannot be
+  represented by that contract, such as repeated Transition containers, fails
+  closed instead of being silently flattened.
   """
-  @behaviour Saxy.Handler
+
+  alias Maxio.S3.RequestParsers.XMLTree
+  alias Maxio.S3.StorageClass
+
+  @root_tags ~w(LifecycleConfiguration LifeCycleConfiguration)
+  @unset {:__maxio_lifecycle_unset__, []}
 
   @spec parse(binary()) :: {:ok, [map()]} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    init = %{rules: [], cur: nil, path: [], in: nil, text: nil, tag: nil}
-
-    case Saxy.parse_string(xml, __MODULE__, init) do
-      {:ok, %{rules: rules}} -> {:ok, Enum.reverse(rules)}
-      {:error, _} -> {:error, :malformed_xml}
+    with {:ok, {root, _attrs, children}} when root in @root_tags <- XMLTree.parse(xml),
+         {:ok, rules} <- parse_rules(children) do
+      {:ok, rules}
+    else
+      _other -> {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:start_document, _p, s), do: {:ok, s}
+  defp parse_rules(children) do
+    children = XMLTree.structural_children(children)
 
-  @impl true
-  def handle_event(:start_element, {name, _attrs}, s) do
-    l = local(name)
-
-    cond do
-      l == "Rule" ->
-        {:ok, %{s | cur: new_rule(), path: ["Rule"], in: nil, tag: nil}}
-
-      l == "Filter" and is_map(s.cur) ->
-        {:ok, %{s | cur: %{s.cur | "has_filter" => true}, in: nil, path: [l | s.path]}}
-
-      l == "Tag" and ("Filter" in s.path or "And" in s.path) ->
-        {:ok, %{s | path: ["Tag" | s.path], in: nil, tag: %{}}}
-
-      l in leaf_tags() ->
-        {:ok, %{s | in: l, text: "", path: [l | s.path]}}
-
-      true ->
-        {:ok, %{s | in: nil, path: [l | s.path]}}
+    if Enum.all?(children, &match?({"Rule", _attrs, _children}, &1)) do
+      Enum.reduce_while(children, {:ok, []}, fn {"Rule", _attrs, rule_children}, {:ok, rules} ->
+        case parse_rule(rule_children) do
+          {:ok, rule} -> {:cont, {:ok, [rule | rules]}}
+          :error -> {:halt, :error}
+        end
+      end)
+      |> case do
+        {:ok, rules} -> {:ok, Enum.reverse(rules)}
+        :error -> {:error, :malformed_xml}
+      end
+    else
+      {:error, :malformed_xml}
     end
   end
-
-  @impl true
-  def handle_event(:characters, c, %{text: t} = s) when is_binary(t),
-    do: {:ok, %{s | text: t <> c}}
-
-  def handle_event(:characters, _c, s), do: {:ok, s}
-
-  @impl true
-  def handle_event(:end_element, name, %{cur: cur} = s) do
-    l = local(name)
-
-    cond do
-      l == "Rule" and is_map(cur) ->
-        {:ok, %{s | rules: [cur | s.rules], cur: nil, path: tl_safe(s.path), in: nil, tag: nil}}
-
-      l == "Tag" and is_map(cur) ->
-        {:ok,
-         %{
-           s
-           | cur: append_tag(cur, s.tag),
-             in: nil,
-             text: nil,
-             tag: nil,
-             path: tl_safe(s.path)
-         }}
-
-      l in leaf_tags() and is_map(cur) ->
-        s = put_tag(s, l, trim(s.text))
-
-        {:ok,
-         %{
-           s
-           | cur: store(cur, l, s.path, trim(s.text)),
-             in: nil,
-             text: nil,
-             path: tl_safe(s.path)
-         }}
-
-      true ->
-        {:ok, %{s | in: nil, text: nil, path: tl_safe(s.path)}}
-    end
-  end
-
-  @impl true
-  def handle_event(:end_document, _d, s), do: {:ok, s}
 
   defp new_rule do
     %{
@@ -116,126 +69,479 @@ defmodule Maxio.S3.RequestParsers.Lifecycle do
     }
   end
 
-  defp leaf_tags do
-    ~w(ID Status Prefix Days Date ExpiredObjectDeleteMarker NoncurrentDays NewerNoncurrentVersions
-       DaysAfterInitiation StorageClass ObjectSizeGreaterThan ObjectSizeLessThan Key Value)
+  defp parse_rule(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, new_rule(), MapSet.new()}, fn
+      {"ID", _attrs, children}, {:ok, rule, seen} ->
+        put_once(rule, seen, :id, "id", text(children, trim: true))
+
+      {"Status", _attrs, children}, {:ok, rule, seen} ->
+        put_once(rule, seen, :status, "status", status(children))
+
+      {"Prefix", _attrs, children}, {:ok, rule, seen} ->
+        put_once(rule, seen, :prefix, "prefix", text(children, trim: true))
+
+      {"Filter", _attrs, children}, {:ok, rule, seen} ->
+        with {:ok, filter} <- parse_filter(children),
+             {:ok, rule, seen} <- put_once_value(rule, seen, :filter, filter) do
+          {:cont, {:ok, rule, seen}}
+        else
+          _other -> {:halt, :error}
+        end
+
+      {"Expiration", _attrs, children}, {:ok, rule, seen} ->
+        put_once_parsed(rule, seen, :expiration, parse_expiration(children))
+
+      {"NoncurrentVersionExpiration", _attrs, children}, {:ok, rule, seen} ->
+        put_once_parsed(
+          rule,
+          seen,
+          :noncurrent_version_expiration,
+          parse_noncurrent_version_expiration(children)
+        )
+
+      {"AbortIncompleteMultipartUpload", _attrs, children}, {:ok, rule, seen} ->
+        put_once_parsed(
+          rule,
+          seen,
+          :abort_incomplete_multipart_upload,
+          parse_abort_incomplete_multipart_upload(children)
+        )
+
+      {"Transition", _attrs, children}, {:ok, rule, seen} ->
+        put_once_parsed(rule, seen, :transition, parse_transition(children))
+
+      {"NoncurrentVersionTransition", _attrs, children}, {:ok, rule, seen} ->
+        put_once_parsed(
+          rule,
+          seen,
+          :noncurrent_version_transition,
+          parse_noncurrent_version_transition(children)
+        )
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> finalize_rule()
   end
 
-  # 据 path（标签栈）把叶子值塞进 rule map 的对应键。path 形如 [叶子, 父, ..., "Rule"]。
-  defp store(cur, "ID", _path, v), do: %{cur | "id" => v}
-  defp store(cur, "Status", _path, v), do: %{cur | "status" => v}
-
-  defp store(cur, "Prefix", path, v) do
-    # Filter 内 Prefix → filter_prefix；Rule 直属（legacy） Prefix → prefix；And 内 Prefix → filter_prefix。
-    if "Filter" in path or "And" in path,
-      do: %{cur | "filter_prefix" => v},
-      else: %{cur | "prefix" => v}
-  end
-
-  defp store(cur, "Days", path, v) do
-    cond do
-      "Transition" in path -> put_int(cur, "transition_days", v, 0)
-      "Expiration" in path -> put_int(cur, "expiration_days", v, 1)
-      true -> cur
+  defp finalize_rule({:ok, rule, seen}) do
+    if MapSet.member?(seen, :prefix) and MapSet.member?(seen, :filter) do
+      :error
+    else
+      {:ok, rule}
     end
   end
 
-  defp store(cur, "Date", path, v) do
-    cond do
-      "Transition" in path -> %{cur | "transition_date" => v}
-      "Expiration" in path -> %{cur | "expiration_date" => v}
-      true -> cur
+  defp finalize_rule(_other), do: :error
+
+  defp parse_filter(children) do
+    children = XMLTree.structural_children(children)
+
+    case children do
+      [] ->
+        {:ok, %{"has_filter" => true}}
+
+      [{"And", _attrs, and_children}] ->
+        parse_and_filter(and_children)
+
+      [{tag, _attrs, leaf_children}]
+      when tag in ~w(Prefix Tag ObjectSizeGreaterThan ObjectSizeLessThan) ->
+        parse_direct_filter(tag, leaf_children)
+
+      _other ->
+        :error
     end
   end
 
-  defp store(cur, "ExpiredObjectDeleteMarker", _p, v),
-    do: %{cur | "expired_object_delete_marker" => v == "true"}
-
-  defp store(cur, "NoncurrentDays", path, v) do
-    cond do
-      "NoncurrentVersionExpiration" in path -> put_int(cur, "noncurrent_days", v, 1)
-      "NoncurrentVersionTransition" in path -> put_int(cur, "noncurrent_transition_days", v, 1)
-      true -> cur
+  defp parse_direct_filter("Prefix", children) do
+    with {:ok, prefix} <- text(children, trim: true) do
+      {:ok, %{"has_filter" => true, "filter_prefix" => prefix}}
     end
   end
 
-  defp store(cur, "NewerNoncurrentVersions", path, v) do
-    cond do
-      "NoncurrentVersionExpiration" in path ->
-        put_int(cur, "newer_noncurrent_versions", v, 1)
-
-      "NoncurrentVersionTransition" in path ->
-        put_int(cur, "noncurrent_transition_newer_noncurrent_versions", v, 1)
-
-      true ->
-        cur
+  defp parse_direct_filter("Tag", children) do
+    with {:ok, tag} <- parse_tag(children) do
+      {:ok, %{"has_filter" => true, "filter_tags" => [tag]}}
     end
   end
 
-  defp store(cur, "DaysAfterInitiation", _p, v),
-    do: put_int(cur, "abort_days_after_initiation", v, 1)
-
-  defp store(cur, "StorageClass", path, v) do
-    cond do
-      "NoncurrentVersionTransition" in path -> %{cur | "noncurrent_transition_storage_class" => v}
-      "Transition" in path -> %{cur | "transition_storage_class" => v}
-      true -> cur
+  defp parse_direct_filter("ObjectSizeGreaterThan", children) do
+    with {:ok, value} <- nonnegative_integer(children) do
+      {:ok, %{"has_filter" => true, "filter_size_gt" => value}}
     end
   end
 
-  defp store(cur, "ObjectSizeGreaterThan", _p, v),
-    do: put_int(cur, "filter_size_gt", v, 0)
+  defp parse_direct_filter("ObjectSizeLessThan", children) do
+    with {:ok, value} <- positive_integer(children) do
+      {:ok, %{"has_filter" => true, "filter_size_lt" => value}}
+    end
+  end
 
-  defp store(cur, "ObjectSizeLessThan", _p, v),
-    do: put_int(cur, "filter_size_lt", v, 1)
+  defp parse_and_filter(children) do
+    children = XMLTree.structural_children(children)
 
-  defp store(cur, _other, _path, _v), do: cur
+    children
+    |> Enum.reduce_while({:ok, %{"has_filter" => true, "filter_tags" => []}, MapSet.new(), 0}, fn
+      {"Prefix", _attrs, leaf_children}, {:ok, filter, seen, count} ->
+        with {:ok, prefix} <- text(leaf_children, trim: true),
+             {:ok, filter, seen} <-
+               put_filter_once(filter, seen, :prefix, "filter_prefix", prefix) do
+          {:cont, {:ok, filter, seen, count + 1}}
+        else
+          _other -> {:halt, :error}
+        end
 
-  defp append_tag(cur, %{"key" => key, "value" => value}) when is_binary(key) do
-    Map.update!(cur, "filter_tags", fn tags ->
-      tags ++ [%{"key" => key, "value" => value || ""}]
+      {"Tag", _attrs, tag_children}, {:ok, filter, seen, count} ->
+        with {:ok, tag} <- parse_tag(tag_children),
+             {:ok, filter, seen} <- put_filter_tag(filter, seen, tag) do
+          {:cont, {:ok, filter, seen, count + 1}}
+        else
+          _other -> {:halt, :error}
+        end
+
+      {"ObjectSizeGreaterThan", _attrs, leaf_children}, {:ok, filter, seen, count} ->
+        with {:ok, value} <- nonnegative_integer(leaf_children),
+             {:ok, filter, seen} <-
+               put_filter_once(filter, seen, :size_gt, "filter_size_gt", value) do
+          {:cont, {:ok, filter, seen, count + 1}}
+        else
+          _other -> {:halt, :error}
+        end
+
+      {"ObjectSizeLessThan", _attrs, leaf_children}, {:ok, filter, seen, count} ->
+        with {:ok, value} <- positive_integer(leaf_children),
+             {:ok, filter, seen} <-
+               put_filter_once(filter, seen, :size_lt, "filter_size_lt", value) do
+          {:cont, {:ok, filter, seen, count + 1}}
+        else
+          _other -> {:halt, :error}
+        end
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, filter, _seen, count} when count >= 2 -> {:ok, filter}
+      _other -> :error
+    end
+  end
+
+  defp parse_tag(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{"key" => @unset, "value" => @unset}}, fn
+      {"Key", _attrs, children}, {:ok, tag} ->
+        put_required_tag_field(tag, "key", children)
+
+      {"Value", _attrs, children}, {:ok, tag} ->
+        put_tag_field(tag, "value", children)
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, %{"key" => key, "value" => value}} when is_binary(key) and is_binary(value) ->
+        {:ok, %{"key" => key, "value" => value}}
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_expiration(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Days", _attrs, children}, {:ok, expiration, seen} ->
+        put_once_value_reduced(expiration, seen, :days, %{
+          "expiration_days" => positive_integer(children)
+        })
+
+      {"Date", _attrs, children}, {:ok, expiration, seen} ->
+        put_once_value_reduced(expiration, seen, :date, %{
+          "expiration_date" => lifecycle_date(children)
+        })
+
+      {"ExpiredObjectDeleteMarker", _attrs, children}, {:ok, expiration, seen} ->
+        put_once_value_reduced(expiration, seen, :eodm, %{
+          "expired_object_delete_marker" => boolean(children)
+        })
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> unwrap_single_action()
+  end
+
+  defp parse_noncurrent_version_expiration(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"NoncurrentDays", _attrs, children}, {:ok, expiration, seen} ->
+        put_once_value_reduced(expiration, seen, :noncurrent_days, %{
+          "noncurrent_days" => positive_integer(children)
+        })
+
+      {"NewerNoncurrentVersions", _attrs, children}, {:ok, expiration, seen} ->
+        put_once_value_reduced(expiration, seen, :newer_noncurrent_versions, %{
+          "newer_noncurrent_versions" => bounded_integer(children, 1, 100)
+        })
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, expiration, seen} ->
+        if MapSet.member?(seen, :noncurrent_days), do: {:ok, expiration}, else: :error
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_abort_incomplete_multipart_upload(children) do
+    children
+    |> XMLTree.structural_children()
+    |> case do
+      [{"DaysAfterInitiation", _attrs, days_children}] ->
+        with {:ok, days} <- positive_integer(days_children) do
+          {:ok, %{"abort_days_after_initiation" => days}}
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_transition(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Days", _attrs, children}, {:ok, transition, seen} ->
+        put_once_value_reduced(transition, seen, :days, %{
+          "transition_days" => nonnegative_integer(children)
+        })
+
+      {"Date", _attrs, children}, {:ok, transition, seen} ->
+        put_once_value_reduced(transition, seen, :date, %{
+          "transition_date" => lifecycle_date(children)
+        })
+
+      {"StorageClass", _attrs, children}, {:ok, transition, seen} ->
+        put_once_value_reduced(transition, seen, :storage_class, %{
+          "transition_storage_class" => storage_class(children)
+        })
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, transition, seen} ->
+        day_or_date? =
+          one_seen?(seen, :days, :date)
+
+        if day_or_date? and MapSet.member?(seen, :storage_class) do
+          {:ok, transition}
+        else
+          :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_noncurrent_version_transition(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"NoncurrentDays", _attrs, children}, {:ok, transition, seen} ->
+        put_once_value_reduced(transition, seen, :noncurrent_days, %{
+          "noncurrent_transition_days" => nonnegative_integer(children)
+        })
+
+      {"NewerNoncurrentVersions", _attrs, children}, {:ok, transition, seen} ->
+        put_once_value_reduced(transition, seen, :newer_noncurrent_versions, %{
+          "noncurrent_transition_newer_noncurrent_versions" => bounded_integer(children, 1, 100)
+        })
+
+      {"StorageClass", _attrs, children}, {:ok, transition, seen} ->
+        put_once_value_reduced(transition, seen, :storage_class, %{
+          "noncurrent_transition_storage_class" => storage_class(children)
+        })
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, transition, seen} ->
+        if MapSet.member?(seen, :noncurrent_days) and MapSet.member?(seen, :storage_class) do
+          {:ok, transition}
+        else
+          :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp unwrap_single_action({:ok, action, seen}) when map_size(action) > 0 do
+    if MapSet.size(seen) == 1, do: {:ok, action}, else: :error
+  end
+
+  defp unwrap_single_action(_other), do: :error
+
+  defp one_seen?(seen, left, right) do
+    MapSet.member?(seen, left) != MapSet.member?(seen, right)
+  end
+
+  defp put_once(rule, seen, seen_key, field, {:ok, value}) do
+    if MapSet.member?(seen, seen_key) do
+      {:halt, :error}
+    else
+      {:cont, {:ok, Map.put(rule, field, value), MapSet.put(seen, seen_key)}}
+    end
+  end
+
+  defp put_once(_rule, _seen, _seen_key, _field, :error), do: {:halt, :error}
+
+  defp put_once_parsed(rule, seen, seen_key, {:ok, fields}) do
+    with {:ok, rule, seen} <- put_once_value(rule, seen, seen_key, fields) do
+      {:cont, {:ok, rule, seen}}
+    else
+      _other -> {:halt, :error}
+    end
+  end
+
+  defp put_once_parsed(_rule, _seen, _seen_key, :error), do: {:halt, :error}
+
+  defp put_once_value(target, seen, seen_key, fields) when is_map(fields) do
+    if MapSet.member?(seen, seen_key) do
+      :error
+    else
+      with {:ok, resolved} <- resolve_fields(fields) do
+        {:ok, Map.merge(target, resolved), MapSet.put(seen, seen_key)}
+      end
+    end
+  end
+
+  defp put_once_value_reduced(target, seen, seen_key, fields) do
+    with {:ok, target, seen} <- put_once_value(target, seen, seen_key, fields) do
+      {:cont, {:ok, target, seen}}
+    else
+      _other -> {:halt, :error}
+    end
+  end
+
+  defp put_filter_once(filter, seen, seen_key, field, value) do
+    if MapSet.member?(seen, seen_key) do
+      :error
+    else
+      {:ok, Map.put(filter, field, value), MapSet.put(seen, seen_key)}
+    end
+  end
+
+  defp put_filter_tag(%{"filter_tags" => tags} = filter, seen, %{"key" => key} = tag) do
+    tag_seen_key = {:tag, key}
+
+    if MapSet.member?(seen, tag_seen_key) do
+      :error
+    else
+      {:ok, %{filter | "filter_tags" => tags ++ [tag]}, MapSet.put(seen, tag_seen_key)}
+    end
+  end
+
+  defp put_required_tag_field(tag, field, children) do
+    case required_text(children) do
+      {:ok, value} -> put_tag_field(tag, field, {:ok, value})
+      :error -> {:halt, :error}
+    end
+  end
+
+  defp put_tag_field(tag, field, children) when is_list(children),
+    do: put_tag_field(tag, field, text(children, trim: true))
+
+  defp put_tag_field(tag, field, {:ok, value}) do
+    if Map.fetch!(tag, field) == @unset do
+      {:cont, {:ok, Map.put(tag, field, value)}}
+    else
+      {:halt, :error}
+    end
+  end
+
+  defp put_tag_field(_tag, _field, :error), do: {:halt, :error}
+
+  defp resolve_fields(fields) do
+    Enum.reduce_while(fields, {:ok, %{}}, fn
+      {key, {:ok, value}}, {:ok, resolved} ->
+        {:cont, {:ok, Map.put(resolved, key, value)}}
+
+      {_key, :error}, _acc ->
+        {:halt, :error}
+
+      {key, value}, {:ok, resolved} ->
+        {:cont, {:ok, Map.put(resolved, key, value)}}
     end)
   end
 
-  defp append_tag(cur, tag) when is_map(tag),
-    do: add_parse_error(cur, "invalid_filter_tag")
+  defp text(children, opts), do: XMLTree.text(children, opts)
+  defp required_text(children), do: XMLTree.required_text(children, trim: true)
 
-  defp append_tag(cur, _tag), do: cur
+  defp positive_integer(children), do: integer(children, 1, nil)
+  defp nonnegative_integer(children), do: integer(children, 0, nil)
+  defp bounded_integer(children, min, max), do: integer(children, min, max)
 
-  defp put_tag(%{tag: tag} = s, "Key", v) when is_map(tag), do: %{s | tag: Map.put(tag, "key", v)}
-
-  defp put_tag(%{tag: tag} = s, "Value", v) when is_map(tag),
-    do: %{s | tag: Map.put(tag, "value", v)}
-
-  defp put_tag(s, _l, _v), do: s
-
-  defp put_int(cur, field, value, min) do
-    case int(value) do
-      n when is_integer(n) and n >= min -> %{cur | field => n}
-      _ -> add_parse_error(cur, "invalid_integer:#{field}")
+  defp integer(children, min, max) do
+    with {:ok, value} <- required_text(children),
+         {integer, ""} <- Integer.parse(value),
+         true <- integer >= min,
+         true <- is_nil(max) or integer <= max do
+      {:ok, integer}
+    else
+      _other -> :error
     end
   end
 
-  defp int(s) do
-    case Integer.parse(s) do
-      {n, ""} -> n
-      _ -> nil
+  defp boolean(children) do
+    case required_text(children) do
+      {:ok, "true"} -> {:ok, true}
+      {:ok, "false"} -> {:ok, false}
+      _other -> :error
     end
   end
 
-  defp add_parse_error(cur, error),
-    do: Map.update!(cur, "parse_errors", &[error | &1])
+  defp status(children) do
+    case required_text(children) do
+      {:ok, status} when status in ["Enabled", "Disabled"] -> {:ok, status}
+      _other -> :error
+    end
+  end
 
-  defp trim(nil), do: ""
-  defp trim(t), do: String.trim(t)
+  defp storage_class(children) do
+    with {:ok, value} <- required_text(children),
+         true <- value in StorageClass.lifecycle_transition_values() do
+      {:ok, value}
+    else
+      _other -> :error
+    end
+  end
 
-  defp tl_safe([]), do: []
-  defp tl_safe([_ | rest]), do: rest
+  defp lifecycle_date(children) do
+    with {:ok, value} <- required_text(children),
+         true <- lifecycle_midnight_utc?(value) do
+      {:ok, value}
+    else
+      _other -> :error
+    end
+  end
 
-  defp local(name) do
-    case String.split(name, ":") do
-      [_ns, l] -> l
-      [l] -> l
+  defp lifecycle_midnight_utc?(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, %DateTime{hour: 0, minute: 0, second: 0, microsecond: {0, _}}, 0} -> true
+      _other -> false
     end
   end
 end

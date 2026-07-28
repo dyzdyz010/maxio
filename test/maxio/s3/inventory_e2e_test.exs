@@ -51,6 +51,20 @@ defmodule Maxio.S3.InventoryE2ETest do
     <Schedule><Frequency>Weekly</Frequency></Schedule>
   </InventoryConfiguration>
   """
+  @no_account """
+  <InventoryConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Destination>
+      <S3BucketDestination>
+        <Bucket>arn:aws:s3:::inventory-dest</Bucket>
+        <Format>CSV</Format>
+      </S3BucketDestination>
+    </Destination>
+    <IsEnabled>true</IsEnabled>
+    <Id>no-account</Id>
+    <IncludedObjectVersions>Current</IncludedObjectVersions>
+    <Schedule><Frequency>Daily</Frequency></Schedule>
+  </InventoryConfiguration>
+  """
 
   setup do
     File.rm_rf(@data_dir)
@@ -153,6 +167,23 @@ defmodule Maxio.S3.InventoryE2ETest do
 
     assert get_inventory("inventorycfg", "daily").status == 404
     assert get_inventory("inventorycfg", "weekly").status == 200
+  end
+
+  test "destination AccountId is optional and omitted on readback when absent" do
+    assert create_bucket("inventorynoaccount").status == 200
+
+    put = put_inventory("inventorynoaccount", "no-account", @no_account)
+    assert put.status == 200
+
+    assert {:ok, %{"Configurations" => [stored]}} =
+             BucketConfigs.get("inventorynoaccount", :inventory)
+
+    refute Map.has_key?(get_in(stored, ["Destination", "S3BucketDestination"]), "AccountId")
+
+    get = get_inventory("inventorynoaccount", "no-account")
+    assert get.status == 200
+    refute get.resp_body =~ "<AccountId>"
+    assert get.resp_body =~ "<Bucket>arn:aws:s3:::inventory-dest</Bucket>"
   end
 
   test "list paginates at 100 configurations with continuation token" do
@@ -260,10 +291,10 @@ defmodule Maxio.S3.InventoryE2ETest do
              BucketConfigs.get("inventorybad", :inventory)
   end
 
-  test "checksum trailers and aws-chunked XML bodies are rejected" do
+  test "checksum trailers and aws-chunked XML bodies are validated before storing config" do
     assert create_bucket("inventorychunked").status == 200
 
-    trailer =
+    plain_trailer =
       put_inventory("inventorychunked", "daily", @daily,
         headers: [
           {"x-amz-sdk-checksum-algorithm", "SHA256"},
@@ -271,18 +302,70 @@ defmodule Maxio.S3.InventoryE2ETest do
         ]
       )
 
-    assert trailer.status == 501
-    assert trailer.resp_body =~ "NotImplemented"
-
-    conn =
-      SigV4Request.signed_chunked_conn(:put, "/inventorychunked", @daily,
-        query: %{"inventory" => "", "id" => "daily"}
-      )
-
-    rejected = call(conn)
-    assert rejected.status == 501
-    assert rejected.resp_body =~ "NotImplemented"
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "InvalidRequest"
     assert BucketConfigs.get("inventorychunked", :inventory) == :none
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/inventorychunked", @daily,
+        query: %{"inventory" => "", "id" => "daily"},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", :crypto.hash(:sha256, "different") |> Base.encode64()}
+        ]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "BadDigest"
+    assert BucketConfigs.get("inventorychunked", :inventory) == :none
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/inventorychunked", @daily,
+        query: %{"inventory" => "", "id" => "daily"},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", :crypto.hash(:sha256, @daily) |> Base.encode64()}
+        ]
+      )
+      |> call()
+
+    assert ok_trailer.status == 200
+
+    assert {:ok, %{"Configurations" => [%{"Id" => "daily"}]}} =
+             BucketConfigs.get("inventorychunked", :inventory)
+
+    ok_chunked =
+      SigV4Request.signed_chunked_conn(:put, "/inventorychunked", @weekly,
+        query: %{"inventory" => "", "id" => "weekly"}
+      )
+      |> call()
+
+    assert ok_chunked.status == 200
+
+    assert {:ok, %{"Configurations" => configs}} =
+             BucketConfigs.get("inventorychunked", :inventory)
+
+    assert Enum.map(configs, & &1["Id"]) == ["daily", "weekly"]
+
+    oversized = String.duplicate("x", 131_073)
+
+    too_large =
+      SigV4Request.signed_chunked_conn(:put, "/inventorychunked", oversized,
+        query: %{"inventory" => "", "id" => "huge"},
+        chunk_size: byte_size(oversized),
+        decoded_length_override: 131_072
+      )
+      |> call()
+
+    assert too_large.status == 400
+    assert too_large.resp_body =~ "MalformedXML"
+    assert too_large.resp_body =~ "InventoryConfiguration exceeds 128KB"
+
+    assert {:ok, %{"Configurations" => configs}} =
+             BucketConfigs.get("inventorychunked", :inventory)
+
+    assert Enum.map(configs, & &1["Id"]) == ["daily", "weekly"]
   end
 
   test "expected bucket owner missing bucket and method boundaries are enforced" do

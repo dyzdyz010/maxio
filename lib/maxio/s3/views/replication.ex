@@ -36,6 +36,7 @@ defmodule Maxio.S3.Views.Replication do
         destination_element(rule["Destination"])
       ])
       |> add_status_block("DeleteMarkerReplication", rule["DeleteMarkerReplication"])
+      |> add_status_block("DeleteReplication", rule["DeleteReplication"])
       |> add_status_block("ExistingObjectReplication", rule["ExistingObjectReplication"])
       |> add_source_selection_criteria(rule["SourceSelectionCriteria"])
     )
@@ -52,6 +53,7 @@ defmodule Maxio.S3.Views.Replication do
     children ++ [element("Filter", [], filter_children(filter))]
   end
 
+  defp filter_children(filter) when filter == %{}, do: []
   defp filter_children(%{"Prefix" => prefix}), do: [element("Prefix", [], characters(prefix))]
   defp filter_children(%{"Tag" => tag}), do: [tag_element(tag)]
 

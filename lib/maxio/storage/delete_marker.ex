@@ -34,7 +34,9 @@ defmodule Maxio.Storage.DeleteMarker do
       "type" => "delete_marker",
       "is_latest" => true,
       "modtime" => Keyword.get(entry_opts, :modtime, System.os_time(:nanosecond)),
-      "generation" => Keyword.get(entry_opts, :generation, 0)
+      "generation" => Keyword.get(entry_opts, :generation, 0),
+      "replication_status" => Keyword.get(entry_opts, :replication_status),
+      "notification_outbox" => Keyword.get(entry_opts, :notification_outbox, [])
     }
 
     %{

@@ -76,6 +76,27 @@ defmodule Maxio.S3.RequestParsers.NotificationTest do
     assert config["EventBridgeConfiguration"] == %{}
   end
 
+  test "accepts ObjectAnnotation events and whitespace-only EventBridgeConfiguration" do
+    assert {:ok, config} =
+             Notification.parse("""
+             <NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+               <QueueConfiguration>
+                 <Queue>arn:aws:sqs:us-east-1:000000000000:annotations</Queue>
+                 <Event>s3:ObjectAnnotation:Put</Event>
+                 <Event>s3:ObjectAnnotation:Delete</Event>
+               </QueueConfiguration>
+               <EventBridgeConfiguration>
+
+               </EventBridgeConfiguration>
+             </NotificationConfiguration>
+             """)
+
+    assert [%{"Events" => ["s3:ObjectAnnotation:Put", "s3:ObjectAnnotation:Delete"]}] =
+             config["QueueConfigurations"]
+
+    assert config["EventBridgeConfiguration"] == %{}
+  end
+
   test "rejects wrong root unknown elements and mixed text" do
     assert {:error, :malformed_xml} =
              Notification.parse("<Wrapper><NotificationConfiguration /></Wrapper>")
@@ -94,9 +115,26 @@ defmodule Maxio.S3.RequestParsers.NotificationTest do
                <QueueConfiguration><Unknown /></QueueConfiguration>
              </NotificationConfiguration>
              """)
+
+    assert {:error, :malformed_xml} =
+             Notification.parse("""
+             <NotificationConfiguration>
+               <QueueConfiguration>
+                 <Queue><Arn>arn:aws:sqs:us-east-1:000000000000:a</Arn></Queue>
+                 <Event>s3:ObjectCreated:*</Event>
+               </QueueConfiguration>
+             </NotificationConfiguration>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Notification.parse("""
+             <NotificationConfiguration>
+               <EventBridgeConfiguration><Event>s3:ObjectCreated:*</Event></EventBridgeConfiguration>
+             </NotificationConfiguration>
+             """)
   end
 
-  test "rejects duplicate singular fields and duplicate EventBridgeConfiguration" do
+  test "rejects duplicate singular fields duplicate events and duplicate EventBridgeConfiguration" do
     assert {:error, :malformed_xml} =
              Notification.parse("""
              <NotificationConfiguration>
@@ -116,6 +154,17 @@ defmodule Maxio.S3.RequestParsers.NotificationTest do
                  <Queue>arn:aws:sqs:us-east-1:000000000000:a</Queue>
                  <Queue>arn:aws:sqs:us-east-1:000000000000:b</Queue>
                  <Event>s3:ObjectCreated:*</Event>
+               </QueueConfiguration>
+             </NotificationConfiguration>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Notification.parse("""
+             <NotificationConfiguration>
+               <QueueConfiguration>
+                 <Queue>arn:aws:sqs:us-east-1:000000000000:a</Queue>
+                 <Event>s3:ObjectCreated:Put</Event>
+                 <Event>s3:ObjectCreated:Put</Event>
                </QueueConfiguration>
              </NotificationConfiguration>
              """)
@@ -149,6 +198,80 @@ defmodule Maxio.S3.RequestParsers.NotificationTest do
                  <Filter>
                    <S3Key>
                      <FilterRule><Name>tag</Name><Value>x</Value></FilterRule>
+                   </S3Key>
+                 </Filter>
+               </QueueConfiguration>
+             </NotificationConfiguration>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Notification.parse("""
+             <NotificationConfiguration>
+               <QueueConfiguration>
+                 <Queue>arn:aws:sqs:us-east-1:000000000000:a</Queue>
+                 <Event>s3:ObjectCreated:*</Event>
+                 <Filter>
+                   <S3Key>
+                     <FilterRule>
+                       <Name>prefix</Name>
+                       <Name>suffix</Name>
+                       <Value>images/</Value>
+                     </FilterRule>
+                   </S3Key>
+                 </Filter>
+               </QueueConfiguration>
+             </NotificationConfiguration>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Notification.parse("""
+             <NotificationConfiguration>
+               <QueueConfiguration>
+                 <Queue>arn:aws:sqs:us-east-1:000000000000:a</Queue>
+                 <Event>s3:ObjectCreated:*</Event>
+                 <Filter>
+                   <S3Key>
+                     <FilterRule><Name>prefix</Name></FilterRule>
+                   </S3Key>
+                 </Filter>
+               </QueueConfiguration>
+             </NotificationConfiguration>
+             """)
+  end
+
+  test "rejects malformed destination ARNs" do
+    for {destination_config, destination, arn} <- [
+          {"QueueConfiguration", "Queue", "arn:aws:sns:us-east-1:000000000000:images"},
+          {"TopicConfiguration", "Topic", "arn:aws:sns:us-east-1:00000000000:events"},
+          {"QueueConfiguration", "Queue", "arn:aws:sqs:us-east-1:000000000000:images.fifo"},
+          {"TopicConfiguration", "Topic", "arn:aws:sns:us-east-1:000000000000:images.fifo"},
+          {"CloudFunctionConfiguration", "CloudFunction",
+           "arn:aws:lambda:us-east-1:000000000000:table:ingest"}
+        ] do
+      assert {:error, :malformed_xml} =
+               Notification.parse("""
+               <NotificationConfiguration>
+                 <#{destination_config}>
+                   <#{destination}>#{arn}</#{destination}>
+                   <Event>s3:ObjectCreated:*</Event>
+                 </#{destination_config}>
+               </NotificationConfiguration>
+               """)
+    end
+  end
+
+  test "rejects filter values longer than 1024 bytes" do
+    too_long = String.duplicate("a", 1025)
+
+    assert {:error, :malformed_xml} =
+             Notification.parse("""
+             <NotificationConfiguration>
+               <QueueConfiguration>
+                 <Queue>arn:aws:sqs:us-east-1:000000000000:a</Queue>
+                 <Event>s3:ObjectCreated:*</Event>
+                 <Filter>
+                   <S3Key>
+                     <FilterRule><Name>prefix</Name><Value>#{too_long}</Value></FilterRule>
                    </S3Key>
                  </Filter>
                </QueueConfiguration>

@@ -37,6 +37,7 @@ defmodule Maxio.Cluster.ScrubberTest do
                no_throttle: true
              )
 
+    assert summary.status == :ok
     assert summary.buckets == 1
     assert summary.scanned == 2
     assert summary.healed == 0
@@ -45,6 +46,30 @@ defmodule Maxio.Cluster.ScrubberTest do
     assert summary.total_size == 40
 
     assert %{object_count: 2, total_size: 40, scanned_at: %DateTime{}} = Usage.get(bucket)
+  end
+
+  test "bucket scan failure promotes the round to partial for operator gates" do
+    bucket = bucket_name("scrub-partial")
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    put_index!(bucket, "a.txt", 11, "etag-a")
+    put_index!(bucket, "b.txt", 29, "etag-b")
+
+    assert {:ok, summary} =
+             Scrubber.run_once(
+               bucket: bucket,
+               backend: Maxio.Storage.FS,
+               max_objects_per_sec: 1,
+               object_burst: 1,
+               throttle_now_fun: fn -> 0 end,
+               throttle_sleep_fun: fn _ms -> raise "injected scrubber throttle failure" end
+             )
+
+    assert summary.status == :partial
+    assert summary.buckets == 1
+    assert summary.scanned == 0
+    assert summary.object_count == 0
+    assert summary.total_size == 0
+    assert Usage.get(bucket) == nil
   end
 
   test "EC backend enumerates PG rows and heals a missing shard directory", %{drives: drives} do

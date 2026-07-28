@@ -56,7 +56,8 @@ defmodule Maxio.ObjectMetadataSidecar do
     Enum.map(endpoints, fn {node, drive} ->
       case transport.get_sidecar(node, Path.join(drive, rel)) do
         {:ok, meta} -> %{node: node, drive: drive, meta: meta}
-        {:error, _} -> :missing
+        {:error, :enoent} -> :missing
+        {:error, reason} -> {:error, reason}
       end
     end)
   end
@@ -180,7 +181,7 @@ defmodule Maxio.ObjectMetadataSidecar do
   defp endpoint_config(bucket, key, opts) do
     case Keyword.get(opts, :topology) do
       %{} = topology ->
-        set_id = Router.set_for(bucket, key, topology)
+        set_id = set_for(bucket, key, topology, opts)
         endpoints = Topology.endpoints_from(topology, set_id)
         {read_quorum, write_quorum} = quorums(topology.data_shards, topology.parity_shards)
         {:ok, %{endpoints: endpoints, read_quorum: read_quorum, write_quorum: write_quorum}}
@@ -195,15 +196,15 @@ defmodule Maxio.ObjectMetadataSidecar do
   defp configured_endpoint_config(bucket, key, opts) do
     cond do
       Topology.configured?() ->
-        set_id = Router.set_for(bucket, key)
+        set_id = set_for(bucket, key, nil, opts)
         endpoints = Topology.endpoints(set_id)
         ec = Topology.ec_params()
         {read_quorum, write_quorum} = quorums(ec[:data_shards], ec[:parity_shards])
         {:ok, %{endpoints: endpoints, read_quorum: read_quorum, write_quorum: write_quorum}}
 
-      Storage.backend() == Maxio.Storage.FS ->
-        topology = Maxio.Storage.FS.local_topology(opts)
-        set_id = Router.set_for(bucket, key, topology)
+      local_topology_backend?() ->
+        topology = local_topology(opts)
+        set_id = set_for(bucket, key, topology, opts)
         endpoints = Topology.endpoints_from(topology, set_id)
         {:ok, %{endpoints: endpoints, read_quorum: 1, write_quorum: 1}}
 
@@ -220,6 +221,39 @@ defmodule Maxio.ObjectMetadataSidecar do
         {:error, :no_topology}
     end
   end
+
+  defp local_topology_backend? do
+    backend = Storage.backend()
+    Code.ensure_loaded?(backend) and function_exported?(backend, :local_topology, 1)
+  end
+
+  defp local_topology(opts) do
+    Storage.backend().local_topology(opts)
+  end
+
+  defp set_for(bucket, key, topology, opts) do
+    case normalize_set_id(Keyword.get(opts, :placement_set_id)) do
+      nil ->
+        routed_set_for(bucket, key, topology)
+
+      set_id ->
+        set_id
+    end
+  end
+
+  defp routed_set_for(bucket, key, nil), do: Router.set_for(bucket, key)
+  defp routed_set_for(bucket, key, topology), do: Router.set_for(bucket, key, topology)
+
+  defp normalize_set_id(set_id) when is_integer(set_id), do: set_id
+
+  defp normalize_set_id(set_id) when is_binary(set_id) do
+    case Integer.parse(set_id) do
+      {int, ""} -> int
+      _other -> nil
+    end
+  end
+
+  defp normalize_set_id(_set_id), do: nil
 
   defp quorums(k, 0) when is_integer(k) and k > 0, do: {k, k}
 

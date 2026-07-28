@@ -52,6 +52,42 @@ defmodule Maxio.S3.Error do
     invalid_argument: {"InvalidArgument", 400, "Invalid Argument"},
     invalid_storage_class:
       {"InvalidStorageClass", 400, "The storage class that you specified is not valid."},
+    missing_header_name:
+      {"MissingHeaderName", 400,
+       "The CSV header name specified in the SQL expression is missing."},
+    ambiguous_field_name:
+      {"AmbiguousFieldName", 400,
+       "The CSV header name specified in the SQL expression is ambiguous."},
+    column_too_long:
+      {"ColumnTooLong", 400,
+       "The length of a column in the result is greater than the maximum allowed size."},
+    expression_too_long:
+      {"ExpressionTooLong", 400,
+       "The SQL expression is too long. The maximum byte-length for an SQL expression is 256 KB."},
+    invalid_json_type:
+      {"InvalidJsonType", 400, "The JSON type provided in the request is not valid."},
+    invalid_key_path:
+      {"InvalidKeyPath", 400, "The key path provided in the request is not valid."},
+    invalid_text_encoding:
+      {"InvalidTextEncoding", 400,
+       "The encoding type is not valid. Only UTF-8 encoding is supported."},
+    unsupported_sql_structure:
+      {"UnsupportedSqlStructure", 400,
+       "We encountered an unsupported SQL structure. Check the SQL Reference."},
+    cast_failed:
+      {"CastFailed", 400,
+       "An attempt to convert from one data type to another using CAST failed in the SQL expression."},
+    value_parse_failure:
+      {"ValueParseFailure", 400, "A timestamp parse failure occurred in the SQL expression."},
+    invalid_request_parameter:
+      {"InvalidRequestParameter", 400, "The request parameter is invalid."},
+    json_parsing_error: {"JSONParsingError", 400, "Encountered an error parsing the JSON file."},
+    over_max_column:
+      {"OverMaxColumn", 400,
+       "The number of columns in the result is greater than the maximum allowable number of columns."},
+    over_max_record_size:
+      {"OverMaxRecordSize", 400,
+       "The length of a record in the input or result is greater than the maximum allowed size."},
     invalid_object_state:
       {"InvalidObjectState", 403, "The operation is not valid for the object's storage class."},
     invalid_tag:
@@ -89,6 +125,9 @@ defmodule Maxio.S3.Error do
     precondition_failed:
       {"PreconditionFailed", 412,
        "At least one of the preconditions that you specified did not hold."},
+    conditional_request_conflict:
+      {"ConditionalRequestConflict", 409,
+       "A conflicting conditional operation is currently in progress against this resource. Please try again."},
     not_modified: {"NotModified", 304, "The resource was not changed."},
     invalid_range: {"InvalidRange", 416, "The requested range cannot be satisfied."},
     method_not_allowed:
@@ -128,6 +167,7 @@ defmodule Maxio.S3.Error do
     invalid_bucket_state:
       {"InvalidBucketState", 409,
        "The request is not valid with the current state of the bucket."},
+    bucket_quota_exceeded: {"XMinioAdminBucketQuotaExceeded", 400, "Bucket quota exceeded."},
     bad_digest:
       {"BadDigest", 400,
        "The Content-MD5 or checksum value that you specified did not match what the server received."},
@@ -137,6 +177,12 @@ defmodule Maxio.S3.Error do
     incomplete_body:
       {"IncompleteBody", 400,
        "You did not provide the number of bytes specified by the Content-Length HTTP header."},
+    malformed_post_request:
+      {"MalformedPOSTRequest", 400,
+       "The body of your POST request is not well-formed multipart/form-data."},
+    invalid_policy_document:
+      {"InvalidPolicyDocument", 400,
+       "The content of the form does not meet the conditions specified in the policy document."},
     malformed_policy:
       {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'."},
     no_such_bucket_policy: {"NoSuchBucketPolicy", 404, "The bucket policy does not exist."},

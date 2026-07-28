@@ -6,7 +6,7 @@ defmodule Maxio.S3.Handlers.OwnershipControls do
   import Plug.Conn
 
   alias Maxio.{Buckets, BucketConfigs}
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{ControlBody, Error, ExpectedBucketOwner, Log}
   alias Maxio.S3.RequestParsers.OwnershipControls, as: Parser
   alias Maxio.S3.Views.OwnershipControls, as: View
 
@@ -16,7 +16,8 @@ defmodule Maxio.S3.Handlers.OwnershipControls do
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     bucket_meta = ensure_bucket!(bucket)
-    {conn, xml} = read_small_body!(conn)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
+    {conn, xml} = read_xml_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, config} ->
@@ -46,6 +47,7 @@ defmodule Maxio.S3.Handlers.OwnershipControls do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
 
     case Maxio.S3.OwnershipControls.get_config(bucket) do
       {:ok, config} ->
@@ -64,6 +66,7 @@ defmodule Maxio.S3.Handlers.OwnershipControls do
   def delete(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     :ok = BucketConfigs.delete(bucket, :ownership_controls)
 
     Log.info("delete bucket ownership controls",
@@ -81,16 +84,9 @@ defmodule Maxio.S3.Handlers.OwnershipControls do
     end
   end
 
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "OwnershipControls config too large")
-
-      {:error, _reason} ->
-        raise Error.new(:malformed_xml)
-    end
+  defp read_xml_body!(conn) do
+    ControlBody.read_and_verify!(conn, @limit, "OwnershipControls config too large",
+      require_integrity: :content_md5_or_flexible
+    )
   end
 end

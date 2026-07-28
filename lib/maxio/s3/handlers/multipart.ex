@@ -7,16 +7,24 @@ defmodule Maxio.S3.Handlers.Multipart do
   import Plug.Conn
   alias Maxio.{Buckets, Multipart, Objects, Storage}
   alias Maxio.Cluster.Placement
+  alias Maxio.Console.DirectMultipartUpload
   alias Maxio.Policy.ACL
 
   alias Maxio.S3.{
     BodyReader,
     Checksum,
+    Conditional,
+    ControlBody,
     CopySource,
     Error,
+    ExpectedBucketOwner,
     Log,
+    NotificationDelivery,
+    NotificationRetainedLedger,
     OwnershipControls,
     PublicAccessBlock,
+    ReplicationDelivery,
+    RequestPayer,
     SSE,
     StorageClass,
     SystemHeaders,
@@ -24,6 +32,8 @@ defmodule Maxio.S3.Handlers.Multipart do
   }
 
   alias Maxio.S3.RequestParsers.CompleteMultipartUpload, as: CompleteParser
+
+  @max_uploads_limit 1000
 
   alias Maxio.S3.Views.{
     InitiateMultipartUpload,
@@ -40,9 +50,12 @@ defmodule Maxio.S3.Handlers.Multipart do
 
   @spec create_multipart_upload(Plug.Conn.t()) :: Plug.Conn.t()
   def create_multipart_upload(conn) do
+    conn = fetch_query_params(conn)
     bucket = conn.assigns.s3_bucket
     key = conn.assigns.s3_key
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: "/#{bucket}/#{key}")
+    charge = RequestPayer.require!(conn, bucket, resource: "/#{bucket}/#{key}")
 
     # multipart 门与单 key 写路径共用同一入口守卫——空 key / ./.. 点段 key 在
     # CreateMultipartUpload 即 400 XMinioInvalidObjectName（对齐 MinIO：对象名校验同样作用于
@@ -57,8 +70,13 @@ defmodule Maxio.S3.Handlers.Multipart do
     acl_input = acl_from_headers!(conn)
     :ok = OwnershipControls.reject_object_acl_headers!(bucket, conn, acl_input)
     :ok = PublicAccessBlock.reject_public_acl_write!(bucket, acl_input)
-    sse_algorithm = SSE.resolve_target!(conn.req_headers, bucket)
+
+    sse_target = SSE.resolve_target!(conn.req_headers, bucket)
+    sse_algorithm = SSE.storage_algorithm(sse_target)
+    sse_envelope = multipart_sse_envelope(sse_target)
     owner = conn.assigns.principal.arn
+    checksum_intent = Checksum.multipart_upload_intent!(conn.req_headers)
+    registry_attrs = console_direct_registry_attrs!(conn, bucket, key)
 
     # ROUTE B B4-6 fidelity：CreateMultipartUpload 须捕获客户端 x-amz-meta-*（与 PutObject 同源解析器），
     # 落进会话 metadata，使 CompleteMultipartUpload 后的最终对象 HEAD/GET 回显这些用户元数据
@@ -67,6 +85,8 @@ defmodule Maxio.S3.Handlers.Multipart do
     # 失败 pre-create、无孤儿会话（铁律 3）。
     user_metadata = Maxio.Metadata.parse_headers(conn.req_headers)
     :ok = Maxio.Metadata.validate_size!(user_metadata)
+    tags = parse_tagging_header!(conn)
+    conn = assign(conn, :s3_metrics_tags, tags)
 
     attrs =
       %{
@@ -75,17 +95,21 @@ defmodule Maxio.S3.Handlers.Multipart do
         acl_canned: acl_input.canned,
         acl_grants: acl_input.grants_doc,
         sse_algorithm: sse_algorithm,
+        sse_envelope: sse_envelope,
         owner: owner,
-        metadata: user_metadata
+        metadata: user_metadata,
+        tags: tags
       }
       |> Map.merge(system_headers)
+      |> Map.merge(checksum_intent)
 
-    case Multipart.initiate(bucket, key, attrs) do
+    case initiate_multipart_upload(bucket, key, attrs, registry_attrs) do
       {:ok, upload} ->
         Log.info("create multipart upload",
           action: :create_multipart_upload,
           bucket: bucket,
-          key: key
+          key: key,
+          console_direct_registered: not is_nil(registry_attrs)
         )
 
         body =
@@ -97,7 +121,10 @@ defmodule Maxio.S3.Handlers.Multipart do
 
         conn
         |> put_resp_content_type("application/xml")
-        |> SSE.put_response_header(sse_algorithm)
+        |> assign(:s3_metrics_tags, upload.tags || %{})
+        |> Checksum.put_multipart_upload_response_headers(upload)
+        |> SSE.put_response_header(sse_target)
+        |> RequestPayer.put_charged_header(charge)
         |> send_resp(200, body)
 
       {:error, reason} ->
@@ -112,6 +139,58 @@ defmodule Maxio.S3.Handlers.Multipart do
     end
   end
 
+  defp initiate_multipart_upload(bucket, key, attrs, nil) do
+    Multipart.initiate(bucket, key, attrs)
+  end
+
+  defp initiate_multipart_upload(bucket, key, attrs, registry_attrs) do
+    Multipart.initiate_with(bucket, key, attrs, fn upload ->
+      DirectMultipartUpload.register(upload, registry_attrs)
+    end)
+  end
+
+  defp console_direct_registry_attrs!(conn, bucket, key) do
+    query = conn.query_params || %{}
+
+    if DirectMultipartUpload.direct_multipart_query?(query) do
+      case DirectMultipartUpload.registry_intent_attrs(query, conn.assigns.principal) do
+        {:ok, attrs} ->
+          attrs
+
+        {:error, reason} ->
+          Log.warn("console direct multipart registry intent rejected",
+            action: :create_multipart_upload,
+            bucket: bucket,
+            key: key,
+            reason: reason
+          )
+
+          raise Error.new(:invalid_argument,
+                  message: console_direct_registry_error_message(reason),
+                  resource: "/#{bucket}/#{key}"
+                )
+      end
+    end
+  end
+
+  defp console_direct_registry_error_message(:invalid_size),
+    do: "Console direct multipart file size is invalid"
+
+  defp console_direct_registry_error_message(:invalid_part_size),
+    do: "Console direct multipart part size is invalid"
+
+  defp console_direct_registry_error_message(:too_many_parts),
+    do: "Console direct multipart part count is too large"
+
+  defp console_direct_registry_error_message(:invalid_file_name),
+    do: "Console direct multipart file name is invalid"
+
+  defp console_direct_registry_error_message(:invalid_file_last_modified),
+    do: "Console direct multipart file last modified timestamp is invalid"
+
+  defp console_direct_registry_error_message(_reason),
+    do: "Console direct multipart registry intent is invalid"
+
   @spec upload_part(Plug.Conn.t()) :: Plug.Conn.t()
   def upload_part(conn) do
     bucket = conn.assigns.s3_bucket
@@ -119,25 +198,93 @@ defmodule Maxio.S3.Handlers.Multipart do
     conn = fetch_query_params(conn)
     upload_id = Map.fetch!(conn.query_params, "uploadId")
     part_number = parse_part_number!(Map.fetch!(conn.query_params, "partNumber"))
+    _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: "/#{bucket}/#{key}")
+    charge = RequestPayer.require!(conn, bucket, resource: "/#{bucket}/#{key}")
 
     upload = upload_or_raise(bucket, key, upload_id)
+    conn = assign(conn, :s3_metrics_tags, upload.tags || %{})
 
     case header(conn, "x-amz-copy-source") do
-      nil -> upload_part_body(conn, bucket, key, upload_id, part_number, upload)
-      raw -> upload_part_copy(conn, bucket, key, upload_id, part_number, upload, raw)
+      nil ->
+        customer_key = upload_part_customer_key!(conn, upload, bucket, key)
+        upload_part_body(conn, bucket, key, upload_id, part_number, upload, charge, customer_key)
+
+      raw ->
+        upload_part_copy(conn, bucket, key, upload_id, part_number, upload, raw, charge)
     end
   end
 
-  defp upload_part_body(conn, bucket, key, upload_id, part_number, upload) do
+  defp upload_part_customer_key!(conn, %{sse_algorithm: "SSE-C"} = upload, bucket, key) do
+    {customer_key, _key_md5_b64} =
+      SSE.resolve_customer_read!(conn.req_headers, upload.sse_envelope,
+        resource: "/#{bucket}/#{key}"
+      )
+
+    customer_key
+  end
+
+  defp upload_part_customer_key!(conn, _upload, bucket, key) do
+    reject_unexpected_target_sse_c_headers!(conn, bucket, key)
+    nil
+  end
+
+  defp maybe_encrypt_upload_part_stream(chunks, %{sse_algorithm: "SSE-C"}, customer_key)
+       when is_binary(customer_key) and byte_size(customer_key) == 32 do
+    {counted_chunks, visible_size} = counted_stream(chunks)
+
+    {Maxio.Crypto.SSE.encrypt_stream_with_customer_key(counted_chunks, customer_key),
+     visible_size}
+  end
+
+  defp maybe_encrypt_upload_part_stream(
+         chunks,
+         %{sse_algorithm: "aws:kms", sse_envelope: %{} = envelope},
+         _customer_key
+       ) do
+    {counted_chunks, visible_size} = counted_stream(chunks)
+    {Maxio.Crypto.SSE.encrypt_stream_with_kms_envelope(counted_chunks, envelope), visible_size}
+  end
+
+  defp maybe_encrypt_upload_part_stream(
+         chunks,
+         %{sse_algorithm: "aws:kms:dsse", sse_envelope: %{} = envelope},
+         _customer_key
+       ) do
+    {counted_chunks, visible_size} = counted_stream(chunks)
+
+    {Maxio.Crypto.SSE.encrypt_stream_with_dsse_kms_envelope(counted_chunks, envelope),
+     visible_size}
+  end
+
+  defp maybe_encrypt_upload_part_stream(_chunks, %{sse_algorithm: "aws:kms"}, _customer_key) do
+    raise Error.new(:invalid_request, message: "SSE-KMS multipart upload is missing its envelope")
+  end
+
+  defp maybe_encrypt_upload_part_stream(_chunks, %{sse_algorithm: "aws:kms:dsse"}, _customer_key) do
+    raise Error.new(:invalid_request,
+            message: "DSSE-KMS multipart upload is missing its envelope"
+          )
+  end
+
+  defp maybe_encrypt_upload_part_stream(chunks, _upload, _customer_key),
+    do: {chunks, fn -> 0 end}
+
+  defp upload_part_body(conn, bucket, key, upload_id, part_number, upload, charge, customer_key) do
     checksum = Checksum.from_conn!(conn)
 
     {body_stream, get_trailers, discard_trailers} =
       BodyReader.stream_with_trailers(conn, conn.assigns.payload_mode)
 
-    checksum = Checksum.with_trailer_getter(checksum, get_trailers)
+    checksum =
+      checksum
+      |> Checksum.with_trailer_getter(get_trailers)
+      |> Checksum.with_multipart_algorithm!(upload.checksum_algorithm)
 
     {chunks, get_checksum, discard_checksum} =
       body_stream |> Checksum.wrap_stream(checksum)
+
+    {chunks, visible_size} = maybe_encrypt_upload_part_stream(chunks, upload, customer_key)
 
     opts =
       upload
@@ -162,9 +309,20 @@ defmodule Maxio.S3.Handlers.Multipart do
       end
 
     case put_result do
-      {:ok, %{size: size, etag: etag} = part_result} ->
-        {:ok, _} = Multipart.put_part(upload, part_number, %{etag: etag, size: size})
+      {:ok, %{size: stored_size, etag: etag} = part_result} ->
         checksum = Map.get(part_result, :checksum, checksum)
+
+        size =
+          if upload.sse_algorithm in ["SSE-C", "aws:kms", "aws:kms:dsse"],
+            do: visible_size.(),
+            else: stored_size
+
+        {:ok, _} =
+          Multipart.put_part(upload, part_number, %{
+            etag: etag,
+            size: size,
+            checksum: Checksum.part_metadata(checksum)
+          })
 
         Log.info("upload part",
           action: :upload_part,
@@ -174,7 +332,10 @@ defmodule Maxio.S3.Handlers.Multipart do
         )
 
         conn
+        |> assign(:s3_metrics_bytes_uploaded, size)
+        |> assign(:s3_metrics_tags, upload.tags || %{})
         |> Checksum.put_response_headers(checksum)
+        |> RequestPayer.put_charged_header(charge)
         |> put_resp_header("etag", XML.quote_etag(etag))
         |> send_resp(200, "")
 
@@ -196,15 +357,37 @@ defmodule Maxio.S3.Handlers.Multipart do
     end
   end
 
-  defp upload_part_copy(conn, bucket, key, upload_id, part_number, upload, copy_source_header) do
+  defp upload_part_copy(
+         conn,
+         bucket,
+         key,
+         upload_id,
+         part_number,
+         upload,
+         copy_source_header,
+         dest_charge
+       ) do
     :ok = Checksum.reject_upload_part_headers!(conn)
+    customer_key = upload_part_customer_key!(conn, upload, bucket, key)
 
     source = CopySource.parse!(copy_source_header)
     :ok = validate_object_key!(source.bucket, source.key)
     :ok = CopySource.validate_version_id!(source)
-    SSE.reject_copy_source_customer_headers!(conn.req_headers)
 
     src_obj = copy_source_or_raise(source)
+    source_customer_key = copy_part_source_customer_key!(conn, source, src_obj)
+
+    :ok =
+      ExpectedBucketOwner.verify!(conn, source.bucket,
+        header: "x-amz-source-expected-bucket-owner",
+        resource: "/#{source.bucket}/#{source.key}"
+      )
+
+    source_charge =
+      RequestPayer.require!(conn, source.bucket, resource: "/#{source.bucket}/#{source.key}")
+
+    charge = RequestPayer.merge(dest_charge, source_charge)
+
     reject_copy_source_marker!(source, src_obj)
 
     case CopySource.conditional_result(conn, src_obj) do
@@ -217,18 +400,48 @@ defmodule Maxio.S3.Handlers.Multipart do
 
     range = CopySource.parse_range!(header(conn, "x-amz-copy-source-range"), src_obj.size)
     reject_small_range_copy!(range, source, src_obj)
-    chunks = copy_part_source_stream!(source, src_obj, range)
+    chunks = copy_part_source_stream!(source, src_obj, range, source_customer_key)
+    checksum = Checksum.for_multipart_algorithm!(upload.checksum_algorithm)
+    {chunks, get_checksum, discard_checksum} = Checksum.wrap_stream(chunks, checksum)
+    {chunks, visible_size} = maybe_encrypt_upload_part_stream(chunks, upload, customer_key)
 
-    case Storage.put_part(
-           bucket,
-           key,
-           upload_id,
-           part_number,
-           chunks,
-           Placement.upload_storage_opts(upload)
-         ) do
-      {:ok, %{size: size, etag: etag}} ->
-        {:ok, part} = Multipart.put_part(upload, part_number, %{etag: etag, size: size})
+    opts =
+      upload
+      |> Placement.upload_storage_opts()
+      |> Keyword.put(:before_part_commit, fn _part ->
+        checksum = get_checksum.()
+        :ok = checksum.verify!.()
+        %{checksum: checksum}
+      end)
+
+    put_result =
+      try do
+        Storage.put_part(bucket, key, upload_id, part_number, chunks, opts)
+      rescue
+        err ->
+          discard_checksum.()
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          discard_checksum.()
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    case put_result do
+      {:ok, %{size: stored_size, etag: etag} = part_result} ->
+        checksum = Map.get(part_result, :checksum, checksum)
+
+        size =
+          if upload.sse_algorithm in ["SSE-C", "aws:kms", "aws:kms:dsse"],
+            do: visible_size.(),
+            else: stored_size
+
+        {:ok, part} =
+          Multipart.put_part(upload, part_number, %{
+            etag: etag,
+            size: size,
+            checksum: Checksum.part_metadata(checksum)
+          })
 
         Log.info("upload part copy",
           action: :upload_part_copy,
@@ -242,22 +455,30 @@ defmodule Maxio.S3.Handlers.Multipart do
         body =
           CopyPartResult.render(%{
             etag: etag,
-            last_modified: part.updated_at
+            last_modified: part.updated_at,
+            checksum: part.checksum || %{}
           })
 
         conn
         |> put_resp_content_type("application/xml")
+        |> assign(:s3_metrics_operation, :upload_part_copy)
+        |> assign(:s3_metrics_bytes_uploaded, size)
+        |> assign(:s3_metrics_tags, upload.tags || %{})
         |> maybe_put_copy_source_version_id(src_obj.version_id)
-        |> SSE.put_response_header(upload.sse_algorithm)
+        |> SSE.put_response_header(upload.sse_algorithm, upload.sse_envelope)
+        |> RequestPayer.put_charged_header(charge)
         |> send_resp(200, body)
 
       {:error, :invalid_key} ->
+        discard_checksum.()
         raise Error.new(:invalid_object_name, resource: "/#{bucket}/#{key}")
 
       {:error, reason} when reason in [:write_quorum, :rename_busy] ->
+        discard_checksum.()
         raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
 
       {:error, reason} ->
+        discard_checksum.()
         raise upload_part_error(reason, bucket, key)
     end
   end
@@ -268,9 +489,16 @@ defmodule Maxio.S3.Handlers.Multipart do
     key = conn.assigns.s3_key
     conn = fetch_query_params(conn)
     upload_id = Map.fetch!(conn.query_params, "uploadId")
+    _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: "/#{bucket}/#{key}")
+    charge = RequestPayer.require!(conn, bucket, resource: "/#{bucket}/#{key}")
 
     upload = upload_or_raise(bucket, key, upload_id)
-    {conn, xml} = read_small_body!(conn)
+    conn = assign(conn, :s3_metrics_tags, upload.tags || %{})
+    customer_key = complete_customer_key!(conn, upload, bucket, key)
+    {conn, xml, trailers} = read_complete_body!(conn)
+    :ok = verify_complete_content_md5!(conn.req_headers, xml, bucket, key)
+    complete_checksum_request = Checksum.complete_multipart_request!(conn, trailers)
 
     requested =
       case CompleteParser.parse(xml) do
@@ -278,47 +506,126 @@ defmodule Maxio.S3.Handlers.Multipart do
         {:error, :malformed_xml} -> raise Error.new(:malformed_xml, resource: "/#{bucket}/#{key}")
       end
 
-    # B1-1：提交 seam（assemble 字节 via Multipart.complete + Objects.put_version_with_id 元数据）
-    # 纳入同一对象锁，避免与并发同 key PUT/Complete 交错（获锁失败 -> 503 RequestTimeout，铁律 3）。
-    # 后端 assemble 不再自持锁（锁责任收敛到 handler 单点，避免 :global.trans 非重入死等）。
+    # Complete and metadata commit share the object lock so same-key writes cannot interleave.
+    # Conditional Complete lock conflicts map to 409; ordinary lock conflicts still map to 503.
+    # The backend assemble path does not acquire its own object lock.
     commit_result =
       Maxio.Lock.with_object_lock({bucket, key}, fn ->
+        recover_retained_notifications!(bucket, key)
+        :ok = ensure_complete_write_conditions!(conn.req_headers, bucket, key)
+
         bucket_record = ensure_bucket!(bucket)
         version_id = complete_version_id(bucket_record)
+        replication_tags = upload.tags || %{}
 
-        case Multipart.complete(upload, requested, version_id: version_id) do
-          {:ok,
-           %{etag: etag, size: size, sse_envelope: sse_envelope, version_id: version_id} =
-               complete_result} ->
-            # ROUTE B B5-1：元数据提交按写权威分流（与 object.ex commit_metadata 同模式）。
-            :ok =
-              commit_complete_metadata(
-                bucket,
-                key,
-                version_id,
-                %{
-                  size: size,
-                  etag: etag,
-                  content_type: upload.content_type,
-                  content_encoding: upload.content_encoding,
-                  content_disposition: upload.content_disposition,
-                  cache_control: upload.cache_control,
-                  expires: upload.expires,
-                  storage_class: upload.storage_class,
-                  acl_canned: upload.acl_canned,
-                  acl_grants: upload.acl_grants || ACL.empty_grants_doc(),
-                  sse_algorithm: upload.sse_algorithm,
-                  sse_envelope: sse_envelope,
-                  # ROUTE B B4-6 fidelity：会话捕获的 user_metadata 也写入 PG 索引行，
-                  # 消除已完成多段对象在 :pg(默认) 读路径下 metadata=%{} 的 D3-style 分裂——
-                  # 与 sidecar 透传（assemble_object_meta.user_metadata）保持两路一致。
-                  metadata: upload.metadata || %{}
-                }
-                |> Map.merge(Placement.attrs_from_result(complete_result))
+        replication_tasks =
+          replication_tasks_for(
+            "s3:ObjectCreated:CompleteMultipartUpload",
+            bucket,
+            key,
+            version_id,
+            replication_tags
+          )
+
+        replication_status = replication_status_for(replication_tasks)
+
+        complete_opts =
+          [
+            version_id: version_id,
+            complete_checksum_request: complete_checksum_request,
+            object_meta_extra: fn %{size: size, etag: etag, version_id: version_id} = info ->
+              complete_object_meta_extra(
+                {"s3:ObjectCreated:CompleteMultipartUpload",
+                 notification_attrs(conn, bucket, key, size, etag, version_id)},
+                Placement.storage_opts(info),
+                replication_status
               )
+            end
+          ]
+          |> maybe_put_sse_customer_key(customer_key)
 
-            _ = Multipart.abort(upload)
-            {:ok, {etag, size, upload.sse_algorithm, version_id}}
+        case Multipart.complete(upload, requested, complete_opts) do
+          {:ok,
+           %{
+             etag: etag,
+             size: size,
+             checksum: checksum,
+             object_parts: object_parts,
+             sse_envelope: sse_envelope,
+             version_id: version_id
+           } = complete_result} ->
+            notification =
+              {"s3:ObjectCreated:CompleteMultipartUpload",
+               notification_attrs(conn, bucket, key, size, etag, version_id)}
+
+            replication = replication_delivery(replication_tasks, size, etag)
+
+            # ROUTE B B5-1：元数据提交按写权威分流（与 object.ex commit_metadata 同模式）。
+            notification_delivery =
+              try do
+                commit_complete_metadata(
+                  bucket,
+                  key,
+                  version_id,
+                  %{
+                    size: size,
+                    etag: etag,
+                    content_type: upload.content_type,
+                    content_encoding: upload.content_encoding,
+                    content_disposition: upload.content_disposition,
+                    cache_control: upload.cache_control,
+                    expires: upload.expires,
+                    website_redirect_location: upload.website_redirect_location,
+                    storage_class: upload.storage_class,
+                    checksum:
+                      SSE.checksum_for_storage(checksum, upload.sse_algorithm, sse_envelope),
+                    object_parts:
+                      SSE.object_parts_for_storage(
+                        object_parts,
+                        upload.sse_algorithm,
+                        sse_envelope
+                      ),
+                    acl_canned: upload.acl_canned,
+                    acl_grants: upload.acl_grants || ACL.empty_grants_doc(),
+                    sse_algorithm: upload.sse_algorithm,
+                    sse_envelope: sse_envelope,
+                    # ROUTE B B4-6 fidelity：会话捕获的 user_metadata 也写入 PG 索引行，
+                    # 消除已完成多段对象在 :pg(默认) 读路径下 metadata=%{} 的 D3-style 分裂——
+                    # 与 sidecar 透传（assemble_object_meta.user_metadata）保持两路一致。
+                    metadata: upload.metadata || %{},
+                    tags: upload.tags || %{},
+                    replication_status: replication_status
+                  }
+                  |> Map.merge(Placement.attrs_from_result(complete_result)),
+                  notification,
+                  replication,
+                  Map.get(complete_result, :notification_outbox, []),
+                  Map.get(complete_result, :notification_retained_ledger, [])
+                )
+              rescue
+                err ->
+                  cleanup_complete_object_bytes_after_metadata_failure(
+                    bucket,
+                    key,
+                    version_id,
+                    upload_id,
+                    complete_result
+                  )
+
+                  reraise(err, __STACKTRACE__)
+              end
+
+            record_console_direct_completed_history(upload, %{
+              etag: etag,
+              version_id: version_id,
+              size: size
+            })
+
+            cleanup_terminal_upload(upload, :complete_multipart_upload)
+
+            {:ok,
+             {etag, size, checksum, upload.sse_algorithm, sse_envelope, version_id,
+              notification_delivery}}
 
           {:error, reason} ->
             {:error, reason}
@@ -326,7 +633,11 @@ defmodule Maxio.S3.Handlers.Multipart do
       end)
 
     case commit_result do
-      {:ok, {:ok, {etag, size, sse_algorithm, version_id}}} ->
+      {:ok,
+       {:ok,
+        {etag, size, checksum, sse_algorithm, sse_envelope, version_id, notification_delivery}}} ->
+        deliver_committed_notification(notification_delivery)
+
         Log.info("complete multipart upload",
           action: :complete_multipart_upload,
           bucket: bucket,
@@ -339,20 +650,111 @@ defmodule Maxio.S3.Handlers.Multipart do
             location: "/#{bucket}/#{key}",
             bucket: bucket,
             key: key,
-            etag: etag
+            etag: etag,
+            checksum: checksum
           })
 
         conn
         |> put_resp_content_type("application/xml")
-        |> SSE.put_response_header(sse_algorithm)
+        |> assign(:s3_metrics_bytes_uploaded, size)
+        |> assign(:s3_metrics_tags, upload.tags || %{})
+        |> SSE.put_response_header(sse_algorithm, sse_envelope)
         |> maybe_put_version_id(version_id)
+        |> RequestPayer.put_charged_header(charge)
         |> send_resp(200, body)
 
       {:ok, {:error, reason}} ->
         raise complete_error(reason, bucket, key)
 
       {:error, :locked} ->
-        raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
+        raise complete_lock_error(conn.req_headers, bucket, key)
+    end
+  end
+
+  defp complete_customer_key!(conn, %{sse_algorithm: "SSE-C"} = upload, bucket, key) do
+    {customer_key, _key_md5_b64} =
+      SSE.resolve_customer_read!(conn.req_headers, upload.sse_envelope,
+        resource: "/#{bucket}/#{key}"
+      )
+
+    customer_key
+  end
+
+  defp complete_customer_key!(conn, _upload, bucket, key) do
+    reject_unexpected_target_sse_c_headers!(conn, bucket, key)
+    nil
+  end
+
+  defp maybe_put_sse_customer_key(opts, nil), do: opts
+
+  defp maybe_put_sse_customer_key(opts, customer_key),
+    do: Keyword.put(opts, :sse_customer_key, customer_key)
+
+  defp record_console_direct_completed_history(upload, attrs) do
+    case DirectMultipartUpload.record_completed(upload, attrs) do
+      {:ok, _history} ->
+        :ok
+
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Log.warn("console direct multipart completed history write failed",
+          action: :console_direct_multipart_history,
+          bucket: upload.bucket_name,
+          key: upload.key,
+          upload_id: upload.upload_id,
+          terminal_state: :completed,
+          reason: inspect(reason)
+        )
+    end
+  end
+
+  defp console_direct_aborted_history_recorder(upload) do
+    registry = DirectMultipartUpload.registry_for_upload(upload)
+
+    fn ->
+      case registry do
+        {:ok, registry_upload} -> record_console_direct_aborted_history(registry_upload)
+        {:error, :not_found} -> :ok
+      end
+    end
+  end
+
+  defp record_console_direct_aborted_history(registry_upload) do
+    case DirectMultipartUpload.record_aborted(registry_upload) do
+      {:ok, _history} ->
+        :ok
+
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Log.warn("console direct multipart aborted history write failed",
+          action: :console_direct_multipart_history,
+          bucket: registry_upload.bucket_name,
+          key: registry_upload.key,
+          upload_id: registry_upload.upload_id,
+          terminal_state: :aborted,
+          reason: inspect(reason)
+        )
+    end
+  end
+
+  defp cleanup_terminal_upload(upload, terminal_action) do
+    case Multipart.cleanup_after_terminal(upload) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Log.warn("multipart terminal cleanup failed",
+          action: :multipart_terminal_cleanup,
+          terminal_action: terminal_action,
+          bucket: upload.bucket_name,
+          key: upload.key,
+          upload_id: upload.upload_id,
+          reason: inspect(reason)
+        )
     end
   end
 
@@ -362,11 +764,31 @@ defmodule Maxio.S3.Handlers.Multipart do
     key = conn.assigns.s3_key
     conn = fetch_query_params(conn)
     upload_id = Map.fetch!(conn.query_params, "uploadId")
+    _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: "/#{bucket}/#{key}")
+    charge = RequestPayer.require!(conn, bucket, resource: "/#{bucket}/#{key}")
 
     upload = upload_or_raise(bucket, key, upload_id)
-    :ok = Multipart.abort(upload)
-    Log.info("abort multipart upload", action: :abort_multipart_upload, bucket: bucket, key: key)
-    send_resp(conn, 204, "")
+    conn = assign(conn, :s3_metrics_tags, upload.tags || %{})
+    record_history_after_abort = console_direct_aborted_history_recorder(upload)
+
+    case Multipart.abort(upload) do
+      :ok ->
+        record_history_after_abort.()
+
+        Log.info("abort multipart upload",
+          action: :abort_multipart_upload,
+          bucket: bucket,
+          key: key
+        )
+
+      {:error, reason} ->
+        raise abort_error(reason, bucket, key)
+    end
+
+    conn
+    |> RequestPayer.put_charged_header(charge)
+    |> send_resp(204, "")
   end
 
   @spec list_parts(Plug.Conn.t()) :: Plug.Conn.t()
@@ -377,13 +799,23 @@ defmodule Maxio.S3.Handlers.Multipart do
     upload_id = Map.fetch!(conn.query_params, "uploadId")
     max_parts = parse_int(Map.get(conn.query_params, "max-parts"), 1000)
     marker = parse_int(Map.get(conn.query_params, "part-number-marker"), 0)
+    _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: "/#{bucket}/#{key}")
+    charge = RequestPayer.require!(conn, bucket, resource: "/#{bucket}/#{key}")
 
     upload = upload_or_raise(bucket, key, upload_id)
+    conn = assign(conn, :s3_metrics_tags, upload.tags || %{})
     res = Multipart.list_parts(upload, %{max_parts: max_parts, part_number_marker: marker})
 
     parts =
       Enum.map(res.parts, fn p ->
-        %{part_number: p.part_number, last_modified: p.updated_at, etag: p.etag, size: p.size}
+        %{
+          part_number: p.part_number,
+          last_modified: p.updated_at,
+          etag: p.etag,
+          size: p.size,
+          checksum: p.checksum || %{}
+        }
       end)
 
     body =
@@ -403,6 +835,7 @@ defmodule Maxio.S3.Handlers.Multipart do
 
     conn
     |> put_resp_content_type("application/xml")
+    |> RequestPayer.put_charged_header(charge)
     |> send_resp(200, body)
   end
 
@@ -412,18 +845,31 @@ defmodule Maxio.S3.Handlers.Multipart do
     conn = fetch_query_params(conn)
     qp = conn.query_params
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: "/" <> bucket)
+    charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
 
     prefix = Map.get(qp, "prefix", "")
     delimiter = Map.get(qp, "delimiter")
-    max_uploads = parse_int(Map.get(qp, "max-uploads"), 1000)
+
+    max_uploads =
+      parse_limited_query_int!(
+        qp,
+        "max-uploads",
+        @max_uploads_limit,
+        1,
+        @max_uploads_limit
+      )
+
     key_marker = Map.get(qp, "key-marker")
+    upload_id_marker = Map.get(qp, "upload-id-marker")
 
     res =
       Multipart.list_uploads(bucket, %{
         prefix: prefix,
         delimiter: delimiter,
         max_uploads: max_uploads,
-        key_marker: key_marker
+        key_marker: key_marker,
+        upload_id_marker: upload_id_marker
       })
 
     uploads =
@@ -442,7 +888,7 @@ defmodule Maxio.S3.Handlers.Multipart do
         prefix: prefix,
         delimiter: delimiter,
         key_marker: key_marker,
-        upload_id_marker: Map.get(qp, "upload-id-marker"),
+        upload_id_marker: upload_id_marker,
         next_key_marker: res.next_key_marker,
         next_upload_id_marker: res.next_upload_id_marker,
         max_uploads: max_uploads,
@@ -455,6 +901,7 @@ defmodule Maxio.S3.Handlers.Multipart do
 
     conn
     |> put_resp_content_type("application/xml")
+    |> RequestPayer.put_charged_header(charge)
     |> send_resp(200, body)
   end
 
@@ -467,10 +914,20 @@ defmodule Maxio.S3.Handlers.Multipart do
   #     （PG 即权威，绝不静默接受落库失败，铁律 3）——字节级不变。
   #
   #   :sidecar → 盘上 assemble 已写出权威 maxio/2 sidecar（达 write_quorum = 最终对象已耐久落盘）；
-  #     PG 仅派生索引，用 put_version_index best-effort：失败 → Log.error（绝不静默）+ 不失败请求
-  #     （索引滞后由 B5-2 scanner reconcile）。响应（etag/size）来自 Multipart.complete，
-  #     本就不依赖 PG 读回，无需内存视图。
-  defp commit_complete_metadata(bucket, key, version_id, attrs) do
+  #     PG 仅派生索引，用 put_version_index 对普通 PG index 失败 best-effort：失败 → Log.error
+  #     （绝不静默）+ 不失败请求（索引滞后由 B5-2 scanner reconcile）。S3 语义错误（如 bucket
+  #     hard quota）会重新抛出并由外层 fail-closed 清理字节。响应（etag/size）来自
+  #     Multipart.complete，本就不依赖 PG 读回，无需内存视图。
+  defp commit_complete_metadata(
+         bucket,
+         key,
+         version_id,
+         attrs,
+         notification,
+         replication,
+         sidecar_notification_outbox,
+         retained_notification_ledger
+       ) do
     case Maxio.ObjectMeta.authoritative_source(:write) do
       :sidecar ->
         case Objects.put_version_index(bucket, key, version_id, attrs) do
@@ -488,9 +945,176 @@ defmodule Maxio.S3.Handlers.Multipart do
             :ok
         end
 
+        notification_after_sidecar_commit(
+          notification,
+          sidecar_notification_outbox,
+          bucket,
+          key,
+          retained_notification_ledger,
+          Placement.storage_opts(attrs)
+        )
+
       _pg ->
-        {:ok, _obj} = Objects.put_version_with_id(bucket, key, version_id, attrs)
-        :ok
+        case Objects.put_version_with_id(
+               bucket,
+               key,
+               version_id,
+               attrs,
+               post_commit_transaction_opts(notification, replication)
+             ) do
+          {:ok, {_obj, enqueued}} -> {:enqueued, enqueued}
+          {:ok, _obj} -> :none
+        end
+    end
+  end
+
+  defp post_commit_transaction_opts(nil, nil), do: []
+
+  defp post_commit_transaction_opts(notification, replication) do
+    [
+      transaction_hook: fn repo, _object ->
+        %{
+          notifications: enqueue_notification(notification, repo),
+          replication: enqueue_replication(replication, repo)
+        }
+      end
+    ]
+  end
+
+  defp enqueue_notification(nil, _repo), do: []
+
+  defp enqueue_notification({event_name, attrs}, repo) do
+    NotificationDelivery.enqueue(event_name, attrs, repo: repo)
+  end
+
+  defp enqueue_replication(nil, _repo), do: []
+
+  defp enqueue_replication({:tasks, tasks}, repo) when is_list(tasks) do
+    ReplicationDelivery.enqueue_tasks(tasks, repo: repo)
+  end
+
+  defp enqueue_replication({event_name, attrs}, repo) do
+    ReplicationDelivery.enqueue(event_name, attrs, repo: repo)
+  end
+
+  defp notification_after_sidecar_commit(
+         notification,
+         ledger,
+         bucket,
+         key,
+         retained,
+         storage_opts
+       )
+
+  defp notification_after_sidecar_commit(nil, _ledger, _bucket, _key, _retained, _storage_opts),
+    do: :none
+
+  defp notification_after_sidecar_commit(_notification, [], _bucket, _key, [], _storage_opts),
+    do: :none
+
+  defp notification_after_sidecar_commit(
+         _notification,
+         ledger,
+         bucket,
+         key,
+         retained,
+         storage_opts
+       ),
+       do:
+         {:sidecar_ledger, ledger,
+          %{bucket: bucket, key: key, retained: retained, storage_opts: storage_opts}}
+
+  defp deliver_committed_notification(:none), do: :ok
+
+  defp deliver_committed_notification(%{notifications: notifications}) do
+    NotificationDelivery.deliver_enqueued(notifications)
+  end
+
+  defp deliver_committed_notification({:enqueued, %{notifications: notifications}}) do
+    NotificationDelivery.deliver_enqueued(notifications)
+  end
+
+  defp deliver_committed_notification({:enqueued, enqueued_notifications}) do
+    NotificationDelivery.deliver_enqueued(enqueued_notifications)
+  end
+
+  defp deliver_committed_notification({:emit, {event_name, attrs}}) do
+    NotificationDelivery.emit(event_name, attrs)
+  end
+
+  defp deliver_committed_notification({:sidecar_ledger, ledger, context}) do
+    ledger
+    |> NotificationDelivery.replay_sidecar_ledger()
+    |> NotificationDelivery.deliver_enqueued()
+
+    context
+    |> Map.get(:retained, [])
+    |> NotificationRetainedLedger.replay_committed(Map.get(context, :storage_opts, []))
+  rescue
+    err ->
+      Log.error("bucket notification sidecar ledger replay deferred",
+        action: :bucket_notification_delivery,
+        bucket: Map.get(context, :bucket),
+        key: Map.get(context, :key),
+        reason: inspect(err)
+      )
+
+      :ok
+  end
+
+  defp complete_object_meta_extra({event_name, attrs}, storage_opts, replication_status) do
+    replication_object_meta = replication_object_meta(replication_status)
+
+    case Maxio.ObjectMeta.authoritative_source(:write) do
+      :sidecar ->
+        notification_outbox = NotificationDelivery.sidecar_ledger(event_name, attrs)
+        bucket = Map.fetch!(attrs, :bucket)
+        key = Map.fetch!(attrs, :key)
+        version_id = Map.fetch!(attrs, :version_id)
+
+        notification_retained_ledger =
+          NotificationRetainedLedger.entries(notification_outbox,
+            bucket: bucket,
+            key: key,
+            operation: :complete_multipart_upload,
+            predicate:
+              NotificationRetainedLedger.version_present(version_id,
+                entry_type: "object",
+                etag: Map.fetch!(attrs, :etag),
+                size: Map.fetch!(attrs, :size)
+              ),
+            request_id: Map.get(attrs, :request_id),
+            storage_opts: storage_opts
+          )
+
+        NotificationRetainedLedger.persist!(
+          bucket,
+          key,
+          notification_retained_ledger,
+          storage_opts
+        )
+
+        %{
+          notification_outbox: notification_outbox,
+          notification_retained_ledger: notification_retained_ledger,
+          object_meta: Map.put(replication_object_meta, :notification_outbox, notification_outbox)
+        }
+
+      _pg ->
+        maybe_object_meta(replication_object_meta)
+    end
+  end
+
+  defp replication_object_meta(nil), do: %{}
+  defp replication_object_meta(status), do: %{replication_status: status}
+
+  defp maybe_object_meta(map) when map == %{}, do: %{}
+  defp maybe_object_meta(map), do: %{object_meta: map}
+
+  defp recover_retained_notifications!(bucket, key) do
+    case Maxio.ObjectMeta.authoritative_source(:write) do
+      :sidecar -> NotificationRetainedLedger.recover_key!(bucket, key)
+      _pg -> :ok
     end
   end
 
@@ -498,6 +1122,94 @@ defmodule Maxio.S3.Handlers.Multipart do
     do: Maxio.Versioning.VersionId.generate()
 
   defp complete_version_id(_bucket), do: "null"
+
+  defp cleanup_complete_object_bytes_after_metadata_failure(
+         bucket,
+         key,
+         version_id,
+         upload_id,
+         complete_result
+       ) do
+    case Storage.delete(bucket, key, version_id, Placement.storage_opts(complete_result)) do
+      :ok ->
+        Log.warn("complete multipart upload rolled back orphan bytes",
+          action: :complete_multipart_upload,
+          bucket: bucket,
+          key: key,
+          upload_id: upload_id,
+          reason: :metadata_commit_failed
+        )
+
+      {:error, reason} ->
+        Log.error("complete multipart orphan bytes cleanup failed after metadata rollback",
+          action: :complete_multipart_upload,
+          bucket: bucket,
+          key: key,
+          upload_id: upload_id,
+          version_id: version_id,
+          reason: inspect(reason)
+        )
+    end
+  end
+
+  defp ensure_complete_write_conditions!(headers, bucket, key) do
+    if complete_write_conditions?(headers) do
+      case Maxio.ObjectMeta.get(bucket, key, nil, []) do
+        %Objects.Object{is_delete_marker: true} ->
+          ensure_complete_absent_conditions!(headers, bucket, key)
+
+        %Objects.Object{} = object ->
+          meta = %{etag: object.etag, last_modified: object.updated_at}
+
+          case Conditional.evaluate(headers, meta, "PUT") do
+            :proceed ->
+              :ok
+
+            {:error, :precondition_failed} ->
+              raise Error.new(:precondition_failed, resource: "/#{bucket}/#{key}")
+
+            {:respond, 304} ->
+              raise Error.new(:precondition_failed, resource: "/#{bucket}/#{key}")
+          end
+
+        {:error, :not_found} ->
+          ensure_complete_absent_conditions!(headers, bucket, key)
+
+        {:error, :read_quorum} ->
+          Log.warn(
+            "complete multipart precondition target unavailable: sidecar read_quorum unmet",
+            action: :complete_multipart_upload,
+            bucket: bucket,
+            key: key,
+            reason: :read_quorum
+          )
+
+          raise Error.new(:slow_down_read, resource: "/#{bucket}/#{key}")
+      end
+    else
+      :ok
+    end
+  end
+
+  defp complete_write_conditions?(headers) do
+    header_value(headers, "if-match") != nil or header_value(headers, "if-none-match") != nil
+  end
+
+  defp ensure_complete_absent_conditions!(headers, bucket, key) do
+    if header_value(headers, "if-match") do
+      raise Error.new(:no_such_key, resource: "/#{bucket}/#{key}")
+    else
+      :ok
+    end
+  end
+
+  defp complete_lock_error(headers, bucket, key) do
+    if complete_write_conditions?(headers) do
+      Error.new(:conditional_request_conflict, resource: "/#{bucket}/#{key}")
+    else
+      Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
+    end
+  end
 
   defp maybe_put_version_id(conn, "null"), do: conn
 
@@ -531,6 +1243,55 @@ defmodule Maxio.S3.Handlers.Multipart do
   defp discard_upload_part_body_state(discard_checksum, discard_trailers) do
     discard_checksum.()
     discard_trailers.()
+  end
+
+  defp header_value(headers, name) do
+    Enum.find_value(headers, fn {header_name, value} ->
+      if String.downcase(header_name) == name, do: value
+    end)
+  end
+
+  defp multipart_sse_envelope({:customer, raw_key, key_md5_b64}) do
+    Maxio.Crypto.SSE.customer_key_envelope(raw_key, key_md5_b64)
+  end
+
+  defp multipart_sse_envelope({:kms, key_id, context_b64, bucket_key_enabled}) do
+    Maxio.Crypto.SSE.kms_envelope(key_id, context_b64, bucket_key_enabled: bucket_key_enabled)
+  end
+
+  defp multipart_sse_envelope({:kms_dsse, key_id, context_b64}) do
+    Maxio.Crypto.SSE.dsse_kms_envelope(key_id, context_b64)
+  end
+
+  defp multipart_sse_envelope(_target), do: nil
+
+  defp reject_unexpected_target_sse_c_headers!(conn, bucket, key) do
+    if SSE.target_customer_headers?(conn.req_headers) do
+      raise Error.new(:invalid_request,
+              message: "SSE-C headers are only valid for SSE-C multipart uploads",
+              resource: "/#{bucket}/#{key}"
+            )
+    end
+
+    :ok =
+      SSE.reject_target_kms_headers!(
+        conn.req_headers,
+        "SSE-KMS headers are only valid on CreateMultipartUpload"
+      )
+
+    :ok
+  end
+
+  defp counted_stream(stream) do
+    counter = :counters.new(1, [])
+
+    counted =
+      Stream.map(stream, fn chunk ->
+        :counters.add(counter, 1, IO.iodata_length(chunk))
+        chunk
+      end)
+
+    {counted, fn -> :counters.get(counter, 1) end}
   end
 
   defp upload_or_raise(bucket, key, upload_id) do
@@ -592,7 +1353,31 @@ defmodule Maxio.S3.Handlers.Multipart do
 
   defp reject_small_range_copy!(_range, _source, _src_obj), do: :ok
 
-  defp copy_part_source_stream!(source, src_obj, range) do
+  defp copy_part_source_customer_key!(
+         conn,
+         source,
+         %{sse_algorithm: "SSE-C", sse_envelope: envelope}
+       ) do
+    {customer_key, _key_md5_b64} =
+      SSE.resolve_copy_source_customer_read!(conn.req_headers, envelope,
+        resource: "/#{source.bucket}/#{source.key}"
+      )
+
+    customer_key
+  end
+
+  defp copy_part_source_customer_key!(conn, source, _src_obj) do
+    if SSE.copy_source_customer_headers?(conn.req_headers) do
+      raise Error.new(:invalid_request,
+              message: "SSE-C copy source headers are only valid for SSE-C source objects",
+              resource: "/#{source.bucket}/#{source.key}"
+            )
+    end
+
+    nil
+  end
+
+  defp copy_part_source_stream!(source, src_obj, range, source_customer_key) do
     case src_obj.sse_algorithm do
       nil ->
         {:ok, stream} =
@@ -618,6 +1403,51 @@ defmodule Maxio.S3.Handlers.Multipart do
 
         raw_stream
         |> Maxio.Crypto.SSE.unwrap_stream(src_obj.sse_envelope)
+        |> trim_stream(range)
+
+      "aws:kms" ->
+        {:ok, raw_stream} =
+          Storage.get(
+            source.bucket,
+            source.key,
+            src_obj.version_id,
+            nil,
+            Placement.storage_opts(src_obj)
+          )
+
+        raw_stream
+        |> Maxio.Crypto.SSE.unwrap_stream_with_kms_key(src_obj.sse_envelope)
+        |> trim_stream(range)
+
+      "aws:kms:dsse" ->
+        {:ok, raw_stream} =
+          Storage.get(
+            source.bucket,
+            source.key,
+            src_obj.version_id,
+            nil,
+            Placement.storage_opts(src_obj)
+          )
+
+        raw_stream
+        |> Maxio.Crypto.SSE.unwrap_stream_with_dsse_kms_key(src_obj.sse_envelope)
+        |> trim_stream(range)
+
+      "SSE-C" ->
+        {:ok, raw_stream} =
+          Storage.get(
+            source.bucket,
+            source.key,
+            src_obj.version_id,
+            nil,
+            Placement.storage_opts(src_obj)
+          )
+
+        raw_stream
+        |> Maxio.Crypto.SSE.unwrap_stream_with_customer_key(
+          src_obj.sse_envelope,
+          source_customer_key
+        )
         |> trim_stream(range)
 
       alg ->
@@ -665,17 +1495,26 @@ defmodule Maxio.S3.Handlers.Multipart do
   defp maybe_put_copy_source_version_id(conn, version_id),
     do: put_resp_header(conn, "x-amz-copy-source-version-id", version_id)
 
-  # CompleteMultipartUpload 的小 XML 整读（带上限，铁律 4）。
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @complete_xml_limit, read_length: @complete_xml_limit) do
-      {:ok, body, conn} ->
-        {conn, body}
+  defp read_complete_body!(conn) do
+    ControlBody.read!(conn, @complete_xml_limit, "Complete request body too large",
+      too_large_error: :entity_too_large
+    )
+  end
 
-      {:more, _partial, _conn} ->
-        raise Error.new(:entity_too_large, message: "Complete request body too large")
+  defp verify_complete_content_md5!(headers, body, bucket, key) do
+    case header_value(headers, "content-md5") do
+      nil ->
+        :ok
 
-      {:error, _} ->
-        raise Error.new(:malformed_xml)
+      value ->
+        with {:ok, expected} <- Base.decode64(value),
+             16 <- byte_size(expected),
+             computed <- :crypto.hash(:md5, body),
+             true <- Maxio.Auth.SigV4.Signer.secure_compare(computed, expected) do
+          :ok
+        else
+          _other -> raise Error.new(:bad_digest, resource: "/#{bucket}/#{key}")
+        end
     end
   end
 
@@ -692,6 +1531,18 @@ defmodule Maxio.S3.Handlers.Multipart do
 
   defp complete_error(:no_parts, b, k), do: Error.new(:malformed_xml, resource: "/#{b}/#{k}")
 
+  defp complete_error(:bad_digest, b, k), do: Error.new(:bad_digest, resource: "/#{b}/#{k}")
+
+  defp complete_error(:invalid_request, b, k),
+    do: Error.new(:invalid_request, resource: "/#{b}/#{k}")
+
+  defp complete_error(:checksum_not_implemented, b, k),
+    do:
+      Error.new(:not_implemented,
+        resource: "/#{b}/#{k}",
+        message: "CompleteMultipartUpload CRC64NVME full-object checksum is not implemented"
+      )
+
   # B5-3 R4 backstop：入口守卫部署前遗留在途会话的点段 key 在 assemble（FS object_path）被
   # 结构化拒绝 → 400 XMinioInvalidObjectName（与 object.ex PUT 提交分支同映射），绝不塌缩
   # 500 InternalError（铁律 3）。新会话已被 create_multipart_upload 入口守卫拦截。
@@ -704,6 +1555,17 @@ defmodule Maxio.S3.Handlers.Multipart do
     do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
 
   defp complete_error(reason, b, k) do
+    if placement_unavailable?(reason) do
+      Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+    else
+      Error.new(:internal_error, resource: "/#{b}/#{k}")
+    end
+  end
+
+  defp abort_error(reason, b, k) when reason in [:write_quorum, :rename_busy],
+    do: Error.new(:slow_down_write, resource: "/#{b}/#{k}")
+
+  defp abort_error(reason, b, k) do
     if placement_unavailable?(reason) do
       Error.new(:slow_down_write, resource: "/#{b}/#{k}")
     else
@@ -792,7 +1654,78 @@ defmodule Maxio.S3.Handlers.Multipart do
     end
   end
 
+  defp parse_limited_query_int!(params, name, default, min, max) do
+    case Map.get(params, name) do
+      nil ->
+        default
+
+      value ->
+        case Integer.parse(value) do
+          {n, ""} when n >= min and n <= max ->
+            n
+
+          _ ->
+            raise Error.new(:invalid_argument,
+                    message: "#{name} must be #{min}..#{max}"
+                  )
+        end
+    end
+  end
+
   defp header(conn, name), do: conn |> get_req_header(name) |> List.first()
+
+  defp parse_tagging_header!(conn) do
+    case header(conn, "x-amz-tagging") do
+      nil ->
+        %{}
+
+      "" ->
+        %{}
+
+      raw ->
+        case Maxio.Tags.parse_header(raw) do
+          {:ok, tags} ->
+            case Maxio.Tags.validate(tags, :object) do
+              :ok -> Maxio.Tags.list_to_map(tags)
+              {:error, :invalid_tag} -> raise Error.new(:invalid_tag)
+            end
+
+          {:error, :invalid_tag} ->
+            raise Error.new(:invalid_tag)
+        end
+    end
+  end
+
+  defp replication_tasks_for(event_name, bucket, key, version_id, tags) do
+    attrs = %{bucket: bucket, key: key, version_id: version_id, tags: tags || %{}}
+
+    case Maxio.ObjectMeta.authoritative_source(:write) do
+      :pg -> ReplicationDelivery.pending_tasks(event_name, attrs)
+      _sidecar -> []
+    end
+  end
+
+  defp replication_status_for([]), do: nil
+  defp replication_status_for(_tasks), do: "PENDING"
+
+  defp replication_delivery([], _size, _etag), do: nil
+
+  defp replication_delivery(tasks, size, etag) when is_list(tasks) do
+    {:tasks, Enum.map(tasks, &Map.merge(&1, %{source_size: size, source_etag: etag}))}
+  end
+
+  defp notification_attrs(conn, bucket, key, size, etag, version_id) do
+    %{
+      bucket: bucket,
+      key: key,
+      size: size,
+      etag: etag,
+      version_id: version_id,
+      request_id: header(conn, "x-request-id"),
+      principal: Map.get(conn.assigns, :principal),
+      source_ip: conn.remote_ip
+    }
+  end
 
   defp acl_from_headers!(conn) do
     grant_headers? = ACL.grant_headers?(conn.req_headers)

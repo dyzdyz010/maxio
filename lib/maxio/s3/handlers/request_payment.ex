@@ -5,7 +5,7 @@ defmodule Maxio.S3.Handlers.RequestPayment do
   import Plug.Conn
 
   alias Maxio.{Buckets, BucketConfigs}
-  alias Maxio.S3.{Checksum, Error, Log}
+  alias Maxio.S3.{ControlBody, Error, ExpectedBucketOwner, Log}
   alias Maxio.S3.RequestParsers.RequestPayment, as: Parser
   alias Maxio.S3.Views.RequestPayment, as: View
 
@@ -15,8 +15,8 @@ defmodule Maxio.S3.Handlers.RequestPayment do
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    {conn, xml} = read_small_body!(conn)
-    :ok = validate_checksums!(conn, xml)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
+    {conn, xml} = read_xml_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, config} ->
@@ -39,6 +39,7 @@ defmodule Maxio.S3.Handlers.RequestPayment do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     {:ok, config} = Maxio.S3.RequestPayment.get_config(bucket)
 
     conn
@@ -53,36 +54,9 @@ defmodule Maxio.S3.Handlers.RequestPayment do
     end
   end
 
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "RequestPaymentConfiguration exceeds 128KB")
-
-      {:error, _reason} ->
-        raise Error.new(:malformed_xml)
-    end
-  end
-
-  defp validate_checksums!(conn, body) do
-    case get_req_header(conn, "content-md5") do
-      [_value] ->
-        checksum = Checksum.from_conn!(conn)
-        {stream, get_context, _discard_context} = Checksum.wrap_stream([body], checksum)
-        _ = Enum.to_list(stream)
-        checksum = get_context.()
-        checksum.verify!.()
-
-      [] ->
-        raise Error.new(:missing_security_header,
-                message: "Missing required Content-MD5 header",
-                resource: "/" <> conn.assigns.s3_bucket
-              )
-
-      _multiple ->
-        raise Error.new(:bad_digest, resource: "/" <> conn.assigns.s3_bucket)
-    end
+  defp read_xml_body!(conn) do
+    ControlBody.read_and_verify!(conn, @limit, "RequestPaymentConfiguration exceeds 128KB",
+      require_integrity: :content_md5
+    )
   end
 end

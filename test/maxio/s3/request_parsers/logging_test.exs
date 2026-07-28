@@ -26,6 +26,20 @@ defmodule Maxio.S3.RequestParsers.LoggingTest do
     assert enabled["TargetObjectKeyFormat"] == %{"type" => "simple"}
   end
 
+  test "parses empty TargetPrefix as an explicitly configured empty prefix" do
+    xml = """
+    <BucketLoggingStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <LoggingEnabled>
+        <TargetBucket>log-target</TargetBucket>
+        <TargetPrefix></TargetPrefix>
+      </LoggingEnabled>
+    </BucketLoggingStatus>
+    """
+
+    assert {:ok, %{"LoggingEnabled" => enabled}} = Logging.parse(xml)
+    assert enabled["TargetPrefix"] == ""
+  end
+
   test "parses namespaced target grants and partitioned key format" do
     xml = """
     <s3:BucketLoggingStatus xmlns:s3="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -131,8 +145,8 @@ defmodule Maxio.S3.RequestParsers.LoggingTest do
              """)
   end
 
-  test "semantic validation rejects missing required TargetPrefix" do
-    assert {:ok, %{"LoggingEnabled" => enabled}} =
+  test "rejects missing required target fields" do
+    assert {:error, :malformed_xml} =
              Logging.parse("""
              <BucketLoggingStatus>
                <LoggingEnabled>
@@ -141,7 +155,14 @@ defmodule Maxio.S3.RequestParsers.LoggingTest do
              </BucketLoggingStatus>
              """)
 
-    assert enabled["TargetPrefix"] == nil
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled>
+                 <TargetPrefix>logs/</TargetPrefix>
+               </LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
   end
 
   test "parses partitioned key format without explicit date source" do
@@ -160,16 +181,17 @@ defmodule Maxio.S3.RequestParsers.LoggingTest do
 
     assert enabled["TargetObjectKeyFormat"] == %{
              "type" => "partitioned",
-             "partition_date_source" => nil
+             "partition_date_source" => "EventTime"
            }
   end
 
-  test "rejects duplicate target object key format variants" do
+  test "rejects invalid target object key format variants" do
     assert {:error, :malformed_xml} =
              Logging.parse("""
              <BucketLoggingStatus>
                <LoggingEnabled>
                  <TargetBucket>log-target</TargetBucket>
+                 <TargetPrefix>logs/</TargetPrefix>
                  <TargetObjectKeyFormat>
                    <SimplePrefix />
                    <PartitionedPrefix>
@@ -179,5 +201,109 @@ defmodule Maxio.S3.RequestParsers.LoggingTest do
                </LoggingEnabled>
              </BucketLoggingStatus>
              """)
+
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled>
+                 <TargetBucket>log-target</TargetBucket>
+                 <TargetPrefix>logs/</TargetPrefix>
+                 <TargetObjectKeyFormat>
+                   <PartitionedPrefix>
+                     <PartitionDateSource>deliverytime</PartitionDateSource>
+                   </PartitionedPrefix>
+                 </TargetObjectKeyFormat>
+               </LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+
+    assert {:error, :malformed_xml} =
+             Logging.parse("""
+             <BucketLoggingStatus>
+               <LoggingEnabled>
+                 <TargetBucket>log-target</TargetBucket>
+                 <TargetPrefix>logs/</TargetPrefix>
+                 <TargetObjectKeyFormat>
+                   <SimplePrefix>unexpected</SimplePrefix>
+                 </TargetObjectKeyFormat>
+               </LoggingEnabled>
+             </BucketLoggingStatus>
+             """)
+  end
+
+  test "rejects malformed grants and unsupported logging grant permissions" do
+    invalid_cases = [
+      """
+      <BucketLoggingStatus>
+        <LoggingEnabled>
+          <TargetBucket>log-target</TargetBucket>
+          <TargetPrefix>logs/</TargetPrefix>
+          <TargetGrants />
+        </LoggingEnabled>
+      </BucketLoggingStatus>
+      """,
+      """
+      <BucketLoggingStatus>
+        <LoggingEnabled>
+          <TargetBucket>log-target</TargetBucket>
+          <TargetPrefix>logs/</TargetPrefix>
+          <TargetGrants><Grant /></TargetGrants>
+        </LoggingEnabled>
+      </BucketLoggingStatus>
+      """,
+      """
+      <BucketLoggingStatus>
+        <LoggingEnabled>
+          <TargetBucket>log-target</TargetBucket>
+          <TargetPrefix>logs/</TargetPrefix>
+          <TargetGrants>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+                <URI>http://acs.amazonaws.com/groups/s3/LogDelivery</URI>
+              </Grantee>
+              <Permission>READ_ACP</Permission>
+            </Grant>
+          </TargetGrants>
+        </LoggingEnabled>
+      </BucketLoggingStatus>
+      """,
+      """
+      <BucketLoggingStatus>
+        <LoggingEnabled>
+          <TargetBucket>log-target</TargetBucket>
+          <TargetPrefix>logs/</TargetPrefix>
+          <TargetGrants>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="AmazonCustomerByEmail">
+                <EmailAddress>owner@example.com</EmailAddress>
+              </Grantee>
+              <Permission>READ</Permission>
+            </Grant>
+          </TargetGrants>
+        </LoggingEnabled>
+      </BucketLoggingStatus>
+      """,
+      """
+      <BucketLoggingStatus>
+        <LoggingEnabled>
+          <TargetBucket>log-target</TargetBucket>
+          <TargetPrefix>logs/</TargetPrefix>
+          <TargetGrants>
+            <Grant>
+              <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+                <ID>abc123</ID>
+                <URI>http://acs.amazonaws.com/groups/s3/LogDelivery</URI>
+              </Grantee>
+              <Permission>READ</Permission>
+            </Grant>
+          </TargetGrants>
+        </LoggingEnabled>
+      </BucketLoggingStatus>
+      """
+    ]
+
+    for xml <- invalid_cases do
+      assert {:error, :malformed_xml} = Logging.parse(xml)
+    end
   end
 end

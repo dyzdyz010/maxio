@@ -34,7 +34,11 @@ defmodule Maxio.S3.Views.ListVersions do
       end)
       |> maybe(data.delimiter, fn d -> element("Delimiter", [], characters(encode(d, enc))) end)
 
-    entries = Enum.map(data.versions, &version_or_marker(&1, enc))
+    entries =
+      Enum.map(
+        data.versions,
+        &version_or_marker(&1, enc, Map.get(data, :include_restore_status?, false))
+      )
 
     common =
       Enum.map(data.common_prefixes, fn cp ->
@@ -46,7 +50,7 @@ defmodule Maxio.S3.Views.ListVersions do
   end
 
   # version 行（含 is_delete_marker）→ <Version> 或 <DeleteMarker>。
-  defp version_or_marker(%{is_delete_marker: true} = o, enc) do
+  defp version_or_marker(%{is_delete_marker: true} = o, enc, _include_restore_status?) do
     element("DeleteMarker", [], [
       element("Key", [], characters(encode(o.key, enc))),
       element("VersionId", [], characters(o.version_id)),
@@ -56,17 +60,21 @@ defmodule Maxio.S3.Views.ListVersions do
     ])
   end
 
-  defp version_or_marker(o, enc) do
-    element("Version", [], [
-      element("Key", [], characters(encode(o.key, enc))),
-      element("VersionId", [], characters(o.version_id)),
-      element("IsLatest", [], characters(to_string(o.is_latest))),
-      element("LastModified", [], characters(XML.iso8601(o.updated_at))),
-      element("ETag", [], characters(XML.quote_etag(o.etag))),
-      element("Size", [], characters(Integer.to_string(o.size))),
-      element("StorageClass", [], characters(o.storage_class || "STANDARD")),
-      owner()
-    ])
+  defp version_or_marker(o, enc, include_restore_status?) do
+    children =
+      [
+        element("Key", [], characters(encode(o.key, enc))),
+        element("VersionId", [], characters(o.version_id)),
+        element("IsLatest", [], characters(to_string(o.is_latest))),
+        element("LastModified", [], characters(XML.iso8601(o.updated_at))),
+        element("ETag", [], characters(XML.quote_etag(o.etag))),
+        element("Size", [], characters(Integer.to_string(o.size))),
+        element("StorageClass", [], characters(o.storage_class || "STANDARD")),
+        owner()
+      ]
+      |> maybe_restore_status(o, include_restore_status?)
+
+    element("Version", [], children)
   end
 
   defp owner do
@@ -75,6 +83,33 @@ defmodule Maxio.S3.Views.ListVersions do
       element("DisplayName", [], characters(@owner_display))
     ])
   end
+
+  defp maybe_restore_status(children, _obj, false), do: children
+
+  defp maybe_restore_status(children, %{restore_status: "ongoing"}, true) do
+    children ++
+      [
+        element("RestoreStatus", [], [
+          element("IsRestoreInProgress", [], characters("true"))
+        ])
+      ]
+  end
+
+  defp maybe_restore_status(
+         children,
+         %{restore_status: "restored", restore_expiry: %DateTime{} = dt},
+         true
+       ) do
+    children ++
+      [
+        element("RestoreStatus", [], [
+          element("IsRestoreInProgress", [], characters("false")),
+          element("RestoreExpiryDate", [], characters(XML.iso8601(dt)))
+        ])
+      ]
+  end
+
+  defp maybe_restore_status(children, _obj, true), do: children
 
   # encoding-type=url → MinIO s3URLEncode（保留字面 '/' 与 '*'，空格→'+'，其余字节→%XX 大写）。
   # 用 Maxio.S3.URLEncode（与 SigV4 的 RFC3986 编码不同：S3 list 编码不转义 '/'，故 delimiter /

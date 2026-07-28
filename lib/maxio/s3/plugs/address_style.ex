@@ -25,10 +25,20 @@ defmodule Maxio.S3.Plugs.AddressStyle do
     host = conn.host
     domain = domain()
 
-    {bucket, key} =
-      case virtual_host_bucket(host, domain) do
-        nil -> RawPath.path_style(conn)
-        vbucket -> {vbucket, RawPath.vhost_key(conn)}
+    {bucket, key, endpoint_kind} =
+      case website_host_bucket(host) do
+        nil ->
+          case virtual_host_bucket(host, domain) do
+            nil ->
+              {bucket, key} = RawPath.path_style(conn)
+              {bucket, key, :rest}
+
+            vbucket ->
+              {vbucket, RawPath.vhost_key(conn), :rest}
+          end
+
+        vbucket ->
+          {vbucket, RawPath.vhost_key(conn), :website}
       end
 
     level = level_of(bucket, key)
@@ -37,6 +47,7 @@ defmodule Maxio.S3.Plugs.AddressStyle do
     |> assign(:s3_bucket, bucket)
     |> assign(:s3_key, key)
     |> assign(:s3_level, level)
+    |> assign(:s3_endpoint_kind, endpoint_kind)
   end
 
   # virtual-host：host == "<bucket>.<domain>" 时返回 bucket，否则 nil。
@@ -52,6 +63,15 @@ defmodule Maxio.S3.Plugs.AddressStyle do
     end
   end
 
+  defp website_host_bucket(nil), do: nil
+
+  defp website_host_bucket(host) do
+    case website_domain() do
+      nil -> nil
+      domain -> virtual_host_bucket(host, domain)
+    end
+  end
+
   defp level_of(nil, _key), do: :service
   defp level_of(_bucket, nil), do: :bucket
   defp level_of(_bucket, ""), do: :bucket
@@ -59,5 +79,15 @@ defmodule Maxio.S3.Plugs.AddressStyle do
 
   defp domain do
     Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:domain)
+  end
+
+  defp website_domain do
+    :maxio
+    |> Application.fetch_env!(:s3)
+    |> Keyword.get(:website_domain)
+    |> case do
+      value when is_binary(value) and value != "" -> value
+      _other -> nil
+    end
   end
 end

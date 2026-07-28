@@ -2,8 +2,8 @@ defmodule Maxio.S3.RequestPayment do
   @moduledoc """
   Bucket-level RequestPayment helpers.
 
-  This slice stores and renders the S3 control-plane RequestPaymentConfiguration.
-  Requester Pays data-plane enforcement is a separate feature.
+  This module stores and renders the S3 control-plane RequestPaymentConfiguration.
+  Data-plane enforcement lives in `Maxio.S3.RequestPayer`.
   """
 
   alias Maxio.BucketConfigs

@@ -14,10 +14,19 @@ defmodule Maxio.S3.Plugs.SigV4 do
   """
   import Plug.Conn
   alias Maxio.Auth
+  alias Maxio.Auth.CredentialStore
   alias Maxio.Auth.SigV4.AuthHeaderParser
+  alias Maxio.IAM
   alias Maxio.S3.{Error, ErrorView, Log, RawPath}
 
   @behaviour Plug
+
+  @console_direct_multipart_signed_only_headers MapSet.new([
+                                                  "cache-control",
+                                                  "content-disposition",
+                                                  "content-encoding",
+                                                  "expires"
+                                                ])
 
   @impl true
   def init(opts), do: opts
@@ -58,13 +67,21 @@ defmodule Maxio.S3.Plugs.SigV4 do
 
         case Auth.authenticate(material) do
           {:ok, principal, sig_context} ->
-            conn
-            |> assign(:principal, principal)
-            |> assign(:auth_type, signed_request.auth_type)
-            |> assign(:payload_mode, signed_request.payload_mode)
-            |> assign(:sigv4_signed_headers, signed_request.signed_headers)
-            |> assign(:sigv4_signed_request, signed_request)
-            |> assign(:sigv4_context, sig_context)
+            case validate_console_direct_multipart_scope(conn, signed_request) do
+              :ok ->
+                record_long_term_access_key_use(conn, principal, signed_request)
+
+                conn
+                |> assign(:principal, principal)
+                |> assign(:auth_type, signed_request.auth_type)
+                |> assign(:payload_mode, signed_request.payload_mode)
+                |> assign(:sigv4_signed_headers, signed_request.signed_headers)
+                |> assign(:sigv4_signed_request, signed_request)
+                |> assign(:sigv4_context, sig_context)
+
+              {:error, %Error{} = err} ->
+                reject(conn, err)
+            end
 
           {:error, %Error{} = err} ->
             reject(conn, err)
@@ -159,6 +176,91 @@ defmodule Maxio.S3.Plugs.SigV4 do
   defp present?(nil), do: false
   defp present?(""), do: false
   defp present?(_value), do: true
+
+  defp validate_console_direct_multipart_scope(conn, sr) do
+    case Map.get(conn.query_params || %{}, "x-maxio-console-direct-multipart") do
+      "1" ->
+        do_validate_console_direct_multipart_scope(conn, sr)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp do_validate_console_direct_multipart_scope(_conn, %{auth_type: auth_type})
+       when auth_type != :presigned do
+    {:error,
+     Error.new(:invalid_request,
+       message: "Console direct multipart scope requires presigned authentication"
+     )}
+  end
+
+  defp do_validate_console_direct_multipart_scope(conn, sr) do
+    signed = sr.signed_headers |> Enum.map(&String.downcase/1) |> MapSet.new()
+
+    unsigned_semantic_header =
+      conn.req_headers
+      |> Enum.map(fn {name, _value} -> String.downcase(name) end)
+      |> Enum.find(fn name ->
+        console_direct_multipart_signed_only_header?(name) and not MapSet.member?(signed, name)
+      end)
+
+    case unsigned_semantic_header do
+      nil ->
+        :ok
+
+      header ->
+        Log.warn("console direct multipart unsigned semantic header rejected",
+          reason: :unsigned_headers,
+          header: header
+        )
+
+        {:error,
+         Error.new(:unsigned_headers,
+           message:
+             "Console direct multipart requests may not include unsigned S3 semantic headers"
+         )}
+    end
+  end
+
+  defp console_direct_multipart_signed_only_header?(name) do
+    String.starts_with?(name, "x-amz-") or
+      MapSet.member?(@console_direct_multipart_signed_only_headers, name)
+  end
+
+  defp record_long_term_access_key_use(conn, principal, signed_request) do
+    if long_term_principal?(principal) and ecto_credential_store?() do
+      case IAM.record_access_key_last_used(
+             signed_request.access_key,
+             signed_request.service,
+             signed_request.region,
+             now(conn)
+           ) do
+        :ok ->
+          :ok
+
+        {:error, :not_found} ->
+          :ok
+
+        {:error, reason} ->
+          Log.warn("access key last-used update failed",
+            action: :access_key_last_used,
+            access_key_id: signed_request.access_key,
+            service: signed_request.service,
+            region: signed_request.region,
+            reason: inspect(reason)
+          )
+      end
+    end
+  end
+
+  defp long_term_principal?(%{credential_type: :session}), do: false
+  defp long_term_principal?(%{type: type}) when type in [:root, :iam_user], do: true
+  defp long_term_principal?(_principal), do: false
+
+  defp ecto_credential_store? do
+    CredentialStore.impl() == Maxio.Auth.CredentialStore.EctoStore
+  end
 
   # 已 URL 解码的真实路径（Canonical 内部再做 S3 单次编码）。
   # 必须取自**原始 request_path**（保留尾/连续/前导斜杠），绝不用 conn.path_info——

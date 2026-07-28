@@ -64,8 +64,13 @@ defmodule Maxio.MixProject do
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
+      {:req, "~> 0.5"},
       # S3 XML 出站构造 + 入站 SAX 解析（一依赖两用）
       {:saxy, "~> 1.6"},
+      # IAM Query API 虚拟 MFA 创建设备时返回可扫描的 QRCodePNG。
+      {:eqrcode, "~> 0.2.1"},
+      # STS AssumeRoleWithWebIdentity OIDC JWT/JWK signature verification.
+      {:jose, "~> 1.11"},
       # 纠删码 Rust NIF（reed-solomon-simd + blake3）；use Rustler 宏在 mix compile 期驱动 cargo
       {:rustler, "~> 0.36"},
       # M7 多节点：libcluster 节点发现（dev gossip / prod epmd env host list）

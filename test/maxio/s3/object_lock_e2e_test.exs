@@ -5,6 +5,7 @@ defmodule Maxio.S3.ObjectLockE2ETest do
 
   alias Maxio.Auth.CredentialStore
   alias Maxio.BucketConfigs
+  alias Maxio.IAM
   alias Maxio.Policy.Store
   alias Maxio.S3.Endpoint
   alias Maxio.Test.SigV4Request
@@ -73,6 +74,16 @@ defmodule Maxio.S3.ObjectLockE2ETest do
       path,
       Keyword.merge([access_key: @alice_ak, secret: @alice_secret], opts)
     )
+  end
+
+  defp unique_access_key(prefix) do
+    suffix =
+      [System.unique_integer([:positive]), System.monotonic_time()]
+      |> :erlang.phash2()
+      |> Integer.to_string(36)
+      |> String.upcase()
+
+    "AKIA" <> prefix <> suffix
   end
 
   defp create_bucket(bucket, headers \\ []) do
@@ -172,7 +183,10 @@ defmodule Maxio.S3.ObjectLockE2ETest do
   defp get_retention(bucket, key, opts) do
     query = Map.merge(%{"retention" => ""}, Keyword.get(opts, :query, %{}))
 
-    SigV4Request.signed_conn(:get, "/#{bucket}/#{key}", query: query)
+    SigV4Request.signed_conn(:get, "/#{bucket}/#{key}",
+      query: query,
+      headers: Keyword.get(opts, :headers, [])
+    )
     |> call()
   end
 
@@ -194,9 +208,87 @@ defmodule Maxio.S3.ObjectLockE2ETest do
   defp get_legal_hold(bucket, key, opts) do
     query = Map.merge(%{"legal-hold" => ""}, Keyword.get(opts, :query, %{}))
 
-    SigV4Request.signed_conn(:get, "/#{bucket}/#{key}", query: query)
+    SigV4Request.signed_conn(:get, "/#{bucket}/#{key}",
+      query: query,
+      headers: Keyword.get(opts, :headers, [])
+    )
     |> call()
   end
+
+  defp alice_put_retention(bucket, key, xml, opts) do
+    headers =
+      Keyword.get(opts, :headers, [])
+      |> maybe_add_content_md5(xml, Keyword.get(opts, :content_md5, true))
+
+    query = Map.merge(%{"retention" => ""}, Keyword.get(opts, :query, %{}))
+
+    alice(:put, "/#{bucket}/#{key}",
+      query: query,
+      body: xml,
+      headers: headers
+    )
+    |> call()
+  end
+
+  defp alice_get_retention(bucket, key, opts) do
+    query = Map.merge(%{"retention" => ""}, Keyword.get(opts, :query, %{}))
+
+    alice(:get, "/#{bucket}/#{key}",
+      query: query,
+      headers: Keyword.get(opts, :headers, [])
+    )
+    |> call()
+  end
+
+  defp alice_put_legal_hold(bucket, key, xml, opts) do
+    headers =
+      Keyword.get(opts, :headers, [])
+      |> maybe_add_content_md5(xml, Keyword.get(opts, :content_md5, true))
+
+    query = Map.merge(%{"legal-hold" => ""}, Keyword.get(opts, :query, %{}))
+
+    alice(:put, "/#{bucket}/#{key}",
+      query: query,
+      body: xml,
+      headers: headers
+    )
+    |> call()
+  end
+
+  defp alice_get_legal_hold(bucket, key, opts) do
+    query = Map.merge(%{"legal-hold" => ""}, Keyword.get(opts, :query, %{}))
+
+    alice(:get, "/#{bucket}/#{key}",
+      query: query,
+      headers: Keyword.get(opts, :headers, [])
+    )
+    |> call()
+  end
+
+  defp enable_requester_pays(bucket),
+    do: BucketConfigs.put(bucket, :request_payment, %{"Payer" => "Requester"})
+
+  defp allow_alice_object_lock(bucket, key, actions \\ object_lock_actions()) do
+    policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":#{Jason.encode!(actions)},"Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    Store.put_principal_policy(@alice_arn, "object-lock-#{bucket}-#{:erlang.phash2(key)}", policy)
+  end
+
+  defp object_lock_actions do
+    [
+      "s3:GetObjectVersion",
+      "s3:GetObjectRetention",
+      "s3:PutObjectRetention",
+      "s3:GetObjectLegalHold",
+      "s3:PutObjectLegalHold"
+    ]
+  end
+
+  defp assert_charged(conn),
+    do: assert(get_resp_header(conn, "x-amz-request-charged") == ["requester"])
+
+  defp refute_charged(conn), do: assert(get_resp_header(conn, "x-amz-request-charged") == [])
 
   defp retention_xml(mode, retain_until) do
     """
@@ -338,24 +430,27 @@ defmodule Maxio.S3.ObjectLockE2ETest do
     assert {:ok, %{"Rule" => %{"DefaultRetention" => %{"Years" => 1}}}} =
              BucketConfigs.get("lockbad", :object_lock)
 
-    bad_xml =
-      put_object_lock(
-        "lockbad",
-        "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days><Years>1</Years></DefaultRetention></Rule></ObjectLockConfiguration>"
-      )
+    for bad_xml <- [
+          "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days><Years>1</Years></DefaultRetention></Rule></ObjectLockConfiguration>",
+          "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>governance</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>",
+          "<ObjectLockConfiguration><ObjectLockEnabled><Value>Enabled</Value></ObjectLockEnabled></ObjectLockConfiguration>",
+          "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"
+        ] do
+      response = put_object_lock("lockbad", bad_xml)
 
-    assert bad_xml.status == 400
-    assert bad_xml.resp_body =~ "MalformedXML"
+      assert response.status == 400
+      assert response.resp_body =~ "MalformedXML"
 
-    assert {:ok, %{"Rule" => %{"DefaultRetention" => %{"Years" => 1}}}} =
-             BucketConfigs.get("lockbad", :object_lock)
+      assert {:ok, %{"Rule" => %{"DefaultRetention" => %{"Years" => 1}}}} =
+               BucketConfigs.get("lockbad", :object_lock)
+    end
   end
 
-  test "checksum trailers and aws-chunked XML bodies are rejected" do
+  test "checksum trailers and aws-chunked XML bodies are validated before storing config" do
     assert create_bucket("lockchunked", [{"x-amz-bucket-object-lock-enabled", "true"}]).status ==
              200
 
-    trailer =
+    plain_trailer =
       put_object_lock("lockchunked", @governance,
         headers: [
           {"x-amz-sdk-checksum-algorithm", "SHA256"},
@@ -363,21 +458,231 @@ defmodule Maxio.S3.ObjectLockE2ETest do
         ]
       )
 
-    assert trailer.status == 501
-    assert trailer.resp_body =~ "NotImplemented"
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "InvalidRequest"
 
-    conn =
-      SigV4Request.signed_chunked_conn(:put, "/lockchunked", @governance,
-        query: %{"object-lock" => ""},
-        headers: [{"content-md5", content_md5(@governance)}]
+    bare_non_checksum_trailer =
+      put_object_lock("lockchunked", @governance,
+        headers: [{"x-amz-trailer", "x-amz-meta-not-a-checksum"}],
+        content_md5: false
       )
 
-    rejected = call(conn)
-    assert rejected.status == 501
-    assert rejected.resp_body =~ "NotImplemented"
+    assert bare_non_checksum_trailer.status == 400
+    assert bare_non_checksum_trailer.resp_body =~ "MissingSecurityHeader"
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/lockchunked", @governance,
+        query: %{"object-lock" => ""},
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"content-md5", content_md5(@governance)}
+        ],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", content_sha256("different")}
+        ]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "BadDigest"
 
     assert {:ok, %{"ObjectLockEnabled" => "Enabled"}} =
              BucketConfigs.get("lockchunked", :object_lock)
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/lockchunked", @governance,
+        query: %{"object-lock" => ""},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", content_sha256(@governance)}
+        ]
+      )
+      |> call()
+
+    assert ok_trailer.status == 200
+
+    assert {:ok, %{"Rule" => %{"DefaultRetention" => %{"Days" => 7}}}} =
+             BucketConfigs.get("lockchunked", :object_lock)
+
+    signed_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/lockchunked", @governance,
+        query: %{"object-lock" => ""},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", content_sha256(@governance)}
+        ],
+        streaming_payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+      )
+      |> call()
+
+    assert signed_trailer.status == 200
+
+    assert {:ok, %{"Rule" => %{"DefaultRetention" => %{"Days" => 7}}}} =
+             BucketConfigs.get("lockchunked", :object_lock)
+
+    ok_chunked =
+      SigV4Request.signed_chunked_conn(:put, "/lockchunked", @compliance,
+        query: %{"object-lock" => ""},
+        headers: [{"content-md5", content_md5(@compliance)}]
+      )
+      |> call()
+
+    assert ok_chunked.status == 200
+
+    assert {:ok, %{"Rule" => %{"DefaultRetention" => %{"Years" => 1}}}} =
+             BucketConfigs.get("lockchunked", :object_lock)
+
+    oversized = String.duplicate("x", 131_073)
+
+    too_large =
+      SigV4Request.signed_chunked_conn(:put, "/lockchunked", oversized,
+        query: %{"object-lock" => ""},
+        chunk_size: byte_size(oversized),
+        decoded_length_override: 131_072,
+        headers: [{"content-md5", content_md5(oversized)}]
+      )
+      |> call()
+
+    assert too_large.status == 400
+    assert too_large.resp_body =~ "MalformedXML"
+    assert too_large.resp_body =~ "ObjectLockConfiguration exceeds 128KB"
+
+    assert {:ok, %{"Rule" => %{"DefaultRetention" => %{"Years" => 1}}}} =
+             BucketConfigs.get("lockchunked", :object_lock)
+  end
+
+  test "object retention and legal hold aws-chunked checksum trailers are validated" do
+    bucket = "lockobjectchunked"
+    key = "doc.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "locked")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    retention = retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z")
+
+    bad_retention =
+      SigV4Request.signed_chunked_conn(:put, "/#{bucket}/#{key}", retention,
+        query: %{"retention" => "", "versionId" => version_id},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", content_sha256("different")}
+        ]
+      )
+      |> call()
+
+    assert bad_retention.status == 400
+    assert bad_retention.resp_body =~ "BadDigest"
+
+    empty_retention = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert empty_retention.status == 200
+    refute empty_retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+
+    ok_retention =
+      SigV4Request.signed_chunked_conn(:put, "/#{bucket}/#{key}", retention,
+        query: %{"retention" => "", "versionId" => version_id},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", content_sha256(retention)}
+        ]
+      )
+      |> call()
+
+    assert ok_retention.status == 200
+
+    get_retention = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert get_retention.status == 200
+    assert get_retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+
+    legal_hold_on = legal_hold_xml("ON")
+
+    bad_legal_hold =
+      SigV4Request.signed_chunked_conn(:put, "/#{bucket}/#{key}", legal_hold_on,
+        query: %{"legal-hold" => "", "versionId" => version_id},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", content_sha256("different")}
+        ]
+      )
+      |> call()
+
+    assert bad_legal_hold.status == 400
+    assert bad_legal_hold.resp_body =~ "BadDigest"
+
+    default_legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+    assert default_legal_hold.status == 200
+    assert default_legal_hold.resp_body =~ "<Status>OFF</Status>"
+
+    ok_legal_hold =
+      SigV4Request.signed_chunked_conn(:put, "/#{bucket}/#{key}", legal_hold_on,
+        query: %{"legal-hold" => "", "versionId" => version_id},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", content_sha256(legal_hold_on)}
+        ]
+      )
+      |> call()
+
+    assert ok_legal_hold.status == 200
+
+    legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+    assert legal_hold.status == 200
+    assert legal_hold.resp_body =~ "<Status>ON</Status>"
+  end
+
+  test "malformed object retention and legal hold XML do not mutate object lock metadata" do
+    bucket = "lockobjectbadxml"
+    key = "doc.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "locked")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    assert put_legal_hold(bucket, key, legal_hold_xml("ON"), query: %{"versionId" => version_id}).status ==
+             200
+
+    for bad_retention <- [
+          "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate><Value>2036-01-01T00:00:00Z</Value></RetainUntilDate></Retention>",
+          "<Retention><Mode>governance</Mode><RetainUntilDate>2036-01-01T00:00:00Z</RetainUntilDate></Retention>",
+          "<Retention><Mode>COMPLIANCE</Mode><Mode>GOVERNANCE</Mode><RetainUntilDate>2036-01-01T00:00:00Z</RetainUntilDate></Retention>",
+          "<LegalHold><Status>OFF</Status></LegalHold>"
+        ] do
+      response =
+        put_retention(bucket, key, bad_retention, query: %{"versionId" => version_id})
+
+      assert response.status == 400
+      assert response.resp_body =~ "MalformedXML"
+
+      retention = get_retention(bucket, key, query: %{"versionId" => version_id})
+      assert retention.status == 200
+      assert retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+      assert retention.resp_body =~ "2035-01-01T00:00:00"
+    end
+
+    for bad_legal_hold <- [
+          "<LegalHold><Status><Value>OFF</Value></Status></LegalHold>",
+          "<LegalHold><Status>off</Status></LegalHold>",
+          "<LegalHold><Status>OFF</Status><Status>ON</Status></LegalHold>",
+          "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2036-01-01T00:00:00Z</RetainUntilDate></Retention>"
+        ] do
+      response =
+        put_legal_hold(bucket, key, bad_legal_hold, query: %{"versionId" => version_id})
+
+      assert response.status == 400
+      assert response.resp_body =~ "MalformedXML"
+
+      legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+      assert legal_hold.status == 200
+      assert legal_hold.resp_body =~ "<Status>ON</Status>"
+    end
   end
 
   test "object lock IAM actions match action map" do
@@ -420,6 +725,61 @@ defmodule Maxio.S3.ObjectLockE2ETest do
 
     denied_get = alice(:get, "/lockauthz", query: %{"object-lock" => ""}) |> call()
     assert denied_get.status == 403
+  end
+
+  test "versioned retention and legal hold reads require their metadata actions" do
+    bucket = "lockmetadataauthz"
+    key = "audit.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "audit")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("GOVERNANCE", "2090-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    assert put_legal_hold(bucket, key, legal_hold_xml("ON"), query: %{"versionId" => version_id}).status ==
+             200
+
+    resource = "arn:aws:s3:::#{bucket}/#{key}"
+
+    metadata_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:GetObjectRetention","s3:GetObjectLegalHold"],"Resource":"#{resource}"}})
+
+    assert :ok = Store.put_principal_policy(@alice_arn, "versioned-lock-read", metadata_policy)
+
+    allowed_retention =
+      alice_get_retention(bucket, key, query: %{"versionId" => version_id})
+
+    assert allowed_retention.status == 200
+    assert allowed_retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+
+    allowed_legal_hold =
+      alice_get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+
+    assert allowed_legal_hold.status == 200
+    assert allowed_legal_hold.resp_body =~ "<Status>ON</Status>"
+
+    version_only_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObjectVersion","Resource":"#{resource}"}})
+
+    assert :ok =
+             Store.put_principal_policy(@alice_arn, "versioned-lock-read", version_only_policy)
+
+    denied_retention =
+      alice_get_retention(bucket, key, query: %{"versionId" => version_id})
+
+    assert denied_retention.status == 403
+    assert denied_retention.resp_body =~ "<Code>AccessDenied</Code>"
+
+    denied_legal_hold =
+      alice_get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+
+    assert denied_legal_hold.status == 403
+    assert denied_legal_hold.resp_body =~ "<Code>AccessDenied</Code>"
   end
 
   test "create bucket with object lock header requires additional object lock permission" do
@@ -489,6 +849,364 @@ defmodule Maxio.S3.ObjectLockE2ETest do
 
     gone = get_object("locklegal", "doc.txt", query: %{"versionId" => version_id})
     assert gone.status == 404
+  end
+
+  test "object retention and legal hold enforce expected bucket owner before metadata changes" do
+    bucket = "lockobjectowner"
+    key = "doc.txt"
+    wrong_owner = [{"x-amz-expected-bucket-owner", "999999999999"}]
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "locked")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    retention = retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z")
+
+    wrong_put_retention =
+      put_retention(bucket, key, retention,
+        query: %{"versionId" => version_id},
+        headers: wrong_owner
+      )
+
+    assert wrong_put_retention.status == 403
+
+    empty_retention = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert empty_retention.status == 200
+    refute empty_retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+
+    assert put_retention(bucket, key, retention, query: %{"versionId" => version_id}).status ==
+             200
+
+    wrong_get_retention =
+      get_retention(bucket, key,
+        query: %{"versionId" => version_id},
+        headers: wrong_owner
+      )
+
+    assert wrong_get_retention.status == 403
+
+    wrong_put_legal_hold =
+      put_legal_hold(bucket, key, legal_hold_xml("ON"),
+        query: %{"versionId" => version_id},
+        headers: wrong_owner
+      )
+
+    assert wrong_put_legal_hold.status == 403
+
+    legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+    assert legal_hold.status == 200
+    assert legal_hold.resp_body =~ "<Status>OFF</Status>"
+
+    assert put_legal_hold(bucket, key, legal_hold_xml("ON"), query: %{"versionId" => version_id}).status ==
+             200
+
+    wrong_get_legal_hold =
+      get_legal_hold(bucket, key,
+        query: %{"versionId" => version_id},
+        headers: wrong_owner
+      )
+
+    assert wrong_get_legal_hold.status == 403
+  end
+
+  test "object retention and legal hold enforce Requester Pays for non-owner callers" do
+    bucket = "lockobjectpayer"
+    key = "doc.txt"
+    header_key = "header-doc.txt"
+    retention = retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z")
+    legal_hold = legal_hold_xml("ON")
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "locked")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    header_put_object = put_object(bucket, header_key, "locked-header")
+    assert header_put_object.status == 200
+    [header_version_id] = get_resp_header(header_put_object, "x-amz-version-id")
+
+    assert :ok = enable_requester_pays(bucket)
+    assert :ok = allow_alice_object_lock(bucket, key)
+    assert :ok = allow_alice_object_lock(bucket, header_key)
+
+    missing_put =
+      alice_put_retention(bucket, key, retention, query: %{"versionId" => version_id})
+
+    assert missing_put.status == 403
+    assert missing_put.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(missing_put)
+
+    invalid_put =
+      alice_put_retention(bucket, key, retention,
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-request-payer", "owner"}]
+      )
+
+    assert invalid_put.status == 403
+    assert invalid_put.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(invalid_put)
+
+    unsigned_put =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        body: retention,
+        headers: [{"content-md5", content_md5(retention)}]
+      )
+      |> put_req_header("x-amz-request-payer", "requester")
+      |> call()
+
+    assert unsigned_put.status == 403
+    assert unsigned_put.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(unsigned_put)
+
+    empty_retention = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert empty_retention.status == 200
+    refute empty_retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+    refute_charged(empty_retention)
+
+    query_put =
+      alice_put_retention(bucket, key, retention,
+        query: %{"versionId" => version_id, "x-amz-request-payer" => "requester"}
+      )
+
+    assert query_put.status == 200
+    assert_charged(query_put)
+
+    header_put =
+      alice_put_retention(bucket, header_key, retention,
+        query: %{"versionId" => header_version_id},
+        headers: [{"x-amz-request-payer", "requester"}]
+      )
+
+    assert header_put.status == 200
+    assert_charged(header_put)
+
+    missing_get = alice_get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert missing_get.status == 403
+    assert missing_get.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(missing_get)
+
+    invalid_get =
+      alice_get_retention(bucket, key,
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-request-payer", "owner"}]
+      )
+
+    assert invalid_get.status == 403
+    assert invalid_get.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(invalid_get)
+
+    header_get =
+      alice_get_retention(bucket, key,
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-request-payer", "requester"}]
+      )
+
+    assert header_get.status == 200
+    assert header_get.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+    assert_charged(header_get)
+
+    query_get =
+      alice_get_retention(bucket, key,
+        query: %{"versionId" => version_id, "x-amz-request-payer" => "requester"}
+      )
+
+    assert query_get.status == 200
+    assert query_get.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+    assert_charged(query_get)
+
+    unsigned_get =
+      alice(:get, "/#{bucket}/#{key}", query: %{"retention" => "", "versionId" => version_id})
+      |> put_req_header("x-amz-request-payer", "requester")
+      |> call()
+
+    assert unsigned_get.status == 403
+    assert unsigned_get.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(unsigned_get)
+
+    owner_get = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert owner_get.status == 200
+    assert owner_get.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+    refute_charged(owner_get)
+
+    missing_legal_hold =
+      alice_put_legal_hold(bucket, key, legal_hold, query: %{"versionId" => version_id})
+
+    assert missing_legal_hold.status == 403
+    assert missing_legal_hold.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(missing_legal_hold)
+
+    default_legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+    assert default_legal_hold.status == 200
+    assert default_legal_hold.resp_body =~ "<Status>OFF</Status>"
+    refute_charged(default_legal_hold)
+
+    invalid_legal_hold =
+      alice_put_legal_hold(bucket, key, legal_hold,
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-request-payer", "owner"}]
+      )
+
+    assert invalid_legal_hold.status == 403
+    assert invalid_legal_hold.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(invalid_legal_hold)
+
+    unsigned_legal_hold =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"legal-hold" => "", "versionId" => version_id},
+        body: legal_hold,
+        headers: [{"content-md5", content_md5(legal_hold)}]
+      )
+      |> put_req_header("x-amz-request-payer", "requester")
+      |> call()
+
+    assert unsigned_legal_hold.status == 403
+    assert unsigned_legal_hold.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(unsigned_legal_hold)
+
+    still_default_legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+    assert still_default_legal_hold.status == 200
+    assert still_default_legal_hold.resp_body =~ "<Status>OFF</Status>"
+    refute_charged(still_default_legal_hold)
+
+    query_legal_hold_put =
+      alice_put_legal_hold(bucket, key, legal_hold,
+        query: %{"versionId" => version_id, "x-amz-request-payer" => "requester"}
+      )
+
+    assert query_legal_hold_put.status == 200
+    assert_charged(query_legal_hold_put)
+
+    header_legal_hold =
+      alice_put_legal_hold(bucket, key, legal_hold,
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-request-payer", "requester"}]
+      )
+
+    assert header_legal_hold.status == 200
+    assert_charged(header_legal_hold)
+
+    missing_legal_hold_get =
+      alice_get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+
+    assert missing_legal_hold_get.status == 403
+    assert missing_legal_hold_get.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(missing_legal_hold_get)
+
+    invalid_legal_hold_get =
+      alice_get_legal_hold(bucket, key,
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-request-payer", "owner"}]
+      )
+
+    assert invalid_legal_hold_get.status == 403
+    assert invalid_legal_hold_get.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(invalid_legal_hold_get)
+
+    unsigned_legal_hold_get =
+      alice(:get, "/#{bucket}/#{key}", query: %{"legal-hold" => "", "versionId" => version_id})
+      |> put_req_header("x-amz-request-payer", "requester")
+      |> call()
+
+    assert unsigned_legal_hold_get.status == 403
+    assert unsigned_legal_hold_get.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(unsigned_legal_hold_get)
+
+    header_legal_hold_get =
+      alice_get_legal_hold(bucket, key,
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-request-payer", "requester"}]
+      )
+
+    assert header_legal_hold_get.status == 200
+    assert header_legal_hold_get.resp_body =~ "<Status>ON</Status>"
+    assert_charged(header_legal_hold_get)
+
+    query_legal_hold_get =
+      alice_get_legal_hold(bucket, key,
+        query: %{"versionId" => version_id, "x-amz-request-payer" => "requester"}
+      )
+
+    assert query_legal_hold_get.status == 200
+    assert query_legal_hold_get.resp_body =~ "<Status>ON</Status>"
+    assert_charged(query_legal_hold_get)
+
+    owner_legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => version_id})
+    assert owner_legal_hold.status == 200
+    assert owner_legal_hold.resp_body =~ "<Status>ON</Status>"
+    refute_charged(owner_legal_hold)
+  end
+
+  test "requester-paid object lock writes target only the requested version" do
+    bucket = "lockpayerversion"
+    key = "doc.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    v1_put = put_object(bucket, key, "v1")
+    assert v1_put.status == 200
+    [v1] = get_resp_header(v1_put, "x-amz-version-id")
+
+    v2_put = put_object(bucket, key, "v2")
+    assert v2_put.status == 200
+    [v2] = get_resp_header(v2_put, "x-amz-version-id")
+
+    assert :ok = enable_requester_pays(bucket)
+    assert :ok = allow_alice_object_lock(bucket, key)
+
+    retention =
+      alice_put_retention(bucket, key, retention_xml("GOVERNANCE", "2037-01-01T00:00:00Z"),
+        query: %{"versionId" => v1, "x-amz-request-payer" => "requester"}
+      )
+
+    assert retention.status == 200
+    assert_charged(retention)
+
+    legal_hold =
+      alice_put_legal_hold(bucket, key, legal_hold_xml("ON"),
+        query: %{"versionId" => v2, "x-amz-request-payer" => "requester"}
+      )
+
+    assert legal_hold.status == 200
+    assert_charged(legal_hold)
+
+    v1_retention = get_retention(bucket, key, query: %{"versionId" => v1})
+    assert v1_retention.status == 200
+    assert v1_retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+    assert v1_retention.resp_body =~ "2037-01-01T00:00:00"
+
+    v2_retention = get_retention(bucket, key, query: %{"versionId" => v2})
+    assert v2_retention.status == 200
+    refute v2_retention.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+
+    v1_legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => v1})
+    assert v1_legal_hold.status == 200
+    assert v1_legal_hold.resp_body =~ "<Status>OFF</Status>"
+
+    v2_legal_hold = get_legal_hold(bucket, key, query: %{"versionId" => v2})
+    assert v2_legal_hold.status == 200
+    assert v2_legal_hold.resp_body =~ "<Status>ON</Status>"
+
+    alice_v1 =
+      alice_get_retention(bucket, key,
+        query: %{"versionId" => v1, "x-amz-request-payer" => "requester"}
+      )
+
+    assert alice_v1.status == 200
+    assert alice_v1.resp_body =~ "<Mode>GOVERNANCE</Mode>"
+    assert_charged(alice_v1)
+
+    alice_v2 =
+      alice_get_legal_hold(bucket, key,
+        query: %{"versionId" => v2, "x-amz-request-payer" => "requester"}
+      )
+
+    assert alice_v2.status == 200
+    assert alice_v2.resp_body =~ "<Status>ON</Status>"
+    assert_charged(alice_v2)
   end
 
   test "governance retention blocks version delete unless bypass governance is authorized" do
@@ -566,6 +1284,73 @@ defmodule Maxio.S3.ObjectLockE2ETest do
     assert allowed.status == 204
   end
 
+  test "governance bypass object delete enforces permissions boundary explicit deny" do
+    bucket = "lockgovboundary"
+    key = "report.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    user_name = "lock-delete-boundary-#{System.unique_integer([:positive])}"
+    access_key = unique_access_key("LOCKDEL")
+    secret = "lock-delete-boundary-secret-123456"
+
+    assert {:ok, user} = IAM.create_user(name: user_name)
+
+    assert :ok =
+             CredentialStore.put_access_key(%{
+               access_key: access_key,
+               secret_key: secret,
+               principal: %{type: :iam_user, access_key: access_key, arn: user.user_arn}
+             })
+
+    identity_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    boundary_policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:DeleteObjectVersion","Resource":"arn:aws:s3:::#{bucket}/#{key}"},{"Effect":"Deny","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::#{bucket}/#{key}"}]})
+
+    assert :ok =
+             Store.put_principal_policy(
+               user.user_arn,
+               "allow-lock-delete-bypass",
+               identity_policy
+             )
+
+    assert {:ok, boundary} =
+             IAM.create_managed_policy(
+               name: "lock-delete-boundary-#{System.unique_integer([:positive])}",
+               path: "/authz/",
+               policy: boundary_policy
+             )
+
+    assert {:ok, _user} =
+             IAM.put_user_permissions_boundary_strict(user.user_name, boundary.policy_arn)
+
+    denied =
+      SigV4Request.signed_conn(:delete, "/#{bucket}/#{key}",
+        query: %{"versionId" => version_id},
+        access_key: access_key,
+        secret: secret,
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+      |> call()
+
+    assert denied.status == 403
+    assert denied.resp_body =~ "<Code>AccessDenied</Code>"
+
+    still_there = get_object(bucket, key, query: %{"versionId" => version_id})
+    assert still_there.status == 200
+    assert still_there.resp_body == "v1"
+  end
+
   test "governance retention update bypass requires explicit bypass permission" do
     bucket = "lockputgovauthz"
     key = "report.txt"
@@ -617,6 +1402,260 @@ defmodule Maxio.S3.ObjectLockE2ETest do
       |> call()
 
     assert allowed.status == 200
+  end
+
+  test "active governance retention can be extended but shortening requires bypass" do
+    bucket = "lockgovtransition"
+    key = "report.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("GOVERNANCE", "2090-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    extended =
+      put_retention(bucket, key, retention_xml("GOVERNANCE", "2091-01-01T00:00:00Z"),
+        query: %{"versionId" => version_id}
+      )
+
+    assert extended.status == 200
+
+    denied_shortening =
+      put_retention(bucket, key, retention_xml("GOVERNANCE", "2089-01-01T00:00:00Z"),
+        query: %{"versionId" => version_id}
+      )
+
+    assert denied_shortening.status == 403
+    assert denied_shortening.resp_body =~ "<Code>AccessDenied</Code>"
+
+    unchanged = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert unchanged.status == 200
+    assert unchanged.resp_body =~ "2091-01-01T00:00:00"
+
+    allowed_shortening =
+      put_retention(bucket, key, retention_xml("GOVERNANCE", "2089-01-01T00:00:00Z"),
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+
+    assert allowed_shortening.status == 200
+  end
+
+  test "active compliance retention can only be extended" do
+    bucket = "lockcomptransition"
+    key = "audit.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("COMPLIANCE", "2090-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    extended =
+      put_retention(bucket, key, retention_xml("COMPLIANCE", "2091-01-01T00:00:00Z"),
+        query: %{"versionId" => version_id}
+      )
+
+    assert extended.status == 200
+
+    denied_shortening =
+      put_retention(bucket, key, retention_xml("COMPLIANCE", "2089-01-01T00:00:00Z"),
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+
+    assert denied_shortening.status == 403
+    assert denied_shortening.resp_body =~ "<Code>AccessDenied</Code>"
+
+    denied_mode_change =
+      put_retention(bucket, key, retention_xml("GOVERNANCE", "2092-01-01T00:00:00Z"),
+        query: %{"versionId" => version_id},
+        headers: [{"x-amz-bypass-governance-retention", "true"}]
+      )
+
+    assert denied_mode_change.status == 403
+    assert denied_mode_change.resp_body =~ "<Code>AccessDenied</Code>"
+
+    unchanged = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert unchanged.status == 200
+    assert unchanged.resp_body =~ "<Mode>COMPLIANCE</Mode>"
+    assert unchanged.resp_body =~ "2091-01-01T00:00:00"
+  end
+
+  test "requester-paid governance retention update requires both payer and bypass permission" do
+    bucket = "lockpaygov"
+    key = "report.txt"
+    original_retention = retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z")
+    shorter_retention = retention_xml("GOVERNANCE", "2034-01-01T00:00:00Z")
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, original_retention, query: %{"versionId" => version_id}).status ==
+             200
+
+    assert :ok = enable_requester_pays(bucket)
+    assert :ok = allow_alice_object_lock(bucket, key, ["s3:PutObjectRetention"])
+
+    denied_no_bypass_permission =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        body: shorter_retention,
+        headers: [
+          {"content-md5", content_md5(shorter_retention)},
+          {"x-amz-bypass-governance-retention", "true"},
+          {"x-amz-request-payer", "requester"}
+        ]
+      )
+      |> call()
+
+    assert denied_no_bypass_permission.status == 403
+    assert denied_no_bypass_permission.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(denied_no_bypass_permission)
+
+    unchanged = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert unchanged.status == 200
+    assert unchanged.resp_body =~ "2035-01-01T00:00:00"
+
+    bypass_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    assert :ok = Store.put_principal_policy(@alice_arn, "bypass-lock-paygov", bypass_policy)
+
+    missing_payer =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        body: shorter_retention,
+        headers: [
+          {"content-md5", content_md5(shorter_retention)},
+          {"x-amz-bypass-governance-retention", "true"}
+        ]
+      )
+      |> call()
+
+    assert missing_payer.status == 403
+    assert missing_payer.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(missing_payer)
+
+    invalid_payer =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        body: shorter_retention,
+        headers: [
+          {"content-md5", content_md5(shorter_retention)},
+          {"x-amz-bypass-governance-retention", "true"},
+          {"x-amz-request-payer", "owner"}
+        ]
+      )
+      |> call()
+
+    assert invalid_payer.status == 403
+    assert invalid_payer.resp_body =~ "<Code>AccessDenied</Code>"
+    refute_charged(invalid_payer)
+
+    still_unchanged = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert still_unchanged.status == 200
+    assert still_unchanged.resp_body =~ "2035-01-01T00:00:00"
+
+    allowed =
+      alice(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        body: shorter_retention,
+        headers: [
+          {"content-md5", content_md5(shorter_retention)},
+          {"x-amz-bypass-governance-retention", "true"},
+          {"x-amz-request-payer", "requester"}
+        ]
+      )
+      |> call()
+
+    assert allowed.status == 200
+    assert_charged(allowed)
+
+    updated = get_retention(bucket, key, query: %{"versionId" => version_id})
+    assert updated.status == 200
+    assert updated.resp_body =~ "2034-01-01T00:00:00"
+  end
+
+  test "governance retention update bypass enforces permissions boundary explicit deny" do
+    bucket = "lockputgovboundary"
+    key = "report.txt"
+
+    assert create_bucket(bucket, [{"x-amz-bucket-object-lock-enabled", "true"}]).status == 200
+
+    put = put_object(bucket, key, "v1")
+    assert put.status == 200
+    [version_id] = get_resp_header(put, "x-amz-version-id")
+
+    assert put_retention(bucket, key, retention_xml("GOVERNANCE", "2035-01-01T00:00:00Z"),
+             query: %{"versionId" => version_id}
+           ).status == 200
+
+    user_name = "lock-retention-boundary-#{System.unique_integer([:positive])}"
+    access_key = unique_access_key("LOCKRET")
+    secret = "lock-retention-boundary-secret-123456"
+
+    assert {:ok, user} = IAM.create_user(name: user_name)
+
+    assert :ok =
+             CredentialStore.put_access_key(%{
+               access_key: access_key,
+               secret_key: secret,
+               principal: %{type: :iam_user, access_key: access_key, arn: user.user_arn}
+             })
+
+    identity_policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:PutObjectRetention","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::#{bucket}/#{key}"}})
+
+    boundary_policy =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::#{bucket}/#{key}"},{"Effect":"Deny","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::#{bucket}/#{key}"}]})
+
+    assert :ok =
+             Store.put_principal_policy(
+               user.user_arn,
+               "allow-lock-retention-bypass",
+               identity_policy
+             )
+
+    assert {:ok, boundary} =
+             IAM.create_managed_policy(
+               name: "lock-retention-boundary-#{System.unique_integer([:positive])}",
+               path: "/authz/",
+               policy: boundary_policy
+             )
+
+    assert {:ok, _user} =
+             IAM.put_user_permissions_boundary_strict(user.user_name, boundary.policy_arn)
+
+    body = retention_xml("GOVERNANCE", "2034-01-01T00:00:00Z")
+
+    denied =
+      SigV4Request.signed_conn(:put, "/#{bucket}/#{key}",
+        query: %{"retention" => "", "versionId" => version_id},
+        access_key: access_key,
+        secret: secret,
+        body: body,
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-bypass-governance-retention", "true"}
+        ]
+      )
+      |> call()
+
+    assert denied.status == 403
+    assert denied.resp_body =~ "<Code>AccessDenied</Code>"
   end
 
   test "compliance retention blocks version delete even with governance bypass header" do

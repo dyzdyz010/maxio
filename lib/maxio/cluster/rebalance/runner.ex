@@ -10,10 +10,12 @@ defmodule Maxio.Cluster.Rebalance.Runner do
   source shards or mutates topology.
   """
 
-  alias Maxio.{Buckets, ObjectMeta, Objects, Storage}
+  alias Maxio.{Buckets, ObjectMeta, Objects, Repo, Storage}
   alias Maxio.Cluster.{Lock, Placement, Topology}
   alias Maxio.Cluster.Rebalance.{Destination, Job, Jobs}
+  alias Maxio.ObjectMutation.Commit, as: ObjectMutationCommit
   alias Maxio.S3.Log
+  alias Maxio.Storage.ObjectCommit.Control
 
   @type report :: %{
           status: :ok | :dry_run | :partial | :failed | :canceled,
@@ -511,24 +513,187 @@ defmodule Maxio.Cluster.Rebalance.Runner do
     end
   end
 
+  # ObjectMutation Phase 2A（C5）：PG 写权威（默认）下 destination copy 全程 journal 化
+  # （operation="rebalance_copy"，placement 迁移语义而非新 logical value：不挂
+  # notification/replication outbox、不动 is_latest；外层 move_with_lock 已持
+  # {bucket, key} 对象锁，seam 在锁内直跑，D5）。storage_opts = dest 写钉扎——
+  # common_opts（topology/transport 覆盖）+ Placement.storage_opts(write_info)，保证
+  # claim/current_epoch/publish 三者解析同一 dest 端点集（B4 审查项 2）。metadata_tx 把
+  # update_placement_if_current（条件 UPDATE，无自带事务）外包 Repo.transaction 并与
+  # journal metadata_committed 同一事务（协议 §8 rebalance 行）。迁移前「metadata 失败
+  # 无回退（dest 字节孤儿）」被 seam restore 取代：fresh dest 的 manifest entries=[] →
+  # epoch=rolled_back、已发布字节留 dest 但 placement 仍指旧 placement、读不受影响
+  # （孤儿收敛归 Phase 2C GC）。:sidecar 写权威维持迁移前值语义（publish 后 placement
+  # 更新失败不回滚 dest 字节，D1）。copy_delete_marker 不迁（2B）；source cleanup
+  # 零接触（2C）。
   defp copy_object(bucket, cfg, object, destination_set_id) do
     source_opts = cfg[:common_opts] ++ Placement.storage_opts(object)
+    meta = object_meta(object)
 
     destination_opts =
       cfg
       |> destination_opts(destination_set_id)
-      |> Keyword.put(:object_meta, object_meta(object))
+      |> Keyword.put(:object_meta, meta)
+
+    around_object_commit = fn write_info, publish ->
+      # 尺寸校验前置到 publish 之前（迁移前在 Storage.put 返回后）：不一致即中止，
+      # 零破坏性 IO、零 journal。
+      with :ok <- verify_unencrypted_size(object, write_info) do
+        # around 接管 commit_opts 后 object_meta 不再经 default_commit_opts merge
+        # （C3 复审 High）：本 caller 无 before_object_commit，防御性 merge 后显式
+        # 传两条权威分支的 publish。
+        committed_object_meta = Map.merge(meta, Map.get(write_info, :object_meta, %{}))
+
+        case ObjectMeta.authoritative_source(:write) do
+          :sidecar ->
+            commit_rebalance_sidecar_authority(
+              object,
+              destination_set_id,
+              committed_object_meta,
+              write_info,
+              publish
+            )
+
+          _pg ->
+            commit_rebalance_pg_authority(
+              bucket,
+              cfg,
+              object,
+              destination_set_id,
+              committed_object_meta,
+              write_info,
+              publish
+            )
+        end
+      end
+    end
 
     with {:ok, stream} <- Storage.get(bucket, object.key, object.version_id, nil, source_opts),
          {:ok, write_result} <-
-           Storage.put(bucket, object.key, object.version_id, stream, destination_opts),
-         :ok <- verify_unencrypted_size(object, write_result),
-         {:ok, attrs} <- placement_attrs_from_write(write_result, destination_set_id, object),
-         {:ok, _updated} <- Objects.update_placement_if_current(object, attrs) do
-      {:ok, :moved}
+           Storage.put(
+             bucket,
+             object.key,
+             object.version_id,
+             stream,
+             Keyword.put(destination_opts, :around_object_commit, around_object_commit)
+           ),
+         {:ok, outcome} <- Map.fetch!(write_result, :around_object_commit_result) do
+      {:ok, outcome}
     else
-      {:error, :stale} -> {:ok, :skipped}
+      # placement 行已被并发者改写：与迁移前 {:error, :stale} → skipped 口径一致
+      # （pg 分支下 seam 已回滚，dest epoch=rolled_back、placement 行不变）。
+      {:error, {:placement_stale, :stale}} -> {:ok, :skipped}
       {:error, reason} -> {:error, {:copy_object_failed, object.key, object.version_id, reason}}
+    end
+  end
+
+  # PG 写权威：ObjectMutation seam（协议 §0.2 序列）。placement PG 更新与 journal
+  # metadata_committed 同一 Repo.transaction（CAS 失败 repo.rollback → 整体回滚，
+  # placement 行零半提交）；update_placement_if_current stale/not_found →
+  # {:placement_stale, reason} 交 seam 回滚（dest epoch=rolled_back，placement 不变）。
+  defp commit_rebalance_pg_authority(
+         bucket,
+         cfg,
+         object,
+         destination_set_id,
+         object_meta,
+         write_info,
+         publish
+       ) do
+    plan = %{
+      bucket: bucket,
+      key: object.key,
+      version_id: object.version_id,
+      operation: "rebalance_copy",
+      authority_mode: "pg",
+      storage_opts: cfg[:common_opts] ++ Placement.storage_opts(write_info),
+      write_info: write_info,
+      publish: fn extra_commit_opts ->
+        publish.(
+          Keyword.merge(
+            [version_id: object.version_id, object_meta: object_meta],
+            extra_commit_opts
+          )
+        )
+      end,
+      metadata_tx: fn journal, published_result ->
+        with {:ok, attrs} <-
+               placement_attrs_from_write(published_result, destination_set_id, object) do
+          Repo.transaction(fn ->
+            case Objects.update_placement_if_current(object, attrs) do
+              {:ok, updated} ->
+                _ = ObjectMutationCommit.commit_metadata_in_tx!(journal, Repo)
+                updated
+
+              {:error, reason} ->
+                Repo.rollback({:placement_stale, reason})
+            end
+          end)
+        end
+      end
+    }
+
+    case ObjectMutationCommit.run(plan) do
+      {:ok, %{published: published_result}} ->
+        {:ok, Map.put(published_result, :around_object_commit_result, {:ok, :moved})}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  # :sidecar 写权威（D1）：publish 即权威提交（dest 字节一经发布即保留，绝不回滚——
+  # 迁移前 Storage.put 返回后才更新 placement，失败仅留孤儿字节），placement 更新结果
+  # （moved/skipped/error）经 around_object_commit_result 原样透出，值语义与迁移前一致。
+  defp commit_rebalance_sidecar_authority(
+         object,
+         destination_set_id,
+         object_meta,
+         write_info,
+         publish
+       ) do
+    case publish.(version_id: object.version_id, object_meta: object_meta) do
+      {:ok, published_result} ->
+        outcome =
+          try do
+            with {:ok, attrs} <-
+                   placement_attrs_from_write(published_result, destination_set_id, object),
+                 {:ok, _updated} <- Objects.update_placement_if_current(object, attrs) do
+              {:ok, :moved}
+            else
+              {:error, :stale} -> {:ok, :skipped}
+              {:error, reason} -> {:error, reason}
+            end
+          rescue
+            err -> {:error, err}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+
+        accelerate_mark_committed(write_info, object)
+        {:ok, Map.put(published_result, :around_object_commit_result, outcome)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  # 与 do_put :sidecar 分支同构：metadata（placement 更新）完成后立即关闭进程内提交
+  # 窗口——此后 publisher DOWN 不再触发字节回滚（sidecar 权威下 publish 已是提交点）。
+  defp accelerate_mark_committed(write_info, object) do
+    case write_info
+         |> Map.fetch!(:object_commit_control)
+         |> Control.mark_committed() do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Log.error("object commit finalize failed after metadata commit",
+          action: :object_commit_finalize,
+          bucket: object.bucket_name,
+          key: object.key,
+          reason: "version_id=#{object.version_id} reason=#{inspect(reason)}"
+        )
     end
   end
 

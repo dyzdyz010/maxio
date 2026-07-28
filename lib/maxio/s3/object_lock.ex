@@ -9,7 +9,7 @@ defmodule Maxio.S3.ObjectLock do
 
   import Plug.Conn, only: [get_req_header: 2]
 
-  alias Maxio.BucketConfigs
+  alias Maxio.{BucketConfigs, Buckets}
   alias Maxio.S3.Error
 
   @valid_modes ~w(COMPLIANCE GOVERNANCE)
@@ -17,6 +17,12 @@ defmodule Maxio.S3.ObjectLock do
 
   @spec enabled_config() :: map()
   def enabled_config, do: %{"ObjectLockEnabled" => @enabled}
+
+  @spec enable_bucket!(String.t()) :: :ok
+  def enable_bucket!(bucket) when is_binary(bucket) do
+    :ok = Buckets.put_versioning(bucket, @enabled, nil)
+    put_config(bucket, enabled_config())
+  end
 
   @spec get_config(String.t()) :: {:ok, map()} | :none
   def get_config(bucket) when is_binary(bucket) do

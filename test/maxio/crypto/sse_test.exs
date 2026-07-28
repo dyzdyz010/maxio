@@ -1,12 +1,29 @@
 defmodule Maxio.Crypto.SSETest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
+  alias Maxio.KMS
   alias Maxio.Crypto.SSE
 
   setup do
     prev = Application.get_env(:maxio, :sse)
+    prev_kms = Application.get_env(:maxio, :kms)
     key = :crypto.strong_rand_bytes(32) |> Base.encode64()
     Application.put_env(:maxio, :sse, master_key: key)
-    on_exit(fn -> Application.put_env(:maxio, :sse, prev) end)
+
+    Application.put_env(:maxio, :kms,
+      provider: Maxio.KMS.LocalProvider,
+      default_key_id: "alias/test"
+    )
+
+    on_exit(fn ->
+      Application.put_env(:maxio, :sse, prev)
+
+      if prev_kms do
+        Application.put_env(:maxio, :kms, prev_kms)
+      else
+        Application.delete_env(:maxio, :kms)
+      end
+    end)
+
     :ok
   end
 
@@ -56,6 +73,136 @@ defmodule Maxio.Crypto.SSETest do
 
     assert_raise RuntimeError, fn ->
       SSE.unwrap_stream([tampered], envelope) |> Enum.to_list()
+    end
+  end
+
+  test "SSE-KMS wrap/unwrap uses provider-wrapped data keys" do
+    plain = :crypto.strong_rand_bytes(90_000)
+    context_b64 = Base.encode64(~s({"bucket":"kms","key":"object"}))
+
+    {cipher_stream, envelope} =
+      SSE.wrap_stream_with_kms_key([plain], "alias/test", context_b64, bucket_key_enabled: true)
+
+    cipher = Enum.to_list(cipher_stream) |> IO.iodata_to_binary()
+    refute cipher == plain
+    assert envelope.mode == "SSE-KMS"
+    assert envelope.kms_key_id == "alias/test"
+    assert envelope.kms_encryption_context_b64 == context_b64
+    assert envelope.bucket_key_enabled == true
+
+    out =
+      [cipher]
+      |> SSE.unwrap_stream_with_kms_key(envelope)
+      |> Enum.to_list()
+      |> IO.iodata_to_binary()
+
+    assert out == plain
+  end
+
+  test "KMS status declares local compatibility boundary without exposing key material" do
+    status = KMS.status()
+
+    assert status.provider == Maxio.KMS.LocalProvider
+    assert status.provider_name == "Maxio.KMS.LocalProvider"
+    assert status.mode == :local_compat
+    assert status.default_key_id == "alias/test"
+    assert status.local_provider? == true
+    assert status.external_provider? == false
+    assert status.production_hsm? == false
+    assert status.local_master_key_configured? == true
+    assert status.local_named_key_count == 0
+    assert status.boundary == "local compatibility provider; not external KMS/HSM"
+
+    master_key = Application.fetch_env!(:maxio, :sse) |> Keyword.fetch!(:master_key)
+    refute inspect(status) =~ master_key
+  end
+
+  test "SSE-KMS can encrypt with an existing envelope" do
+    plain = :crypto.strong_rand_bytes(32_000)
+    context_b64 = Base.encode64(~s({"upload":"mpu"}))
+    envelope = SSE.kms_envelope("alias/mpu", context_b64, bucket_key_enabled: true)
+
+    cipher =
+      [plain]
+      |> SSE.encrypt_stream_with_kms_envelope(envelope)
+      |> Enum.to_list()
+      |> IO.iodata_to_binary()
+
+    refute cipher == plain
+
+    out =
+      [cipher]
+      |> SSE.unwrap_stream_with_kms_key(envelope)
+      |> Enum.to_list()
+      |> IO.iodata_to_binary()
+
+    assert out == plain
+  end
+
+  test "DSSE-KMS wrap/unwrap uses two provider-wrapped data keys" do
+    plain = :crypto.strong_rand_bytes(140_000)
+    context_b64 = Base.encode64(~s({"bucket":"dsse","key":"object"}))
+
+    {cipher_stream, envelope} =
+      SSE.wrap_stream_with_dsse_kms_key([plain], "alias/test", context_b64)
+
+    cipher = Enum.to_list(cipher_stream) |> IO.iodata_to_binary()
+    refute cipher == plain
+    assert envelope.mode == "DSSE-KMS"
+    assert envelope.kms_key_id == "alias/test"
+    assert envelope.kms_encryption_context_b64 == context_b64
+    assert envelope.bucket_key_enabled == false
+    assert is_map(envelope.dsse_inner)
+    assert is_map(envelope.dsse_outer)
+    refute inspect(envelope) =~ "plaintext_key"
+
+    out =
+      [cipher]
+      |> SSE.unwrap_stream_with_dsse_kms_key(envelope)
+      |> Enum.to_list()
+      |> IO.iodata_to_binary()
+
+    assert out == plain
+  end
+
+  test "DSSE-KMS can encrypt with an existing envelope" do
+    plain = :crypto.strong_rand_bytes(90_000)
+    context_b64 = Base.encode64(~s({"upload":"dsse-mpu"}))
+    envelope = SSE.dsse_kms_envelope("alias/dsse-mpu", context_b64)
+
+    cipher =
+      [plain]
+      |> SSE.encrypt_stream_with_dsse_kms_envelope(envelope)
+      |> Enum.to_list()
+      |> IO.iodata_to_binary()
+
+    refute cipher == plain
+
+    out =
+      [cipher]
+      |> SSE.unwrap_stream_with_dsse_kms_key(envelope)
+      |> Enum.to_list()
+      |> IO.iodata_to_binary()
+
+    assert out == plain
+  end
+
+  test "DSSE-KMS encrypts small metadata with both data keys" do
+    envelope = SSE.dsse_kms_envelope("alias/dsse-metadata", nil)
+    metadata = %{"ChecksumCRC64NVME" => "local-checksum", "ChecksumType" => "FULL_OBJECT"}
+
+    encrypted = SSE.encrypt_metadata_with_dsse_kms_key(metadata, envelope, "checksum")
+
+    assert encrypted["mode"] == "DSSE-KMS-METADATA"
+    assert encrypted["label"] == "checksum"
+    refute inspect(encrypted) =~ "local-checksum"
+
+    assert SSE.decrypt_metadata_with_dsse_kms_key(encrypted, envelope, "checksum") == metadata
+
+    tampered = Map.put(encrypted, "label", "object_parts")
+
+    assert_raise RuntimeError, ~r/label mismatch/, fn ->
+      SSE.decrypt_metadata_with_dsse_kms_key(tampered, envelope, "checksum")
     end
   end
 end

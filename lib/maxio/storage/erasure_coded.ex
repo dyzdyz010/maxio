@@ -20,6 +20,17 @@ defmodule Maxio.Storage.ErasureCoded do
   alias Maxio.Cluster.ShardServer
   alias Maxio.Sidecar
 
+  alias Maxio.Storage.{
+    EpochStore,
+    MutationBackup,
+    MutationContext,
+    NotificationLedger,
+    ObjectCommit,
+    ObjectEpoch
+  }
+
+  alias Maxio.Storage.ObjectCommit.Control
+
   @meta_file "meta.json"
   @part_file "part.0"
 
@@ -76,6 +87,37 @@ defmodule Maxio.Storage.ErasureCoded do
   @impl true
   def delete_version(bucket, key, version_id \\ "null", opts \\ []),
     do: do_delete_version(bucket, key, version_id, opts)
+
+  @impl true
+  def put_notification_ledgers(bucket, key, entries, opts \\ []),
+    do: do_put_notification_ledgers(bucket, key, entries, opts)
+
+  @impl true
+  def list_notification_ledgers(bucket, key_filter, opts \\ []),
+    do: do_list_notification_ledgers(bucket, key_filter, opts)
+
+  @impl true
+  def delete_notification_ledgers(bucket, key, ids, opts \\ []),
+    do: do_delete_notification_ledgers(bucket, key, ids, opts)
+
+  # ── ObjectMutation epoch CAS 回调（协议 §3.3，Phase 1 B3）：quorum 编排——per-endpoint
+  # 原语（ShardServer.read_epoch/cas_epoch/restore_mutation/finalize_mutation）对 cfg.drives
+  # 逐盘直调 + 三分类计数；epoch 破坏性 quorum = cfg.epoch_quorum（D4 多数派钳制，config.ex）。
+  # drive_root 恒为 cfg.drives 元素原值透传（EpochStore 串行路由键按原始字符串 phash2，
+  # 绝不自行拼接变体）。──
+
+  @impl true
+  def claim_epoch(target, token, operation, opts \\ []),
+    do: do_claim_epoch(target, token, operation, opts)
+
+  @impl true
+  def current_epoch(target, opts \\ []), do: do_current_epoch(target, opts)
+
+  @impl true
+  def restore_if_current(ctx, opts \\ []), do: do_restore_if_current(ctx, opts)
+
+  @impl true
+  def finalize_if_current(ctx, opts \\ []), do: do_finalize_if_current(ctx, opts)
 
   # part 在盘 d 下的目录。
   defp part_dirs(bucket, upload_id, part_number, cfg) do
@@ -216,6 +258,12 @@ defmodule Maxio.Storage.ErasureCoded do
     end
   end
 
+  # Phase 2A C6：与 do_put 同构改经 ObjectCommit.run 编排——staging = begin_tmp_dirs! + 逐 part
+  # 解码重编码 + run_before_object_commit! + write_tmp_sidecars（object_meta 在此按
+  # opts_with_commit_extra 合并 before_object_commit extra 后落盘，around 与 default 两条路径
+  # 天然同一份 merge），publish = publish_staged_assemble（非协议走 commit_drives quorum 门；
+  # commit_opts[:object_mutation] 存在时复用 publish_mutation_staged_put 四阶段协议分支）。
+  # 不传协议 opt 的调用者行为逐字节不变。
   defp do_assemble(bucket, key, upload_id, part_numbers, opts) do
     cfg = Config.load!(opts)
     version_id = Keyword.get(opts, :version_id, "null")
@@ -255,6 +303,9 @@ defmodule Maxio.Storage.ErasureCoded do
         etag = acc.md5 |> :crypto.hash_final() |> Base.encode16(case: :lower)
         sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
         shard_len = acc.shard_len || 0
+        result = %{size: acc.size, etag: etag, sha256: sha256}
+        extra = run_before_object_commit!(opts, result)
+        prepared = Map.merge(result, extra)
 
         # 多段 assemble 的最终对象落 opts[:version_id] 指定布局（缺省 null）；同样产 maxio/2 sidecar
         # 使其 sidecar-可读/可列。ROUTE B B4-6 D1：透传 assemble 的 opts（携 opts[:object_meta]，由
@@ -264,7 +315,7 @@ defmodule Maxio.Storage.ErasureCoded do
           build_meta(
             cfg,
             version_id,
-            opts,
+            opts_with_commit_extra(opts, extra),
             acc.size,
             etag,
             sha256,
@@ -274,10 +325,124 @@ defmodule Maxio.Storage.ErasureCoded do
 
         write_tmp_sidecars(tmps, meta)
 
+        # assemble 的 version_id/object_meta 在 staging 期已由 opts 钉定（sidecar 已落盘），
+        # default commit_opts 无需承载（publish 只消费 :object_mutation 与 Control 键）。
+        ObjectCommit.run(
+          opts,
+          prepared,
+          [],
+          fn commit_opts ->
+            publish_staged_assemble(
+              tmps,
+              commit_pairs,
+              cfg,
+              opts,
+              version_id,
+              prepared,
+              commit_opts,
+              bucket,
+              key
+            )
+          end,
+          fn -> cleanup_tmps(tmps) end
+        )
+      rescue
+        err ->
+          cleanup_tmps(tmps)
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          cleanup_tmps(tmps)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+    end
+  end
+
+  # assemble 的 publish 阶段（C6）。staging 已把各盘分片 + sidecar 写进 temp obj-dir，此处只做
+  # final 提交编排：
+  #   * 非协议（无 :object_mutation）：Control 注册 no-op rollback/finalize 后走现状
+  #     commit_drives write_quorum 门（不足 → rollback_commit + {:error, :write_quorum}）。
+  #     现状 assemble 本就无 identity 比对回滚语义，注册仅满足 ObjectCommit 收口契约
+  #     （finalize 拒绝未注册）——行为逐字节不变；
+  #   * 协议（%MutationContext{}）：复用 publish_mutation_staged_put 四阶段结构（每盘 manifest
+  #     quorum 前置门 → 物化备份 → 逐盘 epoch CAS quorum 门（不足 → 不 rename、backup 保留）→
+  #     仅 published 盘 commit_drives），错误形状沿 B3 契约（{:error, {:epoch_publish_quorum, _}} 等）。
+  # commit_opts[:version_id] 仅作一致性校验：落点已在 staging 按 opts[:version_id] 钉定，
+  # 不一致意味着 around 调用者与 staging 脱节（绝不静默改写落点，fail-loud 拒绝）。
+  defp publish_staged_assemble(
+         tmps,
+         commit_pairs,
+         cfg,
+         opts,
+         version_id,
+         prepared,
+         commit_opts,
+         bucket,
+         key
+       ) do
+    control = Keyword.fetch!(commit_opts, :object_commit_control)
+    identity = Keyword.fetch!(commit_opts, :object_commit_identity)
+
+    with :ok <- validate_assemble_version(commit_opts, version_id) do
+      case Keyword.get(commit_opts, :object_mutation) do
+        nil ->
+          publish_controlled_assemble(
+            tmps,
+            commit_pairs,
+            cfg,
+            opts,
+            prepared,
+            control,
+            identity,
+            bucket,
+            key
+          )
+
+        %MutationContext{} = ctx ->
+          committed = Map.put(prepared, :version_id, version_id)
+
+          publish_mutation_staged_put(
+            tmps,
+            commit_pairs,
+            cfg,
+            opts,
+            committed,
+            control,
+            identity,
+            ctx,
+            bucket,
+            key
+          )
+
+        invalid ->
+          cleanup_tmps(tmps)
+          {:error, {:invalid_object_mutation, invalid}}
+      end
+    else
+      {:error, reason} ->
+        cleanup_tmps(tmps)
+        {:error, reason}
+    end
+  end
+
+  # 非协议 assemble publish 路径（现状逐字节不变，R6/C6）：commit_drives write_quorum 门。
+  defp publish_controlled_assemble(
+         tmps,
+         commit_pairs,
+         cfg,
+         opts,
+         prepared,
+         control,
+         identity,
+         bucket,
+         key
+       ) do
+    case Control.register(control, identity, fn -> :ok end, fn -> :ok end) do
+      :ok ->
         ok_drives = commit_drives(tmps, commit_pairs, opts)
 
         if ok_drives >= cfg.write_quorum do
-          {:ok, %{size: acc.size}}
+          {:ok, prepared}
         else
           Logger.error("erasure assemble below write quorum",
             bucket: bucket,
@@ -288,15 +453,23 @@ defmodule Maxio.Storage.ErasureCoded do
           rollback_commit(tmps, commit_pairs)
           {:error, :write_quorum}
         end
-      rescue
-        err ->
-          cleanup_tmps(tmps)
-          reraise(err, __STACKTRACE__)
-      catch
-        kind, reason ->
-          cleanup_tmps(tmps)
-          :erlang.raise(kind, reason, __STACKTRACE__)
-      end
+
+      {:error, reason} ->
+        cleanup_tmps(tmps)
+        {:error, reason}
+    end
+  end
+
+  defp validate_assemble_version(commit_opts, version_id) do
+    case Keyword.fetch(commit_opts, :version_id) do
+      :error ->
+        :ok
+
+      {:ok, ^version_id} ->
+        :ok
+
+      {:ok, other} ->
+        {:error, {:assemble_version_mismatch, %{staged: version_id, requested: other}}}
     end
   end
 
@@ -449,6 +622,217 @@ defmodule Maxio.Storage.ErasureCoded do
     end
   end
 
+  # PutObject replacement is stricter than multipart part replacement: a failed
+  # endpoint keeps its previous final value even when the other endpoints reach
+  # quorum. This prevents a successful quorum write from destroying the only
+  # readable old shard on a lagging drive.
+  defp commit_object_replace(
+         tmps,
+         commit_pairs,
+         write_quorum,
+         opts,
+         control,
+         identity
+       ) do
+    with {:ok, plans} <- plan_object_backups(commit_pairs),
+         :ok <-
+           Control.register(
+             control,
+             identity,
+             fn -> rollback_object_plans(plans, identity) end,
+             fn -> discard_object_plans(plans) end
+           ),
+         :ok <- materialize_object_plans(plans) do
+      results = commit_drives_results(tmps, commit_pairs, opts)
+      ok_drives = Enum.count(results, fn {_commit_pair, ok?} -> ok? end)
+
+      if ok_drives >= write_quorum do
+        rollback_failed_object_plans(results, plans, identity)
+        cleanup_tmps(tmps)
+        :ok
+      else
+        {:error, :write_quorum}
+      end
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp plan_object_backups(commit_pairs) do
+    Enum.reduce_while(commit_pairs, {:ok, []}, fn {drive, final}, {:ok, acc} ->
+      entries =
+        [@part_file, @meta_file]
+        |> Enum.map(fn name -> {Path.join(final, name), name} end)
+        |> Enum.filter(fn {source, _name} -> File.regular?(source) end)
+
+      case entries do
+        [] ->
+          plan = %{
+            drive: drive,
+            final: final,
+            backup_dir: nil,
+            entries: [],
+            old_identity: {:error, :enoent}
+          }
+
+          {:cont, {:ok, [plan | acc]}}
+
+        entries ->
+          with {:ok, old_identity} <- readable_object_identity(final),
+               {:ok, backup_dir} <- ShardServer.begin_tmp(drive) do
+            plan = %{
+              drive: drive,
+              final: final,
+              backup_dir: backup_dir,
+              entries:
+                Enum.map(entries, fn {source, name} ->
+                  {source, Path.join(backup_dir, name)}
+                end),
+              old_identity: old_identity
+            }
+
+            {:cont, {:ok, [plan | acc]}}
+          else
+            {:error, reason} ->
+              _ = discard_object_plans(acc)
+              {:halt, {:error, reason}}
+          end
+      end
+    end)
+    |> case do
+      {:ok, plans} -> {:ok, Enum.reverse(plans)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp readable_object_identity(final) do
+    case object_commit_identity(final) do
+      {:ok, identity} -> {:ok, {:ok, identity}}
+      {:error, :enoent} -> {:ok, {:error, :enoent}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp materialize_object_plans(plans) do
+    Enum.reduce_while(plans, :ok, fn plan, :ok ->
+      case materialize_object_plan(plan) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp materialize_object_plan(%{entries: entries}) do
+    Enum.reduce_while(entries, :ok, fn {source, backup}, :ok ->
+      case File.rename(source, backup) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp rollback_failed_object_plans(results, plans, identity) do
+    Enum.zip(results, plans)
+    |> Enum.each(fn
+      {{_commit_pair, true}, _plan} -> :ok
+      {{_commit_pair, false}, plan} -> _ = rollback_object_plan(plan, identity)
+    end)
+  end
+
+  defp rollback_object_plans(plans, identity) do
+    Enum.reduce_while(plans, :ok, fn plan, :ok ->
+      case rollback_object_plan(plan, identity) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp rollback_object_plan(plan, identity) do
+    moved = Enum.filter(plan.entries, fn {_source, backup} -> File.exists?(backup) end)
+
+    cond do
+      moved == [] and plan.backup_dir != nil ->
+        discard_object_plan(plan)
+
+      true ->
+        case object_commit_identity(plan.final) do
+          {:ok, ^identity} ->
+            remove_object_files(plan.final)
+            restore_object_entries(plan, moved)
+
+          current when current == plan.old_identity ->
+            restore_object_entries(plan, moved)
+
+          {:error, :enoent} ->
+            remove_object_files(plan.final)
+            restore_object_entries(plan, moved)
+
+          {:ok, _successor_identity} ->
+            discard_object_plan(plan)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  defp restore_object_entries(plan, moved) do
+    result =
+      Enum.reduce_while(moved, :ok, fn {source, backup}, :ok ->
+        _ = File.rm(source)
+        _ = File.mkdir_p(Path.dirname(source))
+
+        case File.rename(backup, source) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+
+    if result == :ok, do: discard_object_plan(plan), else: result
+  end
+
+  defp remove_object_files(final) do
+    Enum.each([@part_file, @meta_file], fn name -> _ = File.rm(Path.join(final, name)) end)
+    _ = File.rmdir(final)
+    :ok
+  end
+
+  defp object_commit_identity(final) do
+    case File.read(Path.join(final, @meta_file)) do
+      {:ok, bin} ->
+        try do
+          {:ok, bin |> Meta.decode!() |> Map.get("object_commit_identity")}
+        rescue
+          error -> {:error, {:invalid_sidecar, error}}
+        end
+
+      {:error, reason} when reason in [:enoent, :enotdir] ->
+        {:error, :enoent}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp discard_object_plans(plans) do
+    Enum.reduce_while(plans, :ok, fn plan, :ok ->
+      case discard_object_plan(plan) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp discard_object_plan(%{backup_dir: nil}), do: :ok
+
+  defp discard_object_plan(%{backup_dir: backup_dir}) do
+    case File.rm_rf(backup_dir) do
+      {:ok, _paths} -> :ok
+      {:error, reason, _path} -> {:error, reason}
+    end
+  end
+
   defp cleanup_failed_part_finals(results) do
     Enum.each(results, fn
       {_commit_pair, true} -> :ok
@@ -540,14 +924,22 @@ defmodule Maxio.Storage.ErasureCoded do
   defp normalize_part_commit_extra(nil), do: %{}
   defp normalize_part_commit_extra(extra) when is_map(extra), do: extra
 
+  defp opts_with_commit_extra(opts, extra) do
+    object_meta =
+      opts
+      |> Keyword.get(:object_meta, %{})
+      |> Map.merge(Map.get(extra, :object_meta, %{}) || %{})
+
+    Keyword.put(opts, :object_meta, object_meta)
+  end
+
   defp do_put(bucket, key, version_id, chunks, opts) do
     cfg = Config.load!(opts)
 
-    with {:ok, commit_pairs} <- commit_pairs(bucket, key, version_id, cfg) do
+    with {:ok, _validated_commit_pairs} <- commit_pairs(bucket, key, version_id, cfg) do
       # B1-2 原子提交：各盘先建同卷 temp obj-dir，逐块流式写 temp 的 part.0，流尾 sidecar 写 temp，
       # 最后各盘 commit（数据先于元数据原子 rename 到 final），成功盘数 >= write_quorum 才 {:ok}。
-      tmps =
-        commit_pairs |> Enum.map(fn {drive_root, _final} -> drive_root end) |> begin_tmp_dirs!()
+      tmps = begin_tmp_dirs!(cfg.drives)
 
       try do
         fds = Enum.map(tmps, fn tmp -> open_write!(Path.join(tmp, @part_file)) end)
@@ -575,38 +967,30 @@ defmodule Maxio.Storage.ErasureCoded do
         sha256 = acc.sha |> :crypto.hash_final() |> Base.encode16(case: :lower)
         shard_len = acc.shard_len || 0
 
-        meta =
-          build_meta(
-            cfg,
-            version_id,
-            opts,
-            acc.size,
-            etag,
-            sha256,
-            shard_len,
-            Enum.map(acc.block_hashes, &Enum.reverse/1)
-          )
-
         result = %{size: acc.size, etag: etag, sha256: sha256}
         extra = run_before_object_commit!(opts, result)
+        prepared = Map.merge(result, extra)
+        block_hashes = Enum.map(acc.block_hashes, &Enum.reverse/1)
 
-        # sidecar 写各盘 temp（与 part.0 同 temp obj-dir，一并原子提交）。
-        write_tmp_sidecars(tmps, meta)
-
-        ok_drives = commit_drives(tmps, commit_pairs, opts)
-
-        if ok_drives >= cfg.write_quorum do
-          {:ok, Map.merge(result, extra)}
-        else
-          Logger.error("erasure put below write quorum",
-            bucket: bucket,
-            key: key,
-            reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
-          )
-
-          rollback_commit(tmps, commit_pairs)
-          {:error, :write_quorum}
-        end
+        ObjectCommit.run(
+          opts,
+          prepared,
+          default_object_commit_opts(version_id, opts, extra),
+          fn commit_opts ->
+            publish_staged_put(
+              tmps,
+              bucket,
+              key,
+              cfg,
+              opts,
+              prepared,
+              shard_len,
+              block_hashes,
+              commit_opts
+            )
+          end,
+          fn -> cleanup_tmps(tmps) end
+        )
       rescue
         err ->
           cleanup_tmps(tmps)
@@ -616,6 +1000,660 @@ defmodule Maxio.Storage.ErasureCoded do
           cleanup_tmps(tmps)
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
+    end
+  end
+
+  defp default_object_commit_opts(version_id, opts, extra) do
+    object_meta =
+      opts
+      |> Keyword.get(:object_meta, %{})
+      |> Map.merge(Map.get(extra, :object_meta, %{}) || %{})
+
+    [version_id: version_id, object_meta: object_meta]
+  end
+
+  defp publish_staged_put(
+         tmps,
+         bucket,
+         key,
+         cfg,
+         opts,
+         prepared,
+         shard_len,
+         block_hashes,
+         commit_opts
+       ) do
+    version_id = Keyword.fetch!(commit_opts, :version_id)
+    object_meta = Keyword.fetch!(commit_opts, :object_meta)
+    control = Keyword.fetch!(commit_opts, :object_commit_control)
+    identity = Keyword.fetch!(commit_opts, :object_commit_identity)
+    publish_opts = Keyword.put(opts, :object_meta, object_meta)
+
+    case commit_pairs(bucket, key, version_id, cfg) do
+      {:ok, commit_pairs} ->
+        meta =
+          build_meta(
+            cfg,
+            version_id,
+            publish_opts,
+            prepared.size,
+            prepared.etag,
+            prepared.sha256,
+            shard_len,
+            block_hashes
+          )
+          |> Map.put("object_commit_identity", identity)
+
+        write_tmp_sidecars(tmps, meta)
+        committed = Map.put(prepared, :version_id, version_id)
+
+        # 协议化 PutObject（commit_opts[:object_mutation]，B5 orchestrator 注入）走
+        # ObjectMutation publish 分支；不传该 opt 的调用者保持现状路径逐字节不变（R6）。
+        case Keyword.get(commit_opts, :object_mutation) do
+          nil ->
+            publish_controlled_replace(
+              tmps,
+              commit_pairs,
+              cfg,
+              opts,
+              committed,
+              control,
+              identity,
+              bucket,
+              key
+            )
+
+          %MutationContext{} = ctx ->
+            publish_mutation_staged_put(
+              tmps,
+              commit_pairs,
+              cfg,
+              opts,
+              committed,
+              control,
+              identity,
+              ctx,
+              bucket,
+              key
+            )
+
+          invalid ->
+            cleanup_tmps(tmps)
+            {:error, {:invalid_object_mutation, invalid}}
+        end
+
+      {:error, reason} ->
+        cleanup_tmps(tmps)
+        {:error, reason}
+    end
+  end
+
+  # 非协议 publish 路径（现状逐字节不变，R6）：identity 比对式 commit_object_replace。
+  defp publish_controlled_replace(
+         tmps,
+         commit_pairs,
+         cfg,
+         opts,
+         committed,
+         control,
+         identity,
+         bucket,
+         key
+       ) do
+    case commit_object_replace(
+           tmps,
+           commit_pairs,
+           cfg.write_quorum,
+           opts,
+           control,
+           identity
+         ) do
+      :ok ->
+        {:ok, committed}
+
+      {:error, :write_quorum} = error ->
+        Logger.error("erasure put below write quorum",
+          bucket: bucket,
+          key: key,
+          reason: "write_quorum=#{cfg.write_quorum}"
+        )
+
+        error
+
+      # Phase 2A C1（B3 审查项 3）：commit_object_replace 的非 quorum 错误（备份计划、
+      # Control 注册、备份物化失败等）由 CaseClauseError 裸崩收口为结构化返回；
+      # `:write_quorum` 形状保持不变。
+      {:error, reason} ->
+        Logger.error("erasure put replace commit failed",
+          bucket: bucket,
+          key: key,
+          reason: inspect(reason)
+        )
+
+        {:error, {:commit_failed, reason}}
+    end
+  end
+
+  # ── ObjectMutation 协议化 publish（协议 §3.2/§3.3/§5，实现计划 B3）──
+  # 与 FS publish_mutation_obj_dir（B2）同形的协议分支，差异仅在逐盘 quorum 编排：
+  #   * 每盘旧值备份落 <drive>/.maxio-object-mutations/<mutation_id>/ + 每盘 manifest
+  #     （durable，recovery 凭 journal + 磁盘即可定位），不再用 .tmp/<uuid>；
+  #   * Control.register 之后、备份物化之前逐盘写 manifest + fsync（协议 §5「第一次
+  #     destructive IO 前同步注册 durable mutation context」的磁盘侧落点）；manifest 落盘
+  #     数不足 epoch_quorum → 在任何破坏性 IO 之前拒绝；
+  #   * 备份物化之后、destructive rename 之前逐盘 epoch CAS {:exact, token, ["claimed"]}
+  #     → "published"（携精确 fingerprint）quorum 门（D4：oks >= cfg.epoch_quorum）；不足
+  #     quorum → 不进入 rename、backup 保留（实现计划决策点 2：publish CAS 固定在 rename
+  #     之前，不得调换）；
+  #   * rollback/finalize 闭包指向 restore_if_current/finalize_if_current——所有权判定只认
+  #     epoch token；sidecar 仍写 object_commit_identity（旧调用者与取证兼容），协议分支
+  #     不走 identity 比对；
+  #   * 阶段中掉队的失败盘不做即时回位（非协议 rollback_failed_object_plans 的 identity
+  #     比对路径不适用协议分支）——其 backup + manifest 原地保留，收敛交给 epoch token
+  #     授权的 restore_mutation（journal/recovery，B5/B6）。
+  # register 之后的失败不清 tmp/backup：ObjectCommit rollback 经 restore_if_current 收敛
+  # （durable manifest 在，幂等），discard_fun 清 tmps。
+  defp publish_mutation_staged_put(
+         tmps,
+         commit_pairs,
+         cfg,
+         opts,
+         committed,
+         control,
+         identity,
+         ctx,
+         bucket,
+         key
+       ) do
+    with :ok <- validate_mutation_commit_pairs(commit_pairs, ctx),
+         {:ok, plans} <- plan_mutation_backups(commit_pairs, tmps, ctx),
+         {:ok, fingerprint} <- staged_mutation_fingerprint(tmps, committed),
+         {:ok, published_payload} <- published_epoch_payload(ctx, fingerprint) do
+      rollback = fn -> mutation_control_result(do_restore_if_current(ctx, opts)) end
+      finalize = fn -> mutation_control_result(do_finalize_if_current(ctx, opts)) end
+
+      case Control.register(control, identity, rollback, finalize) do
+        :ok ->
+          publish_mutation_plans(
+            plans,
+            cfg,
+            opts,
+            committed,
+            fingerprint,
+            published_payload,
+            ctx,
+            bucket,
+            key
+          )
+
+        {:error, reason} ->
+          cleanup_tmps(tmps)
+          {:error, reason}
+      end
+    else
+      {:error, reason} ->
+        cleanup_tmps(tmps)
+        {:error, reason}
+    end
+  end
+
+  defp publish_mutation_plans(
+         plans,
+         cfg,
+         opts,
+         committed,
+         fingerprint,
+         published_payload,
+         ctx,
+         bucket,
+         key
+       ) do
+    # 阶段 1：每盘 manifest 先行（B1 EpochStore 契约：published 的 restore 要求 manifest
+    # 必在）。落盘数不足 epoch_quorum → 尚无任何破坏性 IO，直接拒绝。
+    {with_manifest, manifest_failures} =
+      split_plans(plans, fn plan -> write_mutation_manifest(plan, ctx, opts) end)
+
+    if length(with_manifest) < cfg.epoch_quorum do
+      Logger.error("erasure mutation backup manifest below epoch quorum",
+        bucket: bucket,
+        key: key,
+        mutation_id: ctx.mutation_id,
+        reason:
+          "ok=#{length(with_manifest)} < epoch_quorum=#{cfg.epoch_quorum} " <>
+            "failures=#{inspect(plan_failures(manifest_failures))}"
+      )
+
+      {:error,
+       {:mutation_backup_quorum,
+        %{endpoints_ok: length(with_manifest), epoch_quorum: cfg.epoch_quorum}}}
+    else
+      # 阶段 2：物化备份（第一次 destructive IO；仅 manifest 已 durable 的盘）。失败盘
+      # 掉队（其 final 残留由 restore_mutation 按 manifest 收敛），绝不中断其他盘。
+      {materialized, materialize_failures} =
+        split_plans(with_manifest, &materialize_object_plan/1)
+
+      if materialize_failures != [] do
+        Logger.warning("erasure mutation backup materialize failed on drives",
+          bucket: bucket,
+          key: key,
+          mutation_id: ctx.mutation_id,
+          reason: inspect(plan_failures(materialize_failures))
+        )
+      end
+
+      # 阶段 3：destructive rename 之前的 epoch publish quorum 门（决策点 2）。
+      {published, cas_failures} =
+        split_plans(materialized, fn plan ->
+          mutation_publish_cas(plan, ctx, published_payload, opts)
+        end)
+
+      if length(published) < cfg.epoch_quorum do
+        Logger.error("erasure mutation epoch publish below epoch quorum",
+          bucket: bucket,
+          key: key,
+          mutation_id: ctx.mutation_id,
+          reason:
+            "ok=#{length(published)} < epoch_quorum=#{cfg.epoch_quorum} " <>
+              "failures=#{inspect(plan_failures(cas_failures))}"
+        )
+
+        {:error,
+         {:epoch_publish_quorum,
+          %{endpoints_ok: length(published), epoch_quorum: cfg.epoch_quorum}}}
+      else
+        if cas_failures != [] do
+          Logger.warning("erasure mutation epoch publish failed on minority drives",
+            bucket: bucket,
+            key: key,
+            mutation_id: ctx.mutation_id,
+            reason: inspect(plan_failures(cas_failures))
+          )
+        end
+
+        # 阶段 4：数据 rename（仅 epoch 已 published 的盘；数据 quorum 沿用 write_quorum，
+        # epoch_quorum >= write_quorum 保证门内盘数足够）。不足 → 不回滚 final/backup，
+        # 收敛交给 restore_if_current（journal/recovery）。
+        data_commit_opts = Keyword.take(opts, [:fsync, :meta_only, :rename_fun])
+
+        ok_drives =
+          Enum.count(published, fn plan ->
+            ShardServer.commit(plan.tmp, plan.final, data_commit_opts) == :ok
+          end)
+
+        if ok_drives >= cfg.write_quorum do
+          cleanup_tmps(Enum.map(plans, & &1.tmp))
+          {:ok, Map.put(committed, :epoch_fingerprint, fingerprint)}
+        else
+          Logger.error("erasure mutation put below write quorum",
+            bucket: bucket,
+            key: key,
+            mutation_id: ctx.mutation_id,
+            reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
+          )
+
+          {:error, :write_quorum}
+        end
+      end
+    end
+  end
+
+  # 逐盘执行一个阶段函数（:ok | {:error, reason}），失败盘掉队、绝不中断其他盘；
+  # quorum 门只看通过盘数（结构同 commit_drives_results 的盘迭代 + 计数）。
+  defp split_plans(plans, fun) do
+    {oks, failures} =
+      Enum.reduce(plans, {[], []}, fn plan, {oks, failures} ->
+        case fun.(plan) do
+          :ok -> {[plan | oks], failures}
+          {:error, reason} -> {oks, [{plan, reason} | failures]}
+        end
+      end)
+
+    {Enum.reverse(oks), Enum.reverse(failures)}
+  end
+
+  defp plan_failures(failures),
+    do: Enum.map(failures, fn {plan, reason} -> {plan.drive, reason} end)
+
+  # 防线：ctx.final_rel（restore 的回位落点，journal 派生）必须与本次 publish 的各盘 final
+  # 指向同一相对路径——不一致意味着上下文与请求落点脱节，restore 会把旧字节回错目录。
+  defp validate_mutation_commit_pairs(commit_pairs, %MutationContext{final_rel: final_rel}) do
+    if is_binary(final_rel) and
+         Enum.all?(commit_pairs, fn {drive, final} -> Path.join(drive, final_rel) == final end) do
+      :ok
+    else
+      {:error, {:mutation_final_rel_mismatch, final_rel}}
+    end
+  end
+
+  # 协议化备份计划（每盘一份）：backup 落 durable mutation 目录（非 .tmp）。names 按盘各自
+  # 探测（滞后盘可能缺 part.0/meta.json；fresh 盘 entries=[]——restore 只按 manifest 名单
+  # 回位，绝不推断删除，nil/:enoent 不当授权同源纪律）。
+  defp plan_mutation_backups(commit_pairs, tmps, %MutationContext{mutation_id: mutation_id}) do
+    plans =
+      commit_pairs
+      |> Enum.zip(tmps)
+      |> Enum.map(fn {{drive, final}, tmp} ->
+        backup_dir = Path.join(drive, MutationBackup.relative_dir(mutation_id))
+
+        names =
+          Enum.filter([@part_file, @meta_file], fn name ->
+            File.regular?(Path.join(final, name))
+          end)
+
+        %{
+          drive: drive,
+          final: final,
+          tmp: tmp,
+          backup_dir: backup_dir,
+          names: names,
+          entries:
+            Enum.map(names, fn name ->
+              {Path.join(final, name), Path.join(backup_dir, name)}
+            end)
+        }
+      end)
+
+    {:ok, plans}
+  end
+
+  # manifest 先行（每盘）：manifest + fsync 落盘于该盘任何 destructive IO 之前，crash 后
+  # recovery 仅凭 mutation_id 即可定位该盘备份名单。
+  defp write_mutation_manifest(plan, ctx, opts) do
+    entries = Enum.map(plan.names, &%{"name" => &1})
+
+    with {:ok, manifest} <-
+           MutationBackup.manifest(ctx.target, ctx.token, previous_epoch_token(ctx), entries),
+         {:ok, bytes} <- MutationBackup.encode(manifest),
+         :ok <- File.mkdir_p(plan.backup_dir),
+         manifest_path = Path.join(plan.backup_dir, MutationBackup.manifest_name()),
+         :ok <- File.write(manifest_path, bytes),
+         :ok <- maybe_sync_mutation_path(opts, manifest_path) do
+      maybe_sync_mutation_dir(opts, plan.backup_dir)
+    end
+  end
+
+  # fingerprint 的 sidecar_sha256 针对**实际落盘**的 tmp meta.json 字节（读回而非重编码，
+  # 杜绝编码漂移）；write_tmp_sidecars 对所有盘写同一份 bin，任一 tmp 读回即全体字节。
+  defp staged_mutation_fingerprint([tmp | _rest], committed) do
+    case File.read(Path.join(tmp, @meta_file)) do
+      {:ok, sidecar_bytes} ->
+        {:ok, ObjectEpoch.fingerprint(committed.etag, committed.size, sidecar_bytes)}
+
+      {:error, reason} ->
+        {:error, {:staged_sidecar_unreadable, reason}}
+    end
+  end
+
+  # 各盘同一份 published payload：{:exact, token, ["claimed"]} 门依赖 B1 收口确认项
+  # 「claim 恒写 phase=claimed」的不变量。
+  defp published_epoch_payload(ctx, fingerprint) do
+    with {:ok, published} <-
+           ObjectEpoch.new(ctx.target, ctx.token, %{
+             operation: ctx.operation,
+             phase: "published",
+             value_type: "object",
+             fingerprint: fingerprint,
+             previous_token: previous_epoch_token(ctx),
+             updated_at: DateTime.utc_now()
+           }) do
+      EpochStore.payload(published)
+    end
+  end
+
+  defp mutation_publish_cas(plan, ctx, published_payload, opts) do
+    case ShardServer.cas_epoch(
+           plan.drive,
+           %{next: published_payload, expect: {:exact, ctx.token, ["claimed"]}},
+           epoch_opts(opts)
+         ) do
+      {:ok, :applied} -> :ok
+      {:error, {:fenced, current}} -> {:error, {:epoch_fenced, current}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Control 闭包契约：:ok | {:error, reason}。restore/finalize 的 :superseded 视为收敛完成
+  # （successor 已建立，本次提交对 final 无事可做——绝不触碰 successor）。
+  defp mutation_control_result({:ok, _outcome}), do: :ok
+  defp mutation_control_result({:error, _reason} = error), do: error
+
+  defp previous_epoch_token(%MutationContext{previous_epoch: %{"token" => token}}), do: token
+  defp previous_epoch_token(%MutationContext{}), do: nil
+
+  # ── ObjectMutation epoch 原语（B3）：per-endpoint 原语的逐盘 quorum 编排。──
+
+  defp do_claim_epoch(target, token, operation, opts) do
+    cfg = Config.load!(opts)
+
+    # 先 quorum 读取 previous（lineage 信息，B5 写入 journal previous_epoch）；fence 正确性
+    # 由各盘 CAS 的「仅接受严格更大 token」独立保证（B5 起 claim 恒在 object lock 内）。
+    with {:ok, current} <- do_current_epoch(target, opts),
+         previous = epoch_or_nil(current),
+         {:ok, claimed} <-
+           ObjectEpoch.new(target, token, %{
+             operation: operation,
+             # B1 收口确认项：EpochStore {:claim, ...} 不约束 next.phase——后端层恒写
+             # "claimed"（publish 的 {:exact, token, ["claimed"]} 门依赖该不变量）。
+             phase: "claimed",
+             value_type: "object",
+             previous_token: previous && previous.token,
+             updated_at: DateTime.utc_now()
+           }),
+         {:ok, payload} <- EpochStore.payload(claimed) do
+      oks =
+        Enum.count(cfg.drives, fn drive ->
+          match?(
+            {:ok, :applied},
+            ShardServer.cas_epoch(
+              drive,
+              %{next: payload, expect: {:claim, token}},
+              epoch_opts(opts)
+            )
+          )
+        end)
+
+      if oks >= cfg.epoch_quorum do
+        {:ok, %{previous: previous, endpoints_ok: oks}}
+      else
+        # 少数盘已写入的 claim 无需回收：fence 单调性保证无害，后继 claim 会取 max+1。
+        Logger.error("erasure claim_epoch below epoch quorum",
+          bucket: Map.get(target, "bucket"),
+          key: Map.get(target, "key"),
+          reason: "ok=#{oks} < epoch_quorum=#{cfg.epoch_quorum}"
+        )
+
+        {:error, :write_quorum}
+      end
+    end
+  end
+
+  # quorum 读裁决（D4）：可读盘数（有效 epoch 或显式 :absent）>= epoch_quorum 才裁决，取
+  # 最大 token 的 epoch；:absent 仅当可读盘全为 absent（nil/:enoent 绝不当授权）；不足 →
+  # {:error, :epoch_quorum_unavailable}（不猜测）。
+  defp do_current_epoch(target, opts) do
+    cfg = Config.load!(opts)
+    views = read_epoch_views(cfg.drives, target, opts)
+    epochs = for {_drive, {:epoch, epoch}} <- views, do: epoch
+    absent = Enum.count(views, fn {_drive, view} -> view == :absent end)
+
+    cond do
+      length(epochs) + absent < cfg.epoch_quorum -> {:error, :epoch_quorum_unavailable}
+      epochs == [] -> {:ok, :absent}
+      true -> {:ok, Enum.max_by(epochs, &token_sort_key/1)}
+    end
+  end
+
+  # 先 quorum 读全局裁决（quorum 视图见 successor → 整体 :superseded，任何盘不动；见本
+  # token 的 committed epoch → {:error, :epoch_committed}，metadata_committed 禁回滚的
+  # quorum 级防线；absent → {:error, :epoch_missing}）；裁决通过才逐盘 restore_mutation
+  # （per-endpoint CAS 仍各自把关），restored 盘数 >= epoch_quorum → 成功，否则
+  # {:error, {:partial, evidence}}（journal 侧 mark_error 重试；backup 保留——不猜测、不破坏）。
+  defp do_restore_if_current(%MutationContext{} = ctx, opts) do
+    cfg = Config.load!(opts)
+
+    case adjudicate_mutation_epoch(ctx, :restore, cfg, opts) do
+      :superseded ->
+        {:ok, :superseded}
+
+      :proceed ->
+        request = %{
+          target: ctx.target,
+          token: ctx.token,
+          mutation_id: ctx.mutation_id,
+          final_rel: ctx.final_rel
+        }
+
+        cfg.drives
+        |> Enum.map(fn drive ->
+          {drive, ShardServer.restore_mutation(drive, request, epoch_opts(opts))}
+        end)
+        |> conclude_mutation_quorum(:restored, cfg.epoch_quorum)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp do_finalize_if_current(%MutationContext{} = ctx, opts) do
+    cfg = Config.load!(opts)
+
+    case adjudicate_mutation_epoch(ctx, :finalize, cfg, opts) do
+      :superseded ->
+        {:ok, :superseded}
+
+      :proceed ->
+        request = %{target: ctx.target, token: ctx.token, mutation_id: ctx.mutation_id}
+
+        cfg.drives
+        |> Enum.map(fn drive ->
+          {drive, ShardServer.finalize_mutation(drive, request, epoch_opts(opts))}
+        end)
+        |> conclude_mutation_quorum(:finalized, cfg.epoch_quorum)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # quorum 读全局裁决：裁决 token > ctx.token（successor 可见）→ :superseded；全 absent →
+  # {:error, :epoch_missing}；裁决 token < ctx.token → 证据矛盾（claim 已达 quorum、两个
+  # quorum 必有交集，可读视图不应只见更旧 token）→ {:error, {:epoch_mismatch, token}}。
+  defp adjudicate_mutation_epoch(%MutationContext{} = ctx, kind, cfg, opts) do
+    views = read_epoch_views(cfg.drives, ctx.target, opts)
+    epochs = for {_drive, {:epoch, epoch}} <- views, do: epoch
+    absent = Enum.count(views, fn {_drive, view} -> view == :absent end)
+
+    cond do
+      length(epochs) + absent < cfg.epoch_quorum ->
+        {:error, :epoch_quorum_unavailable}
+
+      epochs == [] ->
+        {:error, :epoch_missing}
+
+      true ->
+        adjudicated = Enum.max_by(epochs, &token_sort_key/1)
+
+        case ObjectEpoch.compare_tokens(adjudicated.token, ctx.token) do
+          {:ok, :gt} -> :superseded
+          {:ok, :lt} -> {:error, {:epoch_mismatch, adjudicated.token}}
+          {:ok, :eq} -> adjudicate_owned(epochs, ctx.token, kind)
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  # metadata_committed 禁回滚的 quorum 级防线：任一可读盘的本 token epoch 已 committed →
+  # 整体拒绝 restore（per-endpoint restore_mutation 的 :epoch_committed 是端点级同源防线）。
+  defp adjudicate_owned(epochs, token, :restore) do
+    committed? =
+      Enum.any?(epochs, fn epoch -> epoch.token == token and epoch.phase == "committed" end)
+
+    if committed?, do: {:error, :epoch_committed}, else: :proceed
+  end
+
+  # finalize 对 committed 幂等（per-endpoint 收敛残余 backup），无需 quorum 级前置拒绝。
+  defp adjudicate_owned(_epochs, _token, :finalize), do: :proceed
+
+  # 三分类计数（实现计划 B3 要点 1）：ok_outcome（:restored/:finalized）/ :superseded /
+  # error。per-endpoint 的 :superseded（全局裁决后另一写者插入的窗口）不计入成功——诚实
+  # 上报 partial，重试时全局裁决折叠为整体 :superseded。
+  defp conclude_mutation_quorum(results, ok_outcome, epoch_quorum) do
+    {oks, supersededs, errors} =
+      Enum.reduce(results, {0, 0, []}, fn {drive, result}, {oks, sups, errors} ->
+        case result do
+          {:ok, ^ok_outcome} -> {oks + 1, sups, errors}
+          {:ok, :superseded} -> {oks, sups + 1, errors}
+          {:error, reason} -> {oks, sups, [{drive, reason} | errors]}
+        end
+      end)
+
+    if oks >= epoch_quorum do
+      {:ok, ok_outcome}
+    else
+      {:error,
+       {:partial,
+        %{
+          applied: oks,
+          superseded: supersededs,
+          epoch_quorum: epoch_quorum,
+          errors: Enum.reverse(errors)
+        }}}
+    end
+  end
+
+  defp read_epoch_views(drives, target, opts) do
+    Enum.map(drives, fn drive ->
+      view =
+        case ShardServer.read_epoch(drive, target, epoch_opts(opts)) do
+          {:ok, :absent} ->
+            :absent
+
+          {:ok, payload} ->
+            case epoch_from_payload(payload) do
+              {:ok, epoch} -> {:epoch, epoch}
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {drive, view}
+    end)
+  end
+
+  # token 全序（{generation, mutation_id}，与 ObjectEpoch.compare_tokens 同序）：
+  # decode 后 token 已规范化（generation 整数、mutation_id 小写），可直接按键排序。
+  defp token_sort_key(%ObjectEpoch{token: token}),
+    do: {token["generation"], token["mutation_id"]}
+
+  # ShardServer 原语响应是纯数据 payload（erpc 同形）；quorum 裁决按结构体比较 token，
+  # 经 decode 全量重验还原（坏 payload 计入不可读盘，绝不参与裁决）。
+  defp epoch_from_payload(payload) do
+    with {:ok, bytes} <- Jason.encode(payload) do
+      ObjectEpoch.decode(bytes)
+    end
+  end
+
+  defp epoch_or_nil(:absent), do: nil
+  defp epoch_or_nil(%ObjectEpoch{} = epoch), do: epoch
+
+  defp epoch_opts(opts), do: Keyword.take(opts, [:fsync])
+
+  defp maybe_sync_mutation_path(opts, path) do
+    if mutation_fsync?(opts), do: ShardServer.sync_path(path), else: :ok
+  end
+
+  defp maybe_sync_mutation_dir(opts, dir) do
+    if mutation_fsync?(opts), do: ShardServer.sync_dir(dir), else: :ok
+  end
+
+  # opts[:fsync] 显式覆盖；否则读 config :maxio, :durability, fsync:
+  # （与 ShardServer/EpochStore 同源开关）。
+  defp mutation_fsync?(opts) do
+    case Keyword.fetch(opts, :fsync) do
+      {:ok, value} -> value
+      :error -> Application.get_env(:maxio, :durability, [])[:fsync] || false
     end
   end
 
@@ -728,7 +1766,10 @@ defmodule Maxio.Storage.ErasureCoded do
       content_disposition: Map.get(om, :content_disposition),
       cache_control: Map.get(om, :cache_control),
       expires: Map.get(om, :expires),
+      website_redirect_location: Map.get(om, :website_redirect_location),
       tags: Map.get(om, :tags, %{}),
+      checksum: object_meta_value(om, :checksum) || %{},
+      object_parts: object_meta_value(om, :object_parts) || %{},
       sse: Map.get(om, :sse),
       acl_canned: Map.get(om, :acl_canned, "private"),
       acl_grants: Map.get(om, :acl_grants, %{"grants" => []}),
@@ -738,7 +1779,9 @@ defmodule Maxio.Storage.ErasureCoded do
       object_lock_retain_until: Map.get(om, :object_lock_retain_until),
       object_lock_legal_hold: Map.get(om, :object_lock_legal_hold),
       restore_status: Map.get(om, :restore_status),
-      restore_expiry: Map.get(om, :restore_expiry)
+      restore_expiry: Map.get(om, :restore_expiry),
+      replication_status: Map.get(om, :replication_status),
+      notification_outbox: object_meta_value(om, :notification_outbox) || []
     ]
   end
 
@@ -941,6 +1984,106 @@ defmodule Maxio.Storage.ErasureCoded do
     end
   end
 
+  defp do_put_notification_ledgers(_bucket, _key, [], _opts), do: :ok
+
+  defp do_put_notification_ledgers(bucket, key, entries, opts) when is_list(entries) do
+    cfg = Config.load!(opts)
+
+    Enum.reduce_while(entries, :ok, fn entry, :ok ->
+      case put_one_notification_ledger(bucket, key, entry, cfg, opts) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp put_one_notification_ledger(bucket, key, entry, cfg, opts) do
+    with {:ok, id} <- notification_ledger_id(entry) do
+      commit_pairs = notification_ledger_commit_pairs(bucket, key, id, cfg)
+
+      tmps =
+        commit_pairs |> Enum.map(fn {drive_root, _final} -> drive_root end) |> begin_tmp_dirs!()
+
+      try do
+        write_tmp_sidecars(tmps, NotificationLedger.sidecar(entry))
+        ok_drives = commit_drives(tmps, commit_pairs, Keyword.put(opts, :meta_only, true))
+
+        if ok_drives >= cfg.write_quorum do
+          :ok
+        else
+          Logger.error("erasure notification ledger below write quorum",
+            bucket: bucket,
+            key: key,
+            reason: "ok_drives=#{ok_drives} < write_quorum=#{cfg.write_quorum}"
+          )
+
+          rollback_commit(tmps, commit_pairs)
+          {:error, :write_quorum}
+        end
+      rescue
+        err ->
+          cleanup_tmps(tmps)
+          {:error, err}
+      catch
+        kind, reason ->
+          cleanup_tmps(tmps)
+          {:error, {kind, reason}}
+      end
+    end
+  end
+
+  defp do_list_notification_ledgers(bucket, :all, opts) do
+    cfg = Config.load!(opts)
+
+    with {:ok, replicas} <-
+           read_notification_ledger_replicas(cfg.drives, fn drive ->
+             drive
+             |> Path.join(Maxio.Cluster.Paths.notification_ledger_bucket_rel(bucket))
+             |> read_notification_ledger_replicas_under(
+               bucket: bucket,
+               read_fun: notification_ledger_read_fun(opts)
+             )
+           end) do
+      {:ok, NotificationLedger.canonical_entries(replicas, cfg.read_quorum)}
+    end
+  end
+
+  defp do_list_notification_ledgers(bucket, key, opts) when is_binary(key) do
+    cfg = Config.load!(opts)
+
+    with {:ok, replicas} <-
+           read_notification_ledger_replicas(cfg.drives, fn drive ->
+             drive
+             |> Path.join(Maxio.Cluster.Paths.notification_ledger_key_rel(bucket, key))
+             |> read_notification_ledger_replicas_under(
+               bucket: bucket,
+               key: key,
+               read_fun: notification_ledger_read_fun(opts)
+             )
+           end) do
+      {:ok, NotificationLedger.canonical_entries(replicas, cfg.read_quorum)}
+    end
+  end
+
+  defp do_delete_notification_ledgers(_bucket, _key, [], _opts), do: :ok
+
+  defp do_delete_notification_ledgers(bucket, key, ids, opts) when is_list(ids) do
+    with {:ok, ids} <- notification_ledger_ids(ids) do
+      cfg = Config.load!(opts)
+
+      Enum.each(ids, fn id ->
+        Enum.each(cfg.drives, fn drive ->
+          _ =
+            File.rm_rf(
+              Path.join(drive, Maxio.Cluster.Paths.notification_ledger_entry_rel(bucket, key, id))
+            )
+        end)
+      end)
+
+      :ok
+    end
+  end
+
   defp do_put_bucket(bucket, opts) do
     cfg = Config.load!(opts)
     Enum.each(cfg.drives, fn d -> File.mkdir_p!(Path.join(d, bucket)) end)
@@ -963,6 +2106,153 @@ defmodule Maxio.Storage.ErasureCoded do
   end
 
   # ── 辅助 ──
+
+  defp notification_ledger_commit_pairs(bucket, key, id, cfg) do
+    rel = Maxio.Cluster.Paths.notification_ledger_entry_rel(bucket, key, id)
+    Enum.map(cfg.drives, fn drive -> {drive, Path.join(drive, rel)} end)
+  end
+
+  defp notification_ledger_id(entry),
+    do: entry |> NotificationLedger.id() |> NotificationLedger.validate_id()
+
+  defp notification_ledger_ids(ids) do
+    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, acc} ->
+      case NotificationLedger.validate_id(id) do
+        {:ok, id} -> {:cont, {:ok, [id | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, ids} -> {:ok, Enum.reverse(ids)}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  defp read_notification_ledger_replicas(items, fun) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      case fun.(item) do
+        {:ok, replicas} -> {:cont, {:ok, replicas ++ acc}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, replicas} -> {:ok, Enum.reverse(replicas)}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  defp read_notification_ledger_replicas_under(root, context) do
+    with {:ok, paths} <- notification_ledger_meta_paths(root) do
+      read_notification_ledger_replica_paths(paths, context)
+    end
+  end
+
+  defp read_notification_ledger_replica_paths(paths, context) do
+    Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, acc} ->
+      case read_notification_ledger_replica(path, context) do
+        {:ok, replicas} -> {:cont, {:ok, replicas ++ acc}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, replicas} -> {:ok, Enum.reverse(replicas)}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  defp read_notification_ledger_replica(path, context) do
+    with {:ok, bin} <- read_notification_ledger_meta(path, context),
+         {:ok, replicas} <- decode_notification_ledger_replica(bin, path, context) do
+      {:ok, replicas}
+    end
+  end
+
+  defp read_notification_ledger_meta(path, context) do
+    read_fun = Keyword.get(context, :read_fun, &File.read/1)
+
+    case read_fun.(path) do
+      {:ok, bin} -> {:ok, bin}
+      {:error, reason} -> {:error, {:notification_ledger_read_failed, path, reason}}
+      other -> {:error, {:notification_ledger_read_failed, path, other}}
+    end
+  rescue
+    error -> {:error, {:notification_ledger_read_failed, path, error}}
+  catch
+    kind, reason -> {:error, {:notification_ledger_read_failed, path, {kind, reason}}}
+  end
+
+  defp decode_notification_ledger_replica(bin, path, context) do
+    with meta <- Meta.decode!(bin),
+         {:ok, entry} <- NotificationLedger.entry(meta),
+         {:ok, id} <- NotificationLedger.validate_id(NotificationLedger.id(entry)) do
+      {:ok, [{id, entry}]}
+    else
+      _ -> {:ok, [invalid_notification_ledger_replica(path, context)]}
+    end
+  rescue
+    _ -> {:ok, [invalid_notification_ledger_replica(path, context)]}
+  end
+
+  defp notification_ledger_read_fun(opts),
+    do: Keyword.get(opts, :notification_ledger_read_fun, &File.read/1)
+
+  defp invalid_notification_ledger_replica(path, context) do
+    path_id = notification_ledger_id_from_meta_path(path)
+    {path_id, NotificationLedger.invalid_entry(path_id, "invalid_meta", context)}
+  end
+
+  defp notification_ledger_id_from_meta_path(path) do
+    path |> Path.dirname() |> Path.basename()
+  end
+
+  defp notification_ledger_meta_paths(root) do
+    meta_path = Path.join(root, @meta_file)
+
+    case File.stat(meta_path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        {:ok, [meta_path]}
+
+      {:ok, _stat} ->
+        {:error, {:invalid_notification_ledger_meta, meta_path}}
+
+      {:error, reason} when reason in [:enoent, :enotdir] ->
+        notification_ledger_child_meta_paths(root)
+
+      {:error, reason} ->
+        {:error, {:notification_ledger_stat_failed, meta_path, reason}}
+    end
+  end
+
+  defp notification_ledger_child_meta_paths(root) do
+    case File.stat(root) do
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(root) do
+          {:ok, names} ->
+            Enum.reduce_while(names, {:ok, []}, fn name, {:ok, acc} ->
+              case notification_ledger_meta_paths(Path.join(root, name)) do
+                {:ok, paths} -> {:cont, {:ok, paths ++ acc}}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+            end)
+            |> case do
+              {:ok, paths} -> {:ok, Enum.reverse(paths)}
+              {:error, _reason} = err -> err
+            end
+
+          {:error, reason} ->
+            {:error, {:notification_ledger_list_failed, root, reason}}
+        end
+
+      {:ok, _stat} ->
+        {:error, {:invalid_notification_ledger_root, root}}
+
+      {:error, :enoent} ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:error, {:notification_ledger_stat_failed, root, reason}}
+    end
+  end
 
   defp read_any_sidecar(dirs) do
     Enum.find_value(dirs, {:error, :enoent}, fn dir ->

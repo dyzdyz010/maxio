@@ -15,7 +15,7 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
       [--advance-steps N] [--verify-closure] \\
       [--bucket <name>] [--max-objects N] [--page-size N] \\
       [--audit-page-size N] [--scan-current-only] \\
-      [--allow-dry-run-success] \\
+      [--allow-dry-run-success] [--rehearsal-ready] \\
       [--require-scheduler-evidence \\
        [--scheduler-evidence-scheduler fresh_drive_heal|rebalance] \\
        [--scheduler-evidence-from <iso8601>] [--scheduler-evidence-until <iso8601>] \\
@@ -42,7 +42,8 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
     :dry_run,
     :rebalance_if_needed,
     :verify_closure,
-    :scan_current_only
+    :scan_current_only,
+    :rehearsal_ready
   ]
 
   @workflow_values [
@@ -106,6 +107,7 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
           audit_page_size: :integer,
           scan_current_only: :boolean,
           allow_dry_run_success: :boolean,
+          rehearsal_ready: :boolean,
           require_scheduler_evidence: :boolean,
           scheduler_evidence_scheduler: :string,
           scheduler_evidence_from: :string,
@@ -149,6 +151,7 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
          require_scheduler_evidence?: Keyword.get(opts, :require_scheduler_evidence, false),
          dry_run?: Keyword.get(opts, :dry_run, false),
          allow_dry_run_success?: Keyword.get(opts, :allow_dry_run_success, false),
+         rehearsal_ready?: Keyword.get(opts, :rehearsal_ready, false),
          artifact_path: artifact_path(opts),
          mix_cmd: Keyword.get(opts, :mix_cmd) || System.find_executable("mix") || "mix"
        }}
@@ -163,7 +166,7 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
 
     args = workflow_args(config.workflow_opts)
     command = command_string([config.mix_cmd | args])
-    {output, exit_status} = command_runner.(config.mix_cmd, args, stderr_to_stdout: true)
+    {output, exit_status} = run_command(command_runner, config.mix_cmd, args)
     workflow = extract_json(output)
     workflow_gate = workflow_gate(workflow, exit_status, config)
 
@@ -179,10 +182,13 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
 
     artifact = %{
       "version" => 1,
+      "evidence_kind" => "replacement_live_rehearsal",
+      "scenario" => "replacement_workflow_rehearsal",
       "generated_at" => now_fun.() |> DateTime.to_iso8601(),
       "git_sha" => git_sha_fun.(),
       "dry_run?" => config.dry_run?,
       "allow_dry_run_success?" => config.allow_dry_run_success?,
+      "rehearsal_ready?" => config.rehearsal_ready?,
       "command" => command,
       "commands" => commands,
       "workflow_exit_status" => exit_status,
@@ -207,6 +213,7 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
         "workflow_status=#{status} workflow_exit=#{exit_status} " <>
         "workflow_gate_status=#{workflow_gate["status"]} " <>
         "bundle_gate_status=#{bundle_gate["status"]} next_action=#{inspect(next_action)} " <>
+        "rehearsal_ready=#{config.rehearsal_ready?} " <>
         "scheduler_evidence_status=#{scheduler_evidence_gate["status"]}\n"
 
     result = %{
@@ -257,7 +264,7 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
   defp maybe_run_scheduler_evidence(config, command_runner) do
     args = scheduler_evidence_args(config.scheduler_evidence_opts)
     command = command_string([config.mix_cmd | args])
-    {output, exit_status} = command_runner.(config.mix_cmd, args, stderr_to_stdout: true)
+    {output, exit_status} = run_command(command_runner, config.mix_cmd, args)
 
     %{
       command: command,
@@ -455,6 +462,12 @@ defmodule Maxio.Cluster.ReplacementLiveRehearsal do
     end
   rescue
     _error -> nil
+  end
+
+  defp run_command(command_runner, mix_cmd, args) do
+    command_runner.(mix_cmd, args, stderr_to_stdout: true)
+  rescue
+    error -> {Exception.message(error), nil}
   end
 
   defp write_artifact!(path, artifact) do

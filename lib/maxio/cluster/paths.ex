@@ -38,15 +38,22 @@ defmodule Maxio.Cluster.Paths do
   """
 
   # 盘上布局保留名：与编码后的用户段必须不相交（ShardServer @meta_file/@part_file、
-  # 内部根 .versions/.uploads/.tmp、list_dir 的跳过名单同源）。仅精确匹配（part.1 等不在内）。
+  # 内部根 .versions/.uploads/.tmp、list_dir 的跳过名单同源——ShardServer @internal_prefixes
+  # 两处必须同步改）。仅精确匹配（part.1 等不在内）。.maxio-object-epochs /
+  # .maxio-object-mutations 为 ObjectMutation 协议根（B1：durable epoch 与备份 manifest）。
   @layout_reserved [
     "meta.json",
     "part.0",
     ".versions",
     ".uploads",
     ".tmp",
+    ".maxio-notification-ledger",
+    ".maxio-object-epochs",
+    ".maxio-object-mutations",
     ".maxio-removal-quarantine"
   ]
+
+  @notification_ledger_root ".maxio-notification-ledger"
 
   # 编码标记。互不为后缀（decode 按 @dir_suffix → @esc_suffix → @empty_seg 顺序判定无歧义）。
   @esc_suffix "__MXESC__"
@@ -172,6 +179,39 @@ defmodule Maxio.Cluster.Paths do
   @spec upload_rel(String.t(), String.t()) :: String.t()
   def upload_rel(bucket, upload_id) do
     Path.join([".uploads", bucket, upload_id]) |> to_unix()
+  end
+
+  @doc """
+  Bucket-scoped retained notification ledger root.
+
+  The retained ledger is deliberately outside the user object namespace and the
+  `.versions` tree, so object overwrites, delete markers, and hard deletes
+  cannot remove the evidence carrier for post-commit notification replay.
+  """
+  @spec notification_ledger_bucket_rel(String.t()) :: String.t()
+  def notification_ledger_bucket_rel(bucket) do
+    Path.join([@notification_ledger_root, bucket]) |> to_unix()
+  end
+
+  @doc """
+  Retained notification ledger key directory.
+
+  The object key is represented by a SHA-256 digest, not by encoded key
+  segments, to avoid path-length coupling and layout-name collisions. The
+  original key remains inside each ledger entry payload.
+  """
+  @spec notification_ledger_key_rel(String.t(), String.t()) :: String.t()
+  def notification_ledger_key_rel(bucket, key) when is_binary(key) do
+    hash = :crypto.hash(:sha256, key) |> Base.encode16(case: :lower)
+
+    Path.join([notification_ledger_bucket_rel(bucket), binary_part(hash, 0, 2), hash])
+    |> to_unix()
+  end
+
+  @doc "Retained notification ledger entry directory for one stable event id."
+  @spec notification_ledger_entry_rel(String.t(), String.t(), String.t()) :: String.t()
+  def notification_ledger_entry_rel(bucket, key, id) do
+    Path.join([notification_ledger_key_rel(bucket, key), id]) |> to_unix()
   end
 
   # key → 编码后盘段序列（validate_key 与 encode_key 共用的单一来源：长度闸与实际落盘

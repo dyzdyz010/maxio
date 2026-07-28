@@ -65,6 +65,36 @@ defmodule Maxio.S3.AuthzTest do
     assert anon.resp_body == "hello world"
   end
 
+  test "匿名 public GetObject/HeadObject 不能使用 response header override" do
+    SigV4Request.signed_conn(:put, "/pubb") |> call()
+    SigV4Request.signed_conn(:put, "/pubb/open.txt", body: "hello world") |> call()
+
+    SigV4Request.signed_conn(:put, "/pubb",
+      query: %{"policy" => ""},
+      body: @public_get,
+      headers: [{"content-type", "application/json"}]
+    )
+    |> call()
+
+    get =
+      SigV4Request.anon_conn(:get, "/pubb/open.txt",
+        query: %{"response-content-type" => "text/plain"}
+      )
+      |> call()
+
+    assert get.status == 403
+    assert get.resp_body =~ "AccessDenied"
+
+    head =
+      SigV4Request.anon_conn(:head, "/pubb/open.txt",
+        query: %{"response-content-type" => "text/plain"}
+      )
+      |> call()
+
+    assert head.status == 403
+    assert head.resp_body == ""
+  end
+
   test "匿名请求 + public-read ACL 对象 → 放行 GetObject" do
     create_acl_bucket("aclb")
 

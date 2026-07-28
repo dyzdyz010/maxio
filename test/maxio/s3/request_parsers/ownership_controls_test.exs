@@ -32,4 +32,55 @@ defmodule Maxio.S3.RequestParsers.OwnershipControlsTest do
              </OwnershipControls>
              """)
   end
+
+  test "rejects wrong root unknown duplicate misnested mixed text and nested leaf nodes" do
+    cases = [
+      """
+      <Wrapper>
+        <OwnershipControls>
+          <Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>
+        </OwnershipControls>
+      </Wrapper>
+      """,
+      """
+      <OwnershipControls>
+        <Unknown>BucketOwnerEnforced</Unknown>
+      </OwnershipControls>
+      """,
+      """
+      <OwnershipControls>
+        <Rule>
+          <ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>
+          <ObjectOwnership>ObjectWriter</ObjectOwnership>
+        </Rule>
+      </OwnershipControls>
+      """,
+      """
+      <OwnershipControls>
+        <ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>
+      </OwnershipControls>
+      """,
+      """
+      <OwnershipControls>
+        text
+        <Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>
+      </OwnershipControls>
+      """,
+      """
+      <OwnershipControls>
+        <Rule><ObjectOwnership><Value>BucketOwnerEnforced</Value></ObjectOwnership></Rule>
+      </OwnershipControls>
+      """,
+      """
+      <OwnershipControls>
+        <Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule>
+        <Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule>
+      </OwnershipControls>
+      """
+    ]
+
+    for xml <- cases do
+      assert {:error, :malformed_xml} = OwnershipControls.parse(xml)
+    end
+  end
 end

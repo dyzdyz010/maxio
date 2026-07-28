@@ -6,6 +6,7 @@ defmodule Mix.Tasks.Maxio.Replacement.AutomationStatus do
 
       mix maxio.replacement.automation_status
       mix maxio.replacement.automation_status --json
+      mix maxio.replacement.automation_status --rehearsal-ready --json
       mix maxio.replacement.automation_status --fail-on-blocked --json
       mix maxio.replacement.automation_status --require-scheduler-evidence --since-minutes 120 --json
 
@@ -26,6 +27,7 @@ defmodule Mix.Tasks.Maxio.Replacement.AutomationStatus do
         strict: [
           fail_on_blocked: :boolean,
           fail_on_attention: :boolean,
+          rehearsal_ready: :boolean,
           require_scheduler_evidence: :boolean,
           since_minutes: :integer,
           expected_interval_ms: :integer,
@@ -43,6 +45,7 @@ defmodule Mix.Tasks.Maxio.Replacement.AutomationStatus do
       Mix.raise(
         "usage: mix maxio.replacement.automation_status " <>
           "[--fail-on-blocked] [--fail-on-attention] [--json] " <>
+          "[--rehearsal-ready] " <>
           "[--require-scheduler-evidence [--since-minutes N] " <>
           "[--expected-interval-ms N] [--stale-after-ms N] " <>
           "[--expected-nodes node_a,node_b] [--min-effective-nodes N] " <>
@@ -64,13 +67,26 @@ defmodule Mix.Tasks.Maxio.Replacement.AutomationStatus do
     end
 
     report =
-      AutomationProfile.status(
-        require_scheduler_evidence?: require_scheduler_evidence?,
-        scheduler_evidence_opts: scheduler_evidence_opts(opts)
-      )
+      opts
+      |> automation_profile_opts(require_scheduler_evidence?)
+      |> AutomationProfile.status()
 
     print_or_json(report, opts)
     fail_if_needed!(report, opts)
+  end
+
+  defp automation_profile_opts(opts, require_scheduler_evidence?) do
+    base =
+      if Keyword.get(opts, :rehearsal_ready, false) do
+        AutomationProfile.rehearsal_ready_opts()
+      else
+        []
+      end
+
+    Keyword.merge(base,
+      require_scheduler_evidence?: require_scheduler_evidence?,
+      scheduler_evidence_opts: scheduler_evidence_opts(opts)
+    )
   end
 
   defp print_or_json(report, opts) do

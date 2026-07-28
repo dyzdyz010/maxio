@@ -73,7 +73,99 @@ defmodule Maxio.S3.BodyReader do
     {stream, fn -> %{} end, fn -> :ok end}
   end
 
-  defp streaming_resource(conn, trailer_agent) do
+  @doc """
+  Reads a small request body with the same decoded-byte semantics as `stream_with_trailers/2`.
+
+  Streaming aws-chunked callers get the decoded payload and verified trailing
+  headers; ordinary callers get the body from `Plug.Conn.read_body/2` and an
+  empty trailer map. `limit` applies to decoded bytes.
+  """
+  @spec read_small_with_trailers!(Plug.Conn.t(), pos_integer(), String.t()) ::
+          {Plug.Conn.t(), binary(), %{String.t() => String.t()}}
+  def read_small_with_trailers!(
+        %Plug.Conn{assigns: %{payload_mode: :streaming}} = conn,
+        limit,
+        too_large_message
+      )
+      when is_integer(limit) and limit > 0 do
+    if decoded_content_length_exceeds?(conn, limit) do
+      raise Error.new(:malformed_xml, message: too_large_message)
+    end
+
+    {stream, get_trailers, discard_trailers} =
+      stream_with_trailers(conn, :streaming,
+        decoded_limit: limit,
+        decoded_limit_message: too_large_message,
+        read_opts: [length: limit, read_length: limit, read_timeout: 30_000]
+      )
+
+    try do
+      body = collect_limited_stream!(stream, limit, too_large_message)
+      {conn, body, get_trailers.()}
+    rescue
+      err ->
+        discard_trailers.()
+        reraise(err, __STACKTRACE__)
+    catch
+      kind, reason ->
+        discard_trailers.()
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  def read_small_with_trailers!(conn, limit, too_large_message)
+      when is_integer(limit) and limit > 0 do
+    case Plug.Conn.read_body(conn, length: limit, read_length: limit) do
+      {:ok, body, conn} ->
+        {conn, body, %{}}
+
+      {:more, _partial, _conn} ->
+        raise Error.new(:malformed_xml, message: too_large_message)
+
+      {:error, _reason} ->
+        raise Error.new(:malformed_xml)
+    end
+  end
+
+  defp collect_limited_stream!(stream, limit, too_large_message) do
+    case Enum.reduce_while(stream, {[], 0}, fn chunk, {chunks, size} ->
+           chunk = IO.iodata_to_binary(chunk)
+           size = size + byte_size(chunk)
+
+           if size > limit do
+             {:halt, :too_large}
+           else
+             {:cont, {[chunk | chunks], size}}
+           end
+         end) do
+      :too_large ->
+        raise Error.new(:malformed_xml, message: too_large_message)
+
+      {chunks, _size} ->
+        chunks |> Enum.reverse() |> IO.iodata_to_binary()
+    end
+  end
+
+  defp stream_with_trailers(conn, :streaming, opts) do
+    {:ok, trailer_agent} = Agent.start_link(fn -> %{} end)
+
+    stream = streaming_resource(conn, trailer_agent, opts)
+
+    get_trailers = fn ->
+      get_and_stop_agent(trailer_agent)
+    end
+
+    {stream, get_trailers, fn -> stop_agent(trailer_agent) end}
+  end
+
+  defp decoded_content_length_exceeds?(conn, limit) do
+    case parse_int(req_header(conn, "x-amz-decoded-content-length")) do
+      n when is_integer(n) and n > limit -> true
+      _ -> false
+    end
+  end
+
+  defp streaming_resource(conn, trailer_agent, opts \\ []) do
     # 铁律 3：aws-chunked 逐块签名验证由 StreamingVerifier 显式状态机驱动；
     # 坏块/截断/长度不符在 emit 前硬 raise Maxio.S3.Error（绝不把半验证字节交下游）。
     ctx = conn.assigns[:sigv4_context]
@@ -89,6 +181,7 @@ defmodule Maxio.S3.BodyReader do
         scope: ctx.scope,
         seed_signature: ctx.seed_signature,
         expected_decoded_len: decoded_len,
+        decoded_limit: Keyword.get(opts, :decoded_limit),
         flavor: flavor,
         trailer_names: trailer_names
       )
@@ -96,7 +189,7 @@ defmodule Maxio.S3.BodyReader do
     Log.info("aws-chunked streaming verify start", payload_mode: :streaming, reason: flavor)
 
     Stream.resource(
-      fn -> {conn, verifier, :reading, trailer_agent} end,
+      fn -> {conn, verifier, :reading, trailer_agent, opts} end,
       &verify_step/1,
       fn _ -> :ok end
     )
@@ -104,7 +197,7 @@ defmodule Maxio.S3.BodyReader do
 
   # ── aws-chunked 逐块签名验证驱动（StreamingVerifier 状态机）──
   # body 读尽后切到 {:done, v2}，下一迭代过 finalize 校验终止块 + decoded 长度再 :halt。
-  defp verify_step({:done, verifier, trailer_agent}) do
+  defp verify_step({:done, verifier, trailer_agent, opts}) do
     case StreamingVerifier.finalize(verifier) do
       :ok ->
         if trailer_agent do
@@ -114,32 +207,43 @@ defmodule Maxio.S3.BodyReader do
         {:halt, :ok}
 
       {:error, reason} ->
-        raise streaming_error(reason)
+        raise streaming_error(reason, opts)
     end
   end
 
-  defp verify_step({conn, verifier, :reading, trailer_agent}) do
-    case Plug.Conn.read_body(conn, @read_opts) do
+  defp verify_step({conn, verifier, :reading, trailer_agent, opts}) do
+    read_opts = Keyword.get(opts, :read_opts, @read_opts)
+
+    case Plug.Conn.read_body(conn, read_opts) do
       {:ok, more, _conn2} ->
         case StreamingVerifier.feed(verifier, more) do
-          {:ok, chunks, v2} -> {chunks, {:done, v2, trailer_agent}}
-          {:error, reason} -> raise streaming_error(reason)
+          {:ok, chunks, v2} -> {chunks, {:done, v2, trailer_agent, opts}}
+          {:error, reason} -> raise streaming_error(reason, opts)
         end
 
       {:more, more, conn2} ->
         case StreamingVerifier.feed(verifier, more) do
-          {:ok, chunks, v2} -> {chunks, {conn2, v2, :reading, trailer_agent}}
-          {:error, reason} -> raise streaming_error(reason)
+          {:ok, chunks, v2} -> {chunks, {conn2, v2, :reading, trailer_agent, opts}}
+          {:error, reason} -> raise streaming_error(reason, opts)
         end
 
       {:error, _} ->
-        raise streaming_error(:incomplete_body)
+        raise streaming_error(:incomplete_body, opts)
     end
   end
 
-  defp streaming_error(:signature_does_not_match), do: Error.new(:signature_does_not_match)
-  defp streaming_error(:incomplete_body), do: Error.new(:incomplete_body)
-  defp streaming_error(_), do: Error.new(:incomplete_body, message: "invalid aws-chunked frame")
+  defp streaming_error(:decoded_length_exceeded, opts) do
+    case Keyword.get(opts, :decoded_limit_message) do
+      message when is_binary(message) -> Error.new(:malformed_xml, message: message)
+      _ -> Error.new(:incomplete_body, message: "invalid aws-chunked frame")
+    end
+  end
+
+  defp streaming_error(:signature_does_not_match, _opts), do: Error.new(:signature_does_not_match)
+  defp streaming_error(:incomplete_body, _opts), do: Error.new(:incomplete_body)
+
+  defp streaming_error(_reason, _opts),
+    do: Error.new(:incomplete_body, message: "invalid aws-chunked frame")
 
   # flavor 由 x-amz-content-sha256 决定（调用方未声明流式时默认 :signed）。
   defp flavor_of("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"), do: :signed

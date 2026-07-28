@@ -5,7 +5,7 @@ defmodule Maxio.S3.Plugs.Cors do
         命中 → 200 + CORS 响应头并 halt（不进 SigV4/Dispatch；预检无需鉴权）；
         未启用/无匹配 → 403 AccessForbidden 并 halt（绝不静默放行）。
         无 Origin 的 OPTIONS（非预检）→ 放行给下游（罕见）。
-    * 非 OPTIONS 带 Origin：first-match → 注册 before_send 在响应上注入 ACAO/ACAC/ACAM/ACEH + Vary；
+    * 非 OPTIONS 带 Origin：first-match → 注册 before_send 在响应上注入 ACAO/ACAC/ACEH + Vary；
       不 halt（继续 SigV4/Dispatch 正常处理）。无匹配 → 不注入（正常处理）。
   预检与实际跨源响应都回 `Access-Control-Allow-Credentials: true`（FX-H5：凭据型浏览器上传可用；
   已回显请求 Origin 而非字面 `*`，故与 ACAC:true 兼容）。
@@ -68,7 +68,6 @@ defmodule Maxio.S3.Plugs.Cors do
         c
         |> put_resp_header("access-control-allow-origin", origin)
         |> put_resp_header("access-control-allow-credentials", "true")
-        |> put_resp_header("access-control-allow-methods", conn.method)
         |> put_expose_headers(rule)
         |> put_resp_header("vary", "Origin")
       end)

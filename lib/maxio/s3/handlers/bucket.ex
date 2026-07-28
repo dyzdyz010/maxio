@@ -1,9 +1,9 @@
 defmodule Maxio.S3.Handlers.Bucket do
   @moduledoc "Bucket 级 handler：create / delete / head / list_objects_v2 / get_location。"
   import Plug.Conn
-  alias Maxio.{BucketConfigs, Buckets, Objects, Storage}
+  alias Maxio.{BucketConfigs, Buckets, Storage}
   alias Maxio.Policy.ACL
-  alias Maxio.S3.{Error, Log, ObjectLock, OwnershipControls}
+  alias Maxio.S3.{Error, ExpectedBucketOwner, Log, ObjectLock, OwnershipControls, RequestPayer}
   alias Maxio.S3.Views.{ListBucket, ListBucketV1, LocationConstraint, ListVersions}
 
   @max_keys_limit 1000
@@ -71,10 +71,7 @@ defmodule Maxio.S3.Handlers.Bucket do
     end
   end
 
-  defp maybe_enable_object_lock(bucket, true) do
-    :ok = Buckets.put_versioning(bucket, "Enabled", nil)
-    BucketConfigs.put(bucket, :object_lock, ObjectLock.enabled_config())
-  end
+  defp maybe_enable_object_lock(bucket, true), do: ObjectLock.enable_bucket!(bucket)
 
   defp maybe_enable_object_lock(_bucket, false), do: :ok
 
@@ -102,6 +99,8 @@ defmodule Maxio.S3.Handlers.Bucket do
 
     case Buckets.lookup(bucket) do
       {:ok, b} ->
+        :ok = ExpectedBucketOwner.verify!(conn, bucket)
+
         conn
         |> put_resp_header("x-amz-bucket-region", b.region)
         |> send_resp(200, "")
@@ -119,11 +118,14 @@ defmodule Maxio.S3.Handlers.Bucket do
     qp = conn.query_params
 
     with {:ok, b} <- bucket_or_raise(bucket) do
+      :ok = ExpectedBucketOwner.verify!(conn, bucket)
+      charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
       prefix = Map.get(qp, "prefix", "")
       delimiter = Map.get(qp, "delimiter")
       marker = Map.get(qp, "marker")
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       encoding_type = Map.get(qp, "encoding-type")
+      optional_attributes = optional_object_attributes!(conn)
 
       list_opts = %{
         prefix: prefix,
@@ -147,13 +149,15 @@ defmodule Maxio.S3.Handlers.Bucket do
           next_marker: next_marker(res, delimiter),
           objects: objects,
           common_prefixes: res.common_prefixes,
-          encoding_type: encoding_type
+          encoding_type: encoding_type,
+          include_restore_status?: restore_status_requested?(optional_attributes)
         })
 
       Log.info("list objects", action: :list_objects, bucket: bucket)
 
       conn
       |> put_resp_content_type("application/xml")
+      |> RequestPayer.put_charged_header(charge)
       |> send_resp(200, body)
     end
   end
@@ -165,12 +169,15 @@ defmodule Maxio.S3.Handlers.Bucket do
     qp = conn.query_params
 
     with {:ok, b} <- bucket_or_raise(bucket) do
+      :ok = ExpectedBucketOwner.verify!(conn, bucket)
+      charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
       prefix = Map.get(qp, "prefix", "")
       delimiter = Map.get(qp, "delimiter")
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       continuation = Map.get(qp, "continuation-token")
       start_after = Map.get(qp, "start-after")
       encoding_type = Map.get(qp, "encoding-type")
+      optional_attributes = optional_object_attributes!(conn)
 
       list_opts = %{
         prefix: prefix,
@@ -199,17 +206,20 @@ defmodule Maxio.S3.Handlers.Bucket do
           max_keys: max_keys,
           key_count: res.key_count,
           is_truncated: res.is_truncated,
+          continuation_token: continuation,
           next_continuation_token: res.next_continuation_token,
           start_after: start_after,
           objects: objects,
           common_prefixes: res.common_prefixes,
-          encoding_type: encoding_type
+          encoding_type: encoding_type,
+          include_restore_status?: restore_status_requested?(optional_attributes)
         })
 
       Log.info("list objects v2", action: :list_objects_v2, bucket: bucket)
 
       conn
       |> put_resp_content_type("application/xml")
+      |> RequestPayer.put_charged_header(charge)
       |> send_resp(200, body)
     end
   end
@@ -220,22 +230,29 @@ defmodule Maxio.S3.Handlers.Bucket do
     conn = fetch_query_params(conn)
     qp = conn.query_params
 
-    with {:ok, _b} <- bucket_or_raise(bucket) do
+    with {:ok, b} <- bucket_or_raise(bucket) do
+      :ok = ExpectedBucketOwner.verify!(conn, bucket)
+      charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
       prefix = Map.get(qp, "prefix", "")
       delimiter = Map.get(qp, "delimiter")
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       key_marker = Map.get(qp, "key-marker")
       version_id_marker = Map.get(qp, "version-id-marker")
       encoding_type = Map.get(qp, "encoding-type")
+      optional_attributes = optional_object_attributes!(conn)
 
       res =
-        Objects.list_object_versions(bucket, %{
-          prefix: prefix,
-          delimiter: delimiter,
-          max_keys: max_keys,
-          key_marker: key_marker,
-          version_id_marker: version_id_marker
-        })
+        Maxio.ObjectMeta.list_versions(
+          bucket,
+          %{
+            prefix: prefix,
+            delimiter: delimiter,
+            max_keys: max_keys,
+            key_marker: key_marker,
+            version_id_marker: version_id_marker
+          },
+          bucket_versioning: versioning_of(b)
+        )
 
       body =
         ListVersions.render(%{
@@ -250,13 +267,15 @@ defmodule Maxio.S3.Handlers.Bucket do
           next_version_id_marker: res.next_version_id_marker,
           versions: res.versions,
           common_prefixes: res.common_prefixes,
-          encoding_type: encoding_type
+          encoding_type: encoding_type,
+          include_restore_status?: restore_status_requested?(optional_attributes)
         })
 
       Log.info("list object versions", action: :list_object_versions, bucket: bucket)
 
       conn
       |> put_resp_content_type("application/xml")
+      |> RequestPayer.put_charged_header(charge)
       |> send_resp(200, body)
     end
   end
@@ -266,6 +285,7 @@ defmodule Maxio.S3.Handlers.Bucket do
     bucket = conn.assigns.s3_bucket
 
     with {:ok, b} <- bucket_or_raise(bucket) do
+      :ok = ExpectedBucketOwner.verify!(conn, bucket)
       body = LocationConstraint.render(b.region)
 
       conn
@@ -292,10 +312,41 @@ defmodule Maxio.S3.Handlers.Bucket do
         last_modified: Map.get(o, :updated_at) || Map.get(o, :last_modified),
         etag: Map.get(o, :etag),
         size: Map.get(o, :size),
-        storage_class: Map.get(o, :storage_class)
+        storage_class: Map.get(o, :storage_class),
+        restore_status: Map.get(o, :restore_status),
+        restore_expiry: Map.get(o, :restore_expiry)
       }
     end)
   end
+
+  defp optional_object_attributes!(conn) do
+    query_value =
+      conn.query_params
+      |> Map.get("x-amz-optional-object-attributes")
+      |> List.wrap()
+
+    values =
+      conn
+      |> get_req_header("x-amz-optional-object-attributes")
+      |> Kernel.++(query_value)
+      |> Enum.flat_map(&String.split(&1, ","))
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    unsupported = Enum.reject(values, &(&1 == "RestoreStatus"))
+
+    if unsupported != [] do
+      raise Error.new(:invalid_argument,
+              message:
+                "Unsupported x-amz-optional-object-attributes: #{Enum.join(unsupported, ",")}"
+            )
+    end
+
+    MapSet.new(values)
+  end
+
+  defp restore_status_requested?(optional_attributes),
+    do: MapSet.member?(optional_attributes, "RestoreStatus")
 
   defp next_marker(%{is_truncated: true, next_continuation_token: token}, delimiter)
        when is_binary(delimiter) and delimiter != "",

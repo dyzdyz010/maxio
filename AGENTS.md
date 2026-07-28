@@ -37,8 +37,9 @@
 
 1. **设计/规划**：架构/规划 subagent 产出方案/计划 → 评审。
 2. **实现**：开发 subagent 按计划落地（复杂任务用强模型）；串行实现避免并行 mix 编译竞争。
-3. **验证/审查**：独立测试/审查 subagent 收集证据、给审查结论——**不得由实现者自审**。S3 行为优先用 aws-cli / 自签 SigV4 集成测试做端到端活体取证。
-4. **完成判据**：零待办、`compile --warnings-as-errors` 零警告、测试通过、审查证据齐备、可经 CLI/日志/aws-cli 复现验证。
+3. **批量验证（强制）**：不得每完成一个小功能点就跑完整 `mix precommit`。开发中优先用低成本反馈（聚焦 `mix test`、`mix compile --warnings-as-errors`、必要的 `mix format --check-formatted`）定位问题；多个相关功能点合并成一个 coherent batch 后，再做独立审查、更新 STATUS，并在批次收口/最终交付时跑一次完整 `mix precommit`。
+4. **验证/审查**：独立测试/审查 subagent 收集证据、给审查结论——**不得由实现者自审**。S3 行为优先用 aws-cli / 自签 SigV4 集成测试做端到端活体取证。
+5. **完成判据**：零待办、`compile --warnings-as-errors` 零警告、测试通过、审查证据齐备、可经 CLI/日志/aws-cli 复现验证。
 
 ## 6. 里程碑（详见 STATUS.md）
 
@@ -61,6 +62,7 @@ This is a web application written using the Phoenix web framework.
 ## Project guidelines
 
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
+- Batch verification is mandatory: do not run full `mix precommit` after every small slice; use focused tests/compile during implementation and run full `mix precommit` once at the coherent batch or final handoff.
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
 ### Phoenix v1.8 guidelines

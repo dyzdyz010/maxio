@@ -3,7 +3,7 @@ defmodule Maxio.S3.PublicAccessBlockTest do
 
   import Plug.Conn
 
-  alias Maxio.{Auth.CredentialStore, Objects, Policy.Store}
+  alias Maxio.{Auth.CredentialStore, BucketConfigs, Objects, Policy.Store}
   alias Maxio.S3.Endpoint
   alias Maxio.Test.SigV4Request
 
@@ -51,13 +51,19 @@ defmodule Maxio.S3.PublicAccessBlockTest do
     )
   end
 
-  defp put_pab(bucket, values) do
+  defp put_pab(bucket, values, opts \\ []) do
+    body = pab_xml(values)
+
     SigV4Request.signed_conn(:put, "/#{bucket}",
       query: %{"publicAccessBlock" => ""},
-      body: pab_xml(values)
+      body: body,
+      headers: [{"content-md5", content_md5(body)}] ++ Keyword.get(opts, :headers, [])
     )
     |> call()
   end
+
+  defp content_md5(body), do: :crypto.hash(:md5, body) |> Base.encode64()
+  defp content_sha256(body), do: :crypto.hash(:sha256, body) |> Base.encode64()
 
   defp pab_xml(values) do
     values =
@@ -115,6 +121,330 @@ defmodule Maxio.S3.PublicAccessBlockTest do
 
     assert get2.status == 404
     assert get2.resp_body =~ "NoSuchPublicAccessBlockConfiguration"
+  end
+
+  test "PutPublicAccessBlock requires and validates Content-MD5" do
+    SigV4Request.signed_conn(:put, "/pabmd5") |> call()
+    body = pab_xml(%{"BlockPublicAcls" => true})
+
+    missing =
+      SigV4Request.signed_conn(:put, "/pabmd5",
+        query: %{"publicAccessBlock" => ""},
+        body: body,
+        auto_content_md5: false
+      )
+      |> call()
+
+    assert missing.status == 400
+    assert missing.resp_body =~ "MissingSecurityHeader"
+    assert BucketConfigs.get("pabmd5", :public_access_block) == :none
+
+    bad =
+      SigV4Request.signed_conn(:put, "/pabmd5",
+        query: %{"publicAccessBlock" => ""},
+        body: body,
+        headers: [{"content-md5", content_md5("different")}]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "BadDigest"
+    assert BucketConfigs.get("pabmd5", :public_access_block) == :none
+  end
+
+  test "malformed strict PublicAccessBlock XML does not overwrite existing config" do
+    bucket = "pabstrict"
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+    assert put_pab(bucket, %{"BlockPublicAcls" => true}).status == 200
+
+    duplicate =
+      ~s(<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><BlockPublicAcls>true</BlockPublicAcls></PublicAccessBlockConfiguration>)
+
+    duplicate_res =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"publicAccessBlock" => ""},
+        body: duplicate
+      )
+      |> call()
+
+    assert duplicate_res.status == 400
+    assert duplicate_res.resp_body =~ "<Code>MalformedXML</Code>"
+
+    unknown =
+      ~s(<PublicAccessBlockConfiguration><Unknown>true</Unknown></PublicAccessBlockConfiguration>)
+
+    unknown_res =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"publicAccessBlock" => ""},
+        body: unknown
+      )
+      |> call()
+
+    assert unknown_res.status == 400
+    assert unknown_res.resp_body =~ "<Code>MalformedXML</Code>"
+
+    assert {:ok,
+            %{
+              "BlockPublicAcls" => true,
+              "IgnorePublicAcls" => false,
+              "BlockPublicPolicy" => false,
+              "RestrictPublicBuckets" => false
+            }} = BucketConfigs.get(bucket, :public_access_block)
+  end
+
+  test "PutPublicAccessBlock validates modeled flexible checksum headers" do
+    SigV4Request.signed_conn(:put, "/pabflex") |> call()
+    body = pab_xml(%{"BlockPublicPolicy" => true})
+
+    missing_value =
+      SigV4Request.signed_conn(:put, "/pabflex",
+        query: %{"publicAccessBlock" => ""},
+        body: body,
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"}
+        ]
+      )
+      |> call()
+
+    assert missing_value.status == 400
+    assert missing_value.resp_body =~ "InvalidRequest"
+    assert BucketConfigs.get("pabflex", :public_access_block) == :none
+
+    bad_sha256 =
+      SigV4Request.signed_conn(:put, "/pabflex",
+        query: %{"publicAccessBlock" => ""},
+        body: body,
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", content_sha256("different")}
+        ]
+      )
+      |> call()
+
+    assert bad_sha256.status == 400
+    assert bad_sha256.resp_body =~ "BadDigest"
+    assert BucketConfigs.get("pabflex", :public_access_block) == :none
+
+    ok =
+      SigV4Request.signed_conn(:put, "/pabflex",
+        query: %{"publicAccessBlock" => ""},
+        body: body,
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", content_sha256(body)}
+        ]
+      )
+      |> call()
+
+    assert ok.status == 200
+
+    assert {:ok, %{"BlockPublicPolicy" => true}} =
+             BucketConfigs.get("pabflex", :public_access_block)
+  end
+
+  test "x-amz-expected-bucket-owner is enforced on Get Put and Delete" do
+    SigV4Request.signed_conn(:put, "/pabowner") |> call()
+
+    denied_put =
+      put_pab("pabowner", %{"BlockPublicAcls" => true},
+        headers: [{"x-amz-expected-bucket-owner", "999999999999"}]
+      )
+
+    assert denied_put.status == 403
+    assert denied_put.resp_body =~ "AccessDenied"
+    assert BucketConfigs.get("pabowner", :public_access_block) == :none
+
+    allowed_put =
+      put_pab("pabowner", %{"BlockPublicAcls" => true},
+        headers: [{"x-amz-expected-bucket-owner", "000000000000"}]
+      )
+
+    assert allowed_put.status == 200
+
+    denied_get =
+      SigV4Request.signed_conn(:get, "/pabowner",
+        query: %{"publicAccessBlock" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "999999999999"}]
+      )
+      |> call()
+
+    assert denied_get.status == 403
+    assert denied_get.resp_body =~ "AccessDenied"
+
+    allowed_get =
+      SigV4Request.signed_conn(:get, "/pabowner",
+        query: %{"publicAccessBlock" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "000000000000"}]
+      )
+      |> call()
+
+    assert allowed_get.status == 200
+    assert allowed_get.resp_body =~ "<BlockPublicAcls>true</BlockPublicAcls>"
+
+    denied_delete =
+      SigV4Request.signed_conn(:delete, "/pabowner",
+        query: %{"publicAccessBlock" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "999999999999"}]
+      )
+      |> call()
+
+    assert denied_delete.status == 403
+    assert denied_delete.resp_body =~ "AccessDenied"
+    assert {:ok, _config} = BucketConfigs.get("pabowner", :public_access_block)
+
+    allowed_delete =
+      SigV4Request.signed_conn(:delete, "/pabowner",
+        query: %{"publicAccessBlock" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "000000000000"}]
+      )
+      |> call()
+
+    assert allowed_delete.status == 204
+    assert BucketConfigs.get("pabowner", :public_access_block) == :none
+  end
+
+  test "checksum trailers and aws-chunked XML bodies require Content-MD5 and validate before storing config" do
+    SigV4Request.signed_conn(:put, "/pabchunked") |> call()
+    body = pab_xml(%{"RestrictPublicBuckets" => true})
+
+    plain_trailer =
+      put_pab("pabchunked", %{"RestrictPublicBuckets" => true},
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-trailer", "x-amz-checksum-sha256"}
+        ]
+      )
+
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "InvalidRequest"
+    assert BucketConfigs.get("pabchunked", :public_access_block) == :none
+
+    missing_md5 =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", body,
+        query: %{"publicAccessBlock" => ""},
+        auto_content_md5: false,
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256(body)}]
+      )
+      |> call()
+
+    assert missing_md5.status == 400
+    assert missing_md5.resp_body =~ "MissingSecurityHeader"
+    assert BucketConfigs.get("pabchunked", :public_access_block) == :none
+
+    missing_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", body,
+        query: %{"publicAccessBlock" => ""},
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-trailer", "x-amz-checksum-sha256"}
+        ],
+        streaming_payload_hash: "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+      )
+      |> call()
+
+    assert missing_trailer.status == 400
+    assert missing_trailer.resp_body =~ "IncompleteBody"
+    assert BucketConfigs.get("pabchunked", :public_access_block) == :none
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", body,
+        query: %{"publicAccessBlock" => ""},
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"}
+        ],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256("different")}]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "BadDigest"
+    assert BucketConfigs.get("pabchunked", :public_access_block) == :none
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", body,
+        query: %{"publicAccessBlock" => ""},
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"}
+        ],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256(body)}]
+      )
+      |> call()
+
+    assert ok_trailer.status == 200
+
+    assert {:ok, %{"RestrictPublicBuckets" => true}} =
+             BucketConfigs.get("pabchunked", :public_access_block)
+
+    signed_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", body,
+        query: %{"publicAccessBlock" => ""},
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"}
+        ],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256(body)}],
+        streaming_payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+      )
+      |> call()
+
+    assert signed_trailer.status == 200
+
+    bad_signed_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", body,
+        query: %{"publicAccessBlock" => ""},
+        headers: [
+          {"content-md5", content_md5(body)},
+          {"x-amz-sdk-checksum-algorithm", "SHA256"}
+        ],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256(body)}],
+        streaming_payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        tamper: fn chunked ->
+          Regex.replace(
+            ~r/x-amz-trailer-signature:[0-9a-f]{64}/,
+            chunked,
+            "x-amz-trailer-signature:" <> String.duplicate("0", 64)
+          )
+        end
+      )
+      |> call()
+
+    assert bad_signed_trailer.status == 403
+    assert bad_signed_trailer.resp_body =~ "SignatureDoesNotMatch"
+    assert {:ok, _config} = BucketConfigs.get("pabchunked", :public_access_block)
+
+    ok_chunked =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", body,
+        query: %{"publicAccessBlock" => ""},
+        headers: [{"content-md5", content_md5(body)}]
+      )
+      |> call()
+
+    assert ok_chunked.status == 200
+
+    oversized = String.duplicate("x", 1_048_577)
+
+    too_large =
+      SigV4Request.signed_chunked_conn(:put, "/pabchunked", oversized,
+        query: %{"publicAccessBlock" => ""},
+        chunk_size: byte_size(oversized),
+        decoded_length_override: 1_048_576,
+        headers: [{"content-md5", content_md5(oversized)}]
+      )
+      |> call()
+
+    assert too_large.status == 400
+    assert too_large.resp_body =~ "MalformedXML"
+    assert too_large.resp_body =~ "PublicAccessBlock config too large"
+
+    assert {:ok, %{"RestrictPublicBuckets" => true}} =
+             BucketConfigs.get("pabchunked", :public_access_block)
   end
 
   test "BlockPublicAcls rejects new public ACL writes before side effects" do

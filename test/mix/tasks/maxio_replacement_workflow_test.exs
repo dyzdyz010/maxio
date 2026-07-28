@@ -38,12 +38,14 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
     output = capture_io(fn -> Workflow.run([]) end)
 
     assert output =~ "[maxio replacement.workflow] status=audit"
+    assert output =~ "gate_status=blocked"
     assert output =~ "phase=audit"
     assert output =~ "mutating=false"
     assert output =~ "drive_heal_required=1"
     assert output =~ "heal_status=not_requested"
     assert output =~ "rebalance_enqueue_status=not_requested"
     assert output =~ "automation_status=blocked"
+    assert output =~ "[maxio replacement.workflow.blocker]"
     assert output =~ "next_action=\"mix maxio.replacement.workflow --heal --rebalance-if-needed\""
     assert DriveHealth.heal_required?(endpoint)
   end
@@ -55,11 +57,33 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
 
     assert decoded["status"] == "audit"
     assert decoded["phase"] == "audit"
+    assert decoded["gate_status"] in ["ok", "attention", "blocked"]
+    assert is_list(decoded["blockers"])
+    assert is_list(decoded["warnings"])
+    assert is_list(decoded["workflow_blockers"])
     assert decoded["mutating?"] == false
     assert decoded["probe"]["status"] == "not_requested"
     assert decoded["heal"]["status"] == "not_requested"
     assert decoded["rebalance_enqueue"]["status"] == "not_requested"
     assert decoded["rebalance_advance"]["status"] == "not_requested"
+  end
+
+  test "rehearsal-ready workflow injects local ready automation and marks the report" do
+    decoded =
+      capture_io(fn -> Workflow.run(["--json", "--rehearsal-ready"]) end)
+      |> Jason.decode!()
+
+    assert decoded["status"] == "audit"
+    assert decoded["phase"] == "audit"
+    assert decoded["gate_status"] == "ok"
+    assert decoded["rehearsal_ready?"] == true
+    assert decoded["blockers"] == []
+    assert decoded["warnings"] == []
+    assert decoded["automation_profile"]["status"] == "ready"
+    assert decoded["automation_profile"]["blockers"] == []
+    assert decoded["automation_profile"]["warnings"] == []
+    assert decoded["next_action"] == "none"
+    assert decoded["mutating?"] == false
   end
 
   test "fail-on-blocked prints JSON before returning a non-zero gate" do
@@ -96,6 +120,7 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
 
       decoded = Jason.decode!(output)
       assert decoded["status"] == "blocked"
+      assert decoded["gate_status"] == "blocked"
       assert decoded["phase"] == "audit"
       assert decoded["rebalance_workflow"]["phase"] == "rebalance_closure"
       assert decoded["next_action"] == "mix maxio.rebalance.workflow --job-id #{active.id} --json"
@@ -105,6 +130,36 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
       restore_deployment_topology(previous_deployment_topology)
       restore_topology_source(previous_topology_source)
     end
+  end
+
+  test "fail-on-attention prints JSON before returning a non-zero gate" do
+    with_automation_config(attention_fresh_scheduler(), ready_rebalance_scheduler(), fn ->
+      output =
+        capture_io(fn ->
+          assert_raise Mix.Error, ~r/replacement workflow attention/, fn ->
+            Workflow.run(["--json", "--fail-on-attention"])
+          end
+        end)
+
+      decoded = Jason.decode!(output)
+      assert decoded["status"] == "audit"
+      assert decoded["gate_status"] == "attention"
+      assert decoded["blockers"] == []
+      assert "fresh_drive_heal_inline_advance_closure_disabled" in decoded["warnings"]
+    end)
+  end
+
+  test "fail-on-attention also fails blocked gates after printing evidence" do
+    output =
+      capture_io(fn ->
+        assert_raise Mix.Error, ~r/replacement workflow blocked/, fn ->
+          Workflow.run(["--json", "--fail-on-attention"])
+        end
+      end)
+
+    decoded = Jason.decode!(output)
+    assert decoded["gate_status"] == "blocked"
+    assert "fresh_drive_heal_scheduler_disabled" in decoded["blockers"]
   end
 
   test "unsafe advance flags fail closed unless heal is explicit" do
@@ -132,9 +187,11 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
     IO.puts("LIFECYCLE_SCHEDULER=\#{inspect(Process.whereis(Maxio.Lifecycle.Scheduler))}")
     """
 
+    File.mkdir_p!("tmp")
+
     script_path =
       Path.join(
-        System.tmp_dir!(),
+        "tmp",
         "maxio_replacement_workflow_probe_#{System.unique_integer([:positive])}.exs"
       )
 
@@ -144,7 +201,7 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
     {cmd, args} = mix_run_no_start_script(script_path)
 
     {output, status} =
-      System.cmd(cmd, args, env: [{"MIX_ENV", "test"}], stderr_to_stdout: true)
+      System.cmd(cmd, args, env: mix_test_env(), stderr_to_stdout: true)
 
     assert status == 0, output
     assert output =~ "FRESH_SCHEDULER=nil"
@@ -173,6 +230,17 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
     end
   end
 
+  defp mix_test_env do
+    [{"MIX_ENV", "test"}] ++ inherited_elixir_erl_options()
+  end
+
+  defp inherited_elixir_erl_options do
+    case System.get_env("ELIXIR_ERL_OPTIONS") do
+      nil -> []
+      value -> [{"ELIXIR_ERL_OPTIONS", value}]
+    end
+  end
+
   defp restore_topology(:__maxio_no_topology__), do: :persistent_term.erase(@topology_key)
   defp restore_topology(topology), do: :persistent_term.put(@topology_key, topology)
 
@@ -187,4 +255,51 @@ defmodule Mix.Tasks.MaxioReplacementWorkflowTest do
 
   defp restore_topology_source(source),
     do: Application.put_env(:maxio, :topology_source, source)
+
+  defp with_automation_config(fresh_scheduler, rebalance_scheduler, fun) do
+    previous_fresh = Application.get_env(:maxio, :fresh_drive_heal_scheduler, :__maxio_no_env__)
+    previous_rebalance = Application.get_env(:maxio, :rebalance_scheduler, :__maxio_no_env__)
+    previous_ledger = Application.get_env(:maxio, :scheduler_ledger, :__maxio_no_env__)
+
+    try do
+      Application.put_env(:maxio, :fresh_drive_heal_scheduler, fresh_scheduler)
+      Application.put_env(:maxio, :rebalance_scheduler, rebalance_scheduler)
+      Application.put_env(:maxio, :scheduler_ledger, enabled: true)
+      fun.()
+    after
+      restore_env(:fresh_drive_heal_scheduler, previous_fresh)
+      restore_env(:rebalance_scheduler, previous_rebalance)
+      restore_env(:scheduler_ledger, previous_ledger)
+    end
+  end
+
+  defp ready_fresh_scheduler do
+    [
+      enabled: true,
+      probe_drive_health: true,
+      auto_rebalance_after_heal: true,
+      auto_advance_rebalance_after_heal: false,
+      run_opts: [],
+      scheduler_ledger: [enabled: true]
+    ]
+  end
+
+  defp attention_fresh_scheduler do
+    ready_fresh_scheduler()
+    |> Keyword.put(:auto_advance_rebalance_after_heal, true)
+    |> Keyword.put(:rebalance_advance_opts, auto_rebalance_closure: false)
+  end
+
+  defp ready_rebalance_scheduler do
+    [
+      enabled: true,
+      auto_source_cleanup: true,
+      auto_rebalance_closure: true,
+      run_opts: [],
+      scheduler_ledger: [enabled: true]
+    ]
+  end
+
+  defp restore_env(key, :__maxio_no_env__), do: Application.delete_env(:maxio, key)
+  defp restore_env(key, value), do: Application.put_env(:maxio, key, value)
 end

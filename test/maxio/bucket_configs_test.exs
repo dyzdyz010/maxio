@@ -1,7 +1,19 @@
 defmodule Maxio.BucketConfigsTest do
   use Maxio.DataCase, async: true
   alias Maxio.BucketConfigs
+  alias Maxio.Buckets.Bucket
   alias Maxio.Cluster.Notify
+  alias Maxio.Repo
+
+  setup do
+    Enum.each(["b1", "b2", "b-notify"], fn name ->
+      %Bucket{}
+      |> Bucket.changeset(%{name: name, owner: "arn:aws:iam:::root"})
+      |> Repo.insert!()
+    end)
+
+    :ok
+  end
 
   test "put/get/delete CORS（list）" do
     assert BucketConfigs.get("b1", :cors) == :none

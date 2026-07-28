@@ -3,12 +3,18 @@ defmodule Maxio.S3.Views.Encryption do
   import Saxy.XML
   alias Maxio.S3.XML
 
-  @spec render(%{algorithm: String.t(), bucket_key_enabled: boolean()}) :: iodata()
+  @spec render(%{
+          required(:algorithm) => String.t(),
+          optional(:kms_key_id) => String.t() | nil,
+          required(:bucket_key_enabled) => boolean()
+        }) :: iodata()
   def render(%{algorithm: alg} = data) do
+    apply_default_children =
+      [element("SSEAlgorithm", [], characters(alg))]
+      |> maybe_add_kms_key_id(alg, Map.get(data, :kms_key_id))
+
     apply_default =
-      element("ApplyServerSideEncryptionByDefault", [], [
-        element("SSEAlgorithm", [], characters(alg))
-      ])
+      element("ApplyServerSideEncryptionByDefault", [], apply_default_children)
 
     rule_children =
       [apply_default]
@@ -25,4 +31,11 @@ defmodule Maxio.S3.Views.Encryption do
 
     XML.encode(root)
   end
+
+  defp maybe_add_kms_key_id(children, alg, key_id)
+       when alg in ["aws:kms", "aws:kms:dsse"] and is_binary(key_id) and key_id != "" do
+    children ++ [element("KMSMasterKeyID", [], characters(key_id))]
+  end
+
+  defp maybe_add_kms_key_id(children, _alg, _key_id), do: children
 end

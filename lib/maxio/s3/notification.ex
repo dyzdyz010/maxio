@@ -3,8 +3,9 @@ defmodule Maxio.S3.Notification do
   Bucket notification configuration helpers.
 
   This stores and renders the S3 NotificationConfiguration control-plane
-  document. Actual event delivery to SNS/SQS/Lambda/EventBridge is a separate
-  data-plane feature and is not implemented in this slice.
+  document and provides the data-plane matching helpers used by the notification
+  delivery facade. Actual external delivery to SNS/SQS/Lambda/EventBridge stays
+  behind the delivery behaviour.
   """
 
   alias Maxio.BucketConfigs
@@ -38,6 +39,9 @@ defmodule Maxio.S3.Notification do
     s3:ObjectTagging:*
     s3:ObjectTagging:Put
     s3:ObjectTagging:Delete
+    s3:ObjectAnnotation:*
+    s3:ObjectAnnotation:Put
+    s3:ObjectAnnotation:Delete
   )
 
   @empty %{
@@ -107,6 +111,39 @@ defmodule Maxio.S3.Notification do
     end
   end
 
+  @spec matching_destinations(map(), String.t(), String.t()) :: [map()]
+  def matching_destinations(config, event_name, key)
+      when is_map(config) and is_binary(event_name) and is_binary(key) do
+    normalized = normalize(config)
+
+    if known_event?(event_name) do
+      destination_matches(normalized, event_name, key) ++
+        event_bridge_matches(normalized, event_name)
+    else
+      []
+    end
+  end
+
+  @doc """
+  Builds the simplified AWS `s3:TestEvent` payload used while validating SNS/SQS
+  notification destinations.
+
+  This is a control-plane probe payload. It intentionally does not use the
+  regular `Records` event structure and must not be persisted to the durable
+  notification outbox.
+  """
+  @spec test_event_payload(String.t(), keyword()) :: map()
+  def test_event_payload(bucket, opts \\ []) when is_binary(bucket) do
+    %{
+      "Service" => "Amazon S3",
+      "Event" => "s3:TestEvent",
+      "Time" => test_event_time(Keyword.get(opts, :now)),
+      "Bucket" => bucket,
+      "RequestId" => Keyword.get_lazy(opts, :request_id, &random_hex_id/0),
+      "HostId" => Keyword.get_lazy(opts, :host_id, &random_host_id/0)
+    }
+  end
+
   defp normalize_destination_list!(list, destination_key) when is_list(list) do
     Enum.map(list, &normalize_destination!(&1, destination_key))
   end
@@ -120,10 +157,10 @@ defmodule Maxio.S3.Notification do
     filter = value(config, ["Filter", "filter"])
 
     cond do
-      not non_empty_string?(destination) ->
+      not valid_destination_arn?(destination_key, destination) ->
         invalid_stored!()
 
-      not is_list(events) or events == [] or Enum.any?(events, &(not known_event?(&1))) ->
+      not valid_events?(events) ->
         invalid_stored!()
 
       true ->
@@ -137,6 +174,57 @@ defmodule Maxio.S3.Notification do
   end
 
   defp normalize_destination!(_config, _destination_key), do: invalid_stored!()
+
+  defp valid_events?(events) when is_list(events) and events != [] do
+    Enum.all?(events, &known_event?/1) and Enum.uniq(events) == events
+  end
+
+  defp valid_events?(_events), do: false
+
+  defp valid_destination_arn?("Queue", value),
+    do: valid_service_arn?(value, "sqs", &valid_sqs_resource?/1)
+
+  defp valid_destination_arn?("Topic", value),
+    do: valid_service_arn?(value, "sns", &valid_sns_resource?/1)
+
+  defp valid_destination_arn?("LambdaFunction", value),
+    do: valid_service_arn?(value, "lambda", &valid_lambda_resource?/1)
+
+  defp valid_destination_arn?(_destination_key, _value), do: false
+
+  defp valid_service_arn?(value, service, resource_validator) when is_binary(value) do
+    case String.split(value, ":", parts: 6) do
+      ["arn", partition, ^service, region, account, resource] ->
+        valid_arn_partition?(partition) and
+          valid_arn_region?(region) and
+          Regex.match?(~r/\A\d{12}\z/, account) and
+          resource_validator.(resource)
+
+      _other ->
+        false
+    end
+  end
+
+  defp valid_service_arn?(_value, _service, _resource_validator), do: false
+
+  defp valid_arn_partition?(partition), do: Regex.match?(~r/\Aaws(?:-[a-z0-9]+)*\z/, partition)
+
+  defp valid_arn_region?(region) do
+    Regex.match?(~r/\A[a-z0-9-]+\z/, region) and region != ""
+  end
+
+  defp valid_sqs_resource?(resource),
+    do: Regex.match?(~r/\A[A-Za-z0-9_-]{1,80}\z/, resource)
+
+  defp valid_sns_resource?(resource),
+    do: Regex.match?(~r/\A[A-Za-z0-9_-]{1,256}\z/, resource)
+
+  defp valid_lambda_resource?(resource),
+    do:
+      Regex.match?(
+        ~r/\Afunction:[A-Za-z0-9-_]{1,64}(?::(?:[A-Za-z0-9-_]+|\$LATEST))?\z/,
+        resource
+      )
 
   defp normalize_filter!(nil), do: nil
 
@@ -215,6 +303,63 @@ defmodule Maxio.S3.Notification do
       config["QueueConfigurations"] ++ config["LambdaFunctionConfigurations"]
   end
 
+  defp destination_matches(config, event_name, key) do
+    [
+      {"Topic", config["TopicConfigurations"]},
+      {"Queue", config["QueueConfigurations"]},
+      {"LambdaFunction", config["LambdaFunctionConfigurations"]}
+    ]
+    |> Enum.flat_map(fn {type, configs} ->
+      configs
+      |> Enum.filter(&destination_matches?(&1, type, event_name, key))
+      |> Enum.map(&destination_payload(&1, type))
+    end)
+  end
+
+  defp destination_matches?(destination, type, event_name, key) do
+    Enum.any?(destination["Events"], &event_matches?(&1, event_name)) and
+      filter_matches_key?(destination["Filter"], key) and
+      non_empty_string?(destination[type])
+  end
+
+  defp event_bridge_matches(config, event_name) do
+    case config["EventBridgeConfiguration"] do
+      nil ->
+        []
+
+      %{} ->
+        [
+          %{
+            type: "EventBridge",
+            arn: nil,
+            id: "EventBridge",
+            events: [event_name],
+            filter: nil
+          }
+        ]
+    end
+  end
+
+  defp destination_payload(destination, type) do
+    %{
+      type: type,
+      arn: destination[type],
+      id: destination["Id"],
+      events: destination["Events"],
+      filter: destination["Filter"]
+    }
+  end
+
+  defp event_matches?(configured, actual),
+    do: configured == actual or event_wildcard_covers?(configured, actual)
+
+  defp filter_matches_key?(nil, _key), do: true
+
+  defp filter_matches_key?(filter, key) do
+    match = filter_match(filter)
+    String.starts_with?(key, match.prefix) and String.ends_with?(key, match.suffix)
+  end
+
   defp notification_entries(destination) do
     filter = filter_match(destination["Filter"])
     Enum.map(destination["Events"], &%{event: &1, filter: filter})
@@ -263,7 +408,7 @@ defmodule Maxio.S3.Notification do
   end
 
   defp valid_filter_value?(value) when is_binary(value) do
-    valid_encoded_filter_chars?(String.to_charlist(value)) and
+    byte_size(value) <= 1024 and valid_encoded_filter_chars?(String.to_charlist(value)) and
       match?({:ok, _}, decode_filter_value(value))
   end
 
@@ -330,6 +475,22 @@ defmodule Maxio.S3.Notification do
   end
 
   defp non_empty_string?(value), do: is_binary(value) and value != ""
+
+  defp test_event_time(%DateTime{} = now) do
+    now
+    |> DateTime.truncate(:millisecond)
+    |> DateTime.to_iso8601()
+  end
+
+  defp test_event_time(_other), do: test_event_time(DateTime.utc_now())
+
+  defp random_hex_id do
+    8
+    |> :crypto.strong_rand_bytes()
+    |> Base.encode16(case: :upper)
+  end
+
+  defp random_host_id, do: :crypto.strong_rand_bytes(48) |> Base.encode64()
 
   defp invalid_stored!,
     do: raise(Error.new(:internal_error, message: "Invalid stored NotificationConfiguration"))

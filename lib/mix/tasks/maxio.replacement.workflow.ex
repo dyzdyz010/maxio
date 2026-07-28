@@ -11,13 +11,16 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
 
   Default mode is read-only. Mutating work requires explicit flags. This task
   never invokes decommission, topology mutation, deployment finalization,
-  physical removal, or purge. Use `--fail-on-blocked` when rehearsal automation
-  should treat blocked/failed reports as a non-zero gate.
+  physical removal, or purge. `--rehearsal-ready` is an explicit local
+  rehearsal mode that injects a safe ready automation profile without changing
+  production config or starting schedulers. Use `--fail-on-blocked` when
+  rehearsal automation should treat blocked reports as a non-zero gate, or
+  `--fail-on-attention` when automation should also fail on actionable warnings.
   """
 
   use Mix.Task
 
-  alias Maxio.Cluster.Replacement.Workflow
+  alias Maxio.Cluster.Replacement.{AutomationProfile, Workflow}
 
   @impl true
   def run(args) do
@@ -35,7 +38,9 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
           page_size: :integer,
           audit_page_size: :integer,
           scan_current_only: :boolean,
+          rehearsal_ready: :boolean,
           fail_on_blocked: :boolean,
+          fail_on_attention: :boolean,
           json: :boolean
         ]
       )
@@ -47,7 +52,9 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
         "usage: mix maxio.replacement.workflow [--probe] [--heal] [--dry-run] " <>
           "[--rebalance-if-needed] [--advance-steps N] [--verify-closure] " <>
           "[--bucket <name>] [--max-objects N] [--page-size N] " <>
-          "[--audit-page-size N] [--scan-current-only] [--fail-on-blocked] [--json] " <>
+          "[--audit-page-size N] [--scan-current-only] [--rehearsal-ready] " <>
+          "[--fail-on-blocked] " <>
+          "[--fail-on-attention] [--json] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
     end
@@ -86,7 +93,18 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
       audit_page_size: Keyword.get(opts, :audit_page_size),
       scan_versions: not Keyword.get(opts, :scan_current_only, false)
     ]
+    |> maybe_rehearsal_ready(opts)
     |> Keyword.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp maybe_rehearsal_ready(workflow_opts, opts) do
+    if Keyword.get(opts, :rehearsal_ready, false) do
+      workflow_opts
+      |> Keyword.put(:rehearsal_ready?, true)
+      |> Keyword.put(:automation_profile_opts, AutomationProfile.rehearsal_ready_opts())
+    else
+      workflow_opts
+    end
   end
 
   defp print_or_json(report, opts) do
@@ -94,7 +112,9 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
       IO.puts(Jason.encode!(json_ready(report)))
     else
       IO.puts(
-        "[maxio replacement.workflow] status=#{report.status} phase=#{report.phase} " <>
+        "[maxio replacement.workflow] status=#{report.status} gate_status=#{report.gate_status} " <>
+          "phase=#{report.phase} " <>
+          "rehearsal_ready=#{Map.get(report, :rehearsal_ready?, false)} " <>
           "mutating=#{report.mutating?} " <>
           "drive_heal_required=#{report.drive_health_after.heal_required} " <>
           "identity_heal_required=#{report.drive_health_after.identity_heal_required} " <>
@@ -108,9 +128,19 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
           "rebalance_workflow_status=#{status(report.rebalance_workflow)} " <>
           "automation_status=#{status(report.automation_profile)} " <>
           "automation_blockers=#{length(Map.get(report.automation_profile, :blockers, []))} " <>
+          "automation_warnings=#{length(Map.get(report.automation_profile, :warnings, []))} " <>
           "blockers=#{inspect(report.blockers)} " <>
+          "warnings=#{inspect(report.warnings)} " <>
           "next_action=#{inspect(report.next_action)}"
       )
+
+      Enum.each(report.blockers, fn blocker ->
+        IO.puts("[maxio replacement.workflow.blocker] reason=#{blocker}")
+      end)
+
+      Enum.each(report.warnings, fn warning ->
+        IO.puts("[maxio replacement.workflow.warning] reason=#{warning}")
+      end)
     end
   end
 
@@ -178,11 +208,19 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
     end
   end
 
-  defp fail_if_needed!(report, opts) do
-    if Keyword.get(opts, :fail_on_blocked, false) and status(report) in [:blocked, :failed] do
-      Mix.raise("replacement workflow #{status(report)}")
+  defp fail_if_needed!(%{gate_status: "blocked"}, opts) do
+    if Keyword.get(opts, :fail_on_blocked, false) or Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("replacement workflow blocked")
     end
   end
+
+  defp fail_if_needed!(%{gate_status: "attention"} = report, opts) do
+    if Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("replacement workflow #{report.gate_status}")
+    end
+  end
+
+  defp fail_if_needed!(_report, _opts), do: :ok
 
   defp error_message(:advance_requires_heal),
     do: "--advance-steps and --verify-closure require --heal"

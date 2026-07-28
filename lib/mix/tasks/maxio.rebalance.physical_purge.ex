@@ -9,10 +9,13 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurge do
       mix maxio.rebalance.physical_purge <uuid> \
         --confirm-job-id <uuid> --confirm-quarantine-id <id> \
         --retention-hours 168 --json
+      mix maxio.rebalance.physical_purge <uuid> \
+        --confirm-job-id <uuid> --confirm-quarantine-id <id> \
+        --require-secure-erase-evidence --secure-erase-evidence evidence.json
 
   This command deletes only the quarantine root for the stored removed endpoint
   manifest. It does not delete drive roots, mutate topology, rewrite deployment
-  config, remove hardware, or run automatically.
+  config, remove hardware, run device sanitize, or run automatically.
   """
   use Mix.Task
 
@@ -27,6 +30,8 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurge do
           confirm_job_id: :string,
           confirm_quarantine_id: :string,
           retention_hours: :integer,
+          secure_erase_evidence: :string,
+          require_secure_erase_evidence: :boolean,
           json: :boolean
         ]
       )
@@ -46,7 +51,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurge do
 
     purge_opts =
       [confirm_job_id: confirm_job_id, confirm_quarantine_id: confirm_quarantine_id] ++
-        retention_opts(opts)
+        retention_opts(opts) ++ secure_erase_opts(opts)
 
     case PhysicalPurge.apply(job_id, purge_opts) do
       {:ok, report} -> print_or_json(opts, report)
@@ -57,7 +62,17 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurge do
   defp usage do
     "usage: mix maxio.rebalance.physical_purge " <>
       "[JOB_ID|--job-id <uuid>] --confirm-job-id <same uuid> " <>
-      "--confirm-quarantine-id <id> [--retention-hours N] [--json]"
+      "--confirm-quarantine-id <id> [--retention-hours N] " <>
+      "[--secure-erase-evidence PATH] [--require-secure-erase-evidence] [--json]"
+  end
+
+  defp secure_erase_opts(opts) do
+    []
+    |> maybe_put(:secure_erase_evidence, Keyword.get(opts, :secure_erase_evidence))
+    |> maybe_put(
+      :require_secure_erase_evidence,
+      Keyword.get(opts, :require_secure_erase_evidence, false)
+    )
   end
 
   defp retention_opts(opts) do
@@ -78,6 +93,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurge do
           "roots_deleted=#{report.roots_deleted} files_deleted=#{report.files_deleted} " <>
           "dirs_deleted=#{report.dirs_deleted} bytes_deleted=#{report.bytes_deleted} " <>
           "markers_written=#{report.markers_written} errors=#{report.errors} " <>
+          "secure_erase_evidence_status=#{report.secure_erase_evidence["status"]} " <>
           "physical_removal=quarantine_hard_delete topology_mutation=false " <>
           "deployment_config_mutation=false"
       )
@@ -94,6 +110,10 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurge do
     do: "physical purge failed: #{inspect(report.results)}"
 
   defp error_message(reason), do: "physical purge failed: #{inspect(reason)}"
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, _key, false), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp json_ready(nil), do: nil
   defp json_ready(value) when is_boolean(value), do: value

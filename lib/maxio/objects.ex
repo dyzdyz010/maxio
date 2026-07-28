@@ -6,7 +6,7 @@ defmodule Maxio.Objects do
   """
   import Ecto.Query
   alias Maxio.Repo
-  alias Maxio.Buckets
+  alias Maxio.{BucketQuota, Buckets}
   alias Maxio.Cluster.Notify
   alias Maxio.Objects.Object
   alias Maxio.S3.Log
@@ -15,6 +15,7 @@ defmodule Maxio.Objects do
   alias Maxio.Versioning.VersionId
 
   @max_keys_limit 1000
+  @archive_storage_classes ~w(GLACIER DEEP_ARCHIVE)
 
   # ROUTE B B5-1 —— reconcile upsert 的 on_conflict 全字段替换集：scanner 以盘上 sidecar 为权威
   # 收敛 PG 行，**所有读可见字段**都必须被替换（含 tags/sse/metadata——与写路径 upsert 的最小替换集
@@ -27,7 +28,10 @@ defmodule Maxio.Objects do
     :content_disposition,
     :cache_control,
     :expires,
+    :website_redirect_location,
     :metadata,
+    :checksum,
+    :object_parts,
     :storage_class,
     :acl_canned,
     :acl_grants,
@@ -39,10 +43,12 @@ defmodule Maxio.Objects do
     :object_lock_legal_hold,
     :restore_status,
     :restore_expiry,
+    :replication_status,
     :is_latest,
     :is_delete_marker,
     :synced_at,
     :index_generation,
+    :inserted_at,
     :updated_at
   ]
 
@@ -80,6 +86,8 @@ defmodule Maxio.Objects do
           etag: Map.fetch!(attrs, :etag),
           content_type: Map.get(attrs, :content_type, "binary/octet-stream"),
           metadata: Map.get(attrs, :metadata, %{}),
+          checksum: Map.get(attrs, :checksum, %{}),
+          object_parts: Map.get(attrs, :object_parts, %{}),
           storage_class: Map.get(attrs, :storage_class, "STANDARD"),
           acl_canned: Map.get(attrs, :acl_canned, "private"),
           acl_grants: Map.get(attrs, :acl_grants, %{"grants" => []}),
@@ -99,6 +107,15 @@ defmodule Maxio.Objects do
         |> Map.merge(placement_attrs(attrs))
 
       Repo.transaction(fn ->
+        :ok =
+          BucketQuota.ensure_write_allowed!(
+            Repo,
+            bucket_name,
+            key,
+            "null",
+            Map.fetch!(attrs, :size)
+          )
+
         unset_latest(bucket.id, key)
 
         {:ok, obj} =
@@ -115,7 +132,10 @@ defmodule Maxio.Objects do
                  :content_disposition,
                  :cache_control,
                  :expires,
+                 :website_redirect_location,
                  :metadata,
+                 :checksum,
+                 :object_parts,
                  :storage_class,
                  :acl_canned,
                  :acl_grants,
@@ -145,12 +165,14 @@ defmodule Maxio.Objects do
   end
 
   @doc """
-  ROUTE B B5-1 —— best-effort 索引写（与 put_metadata/3 同参数/同语义，但捕获异常返回
-  `{:error, term}` 而非抛出，成功归一为 `:ok`）。
+  ROUTE B B5-1 —— best-effort 索引写（与 put_metadata/3 同参数/同语义；普通 PG
+  index 异常捕获为 `{:error, term}`，成功归一为 `:ok`）。
 
   用于 `authoritative_source(:write) == :sidecar` 的 CompleteMultipartUpload：盘上 assemble 已写出
   权威 maxio/2 sidecar（达 write_quorum），PG 仅作派生索引，故 PG 写失败**非致命**——调用方据
   `:ok | {:error, reason}` 记 Log.error 而非让 Complete 失败（去 PG 写路径 SPOF，铁律 3 绝不静默）。
+  但 S3 语义错误（例如 bucket hard quota）必须重新抛出并让调用方 fail-closed 清理已写字节，
+  不能降级为 best-effort 索引失败。
   `:pg` 默认权威仍走 put_metadata/3 的致命语义。与 put_version_index/4、insert_delete_marker_index/3
   同一 `*_index` best-effort 包装契约。
   """
@@ -161,6 +183,7 @@ defmodule Maxio.Objects do
       {:error, reason} -> {:error, reason}
     end
   rescue
+    e in Maxio.S3.Error -> reraise(e, __STACKTRACE__)
     e -> {:error, e}
   end
 
@@ -213,14 +236,33 @@ defmodule Maxio.Objects do
   @spec get_tags(String.t(), String.t(), String.t() | nil) ::
           {:ok, [{String.t(), String.t()}]} | {:error, :not_found}
   def get_tags(bucket_name, key, version_id \\ nil) do
+    case get_tags_with_version(bucket_name, key, version_id) do
+      {:ok, tags, _version_id} -> {:ok, tags}
+      {:error, :delete_marker, _object} -> {:error, :not_found}
+      {:error, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  @doc "读取对象 tag，并返回实际对象版本 ID。"
+  @spec get_tags_with_version(String.t(), String.t(), String.t() | nil) ::
+          {:ok, [{String.t(), String.t()}], String.t()}
+          | {:error, :delete_marker, Object.t()}
+          | {:error, :not_found}
+  def get_tags_with_version(bucket_name, key, version_id \\ nil) do
     fetch =
       if version_id,
         do: get_version(bucket_name, key, version_id),
         else: get_metadata(bucket_name, key)
 
     case fetch do
-      {:ok, obj} -> {:ok, Maxio.Tags.map_to_list(obj.tags || %{})}
-      {:error, :not_found} -> {:error, :not_found}
+      {:ok, %Object{is_delete_marker: true} = obj} ->
+        {:error, :delete_marker, obj}
+
+      {:ok, obj} ->
+        {:ok, Maxio.Tags.map_to_list(obj.tags || %{}), obj.version_id}
+
+      {:error, :not_found} ->
+        {:error, :not_found}
     end
   end
 
@@ -228,16 +270,35 @@ defmodule Maxio.Objects do
   @spec put_tags(String.t(), String.t(), [{String.t(), String.t()}], String.t() | nil) ::
           :ok | {:error, :not_found}
   def put_tags(bucket_name, key, tags, version_id \\ nil) do
+    case put_tags_with_version(bucket_name, key, tags, version_id) do
+      {:ok, _version_id} -> :ok
+      {:error, :delete_marker, _object} -> {:error, :not_found}
+      {:error, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  @doc "写对象 tag，并返回实际对象版本 ID。"
+  @spec put_tags_with_version(
+          String.t(),
+          String.t(),
+          [{String.t(), String.t()}],
+          String.t() | nil
+        ) ::
+          {:ok, String.t()} | {:error, :delete_marker, Object.t()} | {:error, :not_found}
+  def put_tags_with_version(bucket_name, key, tags, version_id \\ nil) do
     fetch =
       if version_id,
         do: get_version(bucket_name, key, version_id),
         else: get_metadata(bucket_name, key)
 
     case fetch do
+      {:ok, %Object{is_delete_marker: true} = obj} ->
+        {:error, :delete_marker, obj}
+
       {:ok, obj} ->
         obj |> Object.changeset(%{tags: Maxio.Tags.list_to_map(tags)}) |> Repo.update!()
         Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
-        :ok
+        {:ok, obj.version_id}
 
       {:error, :not_found} ->
         {:error, :not_found}
@@ -300,11 +361,14 @@ defmodule Maxio.Objects do
           String.t(),
           String.t() | nil,
           map(),
-          non_neg_integer() | nil
+          non_neg_integer() | keyword() | nil
         ) ::
-          {:ok, Object.t()} | {:error, :not_found}
-  def put_restore_state(bucket_name, key, version_id, attrs, generation \\ nil)
+          {:ok, Object.t() | {Object.t(), term()}} | {:error, :not_found}
+  def put_restore_state(bucket_name, key, version_id, attrs, generation_or_opts \\ nil)
       when is_map(attrs) do
+    opts = restore_state_opts(generation_or_opts)
+    generation = Keyword.get(opts, :generation)
+
     fetch =
       if version_id,
         do: get_version(bucket_name, key, version_id),
@@ -312,21 +376,124 @@ defmodule Maxio.Objects do
 
     case fetch do
       {:ok, %Object{} = obj} ->
-        set_attrs =
-          attrs
-          |> Map.take([:restore_status, :restore_expiry])
-          |> Map.to_list()
-          |> maybe_storage_class_generation(generation)
-
-        from(o in Object, where: o.id == ^obj.id)
-        |> Repo.update_all(set: set_attrs)
-
-        Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
-        get_version(bucket_name, key, obj.version_id)
+        if Keyword.has_key?(opts, :transaction_hook) do
+          Repo.transaction(fn ->
+            object = put_restore_state!(obj, bucket_name, key, attrs, generation)
+            with_transaction_hook_result(object, run_transaction_hook!(opts, Repo, object))
+          end)
+        else
+          {:ok, put_restore_state!(obj, bucket_name, key, attrs, generation)}
+        end
 
       {:error, :not_found} ->
         {:error, :not_found}
     end
+  end
+
+  @doc """
+  Return archive object versions whose restored copy expiry is due.
+
+  This is an operator/background scan source; it does not mutate rows. The
+  caller must use `expire_restore_state/3` so a concurrently extended restore
+  is not cleared by a stale scan candidate.
+  """
+  @spec list_expired_restores(DateTime.t(), keyword()) :: [Object.t()]
+  def list_expired_restores(%DateTime{} = now, opts \\ []) do
+    limit = normalize_expiry_limit(Keyword.get(opts, :limit, 1000))
+
+    query =
+      from(o in Object,
+        where:
+          o.restore_status == "restored" and not is_nil(o.restore_expiry) and
+            o.restore_expiry <= ^now and o.is_delete_marker == false and
+            o.storage_class in ^@archive_storage_classes,
+        order_by: [asc: o.restore_expiry, asc: o.bucket_name, asc: o.key, asc: o.version_id],
+        limit: ^limit
+      )
+
+    query =
+      case Keyword.get(opts, :bucket) do
+        bucket when is_binary(bucket) and bucket != "" ->
+          where(query, [o], o.bucket_name == ^bucket)
+
+        _other ->
+          query
+      end
+
+    Repo.all(query)
+  end
+
+  @doc """
+  Clear a due RestoreObject state if it is still the same expired state.
+
+  Returns `:stale` when the object was restored again, deleted, or otherwise no
+  longer matches the scan candidate. This fail-closed guard prevents a delayed
+  expiry sweep from removing a newer restored copy.
+  """
+  @spec expire_restore_state(Object.t(), DateTime.t(), keyword()) ::
+          {:ok, Object.t() | {Object.t(), term()}} | :stale
+  def expire_restore_state(obj, now, opts \\ [])
+
+  def expire_restore_state(%Object{restore_expiry: %DateTime{}} = obj, %DateTime{} = now, opts) do
+    if Keyword.has_key?(opts, :transaction_hook) do
+      case Repo.transaction(fn -> expire_restore_state_with_hook!(obj, now, opts) end) do
+        {:ok, :stale} -> :stale
+        {:ok, result} -> {:ok, result}
+      end
+    else
+      expire_restore_state!(obj, now)
+    end
+  end
+
+  def expire_restore_state(%Object{}, %DateTime{}, _opts), do: :stale
+
+  defp restore_state_opts(opts) when is_list(opts), do: opts
+  defp restore_state_opts(generation), do: [generation: generation]
+
+  defp expire_restore_state_with_hook!(%Object{} = obj, %DateTime{} = now, opts) do
+    case expire_restore_state!(obj, now) do
+      {:ok, object} ->
+        with_transaction_hook_result(object, run_transaction_hook!(opts, Repo, object))
+
+      :stale ->
+        :stale
+    end
+  end
+
+  defp expire_restore_state!(%Object{} = obj, %DateTime{} = now) do
+    {count, _} =
+      from(o in Object,
+        where:
+          o.id == ^obj.id and o.restore_status == "restored" and
+            o.restore_expiry == ^obj.restore_expiry and o.restore_expiry <= ^now
+      )
+      |> Repo.update_all(set: [restore_status: nil, restore_expiry: nil])
+
+    case count do
+      1 ->
+        Notify.broadcast({:object_metadata_changed, obj.bucket_name, obj.key, obj.version_id})
+        {:ok, Repo.get!(Object, obj.id)}
+
+      _ ->
+        :stale
+    end
+  end
+
+  defp normalize_expiry_limit(limit) when is_integer(limit) and limit > 0, do: min(limit, 10_000)
+  defp normalize_expiry_limit(_limit), do: 1000
+
+  defp put_restore_state!(%Object{} = obj, bucket_name, key, attrs, generation) do
+    set_attrs =
+      attrs
+      |> Map.take([:restore_status, :restore_expiry])
+      |> Map.to_list()
+      |> maybe_storage_class_generation(generation)
+
+    from(o in Object, where: o.id == ^obj.id)
+    |> Repo.update_all(set: set_attrs)
+
+    Notify.broadcast({:object_metadata_changed, bucket_name, key, obj.version_id})
+    Repo.get!(Object, obj.id)
   end
 
   @doc "按 (bucket, key) 取当前版本（is_latest=true）的对象元数据。delete marker 也会返回（调用方判 is_delete_marker）。"
@@ -408,8 +575,9 @@ defmodule Maxio.Objects do
   @spec count_versions_with_placement_set(integer()) :: non_neg_integer()
   def count_versions_with_placement_set(set_id) when is_integer(set_id) do
     query =
-      from o in Object,
+      from(o in Object,
         where: o.placement_set_id == ^set_id
+      )
 
     Repo.aggregate(query, :count, :id)
   end
@@ -424,8 +592,9 @@ defmodule Maxio.Objects do
   @spec count_versions_missing_placement_set() :: non_neg_integer()
   def count_versions_missing_placement_set do
     query =
-      from o in Object,
+      from(o in Object,
         where: is_nil(o.placement_set_id)
+      )
 
     Repo.aggregate(query, :count, :id)
   end
@@ -440,8 +609,9 @@ defmodule Maxio.Objects do
   @spec count_versions_with_unknown_placement_set([integer()]) :: non_neg_integer()
   def count_versions_with_unknown_placement_set(set_ids) when is_list(set_ids) do
     query =
-      from o in Object,
+      from(o in Object,
         where: not is_nil(o.placement_set_id) and o.placement_set_id not in ^set_ids
+      )
 
     Repo.aggregate(query, :count, :id)
   end
@@ -451,19 +621,36 @@ defmodule Maxio.Objects do
   def any_version_with_placement_topology_hash_mismatch?(topology_hash)
       when is_binary(topology_hash) do
     query =
-      from o in Object,
+      from(o in Object,
         where: is_nil(o.placement_topology_hash) or o.placement_topology_hash != ^topology_hash,
         select: o.id,
         limit: 1
+      )
 
     not is_nil(Repo.one(query))
   end
 
   @doc "删除对象元数据（幂等：不存在也返回 :ok）。"
-  @spec delete_metadata(String.t(), String.t()) :: :ok
-  def delete_metadata(bucket_name, key) do
-    Repo.delete_all(from o in Object, where: o.bucket_name == ^bucket_name and o.key == ^key)
-    :ok
+  @spec delete_metadata(String.t(), String.t(), keyword()) ::
+          :ok | map() | {map(), term()} | {:error, term()}
+  def delete_metadata(bucket_name, key, opts \\ []) do
+    if Keyword.has_key?(opts, :transaction_hook) do
+      Repo.transaction(fn ->
+        target =
+          bucket_name
+          |> current_delete_subject(key)
+
+        Repo.delete_all(from(o in Object, where: o.bucket_name == ^bucket_name and o.key == ^key))
+        with_transaction_hook_result(target, run_transaction_hook!(opts, Repo, target))
+      end)
+      |> case do
+        {:ok, result} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      Repo.delete_all(from(o in Object, where: o.bucket_name == ^bucket_name and o.key == ^key))
+      :ok
+    end
   end
 
   @doc """
@@ -483,9 +670,10 @@ defmodule Maxio.Objects do
   end
 
   @doc "用外部已生成的 version_id 写入版本行（PutObject 路径：字节已按此 version_id 落盘）。"
-  @spec put_version_with_id(String.t(), String.t(), String.t(), map()) ::
-          {:ok, Object.t()} | {:error, :no_such_bucket | Ecto.Changeset.t()}
-  def put_version_with_id(bucket_name, key, version_id, attrs) do
+  @spec put_version_with_id(String.t(), String.t(), String.t(), map(), keyword()) ::
+          {:ok, Object.t() | {Object.t(), term()}}
+          | {:error, :no_such_bucket | Ecto.Changeset.t()}
+  def put_version_with_id(bucket_name, key, version_id, attrs, opts \\ []) do
     with {:ok, bucket} <- bucket_or_error(bucket_name) do
       base =
         attrs
@@ -495,7 +683,10 @@ defmodule Maxio.Objects do
           :content_disposition,
           :cache_control,
           :expires,
+          :website_redirect_location,
           :metadata,
+          :checksum,
+          :object_parts,
           :storage_class,
           :acl_canned,
           :acl_grants,
@@ -507,6 +698,7 @@ defmodule Maxio.Objects do
           :object_lock_legal_hold,
           :restore_status,
           :restore_expiry,
+          :replication_status,
           :placement_set_id,
           :placement_pool_id,
           :placement_topology_hash
@@ -527,59 +719,78 @@ defmodule Maxio.Objects do
         })
 
       Repo.transaction(fn ->
+        :ok =
+          BucketQuota.ensure_write_allowed!(
+            Repo,
+            bucket_name,
+            key,
+            version_id,
+            Map.fetch!(attrs, :size)
+          )
+
         unset_latest(bucket.id, key)
 
-        case %Object{}
-             |> Object.changeset(base)
-             |> Repo.insert(
-               on_conflict:
-                 {:replace,
-                  [
-                    :size,
-                    :etag,
-                    :content_type,
-                    :content_encoding,
-                    :content_disposition,
-                    :cache_control,
-                    :expires,
-                    :metadata,
-                    :storage_class,
-                    :acl_canned,
-                    :acl_grants,
-                    :sse_algorithm,
-                    :sse_envelope,
-                    :object_lock_mode,
-                    :object_lock_retain_until,
-                    :object_lock_legal_hold,
-                    :restore_status,
-                    :restore_expiry,
-                    :placement_set_id,
-                    :placement_pool_id,
-                    :placement_topology_hash,
-                    :is_latest,
-                    :is_delete_marker,
-                    :synced_at,
-                    :index_generation,
-                    :inserted_at,
-                    :updated_at
-                  ]},
-               conflict_target: [:bucket_id, :key, :version_id]
-             ) do
-          {:ok, obj} -> obj
-          {:error, cs} -> Repo.rollback(cs)
-        end
+        obj =
+          case %Object{}
+               |> Object.changeset(base)
+               |> Repo.insert(
+                 on_conflict:
+                   {:replace,
+                    [
+                      :size,
+                      :etag,
+                      :content_type,
+                      :content_encoding,
+                      :content_disposition,
+                      :cache_control,
+                      :expires,
+                      :website_redirect_location,
+                      :metadata,
+                      :checksum,
+                      :object_parts,
+                      :storage_class,
+                      :acl_canned,
+                      :acl_grants,
+                      :tags,
+                      :sse_algorithm,
+                      :sse_envelope,
+                      :object_lock_mode,
+                      :object_lock_retain_until,
+                      :object_lock_legal_hold,
+                      :restore_status,
+                      :restore_expiry,
+                      :replication_status,
+                      :placement_set_id,
+                      :placement_pool_id,
+                      :placement_topology_hash,
+                      :is_latest,
+                      :is_delete_marker,
+                      :synced_at,
+                      :index_generation,
+                      :inserted_at,
+                      :updated_at
+                    ]},
+                 conflict_target: [:bucket_id, :key, :version_id]
+               ) do
+            {:ok, obj} -> obj
+            {:error, cs} -> Repo.rollback(cs)
+          end
+
+        with_transaction_hook_result(obj, run_transaction_hook!(opts, Repo, obj))
       end)
     end
   end
 
   @doc """
-  ROUTE B B4-2 —— best-effort 索引写（与 put_version_with_id/4 同参数/同语义，但捕获异常返回
-  `{:error, term}` 而非抛出，且把成功结果归一为 `:ok`）。
+  ROUTE B B4-2 —— best-effort 索引写（与 put_version_with_id/4 同参数/同语义；普通 PG
+  index 异常捕获为 `{:error, term}`，且把成功结果归一为 `:ok`）。
 
   用于 `authoritative_source(:write) == :sidecar`：sidecar 才是写路径的权威载体（Storage.put 达
   write_quorum = 字节 + sidecar 已耐久落盘），PG 仅作派生索引，故 PG 写失败**非致命**——调用方据
   `:ok | {:error, reason}` 记结构化日志而非让对象 PUT 失败（去 PG 写路径 SPOF，铁律 3 绝不静默：
-  失败必由调用方记 Log.error）。`:pg` 权威（默认）仍走 put_version_with_id/4 的致命 + 回滚语义。
+  失败必由调用方记 Log.error）。但 S3 语义错误（例如 bucket hard quota）必须重新抛出并让调用方
+  fail-closed 清理已写字节，不能降级为 best-effort 索引失败。`:pg` 权威（默认）仍走
+  put_version_with_id/4 的致命 + 回滚语义。
   """
   @spec put_version_index(String.t(), String.t(), String.t(), map()) :: :ok | {:error, term()}
   def put_version_index(bucket_name, key, version_id, attrs) do
@@ -588,7 +799,38 @@ defmodule Maxio.Objects do
       {:error, reason} -> {:error, reason}
     end
   rescue
+    e in Maxio.S3.Error -> reraise(e, __STACKTRACE__)
     e -> {:error, e}
+  end
+
+  @spec put_replication_status(String.t(), String.t(), String.t(), String.t() | nil, keyword()) ::
+          :ok | {:error, :not_found}
+  def put_replication_status(bucket_name, key, version_id, status, opts \\ []) do
+    repo = Keyword.get(opts, :repo, Repo)
+    set_attrs = [replication_status: status] |> maybe_replication_status_generation(opts)
+
+    {count, _} =
+      from(o in Object,
+        where: o.bucket_name == ^bucket_name and o.key == ^key and o.version_id == ^version_id
+      )
+      |> repo.update_all(set: set_attrs)
+
+    if count > 0 do
+      Notify.broadcast({:object_metadata_changed, bucket_name, key, version_id})
+      :ok
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp maybe_replication_status_generation(attrs, opts) do
+    case Keyword.get(opts, :generation) do
+      generation when is_integer(generation) and generation >= 0 ->
+        attrs ++ [synced_at: DateTime.utc_now(), index_generation: generation]
+
+      _other ->
+        attrs
+    end
   end
 
   @doc """
@@ -612,9 +854,10 @@ defmodule Maxio.Objects do
   落盘，PG 索引须用同 version_id 保持盘/PG 一致）。Enabled 传新 ULID，Suspended 传 "null"
   （null marker 替换既有 null 版本，AWS 语义）。返回 {:ok, %{version_id}}。
   """
-  @spec insert_delete_marker_with_id(String.t(), String.t(), String.t(), map()) ::
-          {:ok, %{version_id: String.t()}} | {:error, :no_such_bucket}
-  def insert_delete_marker_with_id(bucket_name, key, version_id, attrs \\ %{}) do
+  @spec insert_delete_marker_with_id(String.t(), String.t(), String.t(), map(), keyword()) ::
+          {:ok, %{version_id: String.t()} | {%{version_id: String.t()}, term()}}
+          | {:error, :no_such_bucket}
+  def insert_delete_marker_with_id(bucket_name, key, version_id, attrs \\ %{}, opts \\ []) do
     with {:ok, bucket} <- bucket_or_error(bucket_name) do
       base =
         %{
@@ -631,34 +874,39 @@ defmodule Maxio.Objects do
           index_generation: 0
         }
         |> Map.merge(placement_attrs(attrs))
+        |> maybe_put_replication_status(attrs)
 
       Repo.transaction(fn ->
         unset_latest(bucket.id, key)
 
-        {:ok, _} =
-          %Object{}
-          |> Object.changeset(base)
-          |> Repo.insert(
-            on_conflict:
-              {:replace,
-               [
-                 :size,
-                 :etag,
-                 :placement_set_id,
-                 :placement_pool_id,
-                 :placement_topology_hash,
-                 :is_latest,
-                 :is_delete_marker,
-                 :synced_at,
-                 :index_generation,
-                 :inserted_at,
-                 :updated_at
-               ]},
-            conflict_target: [:bucket_id, :key, :version_id]
-          )
-      end)
+        marker =
+          case %Object{}
+               |> Object.changeset(base)
+               |> Repo.insert(
+                 on_conflict:
+                   {:replace,
+                    [
+                      :size,
+                      :etag,
+                      :placement_set_id,
+                      :placement_pool_id,
+                      :placement_topology_hash,
+                      :replication_status,
+                      :is_latest,
+                      :is_delete_marker,
+                      :synced_at,
+                      :index_generation,
+                      :inserted_at,
+                      :updated_at
+                    ]},
+                 conflict_target: [:bucket_id, :key, :version_id]
+               ) do
+            {:ok, _obj} -> %{version_id: version_id}
+            {:error, cs} -> Repo.rollback(cs)
+          end
 
-      {:ok, %{version_id: version_id}}
+        with_transaction_hook_result(marker, run_transaction_hook!(opts, Repo, marker))
+      end)
     end
   end
 
@@ -708,10 +956,11 @@ defmodule Maxio.Objects do
   entry is_latest=true 时先 unset 该 key 其余 latest 行（与写路径同事务语义）；is_latest=false
   （历史版本 reconcile）不触碰其他行。
 
-  **ROUTE B B5-3 R1 —— `updated_at` 忠于对象写入时刻**：`updated_at` 是客户端可见 Last-Modified /
-  `<LastModified>` 的来源，S3 语义下它随对象写入固定、绝不随扫描漂移。故从 canonical entry 的
-  `modtime`（int64 纳秒，`Sidecar.entry_modtime_datetime/1`，与读路径同源）导出 `updated_at`；
-  modtime 缺失（异常 sidecar）→ 既有行保留其 updated_at（`:updated_at` 剔出 replace 集）、
+  **ROUTE B B5-3 R1 —— 版本写入时刻忠于 sidecar modtime**：`updated_at` 是客户端可见
+  Last-Modified / `<LastModified>` 的来源，`inserted_at` 是版本顺序/生命周期使用的稳定创建时刻；
+  S3 语义下二者随对象写入固定、绝不随扫描漂移。故从 canonical entry 的 `modtime`（int64 纳秒，
+  `Sidecar.entry_modtime_datetime/1`，与读路径同源）同时导出 `inserted_at`/`updated_at`；
+  modtime 缺失（异常 sidecar）→ 既有行保留其时间列（`:inserted_at`/`:updated_at` 剔出 replace 集）、
   新插行回落 timestamps now + divergent 日志（铁律 3 不静默）。`synced_at` 仍用 now——它就是
   「同步确认时刻」。
 
@@ -733,20 +982,20 @@ defmodule Maxio.Objects do
           index_generation: entry_generation(entry)
         })
 
-      {updated_at, replace_fields} =
+      {version_time, replace_fields} =
         case Sidecar.entry_modtime_datetime(entry) do
           {:ok, dt} ->
             {dt, @reconcile_replace}
 
           :error ->
             Log.warn(
-              "reconcile: sidecar entry missing modtime, preserving existing updated_at",
+              "reconcile: sidecar entry missing modtime, preserving existing timestamps",
               bucket: bucket_name,
               key: key,
               reason: "version_id=#{entry["version_id"]} modtime=#{inspect(entry["modtime"])}"
             )
 
-            {nil, @reconcile_replace -- [:updated_at]}
+            {nil, @reconcile_replace -- [:inserted_at, :updated_at]}
         end
 
       result =
@@ -756,8 +1005,11 @@ defmodule Maxio.Objects do
           changeset = Object.changeset(%Object{}, base)
 
           changeset =
-            if updated_at,
-              do: Ecto.Changeset.put_change(changeset, :updated_at, updated_at),
+            if version_time,
+              do:
+                changeset
+                |> Ecto.Changeset.put_change(:inserted_at, version_time)
+                |> Ecto.Changeset.put_change(:updated_at, version_time),
               else: changeset
 
           case Repo.insert(changeset,
@@ -799,7 +1051,10 @@ defmodule Maxio.Objects do
       row.content_disposition != attrs.content_disposition or
       row.cache_control != attrs.cache_control or
       row.expires != attrs.expires or
+      row.website_redirect_location != attrs.website_redirect_location or
       (row.metadata || %{}) != attrs.metadata or
+      (row.checksum || %{}) != attrs.checksum or
+      (row.object_parts || %{}) != attrs.object_parts or
       (row.tags || %{}) != attrs.tags or
       row.storage_class != attrs.storage_class or
       row.acl_canned != attrs.acl_canned or
@@ -811,6 +1066,7 @@ defmodule Maxio.Objects do
       row.object_lock_legal_hold != attrs.object_lock_legal_hold or
       row.restore_status != attrs.restore_status or
       compare_datetime(row.restore_expiry, attrs.restore_expiry) or
+      row.replication_status != attrs.replication_status or
       row.is_latest != attrs.is_latest or
       row.is_delete_marker != attrs.is_delete_marker
   end
@@ -847,6 +1103,11 @@ defmodule Maxio.Objects do
     Map.take(attrs, [:placement_set_id, :placement_pool_id, :placement_topology_hash])
   end
 
+  defp maybe_put_replication_status(base, %{replication_status: status}) when is_binary(status),
+    do: Map.put(base, :replication_status, status)
+
+  defp maybe_put_replication_status(base, _attrs), do: base
+
   defp object_lock_attrs(attrs) do
     Map.take(attrs, [
       :object_lock_mode,
@@ -863,6 +1124,39 @@ defmodule Maxio.Objects do
     do: Map.put(attrs, :index_generation, generation)
 
   defp maybe_put_generation(attrs, _generation), do: attrs
+
+  defp run_transaction_hook!(opts, repo, subject) do
+    case Keyword.fetch(opts, :transaction_hook) do
+      {:ok, hook} when is_function(hook, 2) -> {:ok, hook.(repo, subject)}
+      :error -> :none
+    end
+  end
+
+  defp with_transaction_hook_result(result, :none), do: result
+  defp with_transaction_hook_result(result, {:ok, hook_result}), do: {result, hook_result}
+
+  defp current_delete_subject(bucket_name, key) do
+    case Repo.get_by(Object, bucket_name: bucket_name, key: key, is_latest: true) do
+      %Object{is_delete_marker: true} -> delete_subject_missing()
+      %Object{} = object -> delete_subject_from_object(object)
+      nil -> delete_subject_missing()
+    end
+  end
+
+  defp delete_subject_from_object(%Object{} = object) do
+    %{
+      deleted?: true,
+      was_delete_marker: object.is_delete_marker == true,
+      size: object.size,
+      etag: object.etag,
+      version_id: object.version_id,
+      tags: object.tags || %{}
+    }
+  end
+
+  defp delete_subject_missing do
+    %{deleted?: false, was_delete_marker: false, size: nil, etag: nil, version_id: nil, tags: %{}}
+  end
 
   defp compare_datetime(nil, nil), do: false
 
@@ -881,12 +1175,13 @@ defmodule Maxio.Objects do
 
   @doc """
   永久删除某特定版本行（DELETE ?versionId）。删后若被删的是当时的 latest，则把该 key 余下
-  version_id 最大者重新置 latest（delete marker 的删除会让更老版本重新浮现，对齐 AWS）。
-  返回 {:ok, %{was_delete_marker: boolean()}} | {:error, :not_found}。
+  版本创建时间最新者重新置 latest（delete marker 的删除会让更老版本重新浮现，对齐 AWS）。
+  返回 `{:ok, delete_subject}`；传 `:transaction_hook` 时返回 `{:ok, {delete_subject, hook_result}}`；
+  版本不存在返回 `{:error, :not_found}`。`delete_subject` 含 deleted?/was_delete_marker/size/etag/version_id。
   """
-  @spec delete_version(String.t(), String.t(), String.t()) ::
-          {:ok, %{was_delete_marker: boolean()}} | {:error, :not_found}
-  def delete_version(bucket_name, key, version_id) do
+  @spec delete_version(String.t(), String.t(), String.t(), keyword()) ::
+          {:ok, map() | {map(), term()}} | {:error, :not_found}
+  def delete_version(bucket_name, key, version_id, opts \\ []) do
     case get_version(bucket_name, key, version_id) do
       {:error, :not_found} ->
         {:error, :not_found}
@@ -898,9 +1193,10 @@ defmodule Maxio.Objects do
           if obj.is_latest do
             promote_latest(obj.bucket_id, key)
           end
-        end)
 
-        {:ok, %{was_delete_marker: obj.is_delete_marker}}
+          result = delete_subject_from_object(obj)
+          with_transaction_hook_result(result, run_transaction_hook!(opts, Repo, result))
+        end)
     end
   end
 
@@ -930,18 +1226,26 @@ defmodule Maxio.Objects do
     |> Repo.update_all(set: [is_latest: false])
   end
 
-  # 删 latest 后，把余下 version_id 最大（最新）的行重新置 latest（无余下行则无操作）。
+  # 删 latest 后，把余下版本创建时间最新的行重新置 latest（无余下行则无操作）。
+  # updated_at 会被部分元数据操作刷新，不能作为 current 版本顺序；同时间戳下避免历史
+  # "null" 字典序压过正常 ULID 版本，再用 version_id 作稳定兜底。
   defp promote_latest(bucket_id, key) do
     candidate =
       from(o in Object,
         where: o.bucket_id == ^bucket_id and o.key == ^key,
-        order_by: [desc: o.version_id],
+        order_by: [
+          desc: o.inserted_at,
+          desc: fragment("CASE WHEN ? = 'null' THEN 0 ELSE 1 END", o.version_id),
+          desc: o.index_generation,
+          desc: o.version_id
+        ],
         limit: 1
       )
       |> Repo.one()
 
     if candidate do
-      candidate |> Ecto.Changeset.change(is_latest: true) |> Repo.update!()
+      from(o in Object, where: o.id == ^candidate.id)
+      |> Repo.update_all(set: [is_latest: true])
     end
   end
 
@@ -972,9 +1276,10 @@ defmodule Maxio.Objects do
     version_id_marker = Map.get(opts, :version_id_marker)
 
     base =
-      from o in Object,
+      from(o in Object,
         where: o.bucket_name == ^bucket_name,
         order_by: [asc: o.key, desc: o.version_id]
+      )
 
     base =
       if prefix != "",
@@ -1134,10 +1439,11 @@ defmodule Maxio.Objects do
     # 拉取候选 key（升序），从游标之后开始，仅取该 prefix。多取以便折叠后仍能判断截断。
     # 多版本模型：ListObjectsV2 只看当前版本（is_latest）且非删除标记（is_delete_marker=false）。
     base_query =
-      from o in Object,
+      from(o in Object,
         where:
           o.bucket_name == ^bucket_name and o.is_latest == true and o.is_delete_marker == false,
         order_by: [asc: o.key]
+      )
 
     base_query =
       if prefix != "" do

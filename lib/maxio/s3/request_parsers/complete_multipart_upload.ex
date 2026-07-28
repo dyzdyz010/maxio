@@ -1,93 +1,115 @@
 defmodule Maxio.S3.RequestParsers.CompleteMultipartUpload do
   @moduledoc """
-  CompleteMultipartUpload 请求体 SAX 解析（saxy）。按元素名取值（PartNumber/ETag 顺序不敏感），
-  返回 [%{part_number, etag}]（保留请求出现顺序，升序校验交上下文）。畸形/无 Part → :malformed_xml。
-  小 XML 走带上限整读后传入（铁律 4：只有小 XML 整读，对象字节绝不整读）。
+  Strict XML parser for CompleteMultipartUpload request bodies.
+
+  The object bytes never go through this parser; handlers pass only the small
+  CompleteMultipartUpload XML body after bounded reads.
   """
-  @behaviour Saxy.Handler
+
+  alias Maxio.S3.RequestParsers.XMLTree
+
+  @checksum_fields [
+    "ChecksumCRC32",
+    "ChecksumCRC32C",
+    "ChecksumCRC64NVME",
+    "ChecksumMD5",
+    "ChecksumSHA1",
+    "ChecksumSHA256",
+    "ChecksumSHA512",
+    "ChecksumXXHASH128",
+    "ChecksumXXHASH3",
+    "ChecksumXXHASH64"
+  ]
 
   @spec parse(binary()) ::
           {:ok, [%{part_number: pos_integer(), etag: String.t()}]} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    case Saxy.parse_string(xml, __MODULE__, %{parts: [], current: nil, text: nil, in: nil}) do
-      {:ok, %{parts: []}} -> {:error, :malformed_xml}
-      {:ok, %{parts: parts}} -> {:ok, Enum.reverse(parts)}
-      {:error, _} -> {:error, :malformed_xml}
+    with {:ok, {"CompleteMultipartUpload", _attrs, children}} <- XMLTree.parse(xml),
+         {:ok, parts} <- parse_parts(children),
+         false <- parts == [] do
+      {:ok, parts}
+    else
+      _other -> {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:start_document, _prolog, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:start_element, {name, _attrs}, state) do
-    case local_name(name) do
-      "Part" -> {:ok, %{state | current: %{part_number: nil, etag: nil}, in: nil}}
-      "PartNumber" -> {:ok, %{state | in: :part_number, text: ""}}
-      "ETag" -> {:ok, %{state | in: :etag, text: ""}}
-      _ -> {:ok, %{state | in: nil}}
-    end
-  end
-
-  @impl true
-  def handle_event(:characters, _chars, %{in: nil} = state), do: {:ok, state}
-
-  def handle_event(:characters, chars, %{text: text} = state) when is_binary(text) do
-    {:ok, %{state | text: text <> chars}}
-  end
-
-  def handle_event(:characters, _chars, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:end_element, name, state) do
-    case local_name(name) do
-      "PartNumber" ->
-        pn = parse_int(state.text)
-
-        {:ok,
-         %{state | current: Map.put(state.current || %{}, :part_number, pn), in: nil, text: nil}}
-
-      "ETag" ->
-        {:ok,
-         %{
-           state
-           | current: Map.put(state.current || %{}, :etag, String.trim(state.text || "")),
-             in: nil,
-             text: nil
-         }}
-
-      "Part" ->
-        case state.current do
-          %{part_number: pn, etag: etag} when is_integer(pn) and is_binary(etag) ->
-            {:ok, %{state | parts: [%{part_number: pn, etag: etag} | state.parts], current: nil}}
-
-          _ ->
-            # Part 缺字段：丢弃该 Part；最终若无有效 Part 则 parse/1 报 malformed。
-            {:ok, %{state | current: nil}}
+  defp parse_parts(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, []}, fn
+      {"Part", _attrs, children}, {:ok, parts} ->
+        case parse_part(children) do
+          {:ok, part} -> {:cont, {:ok, [part | parts]}}
+          :error -> {:halt, :error}
         end
 
-      _ ->
-        {:ok, %{state | in: nil, text: nil}}
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, parts} -> {:ok, Enum.reverse(parts)}
+      :error -> :error
     end
   end
 
-  @impl true
-  def handle_event(:end_document, _data, state), do: {:ok, state}
+  defp parse_part(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}}, fn child, {:ok, part} ->
+      case put_part_field(part, child) do
+        {:ok, part} -> {:cont, {:ok, part}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, %{part_number: part_number, etag: etag} = part}
+      when is_integer(part_number) and is_binary(etag) ->
+        {:ok, part}
 
-  # saxy 可能给 "ns:Local" 形式的名；取本地名。
-  defp local_name(name) do
-    case String.split(name, ":") do
-      [_ns, local] -> local
-      [local] -> local
+      _other ->
+        :error
     end
   end
 
-  defp parse_int(nil), do: nil
+  defp put_part_field(part, {"PartNumber", _attrs, children}) do
+    with {:ok, value} <- XMLTree.required_text(children, trim: true),
+         {:ok, part_number} <- parse_part_number(value) do
+      put_once(part, :part_number, part_number)
+    else
+      _other -> :error
+    end
+  end
 
-  defp parse_int(str) do
-    case Integer.parse(String.trim(str)) do
-      {n, _} -> n
-      _ -> nil
+  defp put_part_field(part, {"ETag", _attrs, children}) do
+    with {:ok, etag} <- XMLTree.required_text(children, trim: true) do
+      put_once(part, :etag, etag)
+    else
+      _other -> :error
+    end
+  end
+
+  defp put_part_field(part, {field, _attrs, children}) do
+    if checksum_field?(field) do
+      with {:ok, value} <- XMLTree.required_text(children, trim: true) do
+        put_once(part, field, value)
+      else
+        _other -> :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp checksum_field?(field), do: field in @checksum_fields
+
+  defp put_once(map, key, value) do
+    if Map.has_key?(map, key), do: :error, else: {:ok, Map.put(map, key, value)}
+  end
+
+  defp parse_part_number(value) do
+    case Integer.parse(value) do
+      {part_number, ""} when part_number in 1..10_000 -> {:ok, part_number}
+      _other -> :error
     end
   end
 end

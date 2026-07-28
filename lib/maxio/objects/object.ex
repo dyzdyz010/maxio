@@ -17,7 +17,10 @@ defmodule Maxio.Objects.Object do
     field :content_disposition, :string
     field :cache_control, :string
     field :expires, :string
+    field :website_redirect_location, :string
     field :metadata, :map, default: %{}
+    field :checksum, :map, default: %{}
+    field :object_parts, :map, default: %{}
     field :storage_class, :string, default: "STANDARD"
     field :acl_canned, :string, default: "private"
     field :acl_grants, :map, default: %{"grants" => []}
@@ -26,12 +29,16 @@ defmodule Maxio.Objects.Object do
     field :is_delete_marker, :boolean, default: false
     field :tags, :map, default: %{}
     field :sse_algorithm, :string
-    field :sse_envelope, :map
+
+    # SSE 信封（包裹后的 DEK 材料）：redact 防止 struct/changeset 的 inspect（错误日志的
+    # reason 通道、协议 §7 禁项）泄露密钥材料（B7 脱敏收口，B5 审查项 2）。
+    field :sse_envelope, :map, redact: true
     field :object_lock_mode, :string
     field :object_lock_retain_until, :utc_datetime_usec
     field :object_lock_legal_hold, :string
     field :restore_status, :string
     field :restore_expiry, :utc_datetime_usec
+    field :replication_status, :string
     field :placement_set_id, :integer
     field :placement_pool_id, :integer
     field :placement_topology_hash, :string
@@ -57,7 +64,10 @@ defmodule Maxio.Objects.Object do
     :content_disposition,
     :cache_control,
     :expires,
+    :website_redirect_location,
     :metadata,
+    :checksum,
+    :object_parts,
     :storage_class,
     :acl_canned,
     :acl_grants,
@@ -72,6 +82,7 @@ defmodule Maxio.Objects.Object do
     :object_lock_legal_hold,
     :restore_status,
     :restore_expiry,
+    :replication_status,
     :placement_set_id,
     :placement_pool_id,
     :placement_topology_hash,

@@ -65,12 +65,15 @@ defmodule Maxio.Cluster.ReplacementRebalanceIntegrationTest do
                page_size: 1,
                audit_page_size: 1,
                lock_nodes: [Node.self()],
-               fresh_scheduler: fn opts -> FreshScheduler.run_now(fresh_scheduler, opts) end
+               fresh_scheduler: fn opts -> FreshScheduler.run_now(fresh_scheduler, opts) end,
+               automation_profile_opts: ready_automation_profile_opts()
              )
 
     assert report.status == :ok
+    assert report.gate_status == "ok"
     assert report.phase == :rebalance_advanced
     assert report.blockers == []
+    assert report.warnings == []
     assert report.next_action == "none"
 
     assert report.heal.status == :ok
@@ -126,12 +129,15 @@ defmodule Maxio.Cluster.ReplacementRebalanceIntegrationTest do
                page_size: 1,
                audit_page_size: 1,
                lock_nodes: [Node.self()],
-               fresh_scheduler: fn opts -> FreshScheduler.run_now(fresh_scheduler, opts) end
+               fresh_scheduler: fn opts -> FreshScheduler.run_now(fresh_scheduler, opts) end,
+               automation_profile_opts: ready_automation_profile_opts()
              )
 
     assert report.status == :ok
+    assert report.gate_status == "attention"
     assert report.phase == :rebalance_advanced
     assert report.blockers == []
+    assert report.warnings == ["replacement_workflow_next_action_required"]
     assert report.rebalance_advance.status == :partial
     assert report.rebalance_advance.reason == :max_steps
     assert report.rebalance_advance.steps == 1
@@ -276,4 +282,25 @@ defmodule Maxio.Cluster.ReplacementRebalanceIntegrationTest do
 
   defp restore_runtime_topology(:__maxio_no_topology__), do: :persistent_term.erase(@topology_key)
   defp restore_runtime_topology(topology), do: :persistent_term.put(@topology_key, topology)
+
+  defp ready_automation_profile_opts do
+    [
+      fresh_drive_heal_scheduler: [
+        enabled: true,
+        probe_drive_health: true,
+        auto_rebalance_after_heal: true,
+        auto_advance_rebalance_after_heal: false,
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      rebalance_scheduler: [
+        enabled: true,
+        auto_source_cleanup: true,
+        auto_rebalance_closure: true,
+        run_opts: [],
+        scheduler_ledger: [enabled: true]
+      ],
+      scheduler_ledger: [enabled: true]
+    ]
+  end
 end

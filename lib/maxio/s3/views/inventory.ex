@@ -52,11 +52,12 @@ defmodule Maxio.S3.Views.Inventory do
   end
 
   defp s3_bucket_destination_children(destination) do
-    [
-      element("AccountId", [], characters(destination["AccountId"])),
+    []
+    |> maybe_text("AccountId", destination["AccountId"])
+    |> Kernel.++([
       element("Bucket", [], characters(destination["Bucket"])),
       element("Format", [], characters(destination["Format"]))
-    ]
+    ])
     |> maybe_text("Prefix", destination["Prefix"])
     |> add_encryption(destination["Encryption"])
   end

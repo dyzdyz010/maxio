@@ -116,12 +116,35 @@ defmodule Maxio.S3.AccelerateE2ETest do
     assert bad_checksum.status == 400
     assert bad_checksum.resp_body =~ "BadDigest"
     assert {:ok, %{"Status" => "Enabled"}} = BucketConfigs.get("accelbad", :accelerate)
+
+    good_checksum =
+      put_accelerate("accelbad", @suspended,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", content_sha256(@suspended)}
+        ]
+      )
+
+    assert good_checksum.status == 200
+    assert {:ok, %{"Status" => "Suspended"}} = BucketConfigs.get("accelbad", :accelerate)
+
+    bad_checksum_after_config =
+      put_accelerate("accelbad", @enabled,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", content_sha256("different")}
+        ]
+      )
+
+    assert bad_checksum_after_config.status == 400
+    assert bad_checksum_after_config.resp_body =~ "BadDigest"
+    assert {:ok, %{"Status" => "Suspended"}} = BucketConfigs.get("accelbad", :accelerate)
   end
 
-  test "checksum trailers are rejected without storing config" do
+  test "checksum trailers and aws-chunked XML bodies are validated before storing config" do
     assert (SigV4Request.signed_conn(:put, "/acceltrailer") |> call()).status == 200
 
-    trailer =
+    plain_trailer =
       put_accelerate("acceltrailer", @enabled,
         headers: [
           {"x-amz-sdk-checksum-algorithm", "SHA256"},
@@ -129,9 +152,91 @@ defmodule Maxio.S3.AccelerateE2ETest do
         ]
       )
 
-    assert trailer.status == 501
-    assert trailer.resp_body =~ "NotImplemented"
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "InvalidRequest"
     assert BucketConfigs.get("acceltrailer", :accelerate) == :none
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/acceltrailer", @enabled,
+        query: %{"accelerate" => ""},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256("different")}]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "BadDigest"
+    assert BucketConfigs.get("acceltrailer", :accelerate) == :none
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/acceltrailer", @enabled,
+        query: %{"accelerate" => ""},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256(@enabled)}]
+      )
+      |> call()
+
+    assert ok_trailer.status == 200
+    assert {:ok, %{"Status" => "Enabled"}} = BucketConfigs.get("acceltrailer", :accelerate)
+
+    signed_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/acceltrailer", @enabled,
+        query: %{"accelerate" => ""},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256(@enabled)}],
+        streaming_payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+      )
+      |> call()
+
+    assert signed_trailer.status == 200
+
+    bad_signed_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/acceltrailer", @suspended,
+        query: %{"accelerate" => ""},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [{"x-amz-checksum-sha256", content_sha256(@suspended)}],
+        streaming_payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        tamper: fn chunked ->
+          Regex.replace(
+            ~r/x-amz-trailer-signature:[0-9a-f]{64}/,
+            chunked,
+            "x-amz-trailer-signature:" <> String.duplicate("0", 64)
+          )
+        end
+      )
+      |> call()
+
+    assert bad_signed_trailer.status == 403
+    assert bad_signed_trailer.resp_body =~ "SignatureDoesNotMatch"
+    assert {:ok, %{"Status" => "Enabled"}} = BucketConfigs.get("acceltrailer", :accelerate)
+
+    ok_chunked =
+      SigV4Request.signed_chunked_conn(:put, "/acceltrailer", @suspended,
+        query: %{"accelerate" => ""}
+      )
+      |> call()
+
+    assert ok_chunked.status == 200
+
+    assert {:ok, %{"Status" => "Suspended"}} =
+             BucketConfigs.get("acceltrailer", :accelerate)
+
+    oversized = String.duplicate("x", 131_073)
+
+    too_large =
+      SigV4Request.signed_chunked_conn(:put, "/acceltrailer", oversized,
+        query: %{"accelerate" => ""},
+        chunk_size: byte_size(oversized),
+        decoded_length_override: 131_072
+      )
+      |> call()
+
+    assert too_large.status == 400
+    assert too_large.resp_body =~ "MalformedXML"
+    assert too_large.resp_body =~ "AccelerateConfiguration exceeds 128KB"
+
+    assert {:ok, %{"Status" => "Suspended"}} =
+             BucketConfigs.get("acceltrailer", :accelerate)
   end
 
   test "x-amz-expected-bucket-owner is enforced on Get and Put" do
@@ -245,4 +350,6 @@ defmodule Maxio.S3.AccelerateE2ETest do
     assert denied.status == 403
     assert denied.resp_body =~ "AccessDenied"
   end
+
+  defp content_sha256(body), do: :crypto.hash(:sha256, body) |> Base.encode64()
 end

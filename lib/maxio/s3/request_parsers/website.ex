@@ -1,134 +1,22 @@
 defmodule Maxio.S3.RequestParsers.Website do
   @moduledoc "PutBucketWebsite WebsiteConfiguration XML parser."
-  @behaviour Saxy.Handler
 
   @type config :: map()
 
-  @leaf_tags ~w(Suffix Key HostName Protocol HttpErrorCodeReturnedEquals KeyPrefixEquals
-                ReplaceKeyPrefixWith ReplaceKeyWith HttpRedirectCode)
+  alias Maxio.S3.RequestParsers.XMLTree
+
+  @unset {:__maxio_website_unset__, []}
 
   @spec parse(binary()) :: {:ok, config()} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    init = %{
-      root?: false,
-      config: new_config(),
-      current_rule: nil,
-      routing_rule_depth: 0,
-      path: [],
-      in: nil,
-      text: nil,
-      invalid?: false
-    }
+    case XMLTree.parse(xml) do
+      {:ok, {"WebsiteConfiguration", _attrs, children}} ->
+        parse_root(children)
 
-    case Saxy.parse_string(xml, __MODULE__, init) do
-      {:ok, %{root?: true, invalid?: false, config: config}} -> {:ok, config}
-      _other -> {:error, :malformed_xml}
+      _other ->
+        {:error, :malformed_xml}
     end
   end
-
-  @impl true
-  def handle_event(:start_document, _prolog, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:start_element, {name, _attrs}, state) do
-    tag = local(name)
-    parent_path = state.path
-    state = %{state | path: [tag | parent_path], in: nil, text: nil}
-
-    cond do
-      parent_path == [] and tag == "WebsiteConfiguration" ->
-        {:ok, %{state | root?: true}}
-
-      parent_path == [] ->
-        {:ok, invalid(state)}
-
-      tag == "WebsiteConfiguration" ->
-        {:ok, invalid(state)}
-
-      tag in ~w(IndexDocument ErrorDocument RedirectAllRequestsTo RoutingRules) ->
-        if parent_path == ["WebsiteConfiguration"] do
-          {:ok, state}
-        else
-          {:ok, invalid(state)}
-        end
-
-      tag == "RoutingRule" ->
-        if parent_path == ["RoutingRules", "WebsiteConfiguration"] do
-          {:ok,
-           %{
-             state
-             | current_rule: new_rule(),
-               routing_rule_depth: state.routing_rule_depth + 1
-           }}
-        else
-          {:ok, invalid(state)}
-        end
-
-      tag == "Condition" and is_map(state.current_rule) ->
-        if parent_path == ["RoutingRule", "RoutingRules", "WebsiteConfiguration"] do
-          {:ok, %{state | current_rule: put_new_section(state.current_rule, "condition")}}
-        else
-          {:ok, invalid(state)}
-        end
-
-      tag == "Redirect" and is_map(state.current_rule) ->
-        if parent_path == ["RoutingRule", "RoutingRules", "WebsiteConfiguration"] do
-          {:ok, %{state | current_rule: put_new_section(state.current_rule, "redirect")}}
-        else
-          {:ok, invalid(state)}
-        end
-
-      tag in ~w(Condition Redirect) ->
-        {:ok, invalid(state)}
-
-      tag in @leaf_tags ->
-        if valid_leaf_parent?(tag, parent_path) do
-          {:ok, %{state | in: tag, text: ""}}
-        else
-          {:ok, invalid(state)}
-        end
-
-      true ->
-        {:ok, state}
-    end
-  end
-
-  @impl true
-  def handle_event(:characters, chars, %{text: text} = state) when is_binary(text),
-    do: {:ok, %{state | text: text <> chars}}
-
-  def handle_event(:characters, _chars, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:end_element, name, state) do
-    tag = local(name)
-
-    cond do
-      tag in @leaf_tags ->
-        value = trim(state.text)
-
-        {:ok,
-         state
-         |> store_leaf(tag, value)
-         |> clear_text()
-         |> pop_path()}
-
-      tag == "RoutingRule" ->
-        {:ok,
-         state
-         |> append_current_rule()
-         |> Map.update!(:routing_rule_depth, &max(&1 - 1, 0))
-         |> Map.put(:current_rule, nil)
-         |> clear_text()
-         |> pop_path()}
-
-      true ->
-        {:ok, state |> clear_text() |> pop_path()}
-    end
-  end
-
-  @impl true
-  def handle_event(:end_document, _data, state), do: {:ok, state}
 
   defp new_config do
     %{
@@ -139,138 +27,193 @@ defmodule Maxio.S3.RequestParsers.Website do
     }
   end
 
-  defp new_rule do
+  defp new_acc do
     %{
-      "condition" => nil,
-      "redirect" => nil
+      index_document: @unset,
+      error_document: @unset,
+      redirect_all_requests_to: @unset,
+      routing_rules: @unset
     }
   end
 
-  defp put_new_section(rule, section), do: Map.put(rule, section, Map.get(rule, section) || %{})
+  defp parse_root(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, new_acc()}, fn
+      {"IndexDocument", _attrs, children}, {:ok, acc} ->
+        put_once(acc, :index_document, parse_index_document(children))
 
-  defp store_leaf(
-         %{path: ["Suffix", "IndexDocument", "WebsiteConfiguration"]} = state,
-         "Suffix",
-         value
-       ),
-       do: put_config_path(state, ["index_document", "suffix"], value)
+      {"ErrorDocument", _attrs, children}, {:ok, acc} ->
+        put_once(acc, :error_document, parse_error_document(children))
 
-  defp store_leaf(
-         %{path: ["Key", "ErrorDocument", "WebsiteConfiguration"]} = state,
-         "Key",
-         value
-       ),
-       do: put_config_path(state, ["error_document", "key"], value)
+      {"RedirectAllRequestsTo", _attrs, children}, {:ok, acc} ->
+        put_once(acc, :redirect_all_requests_to, parse_redirect_all(children))
 
-  defp store_leaf(
-         %{path: [_, "RedirectAllRequestsTo", "WebsiteConfiguration"]} = state,
-         tag,
-         value
-       )
-       when tag in ["HostName", "Protocol"] do
-    put_config_path(state, ["redirect_all_requests_to", field_name(tag)], value)
-  end
+      {"RoutingRules", _attrs, children}, {:ok, acc} ->
+        put_once(acc, :routing_rules, parse_routing_rules(children))
 
-  defp store_leaf(
-         %{
-           path: [_, "Condition", "RoutingRule", "RoutingRules", "WebsiteConfiguration"],
-           current_rule: rule
-         } =
-           state,
-         tag,
-         value
-       )
-       when is_map(rule) and tag in ["HttpErrorCodeReturnedEquals", "KeyPrefixEquals"] do
-    put_rule_path(state, ["condition", field_name(tag)], value)
-  end
-
-  defp store_leaf(
-         %{
-           path: [_, "Redirect", "RoutingRule", "RoutingRules", "WebsiteConfiguration"],
-           current_rule: rule
-         } =
-           state,
-         tag,
-         value
-       )
-       when is_map(rule) and
-              tag in [
-                "HostName",
-                "Protocol",
-                "ReplaceKeyPrefixWith",
-                "ReplaceKeyWith",
-                "HttpRedirectCode"
-              ] do
-    put_rule_path(state, ["redirect", field_name(tag)], value)
-  end
-
-  defp store_leaf(state, _tag, _value), do: state
-
-  defp put_config_path(%{config: config} = state, [section, field], value) do
-    section_value = Map.get(config, section) || %{}
-    %{state | config: Map.put(config, section, Map.put(section_value, field, value))}
-  end
-
-  defp put_rule_path(%{current_rule: rule} = state, [section, field], value) do
-    section_value = Map.get(rule, section) || %{}
-    %{state | current_rule: Map.put(rule, section, Map.put(section_value, field, value))}
-  end
-
-  defp append_current_rule(%{current_rule: rule, config: config} = state) when is_map(rule) do
-    rules = Map.get(config, "routing_rules", [])
-    %{state | config: Map.put(config, "routing_rules", rules ++ [rule])}
-  end
-
-  defp append_current_rule(state), do: state
-
-  defp clear_text(state), do: %{state | in: nil, text: nil}
-
-  defp pop_path(%{path: []} = state), do: state
-  defp pop_path(%{path: [_tag | rest]} = state), do: %{state | path: rest}
-
-  defp field_name("HttpErrorCodeReturnedEquals"), do: "http_error_code_returned_equals"
-  defp field_name("KeyPrefixEquals"), do: "key_prefix_equals"
-  defp field_name("ReplaceKeyPrefixWith"), do: "replace_key_prefix_with"
-  defp field_name("ReplaceKeyWith"), do: "replace_key_with"
-  defp field_name("HttpRedirectCode"), do: "http_redirect_code"
-  defp field_name("HostName"), do: "host_name"
-  defp field_name("Protocol"), do: "protocol"
-
-  defp valid_leaf_parent?("Suffix", path), do: path == ["IndexDocument", "WebsiteConfiguration"]
-  defp valid_leaf_parent?("Key", path), do: path == ["ErrorDocument", "WebsiteConfiguration"]
-
-  defp valid_leaf_parent?(tag, ["RedirectAllRequestsTo", "WebsiteConfiguration"]),
-    do: tag in ["HostName", "Protocol"]
-
-  defp valid_leaf_parent?(tag, [
-         "Condition",
-         "RoutingRule",
-         "RoutingRules",
-         "WebsiteConfiguration"
-       ]),
-       do: tag in ["HttpErrorCodeReturnedEquals", "KeyPrefixEquals"]
-
-  defp valid_leaf_parent?(tag, ["Redirect", "RoutingRule", "RoutingRules", "WebsiteConfiguration"]),
-       do:
-         tag in [
-           "HostName",
-           "Protocol",
-           "ReplaceKeyPrefixWith",
-           "ReplaceKeyWith",
-           "HttpRedirectCode"
-         ]
-
-  defp valid_leaf_parent?(_tag, _path), do: false
-
-  defp invalid(state), do: %{state | invalid?: true, in: nil, text: nil}
-
-  defp trim(nil), do: ""
-  defp trim(text), do: String.trim(text)
-
-  defp local(name) do
-    case String.split(name, ":") do
-      [_namespace, local] -> local
-      [local] -> local
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, acc} -> {:ok, normalize_config(acc)}
+      :error -> {:error, :malformed_xml}
     end
   end
+
+  defp parse_index_document(children) do
+    case XMLTree.structural_children(children) do
+      [{"Suffix", _attrs, children}] ->
+        with {:ok, value} <- leaf_text(children) do
+          {:ok, %{"suffix" => value}}
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_error_document(children) do
+    case XMLTree.structural_children(children) do
+      [{"Key", _attrs, children}] ->
+        with {:ok, value} <- leaf_text(children) do
+          {:ok, %{"key" => value}}
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_redirect_all(children) do
+    parse_unique_fields(children, ~w(HostName Protocol), fn
+      "HostName", value -> {"host_name", value}
+      "Protocol", value -> {"protocol", value}
+    end)
+  end
+
+  defp parse_routing_rules(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, []}, fn
+      {"RoutingRule", _attrs, children}, {:ok, rules} ->
+        case parse_routing_rule(children) do
+          {:ok, rule} -> {:cont, {:ok, rules ++ [rule]}}
+          :error -> {:halt, :error}
+        end
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, rules} -> {:ok, rules}
+      :error -> :error
+    end
+  end
+
+  defp parse_routing_rule(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{condition: @unset, redirect: @unset}}, fn
+      {"Condition", _attrs, children}, {:ok, rule} ->
+        put_once(rule, :condition, parse_condition(children))
+
+      {"Redirect", _attrs, children}, {:ok, rule} ->
+        put_once(rule, :redirect, parse_redirect(children))
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, rule} ->
+        {:ok,
+         %{
+           "condition" => normalize_optional(rule.condition),
+           "redirect" => normalize_optional(rule.redirect)
+         }}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp parse_condition(children) do
+    parse_unique_fields(children, ~w(HttpErrorCodeReturnedEquals KeyPrefixEquals), fn
+      "HttpErrorCodeReturnedEquals", value -> {"http_error_code_returned_equals", value}
+      "KeyPrefixEquals", value -> {"key_prefix_equals", value}
+    end)
+  end
+
+  defp parse_redirect(children) do
+    parse_unique_fields(
+      children,
+      ~w(HostName Protocol ReplaceKeyPrefixWith ReplaceKeyWith HttpRedirectCode),
+      fn
+        "HostName", value -> {"host_name", value}
+        "Protocol", value -> {"protocol", value}
+        "ReplaceKeyPrefixWith", value -> {"replace_key_prefix_with", value}
+        "ReplaceKeyWith", value -> {"replace_key_with", value}
+        "HttpRedirectCode", value -> {"http_redirect_code", value}
+      end
+    )
+  end
+
+  defp parse_unique_fields(children, allowed_tags, mapper) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, Map.new(allowed_tags, &{&1, @unset})}, fn
+      {tag, _attrs, children}, {:ok, acc} ->
+        if tag in allowed_tags do
+          case leaf_text(children) do
+            {:ok, value} ->
+              if Map.fetch!(acc, tag) == @unset do
+                {:cont, {:ok, Map.put(acc, tag, value)}}
+              else
+                {:halt, :error}
+              end
+
+            :error ->
+              {:halt, :error}
+          end
+        else
+          {:halt, :error}
+        end
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, acc} ->
+        {:ok,
+         acc
+         |> Enum.reject(&match?({_key, @unset}, &1))
+         |> Map.new(fn {tag, value} -> mapper.(tag, value) end)}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp leaf_text(children), do: XMLTree.text(children, trim: true)
+
+  defp put_once(map, key, {:ok, value}) do
+    if Map.fetch!(map, key) == @unset do
+      {:cont, {:ok, Map.put(map, key, value)}}
+    else
+      {:halt, :error}
+    end
+  end
+
+  defp put_once(_map, _key, :error), do: {:halt, :error}
+
+  defp normalize_config(acc) do
+    new_config()
+    |> Map.put("index_document", normalize_optional(acc.index_document))
+    |> Map.put("error_document", normalize_optional(acc.error_document))
+    |> Map.put("redirect_all_requests_to", normalize_optional(acc.redirect_all_requests_to))
+    |> Map.put("routing_rules", if(acc.routing_rules == @unset, do: [], else: acc.routing_rules))
+  end
+
+  defp normalize_optional(@unset), do: nil
+  defp normalize_optional(value), do: value
 end

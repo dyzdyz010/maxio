@@ -38,12 +38,17 @@ defmodule MaxioWeb.ConsoleE2ETest do
     # 6. access keys（列表 stream 挂载）
     {:ok, keys_view, _} = live(conn, ~p"/access-keys")
     assert has_element?(keys_view, "#access-keys")
+
+    # 7. ops gate（只读 artifact shell 挂载）
+    {:ok, ops_gate_view, _} = live(conn, ~p"/ops/gate")
+    assert has_element?(ops_gate_view, "#ops-gate")
   end
 
-  test "未登录全程被门控（/ /buckets /access-keys 均 redirect /login）", %{conn: _conn} do
+  test "未登录全程被门控（/ /buckets /access-keys /ops/gate 均 redirect /login）", %{conn: _conn} do
     fresh = Phoenix.ConnTest.build_conn()
     assert {:error, {:redirect, %{to: "/login"}}} = live(fresh, ~p"/")
     assert {:error, {:redirect, %{to: "/login"}}} = live(fresh, ~p"/buckets")
     assert {:error, {:redirect, %{to: "/login"}}} = live(fresh, ~p"/access-keys")
+    assert {:error, {:redirect, %{to: "/login"}}} = live(fresh, ~p"/ops/gate")
   end
 end

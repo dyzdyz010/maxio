@@ -81,6 +81,58 @@ defmodule Maxio.Policy.StatementTest do
     assert s.actions == ["s3:GetObject"]
   end
 
+  test "identity policy accepts MinIO admin action without Resource as global wildcard" do
+    json =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"admin:Prometheus"}]})
+
+    assert {:ok, [s]} = Statement.parse_identity_policy(json)
+    assert s.principals == :any
+    assert s.actions == ["admin:Prometheus"]
+    assert s.resources == ["*"]
+    assert Statement.resource_match?(s, "arn:aws:s3:::*")
+  end
+
+  test "role trust policy accepts WebIdentity federated principal" do
+    json =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam:::oidc-provider/issuer.example.test"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"issuer.example.test:aud":"sts.amazonaws.com"}}}})
+
+    assert {:ok, [statement]} =
+             Statement.parse_trust_policy(json, "arn:aws:iam:::role/webid")
+
+    assert statement.principals ==
+             {:federated, ["arn:aws:iam:::oidc-provider/issuer.example.test"]}
+
+    assert statement.actions == ["sts:AssumeRoleWithWebIdentity"]
+  end
+
+  test "role trust policy preserves mixed AWS and Federated principals" do
+    json =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam:::root","Federated":"arn:aws:iam:::oidc-provider/issuer.example.test"},"Action":["sts:AssumeRole","sts:AssumeRoleWithWebIdentity"]}})
+
+    assert {:ok, [statement]} =
+             Statement.parse_trust_policy(json, "arn:aws:iam:::role/mixed")
+
+    assert statement.principals ==
+             {:mixed,
+              %{
+                aws: ["arn:aws:iam:::root"],
+                federated: ["arn:aws:iam:::oidc-provider/issuer.example.test"]
+              }}
+
+    bad_json =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam:::oidc-provider/issuer.example.test","AWS":[123]},"Action":"sts:AssumeRoleWithWebIdentity"}})
+
+    assert {:error, :malformed} =
+             Statement.parse_trust_policy(bad_json, "arn:aws:iam:::role/mixed")
+  end
+
+  test "identity policy still rejects S3 action without Resource" do
+    json =
+      ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject"}]})
+
+    assert {:error, :malformed} = Statement.parse_identity_policy(json)
+  end
+
   test "identity policy 显式 Principal → malformed" do
     json =
       ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
@@ -291,5 +343,16 @@ defmodule Maxio.Policy.StatementTest do
 
       assert {:error, :malformed} = Statement.parse_policy(json, "b")
     end
+  end
+
+  test "rejects duplicate JSON object keys at every nesting level" do
+    bucket_duplicate =
+      ~s({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Action":"s3:PutObject","Resource":"arn:aws:s3:::b/*"}})
+
+    identity_duplicate =
+      ~s({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"StringEquals":{"s3:prefix":"a","s3:prefix":"b"}}}})
+
+    assert {:error, :malformed} = Statement.parse_policy(bucket_duplicate)
+    assert {:error, :malformed} = Statement.parse_identity_policy(identity_duplicate)
   end
 end

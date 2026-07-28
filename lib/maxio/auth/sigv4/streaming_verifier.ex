@@ -41,6 +41,7 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
     :prev_sig,
     :flavor,
     expected_decoded_len: nil,
+    decoded_limit: nil,
     trailer_names: [],
     trailers: %{},
     decoded_count: 0,
@@ -59,6 +60,7 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
       prev_sig: Keyword.fetch!(opts, :seed_signature),
       flavor: Keyword.get(opts, :flavor, :signed),
       expected_decoded_len: Keyword.get(opts, :expected_decoded_len),
+      decoded_limit: Keyword.get(opts, :decoded_limit),
       trailer_names: Keyword.get(opts, :trailer_names, [])
     }
   end
@@ -221,7 +223,7 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
           if byte_size(after_header) >= size + 2 do
             take_frame_data(v, size, nil, after_header)
           else
-            :need_more
+            wait_for_limited_frame(v, size)
           end
         else
           {:error, reason} -> {:error, reason}
@@ -240,11 +242,26 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
           if byte_size(after_header) >= size + 2 do
             take_frame_data(v, size, sig, after_header)
           else
-            :need_more
+            wait_for_limited_frame(v, size)
           end
         end
     end
   end
+
+  defp wait_for_limited_frame(v, size) do
+    case validate_decoded_limit(v, size) do
+      :ok -> :need_more
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_decoded_limit(%__MODULE__{decoded_limit: nil}, _size), do: :ok
+
+  defp validate_decoded_limit(%__MODULE__{decoded_count: count, decoded_limit: limit}, size)
+       when count + size > limit,
+       do: {:error, :decoded_length_exceeded}
+
+  defp validate_decoded_limit(_v, _size), do: :ok
 
   defp take_frame_data(%__MODULE__{flavor: flavor}, 0, sig, after_header)
        when flavor in [:signed_trailer, :unsigned_trailer] do
@@ -257,13 +274,15 @@ defmodule Maxio.Auth.SigV4.StreamingVerifier do
     {:frame, 0, sig, "", rest}
   end
 
-  defp take_frame_data(_v, size, sig, after_header) do
-    case after_header do
-      <<data::binary-size(^size), "\r\n", rest::binary>> ->
-        {:frame, size, sig, data, rest}
+  defp take_frame_data(v, size, sig, after_header) do
+    with :ok <- validate_decoded_limit(v, size) do
+      case after_header do
+        <<data::binary-size(^size), "\r\n", rest::binary>> ->
+          {:frame, size, sig, data, rest}
 
-      _ ->
-        {:error, :invalid_chunk}
+        _ ->
+          {:error, :invalid_chunk}
+      end
     end
   end
 

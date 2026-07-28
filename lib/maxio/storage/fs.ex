@@ -37,7 +37,18 @@ defmodule Maxio.Storage.FS do
 
   alias Maxio.Cluster.{Paths, ShardServer}
   alias Maxio.Sidecar
-  alias Maxio.Storage.DeleteMarker
+
+  alias Maxio.Storage.{
+    DeleteMarker,
+    EpochStore,
+    MutationBackup,
+    MutationContext,
+    NotificationLedger,
+    ObjectCommit,
+    ObjectEpoch
+  }
+
+  alias Maxio.Storage.ObjectCommit.Control
 
   @chunk_size 1_048_576
   @part_file "part.0"
@@ -101,6 +112,35 @@ defmodule Maxio.Storage.FS do
   def delete_version(bucket, key, version_id \\ "null", opts \\ []),
     do: do_delete(bucket, key, version_id, opts)
 
+  @impl true
+  def put_notification_ledgers(bucket, key, entries, opts \\ []),
+    do: do_put_notification_ledgers(bucket, key, entries, opts)
+
+  @impl true
+  def list_notification_ledgers(bucket, key_filter, opts \\ []),
+    do: do_list_notification_ledgers(bucket, key_filter, opts)
+
+  @impl true
+  def delete_notification_ledgers(bucket, key, ids, opts \\ []),
+    do: do_delete_notification_ledgers(bucket, key, ids, opts)
+
+  # ── ObjectMutation epoch CAS 回调（协议 §3.3，Phase 1 B2）：FS 单 drive 薄包装——
+  # drive_root 恒为 data_dir(opts) 原值透传（EpochStore 串行路由键按原始字符串 phash2，
+  # 绝不自行拼接变体），直调 ShardServer per-endpoint 原语（quorum=1：单盘成功即权威提交）。──
+
+  @impl true
+  def claim_epoch(target, token, operation, opts \\ []),
+    do: do_claim_epoch(target, token, operation, opts)
+
+  @impl true
+  def current_epoch(target, opts \\ []), do: do_current_epoch(target, opts)
+
+  @impl true
+  def restore_if_current(ctx, opts \\ []), do: do_restore_if_current(ctx, opts)
+
+  @impl true
+  def finalize_if_current(ctx, opts \\ []), do: do_finalize_if_current(ctx, opts)
+
   @doc """
   ROUTE B B6-2 —— FS 的**合成单端点 topology**（单一事实来源；经
   `Maxio.ObjectMeta.effective_topology/1` 注入读/列/scanner 权威路径的 `opts[:topology]`）。
@@ -140,7 +180,7 @@ defmodule Maxio.Storage.FS do
   # ── PUT：流式写 temp obj-dir（part.0 + meta.json sidecar），原子提交到 final ──
 
   defp do_put(bucket, key, version_id, chunks, opts) do
-    with {:ok, final_dir} <- object_path(bucket, key, version_id, opts) do
+    with {:ok, _validated_path} <- object_path(bucket, key, version_id, opts) do
       # B1-2 原子提交：同卷 .tmp temp obj-dir 内流式写 part.0，流尾写 maxio/2 sidecar（meta.json），
       # 数据先于元数据原子 rename 到 final（crash 前 final 保旧值/缺失）。
       {:ok, tmp} = ShardServer.begin_tmp(data_dir(opts))
@@ -170,24 +210,17 @@ defmodule Maxio.Storage.FS do
 
         result = %{size: size, etag: etag, sha256: sha256}
         extra = run_before_object_commit!(opts, result)
-        meta = build_meta(version_id, opts, size, etag, sha256)
+        prepared = Map.merge(result, extra)
 
-        case ShardServer.put_sidecar(tmp, meta) do
-          :ok ->
-            commit_obj_dir(
-              tmp,
-              final_dir,
-              bucket,
-              key,
-              version_id,
-              opts,
-              Map.merge(result, extra)
-            )
-
-          {:error, reason} ->
-            _ = File.rm_rf(tmp)
-            {:error, reason}
-        end
+        ObjectCommit.run(
+          opts,
+          prepared,
+          default_object_commit_opts(version_id, opts, extra),
+          fn commit_opts ->
+            publish_staged_put(tmp, bucket, key, opts, prepared, commit_opts)
+          end,
+          fn -> File.rm_rf(tmp) end
+        )
       rescue
         err ->
           _ = File.rm_rf(tmp)
@@ -197,6 +230,360 @@ defmodule Maxio.Storage.FS do
           _ = File.rm_rf(tmp)
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
+    end
+  end
+
+  defp default_object_commit_opts(version_id, opts, extra) do
+    object_meta =
+      opts
+      |> Keyword.get(:object_meta, %{})
+      |> Map.merge(Map.get(extra, :object_meta, %{}))
+
+    [version_id: version_id, object_meta: object_meta]
+  end
+
+  defp publish_staged_put(tmp, bucket, key, opts, prepared, commit_opts) do
+    version_id = Keyword.fetch!(commit_opts, :version_id)
+    object_meta = Keyword.fetch!(commit_opts, :object_meta)
+    control = Keyword.fetch!(commit_opts, :object_commit_control)
+    identity = Keyword.fetch!(commit_opts, :object_commit_identity)
+    publish_opts = Keyword.put(opts, :object_meta, object_meta)
+
+    case object_path(bucket, key, version_id, opts) do
+      {:ok, final_dir} ->
+        meta =
+          version_id
+          |> build_meta(
+            publish_opts,
+            prepared.size,
+            prepared.etag,
+            prepared.sha256
+          )
+          |> Map.put("object_commit_identity", identity)
+
+        case ShardServer.put_sidecar(tmp, meta) do
+          :ok ->
+            committed = Map.put(prepared, :version_id, version_id)
+
+            # 协议化 PutObject（commit_opts[:object_mutation]，B5 orchestrator 注入）走
+            # ObjectMutation publish 分支；不传该 opt 的调用者保持现状路径逐字节不变（R6）。
+            case Keyword.get(commit_opts, :object_mutation) do
+              nil ->
+                publish_controlled_obj_dir(
+                  tmp,
+                  final_dir,
+                  bucket,
+                  key,
+                  version_id,
+                  opts,
+                  committed,
+                  control,
+                  identity
+                )
+
+              %MutationContext{} = ctx ->
+                publish_mutation_obj_dir(tmp, final_dir, opts, committed, control, identity, ctx)
+
+              invalid ->
+                _ = File.rm_rf(tmp)
+                {:error, {:invalid_object_mutation, invalid}}
+            end
+
+          {:error, reason} ->
+            _ = File.rm_rf(tmp)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        _ = File.rm_rf(tmp)
+        {:error, reason}
+    end
+  end
+
+  defp publish_controlled_obj_dir(
+         tmp,
+         final_dir,
+         bucket,
+         key,
+         version_id,
+         opts,
+         result,
+         control,
+         identity
+       ) do
+    case plan_put_backup(final_dir, opts) do
+      {:ok, plan} ->
+        rollback = fn ->
+          rollback_put_plan(final_dir, plan, identity, bucket, key, version_id)
+        end
+
+        finalize = fn -> discard_put_plan(plan) end
+
+        case Control.register(control, identity, rollback, finalize) do
+          :ok ->
+            with :ok <- materialize_put_backup(plan),
+                 :ok <- log_materialized_legacy_replace(plan, final_dir, bucket, key, version_id),
+                 :ok <- ShardServer.commit(tmp, final_dir, commit_opts(opts)) do
+              {:ok, result}
+            else
+              {:error, reason} -> {:error, structured_reason(reason)}
+            end
+
+          {:error, reason} ->
+            _ = discard_put_plan(plan)
+            _ = File.rm_rf(tmp)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        _ = File.rm_rf(tmp)
+        {:error, structured_reason(reason)}
+    end
+  end
+
+  # ── ObjectMutation 协议化 publish（协议 §3.2/§3.3/§5，实现计划 B2）──
+  # commit_opts[:object_mutation]（%MutationContext{}）存在时的 publish 分支，与
+  # publish_controlled_obj_dir 的差异：
+  #   * 旧值备份落 <data_dir>/.maxio-object-mutations/<mutation_id>/（durable，recovery 凭
+  #     journal + 磁盘即可定位），不再用 .tmp/<uuid>；
+  #   * Control.register 之后、备份物化之前写 manifest.json 并 fsync（协议 §5「backend 在
+  #     第一次 destructive IO 前同步注册 durable mutation context」的磁盘侧落点）；
+  #   * 备份物化之后、destructive rename 之前 epoch CAS {:exact, token, ["claimed"]} →
+  #     "published"（携精确 fingerprint）；fenced → 不 rename，{:error, {:epoch_fenced, ...}}
+  #     （实现计划决策点 2：publish CAS 固定在 rename 之前，不得调换）；
+  #   * rollback/finalize 闭包指向 restore_if_current/finalize_if_current——所有权判定只认
+  #     epoch token；sidecar 仍写 object_commit_identity（旧调用者与取证兼容），但协议分支
+  #     不再走 identity 比对。
+  # 非协议路径 rollback_put_plan 的 `{:error, :enoent} → remove_current_object_files` 分支
+  # （把 sidecar 缺失当删除授权）仅存在于旧路径（Phase 2 迁移）；协议路径不触达——epoch
+  # absent 时 restore_mutation 返回 {:error, :epoch_missing}，绝不删任何字节（协议 §3.3
+  # 「禁止把 nil/:enoent 当成可恢复授权」）。
+  # VERIFY-AT-IMPL(Phase 2B)：sidecar entry 的 "generation"（version_opts/DeleteMarker.sidecar）
+  # 与 mutation generation 的代际收敛属 Phase 2B；Phase 1 fence 唯一事实来源是 epoch token。
+  defp publish_mutation_obj_dir(tmp, final_dir, opts, result, control, identity, ctx) do
+    drive_root = data_dir(opts)
+
+    with :ok <- validate_mutation_final_dir(final_dir, drive_root, ctx),
+         {:ok, plan} <- plan_mutation_backup(final_dir, drive_root, ctx),
+         {:ok, fingerprint} <- staged_fingerprint(tmp, result) do
+      rollback = fn -> mutation_control_result(do_restore_if_current(ctx, opts)) end
+      finalize = fn -> mutation_control_result(do_finalize_if_current(ctx, opts)) end
+
+      case Control.register(control, identity, rollback, finalize) do
+        :ok ->
+          # register 之后的失败不清 tmp/backup：ObjectCommit 的 rollback 路径会经
+          # restore_if_current 收敛（durable manifest 在，幂等），discard_fun 清 tmp。
+          with :ok <- write_mutation_manifest(plan, ctx, opts),
+               :ok <- materialize_put_backup(plan),
+               :ok <- publish_mutation_epoch(drive_root, ctx, fingerprint, opts),
+               :ok <- ShardServer.commit(tmp, final_dir, commit_opts(opts)) do
+            {:ok, Map.put(result, :epoch_fingerprint, fingerprint)}
+          else
+            {:error, reason} -> {:error, structured_reason(reason)}
+          end
+
+        {:error, reason} ->
+          _ = File.rm_rf(tmp)
+          {:error, reason}
+      end
+    else
+      {:error, reason} ->
+        _ = File.rm_rf(tmp)
+        {:error, structured_reason(reason)}
+    end
+  end
+
+  # 防线：ctx.final_rel（restore 的回位落点，journal 派生）必须与本次 publish 的 final_dir
+  # 指向同一路径——不一致意味着上下文与请求落点脱节，restore 会把旧字节回错目录。
+  defp validate_mutation_final_dir(final_dir, drive_root, %MutationContext{final_rel: final_rel}) do
+    if is_binary(final_rel) and Path.join(drive_root, final_rel) == final_dir do
+      :ok
+    else
+      {:error, {:mutation_final_rel_mismatch, final_rel}}
+    end
+  end
+
+  # 协议化备份计划：backup 落 durable mutation 目录（非 .tmp）。旧单文件布局（pre-B6-1）
+  # 与 manifest 契约（entries = final obj-dir 内单层文件名）不可表达——fail-closed 结构化
+  # 拒绝，绝不静默转换布局或把旧字节留在 recovery 定位不到的地方（P7 backfill 迁移旧布局
+  # 后此分支消亡；非协议路径的 legacy 替换行为不变）。
+  defp plan_mutation_backup(final_dir, drive_root, %MutationContext{mutation_id: mutation_id}) do
+    backup_dir = Path.join(drive_root, MutationBackup.relative_dir(mutation_id))
+
+    cond do
+      File.regular?(final_dir) ->
+        {:error, :legacy_layout_conflict}
+
+      File.dir?(final_dir) ->
+        names =
+          Enum.filter([@part_file, @meta_file], fn name ->
+            File.regular?(Path.join(final_dir, name))
+          end)
+
+        {:ok,
+         %{
+           backup_dir: backup_dir,
+           names: names,
+           entries:
+             Enum.map(names, fn name ->
+               {Path.join(final_dir, name), Path.join(backup_dir, name)}
+             end)
+         }}
+
+      true ->
+        # fresh put：无旧文件可备份，manifest entries=[]（restore 只翻转 epoch、清 backup）。
+        {:ok, %{backup_dir: backup_dir, names: [], entries: []}}
+    end
+  end
+
+  # manifest 先行（B1 EpochStore 契约：published 的 restore 要求 manifest 必在）：manifest +
+  # fsync 落盘于任何 destructive IO 之前，crash 后 recovery 仅凭 mutation_id 即可定位备份名单。
+  defp write_mutation_manifest(plan, ctx, opts) do
+    entries = Enum.map(plan.names, &%{"name" => &1})
+
+    with {:ok, manifest} <-
+           MutationBackup.manifest(ctx.target, ctx.token, previous_epoch_token(ctx), entries),
+         {:ok, bytes} <- MutationBackup.encode(manifest),
+         :ok <- File.mkdir_p(plan.backup_dir),
+         manifest_path = Path.join(plan.backup_dir, MutationBackup.manifest_name()),
+         :ok <- File.write(manifest_path, bytes),
+         :ok <- maybe_sync_mutation_path(opts, manifest_path) do
+      maybe_sync_mutation_dir(opts, plan.backup_dir)
+    end
+  end
+
+  # fingerprint 的 sidecar_sha256 针对**实际落盘**的 tmp/meta.json 字节（读回而非重编码，
+  # 杜绝编码漂移）；publish rename 后 final/meta.json 即这份字节。
+  defp staged_fingerprint(tmp, result) do
+    case File.read(Path.join(tmp, @meta_file)) do
+      {:ok, sidecar_bytes} ->
+        {:ok, ObjectEpoch.fingerprint(result.etag, result.size, sidecar_bytes)}
+
+      {:error, reason} ->
+        {:error, {:staged_sidecar_unreadable, reason}}
+    end
+  end
+
+  # destructive rename 之前的 publish 门（FS 单盘 quorum=1）：epoch {:exact, token,
+  # ["claimed"]} → "published" + 精确 fingerprint。fenced（successor 已 claim）→ 绝不
+  # rename——backup + manifest 保留在 durable 目录，收敛交给 journal/recovery（B5/B6）。
+  defp publish_mutation_epoch(drive_root, ctx, fingerprint, opts) do
+    with {:ok, published} <-
+           ObjectEpoch.new(ctx.target, ctx.token, %{
+             operation: ctx.operation,
+             phase: "published",
+             value_type: "object",
+             fingerprint: fingerprint,
+             previous_token: previous_epoch_token(ctx),
+             updated_at: DateTime.utc_now()
+           }),
+         {:ok, payload} <- EpochStore.payload(published) do
+      case ShardServer.cas_epoch(
+             drive_root,
+             %{next: payload, expect: {:exact, ctx.token, ["claimed"]}},
+             epoch_opts(opts)
+           ) do
+        {:ok, :applied} -> :ok
+        {:error, {:fenced, current}} -> {:error, {:epoch_fenced, current}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  # Control 闭包契约：:ok | {:error, reason}。restore/finalize 的 :superseded 视为收敛完成
+  # （successor 已建立，本次提交对 final 无事可做——绝不触碰 successor）。
+  defp mutation_control_result({:ok, _outcome}), do: :ok
+  defp mutation_control_result({:error, _reason} = error), do: error
+
+  defp previous_epoch_token(%MutationContext{previous_epoch: %{"token" => token}}), do: token
+  defp previous_epoch_token(%MutationContext{}), do: nil
+
+  # ── ObjectMutation epoch 原语（B2）：单 drive 直调 ShardServer 的薄包装。──
+
+  defp do_claim_epoch(target, token, operation, opts) do
+    drive_root = data_dir(opts)
+
+    # read → CAS 非单一串行段：previous 仅作 lineage 信息（B5 写入 journal previous_epoch），
+    # fence 正确性由 CAS 的「仅接受严格更大 token」独立保证（B5 起 claim 恒在 object lock 内）。
+    with {:ok, current} <- do_current_epoch(target, opts),
+         previous = epoch_or_nil(current),
+         {:ok, claimed} <-
+           ObjectEpoch.new(target, token, %{
+             operation: operation,
+             # B1 收口确认项：EpochStore {:claim, ...} 不约束 next.phase——后端层恒写
+             # "claimed"（publish 的 {:exact, token, ["claimed"]} 门依赖该不变量）。
+             phase: "claimed",
+             value_type: "object",
+             previous_token: previous && previous.token,
+             updated_at: DateTime.utc_now()
+           }),
+         {:ok, payload} <- EpochStore.payload(claimed),
+         {:ok, :applied} <-
+           ShardServer.cas_epoch(
+             drive_root,
+             %{next: payload, expect: {:claim, token}},
+             epoch_opts(opts)
+           ) do
+      {:ok, %{previous: previous, endpoints_ok: 1}}
+    end
+  end
+
+  defp do_current_epoch(target, opts) do
+    case ShardServer.read_epoch(data_dir(opts), target, epoch_opts(opts)) do
+      {:ok, :absent} -> {:ok, :absent}
+      {:ok, payload} -> epoch_from_payload(payload)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp do_restore_if_current(%MutationContext{} = ctx, opts) do
+    ShardServer.restore_mutation(
+      data_dir(opts),
+      %{
+        target: ctx.target,
+        token: ctx.token,
+        mutation_id: ctx.mutation_id,
+        final_rel: ctx.final_rel
+      },
+      epoch_opts(opts)
+    )
+  end
+
+  defp do_finalize_if_current(%MutationContext{} = ctx, opts) do
+    ShardServer.finalize_mutation(
+      data_dir(opts),
+      %{target: ctx.target, token: ctx.token, mutation_id: ctx.mutation_id},
+      epoch_opts(opts)
+    )
+  end
+
+  defp epoch_or_nil(:absent), do: nil
+  defp epoch_or_nil(%ObjectEpoch{} = epoch), do: epoch
+
+  # ShardServer 原语响应是纯数据 payload（erpc 同形）；behaviour 契约返回结构体，
+  # 经 decode 全量重验还原（坏 payload 结构化拒绝，绝不静默）。
+  defp epoch_from_payload(payload) do
+    with {:ok, bytes} <- Jason.encode(payload) do
+      ObjectEpoch.decode(bytes)
+    end
+  end
+
+  defp epoch_opts(opts), do: Keyword.take(opts, [:fsync])
+
+  defp maybe_sync_mutation_path(opts, path) do
+    if mutation_fsync?(opts), do: ShardServer.sync_path(path), else: :ok
+  end
+
+  defp maybe_sync_mutation_dir(opts, dir) do
+    if mutation_fsync?(opts), do: ShardServer.sync_dir(dir), else: :ok
+  end
+
+  # opts[:fsync] 显式覆盖；否则读 config :maxio, :durability, fsync:
+  # （与 ShardServer/EpochStore 同源开关）。
+  defp mutation_fsync?(opts) do
+    case Keyword.fetch(opts, :fsync) do
+      {:ok, value} -> value
+      :error -> Application.get_env(:maxio, :durability, [])[:fsync] || false
     end
   end
 
@@ -252,6 +639,57 @@ defmodule Maxio.Storage.FS do
         # 旧单文件布局（或不存在，幂等 :ok）。
         rm_ok(dir)
       end
+    end
+  end
+
+  defp do_put_notification_ledgers(_bucket, _key, [], _opts), do: :ok
+
+  defp do_put_notification_ledgers(bucket, key, entries, opts) when is_list(entries) do
+    Enum.reduce_while(entries, :ok, fn entry, :ok ->
+      case put_one_notification_ledger(bucket, key, entry, opts) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp put_one_notification_ledger(bucket, key, entry, opts) do
+    with {:ok, id} <- notification_ledger_id(entry),
+         final_dir <- notification_ledger_path(bucket, key, id, opts),
+         {:ok, tmp} <- ShardServer.begin_tmp(data_dir(opts)),
+         :ok <- ShardServer.put_sidecar(tmp, NotificationLedger.sidecar(entry)) do
+      case ShardServer.commit(tmp, final_dir, commit_opts(opts) ++ [meta_only: true]) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          _ = File.rm_rf(tmp)
+          {:error, structured_reason(reason)}
+      end
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp do_list_notification_ledgers(bucket, :all, opts) do
+    root = Path.join(data_dir(opts), Paths.notification_ledger_bucket_rel(bucket))
+    read_notification_ledgers_under(root, bucket: bucket)
+  end
+
+  defp do_list_notification_ledgers(bucket, key, opts) when is_binary(key) do
+    root = Path.join(data_dir(opts), Paths.notification_ledger_key_rel(bucket, key))
+    read_notification_ledgers_under(root, bucket: bucket, key: key)
+  end
+
+  defp do_delete_notification_ledgers(_bucket, _key, [], _opts), do: :ok
+
+  defp do_delete_notification_ledgers(bucket, key, ids, opts) when is_list(ids) do
+    with {:ok, ids} <- notification_ledger_ids(ids) do
+      Enum.each(ids, fn id ->
+        _ = File.rm_rf(notification_ledger_path(bucket, key, id, opts))
+      end)
+
+      :ok
     end
   end
 
@@ -348,6 +786,15 @@ defmodule Maxio.Storage.FS do
   defp normalize_part_commit_extra(nil), do: %{}
   defp normalize_part_commit_extra(extra) when is_map(extra), do: extra
 
+  defp opts_with_commit_extra(opts, extra) do
+    object_meta =
+      opts
+      |> Keyword.get(:object_meta, %{})
+      |> Map.merge(Map.get(extra, :object_meta, %{}) || %{})
+
+    Keyword.put(opts, :object_meta, object_meta)
+  end
+
   defp do_get_part_stream(bucket, key, upload_id, part_number, opts) do
     with {:ok, _obj} <- object_path(bucket, key, "null", opts) do
       path = part_path(bucket, upload_id, part_number, opts)
@@ -361,47 +808,149 @@ defmodule Maxio.Storage.FS do
 
   # ── ASSEMBLE：逐 part 流式拼进 temp obj-dir 的 part.0（边拷边算 etag/sha256），流尾写
   # maxio/2 sidecar，原子提交到 opts[:version_id] 指定布局 final（缺省 null，与 EC do_assemble
-  # 同语义：assemble 透传 opts[:object_meta]，sidecar 自描述真实 content_type/user_metadata，B4-6 D1）。──
+  # 同语义：assemble 透传 opts[:object_meta]，sidecar 自描述真实 content_type/user_metadata，B4-6 D1）。
+  #
+  # Phase 2A C6：与 do_put 同构改经 ObjectCommit.run 编排——staging = begin_tmp + part 拼接 +
+  # run_before_object_commit! + sidecar（object_meta 在此按 opts_with_commit_extra 合并
+  # before_object_commit extra 后落盘，around 与 default 两条路径天然同一份 merge），
+  # publish = publish_staged_assemble（非协议走 commit_obj_dir；commit_opts[:object_mutation]
+  # 存在时复用 publish_mutation_obj_dir 协议分支）。不传协议 opt 的调用者行为逐字节不变。──
 
   defp do_assemble(bucket, key, upload_id, part_numbers, opts) do
     version_id = Keyword.get(opts, :version_id, "null")
 
     with {:ok, final_dir} <- object_path(bucket, key, version_id, opts) do
       {:ok, tmp} = ShardServer.begin_tmp(data_dir(opts))
-      {:ok, out} = File.open(Path.join(tmp, @part_file), [:write, :binary, :raw])
 
-      {etag, sha256, size} =
-        try do
-          acc0 = {:crypto.hash_init(:md5), :crypto.hash_init(:sha256), 0}
+      try do
+        {:ok, out} = File.open(Path.join(tmp, @part_file), [:write, :binary, :raw])
 
-          {md5_ctx, sha_ctx, size} =
-            Enum.reduce(part_numbers, acc0, fn pn, acc ->
-              path = part_path(bucket, upload_id, pn, opts)
-              {:ok, in_fd} = :file.open(String.to_charlist(path), [:read, :binary, :raw])
+        {etag, sha256, size} =
+          try do
+            acc0 = {:crypto.hash_init(:md5), :crypto.hash_init(:sha256), 0}
 
-              try do
-                copy_fd(in_fd, out, acc)
-              after
-                :file.close(in_fd)
-              end
-            end)
+            {md5_ctx, sha_ctx, size} =
+              Enum.reduce(part_numbers, acc0, fn pn, acc ->
+                path = part_path(bucket, upload_id, pn, opts)
+                {:ok, in_fd} = :file.open(String.to_charlist(path), [:read, :binary, :raw])
 
-          {md5_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower),
-           sha_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower), size}
-        after
-          File.close(out)
+                try do
+                  copy_fd(in_fd, out, acc)
+                after
+                  :file.close(in_fd)
+                end
+              end)
+
+            {md5_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower),
+             sha_ctx |> :crypto.hash_final() |> Base.encode16(case: :lower), size}
+          after
+            File.close(out)
+          end
+
+        result = %{size: size, etag: etag, sha256: sha256}
+        extra = run_before_object_commit!(opts, result)
+        meta = build_meta(version_id, opts_with_commit_extra(opts, extra), size, etag, sha256)
+        prepared = Map.merge(result, extra)
+
+        case ShardServer.put_sidecar(tmp, meta) do
+          :ok ->
+            # assemble 的 version_id/object_meta 在 staging 期已由 opts 钉定（sidecar 已落盘），
+            # default commit_opts 无需承载（publish 只消费 :object_mutation 与 Control 键）。
+            ObjectCommit.run(
+              opts,
+              prepared,
+              [],
+              fn commit_opts ->
+                publish_staged_assemble(
+                  tmp,
+                  final_dir,
+                  bucket,
+                  key,
+                  version_id,
+                  opts,
+                  prepared,
+                  commit_opts
+                )
+              end,
+              fn -> File.rm_rf(tmp) end
+            )
+
+          {:error, reason} ->
+            _ = File.rm_rf(tmp)
+            {:error, reason}
         end
-
-      meta = build_meta(version_id, opts, size, etag, sha256)
-
-      case ShardServer.put_sidecar(tmp, meta) do
-        :ok ->
-          commit_obj_dir(tmp, final_dir, bucket, key, version_id, opts, %{size: size})
-
-        {:error, reason} ->
+      rescue
+        err ->
           _ = File.rm_rf(tmp)
-          {:error, reason}
+          reraise(err, __STACKTRACE__)
+      catch
+        kind, reason ->
+          _ = File.rm_rf(tmp)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
+    end
+  end
+
+  # assemble 的 publish 阶段（C6）。staging 已把拼接字节 + sidecar 写进 tmp obj-dir，此处只做
+  # final 提交编排：
+  #   * 非协议（无 :object_mutation）：Control 注册 no-op rollback/finalize 后 commit_obj_dir。
+  #     现状 assemble 本就无 identity 比对回滚语义（temp→final 原子 rename 级原子性），注册仅
+  #     满足 ObjectCommit 收口契约（finalize 拒绝未注册）——行为逐字节不变；
+  #   * 协议（%MutationContext{}）：复用 publish_mutation_obj_dir（与 do_put 协议分支同一结构：
+  #     plan backup 旧 final entries → staged fingerprint → Control.register → manifest 写+fsync →
+  #     materialize 备份 → epoch CAS claimed→published → ShardServer.commit）。
+  # commit_opts[:version_id] 仅作一致性校验：落点已在 staging 按 opts[:version_id] 钉定，
+  # 不一致意味着 around 调用者与 staging 脱节（绝不静默改写落点，fail-loud 拒绝）。
+  defp publish_staged_assemble(
+         tmp,
+         final_dir,
+         bucket,
+         key,
+         version_id,
+         opts,
+         prepared,
+         commit_opts
+       ) do
+    control = Keyword.fetch!(commit_opts, :object_commit_control)
+    identity = Keyword.fetch!(commit_opts, :object_commit_identity)
+
+    with :ok <- validate_assemble_version(commit_opts, version_id) do
+      case Keyword.get(commit_opts, :object_mutation) do
+        nil ->
+          case Control.register(control, identity, fn -> :ok end, fn -> :ok end) do
+            :ok ->
+              commit_obj_dir(tmp, final_dir, bucket, key, version_id, opts, prepared)
+
+            {:error, reason} ->
+              _ = File.rm_rf(tmp)
+              {:error, reason}
+          end
+
+        %MutationContext{} = ctx ->
+          committed = Map.put(prepared, :version_id, version_id)
+          publish_mutation_obj_dir(tmp, final_dir, opts, committed, control, identity, ctx)
+
+        invalid ->
+          _ = File.rm_rf(tmp)
+          {:error, {:invalid_object_mutation, invalid}}
+      end
+    else
+      {:error, reason} ->
+        _ = File.rm_rf(tmp)
+        {:error, reason}
+    end
+  end
+
+  defp validate_assemble_version(commit_opts, version_id) do
+    case Keyword.fetch(commit_opts, :version_id) do
+      :error ->
+        :ok
+
+      {:ok, ^version_id} ->
+        :ok
+
+      {:ok, other} ->
+        {:error, {:assemble_version_mismatch, %{staged: version_id, requested: other}}}
     end
   end
 
@@ -487,7 +1036,344 @@ defmodule Maxio.Storage.FS do
     end
   end
 
+  # Planning allocates same-volume backup paths and records the old sidecar
+  # identity without moving final. The control is registered synchronously
+  # before materialize_put_backup/1 performs the first destructive rename.
+  defp plan_put_backup(final_dir, opts) do
+    cond do
+      File.regular?(final_dir) ->
+        with {:ok, backup_dir} <- ShardServer.begin_tmp(data_dir(opts)) do
+          {:ok,
+           %{
+             kind: :legacy,
+             backup_dir: backup_dir,
+             entries: [{final_dir, Path.join(backup_dir, "legacy-file")}],
+             old_identity: :legacy
+           }}
+        end
+
+      File.dir?(final_dir) ->
+        plan_object_file_backup(final_dir, opts)
+
+      true ->
+        {:ok, %{kind: :none, backup_dir: nil, entries: [], old_identity: {:error, :enoent}}}
+    end
+  end
+
+  defp plan_object_file_backup(final_dir, opts) do
+    entries =
+      [@part_file, @meta_file]
+      |> Enum.map(fn name -> {Path.join(final_dir, name), name} end)
+      |> Enum.filter(fn {source, _name} -> File.regular?(source) end)
+
+    case entries do
+      [] ->
+        {:ok, %{kind: :none, backup_dir: nil, entries: [], old_identity: {:error, :enoent}}}
+
+      entries ->
+        with {:ok, old_identity} <- readable_old_identity(final_dir),
+             {:ok, backup_dir} <- ShardServer.begin_tmp(data_dir(opts)) do
+          {:ok,
+           %{
+             kind: :object,
+             backup_dir: backup_dir,
+             entries:
+               Enum.map(entries, fn {source, name} ->
+                 {source, Path.join(backup_dir, name)}
+               end),
+             old_identity: old_identity
+           }}
+        end
+    end
+  end
+
+  defp readable_old_identity(final_dir) do
+    case final_object_commit_identity(final_dir) do
+      {:ok, identity} -> {:ok, {:ok, identity}}
+      {:error, :enoent} -> {:ok, {:error, :enoent}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp materialize_put_backup(%{entries: entries}) do
+    Enum.reduce_while(entries, :ok, fn {source, backup}, :ok ->
+      case File.rename(source, backup) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp log_materialized_legacy_replace(
+         %{kind: :legacy},
+         final_dir,
+         bucket,
+         key,
+         version_id
+       ) do
+    log_legacy_replace(final_dir, bucket, key, version_id)
+  end
+
+  defp log_materialized_legacy_replace(
+         _plan,
+         _final_dir,
+         _bucket,
+         _key,
+         _version_id
+       ),
+       do: :ok
+
+  defp rollback_put_plan(final_dir, %{kind: :none} = plan, identity, bucket, key, version_id) do
+    case final_object_commit_identity(final_dir) do
+      {:ok, ^identity} -> remove_current_object_files(final_dir)
+      {:error, :enoent} -> remove_current_object_files(final_dir)
+      {:ok, _successor_identity} -> discard_put_plan(plan)
+      {:error, reason} -> rollback_identity_error(reason, identity, bucket, key, version_id)
+    end
+  end
+
+  defp rollback_put_plan(final_dir, plan, identity, bucket, key, version_id) do
+    moved = moved_put_entries(plan)
+
+    if moved == [] do
+      discard_put_plan(plan)
+    else
+      case final_object_commit_identity(final_dir) do
+        {:ok, ^identity} ->
+          with :ok <- remove_current_object_files(final_dir) do
+            restore_put_entries(plan, moved, final_dir, bucket, key, version_id)
+          end
+
+        current when current == plan.old_identity ->
+          # Publisher died while backing up: old final is still authoritative;
+          # restore only files that were already moved.
+          restore_put_entries(plan, moved, final_dir, bucket, key, version_id)
+
+        {:error, :enoent} ->
+          with :ok <- remove_current_object_files(final_dir) do
+            restore_put_entries(plan, moved, final_dir, bucket, key, version_id)
+          end
+
+        {:ok, _successor_identity} ->
+          # A later writer owns final. This stale rollback may only discard its
+          # own backup; it must never remove the successor's part/meta.
+          discard_put_plan(plan)
+
+        {:error, reason} ->
+          rollback_identity_error(reason, identity, bucket, key, version_id)
+      end
+    end
+  end
+
+  defp moved_put_entries(%{entries: entries}) do
+    Enum.filter(entries, fn {_source, backup} -> File.exists?(backup) end)
+  end
+
+  defp restore_put_entries(plan, moved, final_dir, bucket, key, version_id) do
+    result =
+      Enum.reduce_while(moved, :ok, fn {source, backup}, :ok ->
+        _ = remove_restore_target(source)
+        _ = File.mkdir_p(Path.dirname(source))
+
+        case File.rename(backup, source) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+
+    case result do
+      :ok ->
+        with :ok <- log_restored_legacy_plan(plan, final_dir, bucket, key, version_id),
+             do: discard_put_plan(plan)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp log_restored_legacy_plan(%{kind: :legacy}, final_dir, bucket, key, version_id) do
+    log_legacy_restore(final_dir, bucket, key, version_id, :object_commit_rollback)
+  end
+
+  defp log_restored_legacy_plan(_plan, _final_dir, _bucket, _key, _version_id), do: :ok
+
+  defp remove_restore_target(path) do
+    cond do
+      File.dir?(path) ->
+        File.rmdir(path)
+
+      true ->
+        case File.rm(path) do
+          :ok -> :ok
+          {:error, :enoent} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp final_object_commit_identity(final_dir) do
+    case File.read(Path.join(final_dir, @meta_file)) do
+      {:ok, bin} ->
+        try do
+          {:ok, bin |> Sidecar.decode!() |> Map.get("object_commit_identity")}
+        rescue
+          error -> {:error, {:invalid_sidecar, error}}
+        end
+
+      {:error, reason} when reason in [:enoent, :enotdir] ->
+        {:error, :enoent}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp remove_current_object_files(final_dir) do
+    result =
+      Enum.reduce_while([@part_file, @meta_file], :ok, fn name, :ok ->
+        case File.rm(Path.join(final_dir, name)) do
+          :ok -> {:cont, :ok}
+          {:error, :enoent} -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+
+    if result == :ok, do: _ = File.rmdir(final_dir)
+    result
+  end
+
+  defp rollback_identity_error(reason, identity, bucket, key, version_id) do
+    Logger.error("fs object commit identity check failed",
+      action: :object_commit_rollback,
+      bucket: bucket,
+      key: key,
+      version_id: version_id,
+      commit_identity: identity,
+      reason: inspect(reason)
+    )
+
+    {:error, reason}
+  end
+
+  defp discard_put_plan(%{backup_dir: nil}), do: :ok
+
+  defp discard_put_plan(%{backup_dir: backup_dir}) do
+    case File.rm_rf(backup_dir) do
+      {:ok, _paths} -> :ok
+      {:error, reason, _path} -> {:error, reason}
+    end
+  end
+
   defp commit_opts(opts), do: Keyword.take(opts, [:fsync, :rename_fun])
+
+  defp notification_ledger_path(bucket, key, id, opts) do
+    Path.join(data_dir(opts), Paths.notification_ledger_entry_rel(bucket, key, id))
+  end
+
+  defp notification_ledger_id(entry),
+    do: entry |> NotificationLedger.id() |> NotificationLedger.validate_id()
+
+  defp notification_ledger_ids(ids) do
+    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, acc} ->
+      case NotificationLedger.validate_id(id) do
+        {:ok, id} -> {:cont, {:ok, [id | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, ids} -> {:ok, Enum.reverse(ids)}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  defp read_notification_ledgers_under(root, context) do
+    with {:ok, paths} <- notification_ledger_meta_paths(root) do
+      Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, acc} ->
+        case File.read(path) do
+          {:ok, bin} ->
+            {:cont, {:ok, decode_notification_ledger(bin, path, context) ++ acc}}
+
+          {:error, reason} ->
+            {:halt, {:error, {:notification_ledger_read_failed, path, reason}}}
+        end
+      end)
+      |> case do
+        {:ok, entries} -> {:ok, Enum.reverse(entries)}
+        {:error, _reason} = err -> err
+      end
+    end
+  end
+
+  defp decode_notification_ledger(bin, path, context) do
+    bin
+    |> Sidecar.decode!()
+    |> NotificationLedger.entry()
+    |> case do
+      {:ok, entry} -> [entry]
+      {:error, _} -> [invalid_notification_ledger(path, "invalid_format", context)]
+    end
+  rescue
+    _ -> [invalid_notification_ledger(path, "invalid_meta", context)]
+  end
+
+  defp invalid_notification_ledger(path, reason, context) do
+    path
+    |> notification_ledger_id_from_meta_path()
+    |> NotificationLedger.invalid_entry(reason, context)
+  end
+
+  defp notification_ledger_id_from_meta_path(path) do
+    path |> Path.dirname() |> Path.basename()
+  end
+
+  defp notification_ledger_meta_paths(root) do
+    meta_path = Path.join(root, @meta_file)
+
+    case File.stat(meta_path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        {:ok, [meta_path]}
+
+      {:ok, _stat} ->
+        {:error, {:invalid_notification_ledger_meta, meta_path}}
+
+      {:error, reason} when reason in [:enoent, :enotdir] ->
+        notification_ledger_child_meta_paths(root)
+
+      {:error, reason} ->
+        {:error, {:notification_ledger_stat_failed, meta_path, reason}}
+    end
+  end
+
+  defp notification_ledger_child_meta_paths(root) do
+    case File.stat(root) do
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(root) do
+          {:ok, names} ->
+            Enum.reduce_while(names, {:ok, []}, fn name, {:ok, acc} ->
+              case notification_ledger_meta_paths(Path.join(root, name)) do
+                {:ok, paths} -> {:cont, {:ok, paths ++ acc}}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+            end)
+            |> case do
+              {:ok, paths} -> {:ok, Enum.reverse(paths)}
+              {:error, _reason} = err -> err
+            end
+
+          {:error, reason} ->
+            {:error, {:notification_ledger_list_failed, root, reason}}
+        end
+
+      {:ok, _stat} ->
+        {:error, {:invalid_notification_ledger_root, root}}
+
+      {:error, :enoent} ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:error, {:notification_ledger_stat_failed, root, reason}}
+    end
+  end
 
   # OS 报路径段超 NAME_MAX（:enametoolong）→ 结构化 :key_too_long（handler 映射 400
   # KeyTooLongError），对齐 MinIO toObjectErr：errFileNameTooLong → ObjectNameTooLong →
@@ -502,18 +1388,23 @@ defmodule Maxio.Storage.FS do
   # pre-B6-1 字节。命中必记结构化日志（绝不静默），P7 backfill 迁移后此路径消亡。
   defp protect_legacy_file(final_dir, bucket, key, version_id, opts) do
     if File.regular?(final_dir) do
-      Logger.warning("fs legacy single-file layout object replaced by obj-dir commit",
-        action: :legacy_layout_replace,
-        bucket: bucket,
-        key: key,
-        version_id: version_id,
-        path: final_dir
-      )
-
-      backup_legacy_file(final_dir, opts)
+      with {:ok, legacy} <- backup_legacy_file(final_dir, opts),
+           :ok <- log_legacy_replace(final_dir, bucket, key, version_id) do
+        {:ok, legacy}
+      end
     else
       {:ok, :none}
     end
+  end
+
+  defp log_legacy_replace(final_dir, bucket, key, version_id) do
+    Logger.warning("fs legacy single-file layout object replaced by obj-dir commit",
+      action: :legacy_layout_replace,
+      bucket: bucket,
+      key: key,
+      version_id: version_id,
+      path: final_dir
+    )
   end
 
   defp backup_legacy_file(final_dir, opts) do
@@ -558,16 +1449,7 @@ defmodule Maxio.Storage.FS do
     case File.rename(backup_path, final_dir) do
       :ok ->
         _ = File.rm_rf(backup_dir)
-
-        Logger.warning("fs legacy single-file layout restored after obj-dir commit failure",
-          action: :legacy_layout_restore,
-          bucket: bucket,
-          key: key,
-          version_id: version_id,
-          path: final_dir,
-          reason: inspect(original_reason)
-        )
-
+        :ok = log_legacy_restore(final_dir, bucket, key, version_id, original_reason)
         :ok
 
       {:error, reason} ->
@@ -584,6 +1466,17 @@ defmodule Maxio.Storage.FS do
 
         {:error, reason}
     end
+  end
+
+  defp log_legacy_restore(final_dir, bucket, key, version_id, reason) do
+    Logger.warning("fs legacy single-file layout restored after obj-dir commit failure",
+      action: :legacy_layout_restore,
+      bucket: bucket,
+      key: key,
+      version_id: version_id,
+      path: final_dir,
+      reason: inspect(reason)
+    )
   end
 
   # 旧单文件布局读回退：obj-dir 的 part.0 miss 后，对象路径本身若是常规文件即 B6-1 之前落的
@@ -664,7 +1557,10 @@ defmodule Maxio.Storage.FS do
       content_disposition: Map.get(om, :content_disposition),
       cache_control: Map.get(om, :cache_control),
       expires: Map.get(om, :expires),
+      website_redirect_location: Map.get(om, :website_redirect_location),
       tags: Map.get(om, :tags, %{}),
+      checksum: object_meta_value(om, :checksum) || %{},
+      object_parts: object_meta_value(om, :object_parts) || %{},
       sse: Map.get(om, :sse),
       acl_canned: Map.get(om, :acl_canned, "private"),
       acl_grants: Map.get(om, :acl_grants, %{"grants" => []}),
@@ -674,7 +1570,9 @@ defmodule Maxio.Storage.FS do
       object_lock_retain_until: Map.get(om, :object_lock_retain_until),
       object_lock_legal_hold: Map.get(om, :object_lock_legal_hold),
       restore_status: Map.get(om, :restore_status),
-      restore_expiry: Map.get(om, :restore_expiry)
+      restore_expiry: Map.get(om, :restore_expiry),
+      replication_status: Map.get(om, :replication_status),
+      notification_outbox: object_meta_value(om, :notification_outbox) || []
     ]
   end
 

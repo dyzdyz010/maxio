@@ -21,11 +21,20 @@ defmodule Maxio.STS.Error do
     access_denied: {"AccessDenied", 403, "Access denied.", "Sender"},
     invalid_action:
       {"InvalidAction", 400, "The action or operation requested is invalid.", "Sender"},
+    invalid_client_token_id:
+      {"InvalidClientTokenId", 403, "The security token included in the request is invalid.",
+       "Sender"},
     malformed_policy_document:
       {"MalformedPolicyDocument", 400, "The policy document is malformed.", "Sender"},
     invalid_parameter_value:
       {"InvalidParameterValue", 400, "An invalid or out-of-range value was supplied.", "Sender"},
     invalid_request: {"InvalidRequest", 400, "The request is invalid.", "Sender"},
+    invalid_identity_token:
+      {"InvalidIdentityToken", 400, "The web identity token is invalid.", "Sender"},
+    expired_token:
+      {"ExpiredToken", 400, "The security token included in the request is expired.", "Sender"},
+    idp_rejected_claim:
+      {"IDPRejectedClaim", 403, "The identity provider rejected the claim.", "Sender"},
     internal_failure: {"InternalFailure", 500, "The request processing has failed.", "Receiver"}
   }
 

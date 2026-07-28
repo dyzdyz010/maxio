@@ -6,6 +6,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.Workflow do
       mix maxio.rebalance.workflow
       mix maxio.rebalance.workflow --job-id <uuid>
       mix maxio.rebalance.workflow <uuid> --json
+      mix maxio.rebalance.workflow --job-id <uuid> --fail-on-attention --json
 
   This task never advances a job and never runs destructive physical removal or
   purge phases. It only reports the next operator action and the current audit
@@ -22,6 +23,8 @@ defmodule Mix.Tasks.Maxio.Rebalance.Workflow do
         strict: [
           job_id: :string,
           decommission_set: :integer,
+          fail_on_blocked: :boolean,
+          fail_on_attention: :boolean,
           json: :boolean
         ]
       )
@@ -30,19 +33,28 @@ defmodule Mix.Tasks.Maxio.Rebalance.Workflow do
       unexpected = rest ++ Enum.map(invalid, &elem(&1, 0))
 
       Mix.raise(
-        "usage: mix maxio.rebalance.workflow [JOB_ID|--job-id <uuid>] [--json] " <>
+        "usage: mix maxio.rebalance.workflow [JOB_ID|--job-id <uuid>] " <>
+          "[--decommission-set N] [--fail-on-blocked] [--fail-on-attention] [--json] " <>
           "(unexpected: #{inspect(unexpected)})"
       )
     end
 
-    Mix.Task.run("app.start")
+    ensure_minimal_runtime_started!()
 
     job_id = Keyword.get(opts, :job_id) || List.first(rest)
 
     case load_report(job_id, opts) do
-      {:ok, report} -> print_or_json(report, opts)
-      {:error, :not_found} -> print_not_started(opts)
-      {:error, reason} -> Mix.raise("rebalance workflow unavailable: #{inspect(reason)}")
+      {:ok, report} ->
+        print_or_json(report, opts)
+        fail_if_needed!(report, opts)
+
+      {:error, :not_found} ->
+        report = not_started_report()
+        print_or_json(report, opts)
+        fail_if_needed!(report, opts)
+
+      {:error, reason} ->
+        Mix.raise("rebalance workflow unavailable: #{inspect(reason)}")
     end
   end
 
@@ -55,20 +67,40 @@ defmodule Mix.Tasks.Maxio.Rebalance.Workflow do
 
   defp load_report(job_id, _opts), do: Workflow.summary(job_id)
 
+  defp print_or_json(%{status: "not_started"} = report, opts) do
+    if Keyword.get(opts, :json, false) do
+      IO.puts(Jason.encode!(report))
+    else
+      IO.puts(
+        "[maxio rebalance.workflow] status=not_started gate_status=#{report.gate_status} " <>
+          "jobs=0 blockers=#{length(report.blockers)} warnings=#{length(report.warnings)}"
+      )
+    end
+  end
+
   defp print_or_json(report, opts) do
     if Keyword.get(opts, :json, false) do
       IO.puts(Jason.encode!(report))
     else
       IO.puts(
         "[maxio rebalance.workflow] job_id=#{report.job_id} " <>
-          "kind=#{report.job_kind} status=#{report.status} phase=#{report.phase} " <>
+          "kind=#{report.job_kind} status=#{report.status} gate_status=#{report.gate_status} " <>
+          "phase=#{report.phase} " <>
           "next_action=#{inspect(report.next_action)} " <>
           "destructive_next_action=#{report.destructive_next_action?} " <>
-          "blockers=#{inspect(report.blockers)} " <>
+          "blockers=#{inspect(report.blockers)} warnings=#{inspect(report.warnings)} " <>
           "runtime_pool_ids=#{inspect(report.runtime_topology.pool_ids)} " <>
           "deployment_pool_ids=#{inspect(report.deployment_topology.pool_ids)}" <>
           workflow_suffix(report)
       )
+
+      Enum.each(report.blockers, fn blocker ->
+        IO.puts("[maxio rebalance.workflow.blocker] reason=#{blocker}")
+      end)
+
+      Enum.each(report.warnings, fn warning ->
+        IO.puts("[maxio rebalance.workflow.warning] reason=#{warning}")
+      end)
     end
   end
 
@@ -102,11 +134,45 @@ defmodule Mix.Tasks.Maxio.Rebalance.Workflow do
       "removed_pool_ids=#{inspect(report.removed_pool_ids)}"
   end
 
-  defp print_not_started(opts) do
-    if Keyword.get(opts, :json, false) do
-      IO.puts(Jason.encode!(%{status: "not_started", jobs: []}))
-    else
-      IO.puts("[maxio rebalance.workflow] status=not_started jobs=0")
+  defp not_started_report do
+    %{status: "not_started", gate_status: "ok", blockers: [], warnings: [], jobs: []}
+  end
+
+  defp fail_if_needed!(%{gate_status: "blocked"}, opts) do
+    if Keyword.get(opts, :fail_on_blocked, false) or Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("rebalance workflow blocked")
+    end
+  end
+
+  defp fail_if_needed!(%{gate_status: "attention"}, opts) do
+    if Keyword.get(opts, :fail_on_attention, false) do
+      Mix.raise("rebalance workflow attention")
+    end
+  end
+
+  defp fail_if_needed!(_report, _opts), do: :ok
+
+  defp ensure_minimal_runtime_started! do
+    ensure_started!(:ecto_sql)
+    ensure_started!(:postgrex)
+
+    case Process.whereis(Maxio.Repo) do
+      nil ->
+        case Maxio.Repo.start_link() do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+          {:error, reason} -> Mix.raise("failed to start Maxio.Repo: #{inspect(reason)}")
+        end
+
+      _pid ->
+        :ok
+    end
+  end
+
+  defp ensure_started!(application) do
+    case Application.ensure_all_started(application) do
+      {:ok, _apps} -> :ok
+      {:error, {app, reason}} -> Mix.raise("failed to start #{inspect(app)}: #{inspect(reason)}")
     end
   end
 end

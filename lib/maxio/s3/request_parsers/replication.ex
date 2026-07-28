@@ -1,363 +1,287 @@
 defmodule Maxio.S3.RequestParsers.Replication do
-  @moduledoc "PutBucketReplication ReplicationConfiguration XML parser."
-  @behaviour Saxy.Handler
+  @moduledoc """
+  Strict PutBucketReplication ReplicationConfiguration XML parser.
+
+  The parser owns XML shape, duplicate-field, and scalar syntax validation. The
+  `Maxio.S3.Replication` domain module still owns the cross-field S3 semantics
+  and stores the normalized configuration contract.
+  """
 
   alias Maxio.S3.Replication
+  alias Maxio.S3.RequestParsers.XMLTree
 
   @unset {:__maxio_replication_unset__, []}
+  @valid_statuses ~w(Enabled Disabled)
+  @valid_storage_classes ~w(
+    STANDARD REDUCED_REDUNDANCY STANDARD_IA ONEZONE_IA INTELLIGENT_TIERING
+    GLACIER DEEP_ARCHIVE OUTPOSTS GLACIER_IR SNOW EXPRESS_ONEZONE FSX_ONTAP
+  )
 
   @spec parse(binary()) :: {:ok, map()} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    case Saxy.parse_string(xml, __MODULE__, %{stack: [], root: nil, invalid?: false}) do
-      {:ok, %{root: {"ReplicationConfiguration", _attrs, children}, invalid?: false}} ->
-        build_config(children)
-
-      _other ->
-        {:error, :malformed_xml}
-    end
-  end
-
-  @impl true
-  def handle_event(:start_document, _prolog, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:start_element, {name, attrs}, state) do
-    tag = local(name)
-    attrs = Enum.map(attrs, fn {name, value} -> {local(name), value} end)
-    {:ok, %{state | stack: [{tag, attrs, []} | state.stack]}}
-  end
-
-  @impl true
-  def handle_event(:characters, chars, state) do
-    {:ok, append_child(state, {:text, chars})}
-  end
-
-  @impl true
-  def handle_event(:end_element, name, %{stack: [{tag, attrs, children} | rest]} = state) do
-    if local(name) == tag do
-      node = {tag, attrs, Enum.reverse(children)}
-
-      case rest do
-        [] ->
-          {:ok, %{state | root: node, stack: []}}
-
-        [{parent_tag, parent_attrs, parent_children} | parent_rest] ->
-          stack = [{parent_tag, parent_attrs, [node | parent_children]} | parent_rest]
-          {:ok, %{state | stack: stack}}
-      end
+    with {:ok, {"ReplicationConfiguration", _attrs, children}} <- XMLTree.parse(xml),
+         {:ok, config} <- parse_config(children),
+         {:ok, config} <- Replication.validate_client_config(config) do
+      {:ok, config}
     else
-      {:ok, %{state | invalid?: true}}
+      _other -> {:error, :malformed_xml}
     end
   end
 
-  def handle_event(:end_element, _name, state), do: {:ok, %{state | invalid?: true}}
-
-  @impl true
-  def handle_event(:end_document, _data, state), do: {:ok, state}
-
-  defp append_child(%{stack: []} = state, _child), do: %{state | invalid?: true}
-
-  defp append_child(%{stack: [{tag, attrs, children} | rest]} = state, child) do
-    %{state | stack: [{tag, attrs, [child | children]} | rest]}
-  end
-
-  defp build_config(children) do
+  defp parse_config(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"Role" => @unset, "Rules" => []}}, fn
-      {"Role", _attrs, children}, {:ok, config} ->
-        put_once(config, "Role", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{"Rules" => []}, MapSet.new()}, fn
+      {"Role", _attrs, children}, {:ok, config, seen} ->
+        put_once(config, seen, :role, "Role", required_text(children))
 
-      {"Rule", _attrs, children}, {:ok, config} ->
+      {"Rule", _attrs, children}, {:ok, config, seen} ->
         case parse_rule(children) do
-          {:ok, rule} -> {:cont, {:ok, Map.update!(config, "Rules", &(&1 ++ [rule]))}}
+          {:ok, rule} -> {:cont, {:ok, Map.update!(config, "Rules", &(&1 ++ [rule])), seen}}
           :error -> {:halt, :error}
         end
 
       _other, _acc ->
         {:halt, :error}
     end)
-    |> case do
-      {:ok, config} ->
-        config = normalize_unset_fields(config)
-
-        case Replication.validate_client_config(config) do
-          {:ok, config} -> {:ok, config}
-          {:error, :malformed_xml} -> {:error, :malformed_xml}
-        end
-
-      :error ->
-        {:error, :malformed_xml}
-    end
+    |> unwrap_acc()
   end
 
   defp parse_rule(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while(
-      {:ok,
-       %{
-         "ID" => @unset,
-         "Priority" => @unset,
-         "Prefix" => @unset,
-         "Filter" => @unset,
-         "Status" => @unset,
-         "Destination" => @unset,
-         "DeleteMarkerReplication" => @unset,
-         "ExistingObjectReplication" => @unset,
-         "SourceSelectionCriteria" => @unset
-       }},
-      fn
-        {tag, _attrs, children}, {:ok, rule} when tag in ["ID", "Id"] ->
-          put_once(rule, "ID", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"ID", _attrs, children}, {:ok, rule, seen} ->
+        put_once(rule, seen, :id, "ID", required_text(children))
 
-        {"Priority", _attrs, children}, {:ok, rule} ->
-          put_once(rule, "Priority", required_text(children))
+      {"Priority", _attrs, children}, {:ok, rule, seen} ->
+        put_once(rule, seen, :priority, "Priority", integer(children))
 
-        {"Prefix", _attrs, children}, {:ok, rule} ->
-          put_once(rule, "Prefix", text(children))
+      {"Prefix", _attrs, children}, {:ok, rule, seen} ->
+        put_once(rule, seen, :prefix, "Prefix", text(children))
 
-        {"Filter", _attrs, children}, {:ok, rule} ->
-          with {:ok, filter} <- parse_filter(children),
-               {:cont, {:ok, rule}} <- put_once(rule, "Filter", {:ok, filter}) do
-            {:cont, {:ok, rule}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"Filter", _attrs, children}, {:ok, rule, seen} ->
+        with {:ok, filter} <- parse_filter(children) do
+          put_once(rule, seen, :filter, "Filter", {:ok, filter})
+        else
+          _other -> {:halt, :error}
+        end
 
-        {"Status", _attrs, children}, {:ok, rule} ->
-          put_once(rule, "Status", required_text(children))
+      {"Status", _attrs, children}, {:ok, rule, seen} ->
+        put_once(rule, seen, :status, "Status", status(children))
 
-        {"Destination", _attrs, children}, {:ok, rule} ->
-          with {:ok, destination} <- parse_destination(children),
-               {:cont, {:ok, rule}} <- put_once(rule, "Destination", {:ok, destination}) do
-            {:cont, {:ok, rule}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"Destination", _attrs, children}, {:ok, rule, seen} ->
+        with {:ok, destination} <- parse_destination(children) do
+          put_once(rule, seen, :destination, "Destination", {:ok, destination})
+        else
+          _other -> {:halt, :error}
+        end
 
-        {"DeleteMarkerReplication", _attrs, children}, {:ok, rule} ->
-          parse_status_block(rule, "DeleteMarkerReplication", children)
+      {"DeleteMarkerReplication", _attrs, children}, {:ok, rule, seen} ->
+        parse_status_block(
+          rule,
+          seen,
+          :delete_marker_replication,
+          "DeleteMarkerReplication",
+          children
+        )
 
-        {"ExistingObjectReplication", _attrs, children}, {:ok, rule} ->
-          parse_status_block(rule, "ExistingObjectReplication", children)
+      {"DeleteReplication", _attrs, children}, {:ok, rule, seen} ->
+        parse_status_block(rule, seen, :delete_replication, "DeleteReplication", children)
 
-        {"SourceSelectionCriteria", _attrs, children}, {:ok, rule} ->
-          with {:ok, criteria} <- parse_source_selection_criteria(children),
-               {:cont, {:ok, rule}} <-
-                 put_once(rule, "SourceSelectionCriteria", {:ok, criteria}) do
-            {:cont, {:ok, rule}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"ExistingObjectReplication", _attrs, children}, {:ok, rule, seen} ->
+        parse_status_block(
+          rule,
+          seen,
+          :existing_object_replication,
+          "ExistingObjectReplication",
+          children
+        )
 
-        _other, _acc ->
-          {:halt, :error}
-      end
-    )
-    |> normalize_result()
+      {"SourceSelectionCriteria", _attrs, children}, {:ok, rule, seen} ->
+        with {:ok, criteria} <- parse_source_selection_criteria(children) do
+          put_once(
+            rule,
+            seen,
+            :source_selection_criteria,
+            "SourceSelectionCriteria",
+            {:ok, criteria}
+          )
+        else
+          _other -> {:halt, :error}
+        end
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> unwrap_acc()
   end
 
-  defp parse_filter(children), do: do_parse_filter(structural_children(children))
+  defp parse_filter(children) do
+    case XMLTree.structural_children(children) do
+      [] ->
+        {:ok, %{}}
 
-  defp do_parse_filter([{"Prefix", _attrs, children}]) do
-    with {:ok, prefix} <- text(children) do
-      {:ok, %{"Prefix" => prefix}}
+      [{"Prefix", _attrs, children}] ->
+        with {:ok, prefix} <- text(children), do: {:ok, %{"Prefix" => prefix}}
+
+      [{"Tag", _attrs, children}] ->
+        with {:ok, tag} <- parse_tag(children), do: {:ok, %{"Tag" => tag}}
+
+      [{"And", _attrs, children}] ->
+        with {:ok, and_operator} <- parse_and(children), do: {:ok, %{"And" => and_operator}}
+
+      _other ->
+        :error
     end
   end
-
-  defp do_parse_filter([{"Tag", _attrs, children}]) do
-    with {:ok, tag} <- parse_tag(children) do
-      {:ok, %{"Tag" => tag}}
-    end
-  end
-
-  defp do_parse_filter([{"And", _attrs, children}]) do
-    with {:ok, and_operator} <- parse_and(children) do
-      {:ok, %{"And" => and_operator}}
-    end
-  end
-
-  defp do_parse_filter(_children), do: :error
 
   defp parse_and(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"Prefix" => @unset, "Tags" => []}}, fn
-      {"Prefix", _attrs, children}, {:ok, and_operator} ->
-        put_once(and_operator, "Prefix", text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{"Tags" => []}, MapSet.new(), 0}, fn
+      {"Prefix", _attrs, children}, {:ok, and_operator, seen, count} ->
+        with {:ok, prefix} <- text(children),
+             {:ok, and_operator, seen} <-
+               put_once_value(and_operator, seen, :prefix, "Prefix", prefix) do
+          {:cont, {:ok, and_operator, seen, count + 1}}
+        else
+          _other -> {:halt, :error}
+        end
 
-      {"Tag", _attrs, children}, {:ok, and_operator} ->
-        case parse_tag(children) do
-          {:ok, tag} -> {:cont, {:ok, Map.update!(and_operator, "Tags", &(&1 ++ [tag]))}}
-          :error -> {:halt, :error}
+      {"Tag", _attrs, children}, {:ok, and_operator, seen, count} ->
+        with {:ok, tag} <- parse_tag(children),
+             {:ok, and_operator, seen} <- put_tag(and_operator, seen, tag) do
+          {:cont, {:ok, and_operator, seen, count + 1}}
+        else
+          _other -> {:halt, :error}
         end
 
       _other, _acc ->
         {:halt, :error}
     end)
     |> case do
-      {:ok, and_operator} ->
-        and_operator = normalize_unset_fields(and_operator)
-
-        try do
-          {:ok, %{"Rules" => [%{"Filter" => %{"And" => normalized}}]}} =
-            Replication.validate_client_config(%{
-              "Role" => "arn:aws:iam::000000000000:role/probe",
-              "Rules" => [
-                %{
-                  "Status" => "Enabled",
-                  "Priority" => "1",
-                  "Filter" => %{"And" => and_operator},
-                  "DeleteMarkerReplication" => %{"Status" => "Disabled"},
-                  "Destination" => %{"Bucket" => "arn:aws:s3:::dest"}
-                }
-              ]
-            })
-
-          {:ok, normalized}
-        rescue
-          _err -> :error
-        end
-
-      :error ->
-        :error
+      {:ok, and_operator, _seen, count} when count >= 2 -> {:ok, and_operator}
+      _other -> :error
     end
   end
 
   defp parse_tag(children) do
     children
-    |> structural_children()
+    |> XMLTree.structural_children()
     |> Enum.reduce_while({:ok, %{"Key" => @unset, "Value" => @unset}}, fn
       {"Key", _attrs, children}, {:ok, tag} ->
-        put_once(tag, "Key", required_text(children))
+        put_tag_field(tag, "Key", required_text(children))
 
       {"Value", _attrs, children}, {:ok, tag} ->
-        put_once(tag, "Value", text(children))
+        put_tag_field(tag, "Value", text(children))
 
       _other, _acc ->
         {:halt, :error}
     end)
     |> case do
-      {:ok, tag} ->
-        tag = normalize_unset_fields(tag)
+      {:ok, %{"Key" => key, "Value" => value}} when is_binary(key) and is_binary(value) ->
+        {:ok, %{"Key" => key, "Value" => value}}
 
-        try do
-          {:ok, %{"Rules" => [%{"Filter" => %{"Tag" => normalized}}]}} =
-            Replication.validate_client_config(%{
-              "Role" => "arn:aws:iam::000000000000:role/probe",
-              "Rules" => [
-                %{
-                  "Status" => "Enabled",
-                  "Priority" => "1",
-                  "Filter" => %{"Tag" => tag},
-                  "DeleteMarkerReplication" => %{"Status" => "Disabled"},
-                  "Destination" => %{"Bucket" => "arn:aws:s3:::dest"}
-                }
-              ]
-            })
-
-          {:ok, normalized}
-        rescue
-          _err -> :error
-        end
-
-      :error ->
+      _other ->
         :error
     end
   end
 
   defp parse_destination(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while(
-      {:ok,
-       %{
-         "Bucket" => @unset,
-         "Account" => @unset,
-         "StorageClass" => @unset,
-         "EncryptionConfiguration" => @unset,
-         "Metrics" => @unset,
-         "ReplicationTime" => @unset,
-         "AccessControlTranslation" => @unset
-       }},
-      fn
-        {"Bucket", _attrs, children}, {:ok, destination} ->
-          put_once(destination, "Bucket", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Bucket", _attrs, children}, {:ok, destination, seen} ->
+        put_once(destination, seen, :bucket, "Bucket", required_text(children))
 
-        {"Account", _attrs, children}, {:ok, destination} ->
-          put_once(destination, "Account", required_text(children))
+      {"Account", _attrs, children}, {:ok, destination, seen} ->
+        put_once(destination, seen, :account, "Account", required_text(children))
 
-        {"StorageClass", _attrs, children}, {:ok, destination} ->
-          put_once(destination, "StorageClass", required_text(children))
+      {"StorageClass", _attrs, children}, {:ok, destination, seen} ->
+        put_once(destination, seen, :storage_class, "StorageClass", storage_class(children))
 
-        {"EncryptionConfiguration", _attrs, children}, {:ok, destination} ->
-          with {:ok, encryption} <- parse_encryption(children),
-               {:cont, {:ok, destination}} <-
-                 put_once(destination, "EncryptionConfiguration", {:ok, encryption}) do
-            {:cont, {:ok, destination}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"EncryptionConfiguration", _attrs, children}, {:ok, destination, seen} ->
+        with {:ok, encryption} <- parse_encryption(children) do
+          put_once(
+            destination,
+            seen,
+            :encryption_configuration,
+            "EncryptionConfiguration",
+            {:ok, encryption}
+          )
+        else
+          _other -> {:halt, :error}
+        end
 
-        {"Metrics", _attrs, children}, {:ok, destination} ->
-          with {:ok, metrics} <- parse_metrics(children),
-               {:cont, {:ok, destination}} <- put_once(destination, "Metrics", {:ok, metrics}) do
-            {:cont, {:ok, destination}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"Metrics", _attrs, children}, {:ok, destination, seen} ->
+        with {:ok, metrics} <- parse_metrics(children) do
+          put_once(destination, seen, :metrics, "Metrics", {:ok, metrics})
+        else
+          _other -> {:halt, :error}
+        end
 
-        {"ReplicationTime", _attrs, children}, {:ok, destination} ->
-          with {:ok, replication_time} <- parse_replication_time(children),
-               {:cont, {:ok, destination}} <-
-                 put_once(destination, "ReplicationTime", {:ok, replication_time}) do
-            {:cont, {:ok, destination}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"ReplicationTime", _attrs, children}, {:ok, destination, seen} ->
+        with {:ok, replication_time} <- parse_replication_time(children) do
+          put_once(
+            destination,
+            seen,
+            :replication_time,
+            "ReplicationTime",
+            {:ok, replication_time}
+          )
+        else
+          _other -> {:halt, :error}
+        end
 
-        {"AccessControlTranslation", _attrs, children}, {:ok, destination} ->
-          with {:ok, translation} <- parse_access_control_translation(children),
-               {:cont, {:ok, destination}} <-
-                 put_once(destination, "AccessControlTranslation", {:ok, translation}) do
-            {:cont, {:ok, destination}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"AccessControlTranslation", _attrs, children}, {:ok, destination, seen} ->
+        with {:ok, translation} <- parse_access_control_translation(children) do
+          put_once(
+            destination,
+            seen,
+            :access_control_translation,
+            "AccessControlTranslation",
+            {:ok, translation}
+          )
+        else
+          _other -> {:halt, :error}
+        end
 
-        _other, _acc ->
-          {:halt, :error}
-      end
-    )
-    |> normalize_result()
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> unwrap_acc()
   end
 
   defp parse_encryption(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"ReplicaKmsKeyID" => @unset}}, fn
-      {tag, _attrs, children}, {:ok, encryption}
-      when tag in ["ReplicaKmsKeyID", "ReplicaKmsKeyId"] ->
-        put_once(encryption, "ReplicaKmsKeyID", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"ReplicaKmsKeyID", _attrs, children}, {:ok, encryption, seen} ->
+        put_once(
+          encryption,
+          seen,
+          :replica_kms_key_id,
+          "ReplicaKmsKeyID",
+          required_text(children)
+        )
 
       _other, _acc ->
         {:halt, :error}
     end)
-    |> normalize_result()
+    |> unwrap_acc()
   end
 
   defp parse_metrics(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"Status" => @unset, "EventThreshold" => @unset}}, fn
-      {"Status", _attrs, children}, {:ok, metrics} ->
-        put_once(metrics, "Status", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Status", _attrs, children}, {:ok, metrics, seen} ->
+        put_once(metrics, seen, :status, "Status", status(children))
 
-      {"EventThreshold", _attrs, children}, {:ok, metrics} ->
-        with {:ok, threshold} <- parse_minutes_block(children),
-             {:cont, {:ok, metrics}} <- put_once(metrics, "EventThreshold", {:ok, threshold}) do
-          {:cont, {:ok, metrics}}
+      {"EventThreshold", _attrs, children}, {:ok, metrics, seen} ->
+        with {:ok, threshold} <- parse_minutes_block(children) do
+          put_once(metrics, seen, :event_threshold, "EventThreshold", {:ok, threshold})
         else
           _other -> {:halt, :error}
         end
@@ -365,20 +289,19 @@ defmodule Maxio.S3.RequestParsers.Replication do
       _other, _acc ->
         {:halt, :error}
     end)
-    |> normalize_result()
+    |> unwrap_acc()
   end
 
   defp parse_replication_time(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"Status" => @unset, "Time" => @unset}}, fn
-      {"Status", _attrs, children}, {:ok, replication_time} ->
-        put_once(replication_time, "Status", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Status", _attrs, children}, {:ok, replication_time, seen} ->
+        put_once(replication_time, seen, :status, "Status", status(children))
 
-      {"Time", _attrs, children}, {:ok, replication_time} ->
-        with {:ok, time} <- parse_minutes_block(children),
-             {:cont, {:ok, replication_time}} <- put_once(replication_time, "Time", {:ok, time}) do
-          {:cont, {:ok, replication_time}}
+      {"Time", _attrs, children}, {:ok, replication_time, seen} ->
+        with {:ok, time} <- parse_minutes_block(children) do
+          put_once(replication_time, seen, :time, "Time", {:ok, time})
         else
           _other -> {:halt, :error}
         end
@@ -386,71 +309,68 @@ defmodule Maxio.S3.RequestParsers.Replication do
       _other, _acc ->
         {:halt, :error}
     end)
-    |> normalize_result()
+    |> unwrap_acc()
   end
 
   defp parse_minutes_block(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"Minutes" => @unset}}, fn
-      {"Minutes", _attrs, children}, {:ok, time} ->
-        put_once(time, "Minutes", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Minutes", _attrs, children}, {:ok, time, seen} ->
+        put_once(time, seen, :minutes, "Minutes", minutes(children))
 
       _other, _acc ->
         {:halt, :error}
     end)
-    |> normalize_result()
+    |> unwrap_acc()
   end
 
   defp parse_access_control_translation(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"Owner" => @unset}}, fn
-      {"Owner", _attrs, children}, {:ok, translation} ->
-        put_once(translation, "Owner", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Owner", _attrs, children}, {:ok, translation, seen} ->
+        put_once(translation, seen, :owner, "Owner", owner(children))
 
       _other, _acc ->
         {:halt, :error}
     end)
-    |> normalize_result()
+    |> unwrap_acc()
   end
 
   defp parse_source_selection_criteria(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while(
-      {:ok, %{"SseKmsEncryptedObjects" => @unset, "ReplicaModifications" => @unset}},
-      fn
-        {tag, _attrs, children}, {:ok, criteria}
-        when tag in ["SseKmsEncryptedObjects", "SSEKmsEncryptedObjects"] ->
-          with {:ok, block} <- parse_plain_status_block(children),
-               {:cont, {:ok, criteria}} <-
-                 put_once(criteria, "SseKmsEncryptedObjects", {:ok, block}) do
-            {:cont, {:ok, criteria}}
-          else
-            _other -> {:halt, :error}
-          end
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"SseKmsEncryptedObjects", _attrs, children}, {:ok, criteria, seen} ->
+        with {:ok, block} <- parse_plain_status_block(children) do
+          put_once(
+            criteria,
+            seen,
+            :sse_kms_encrypted_objects,
+            "SseKmsEncryptedObjects",
+            {:ok, block}
+          )
+        else
+          _other -> {:halt, :error}
+        end
 
-        {"ReplicaModifications", _attrs, children}, {:ok, criteria} ->
-          with {:ok, block} <- parse_plain_status_block(children),
-               {:cont, {:ok, criteria}} <-
-                 put_once(criteria, "ReplicaModifications", {:ok, block}) do
-            {:cont, {:ok, criteria}}
-          else
-            _other -> {:halt, :error}
-          end
+      {"ReplicaModifications", _attrs, children}, {:ok, criteria, seen} ->
+        with {:ok, block} <- parse_plain_status_block(children) do
+          put_once(criteria, seen, :replica_modifications, "ReplicaModifications", {:ok, block})
+        else
+          _other -> {:halt, :error}
+        end
 
-        _other, _acc ->
-          {:halt, :error}
-      end
-    )
-    |> normalize_result()
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> unwrap_acc()
   end
 
-  defp parse_status_block(rule, key, children) do
-    with {:ok, block} <- parse_plain_status_block(children),
-         {:cont, {:ok, rule}} <- put_once(rule, key, {:ok, block}) do
-      {:cont, {:ok, rule}}
+  defp parse_status_block(rule, seen, seen_key, key, children) do
+    with {:ok, block} <- parse_plain_status_block(children) do
+      put_once(rule, seen, seen_key, key, {:ok, block})
     else
       _other -> {:halt, :error}
     end
@@ -458,67 +378,101 @@ defmodule Maxio.S3.RequestParsers.Replication do
 
   defp parse_plain_status_block(children) do
     children
-    |> structural_children()
-    |> Enum.reduce_while({:ok, %{"Status" => @unset}}, fn
-      {"Status", _attrs, children}, {:ok, block} ->
-        put_once(block, "Status", required_text(children))
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
+      {"Status", _attrs, children}, {:ok, block, seen} ->
+        put_once(block, seen, :status, "Status", status(children))
 
       _other, _acc ->
         {:halt, :error}
     end)
-    |> normalize_result()
+    |> unwrap_acc()
   end
 
-  defp normalize_result({:ok, value}), do: {:ok, normalize_unset_fields(value)}
-  defp normalize_result(:error), do: :error
-
-  defp normalize_unset_fields(map) do
-    Map.new(map, fn
-      {key, @unset} -> {key, nil}
-      {key, value} -> {key, value}
-    end)
+  defp put_once(map, seen, seen_key, key, {:ok, value}) do
+    with {:ok, map, seen} <- put_once_value(map, seen, seen_key, key, value) do
+      {:cont, {:ok, map, seen}}
+    else
+      :error -> {:halt, :error}
+    end
   end
 
-  defp put_once(map, key, {:ok, value}) do
-    if Map.fetch!(map, key) == @unset do
-      {:cont, {:ok, Map.put(map, key, value)}}
+  defp put_once(_map, _seen, _seen_key, _key, :error), do: {:halt, :error}
+
+  defp put_once_value(map, seen, seen_key, key, value) do
+    if MapSet.member?(seen, seen_key) do
+      :error
+    else
+      {:ok, Map.put(map, key, value), MapSet.put(seen, seen_key)}
+    end
+  end
+
+  defp put_tag(%{"Tags" => tags} = and_operator, seen, %{"Key" => key} = tag) do
+    seen_key = {:tag, key}
+
+    if MapSet.member?(seen, seen_key) do
+      :error
+    else
+      {:ok, %{and_operator | "Tags" => tags ++ [tag]}, MapSet.put(seen, seen_key)}
+    end
+  end
+
+  defp put_tag_field(tag, key, {:ok, value}) do
+    if Map.fetch!(tag, key) == @unset do
+      {:cont, {:ok, Map.put(tag, key, value)}}
     else
       {:halt, :error}
     end
   end
 
-  defp put_once(_map, _key, :error), do: {:halt, :error}
+  defp put_tag_field(_tag, _key, :error), do: {:halt, :error}
 
-  defp required_text(children) do
-    case text(children) do
-      {:ok, ""} -> :error
-      other -> other
-    end
-  end
+  defp unwrap_acc({:ok, map, _seen}), do: {:ok, map}
+  defp unwrap_acc(:error), do: :error
 
-  defp text([]), do: {:ok, ""}
+  defp text(children), do: XMLTree.text(children, trim: true)
+  defp required_text(children), do: XMLTree.required_text(children, trim: true)
 
-  defp text(children) when is_list(children) do
-    if Enum.all?(children, &match?({:text, value} when is_binary(value), &1)) do
-      {:ok, children |> Enum.map(fn {:text, value} -> value end) |> Enum.join()}
+  defp status(children) do
+    with {:ok, value} <- required_text(children),
+         true <- value in @valid_statuses do
+      {:ok, value}
     else
-      :error
+      _other -> :error
     end
   end
 
-  defp structural_children(children) do
-    Enum.reject(children, fn
-      {:text, value} -> String.trim(value) == ""
-      _node -> false
-    end)
+  defp storage_class(children) do
+    with {:ok, value} <- required_text(children),
+         true <- value in @valid_storage_classes do
+      {:ok, value}
+    else
+      _other -> :error
+    end
   end
 
-  defp local({_namespace, name}), do: local(name)
+  defp integer(children) do
+    with {:ok, value} <- required_text(children),
+         {integer, ""} <- Integer.parse(value) do
+      {:ok, integer}
+    else
+      _other -> :error
+    end
+  end
 
-  defp local(name) do
-    case String.split(to_string(name), ":") do
-      [_namespace, local] -> local
-      [local] -> local
+  defp minutes(children) do
+    with {:ok, 15} <- integer(children) do
+      {:ok, 15}
+    else
+      _other -> :error
+    end
+  end
+
+  defp owner(children) do
+    with {:ok, "Destination"} <- required_text(children) do
+      {:ok, "Destination"}
+    else
+      _other -> :error
     end
   end
 end

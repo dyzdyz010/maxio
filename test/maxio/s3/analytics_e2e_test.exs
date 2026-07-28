@@ -249,10 +249,10 @@ defmodule Maxio.S3.AnalyticsE2ETest do
              BucketConfigs.get("analyticsbad", :analytics)
   end
 
-  test "checksum trailers and aws-chunked XML bodies are rejected" do
+  test "checksum trailers and aws-chunked XML bodies are validated before storing config" do
     assert create_bucket("analyticschunked").status == 200
 
-    trailer =
+    plain_trailer =
       put_analytics("analyticschunked", "entire", @entire,
         headers: [
           {"x-amz-sdk-checksum-algorithm", "SHA256"},
@@ -260,18 +260,70 @@ defmodule Maxio.S3.AnalyticsE2ETest do
         ]
       )
 
-    assert trailer.status == 501
-    assert trailer.resp_body =~ "NotImplemented"
-
-    conn =
-      SigV4Request.signed_chunked_conn(:put, "/analyticschunked", @entire,
-        query: %{"analytics" => "", "id" => "entire"}
-      )
-
-    rejected = call(conn)
-    assert rejected.status == 501
-    assert rejected.resp_body =~ "NotImplemented"
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "InvalidRequest"
     assert BucketConfigs.get("analyticschunked", :analytics) == :none
+
+    bad =
+      SigV4Request.signed_chunked_conn(:put, "/analyticschunked", @entire,
+        query: %{"analytics" => "", "id" => "entire"},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", :crypto.hash(:sha256, "different") |> Base.encode64()}
+        ]
+      )
+      |> call()
+
+    assert bad.status == 400
+    assert bad.resp_body =~ "BadDigest"
+    assert BucketConfigs.get("analyticschunked", :analytics) == :none
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/analyticschunked", @entire,
+        query: %{"analytics" => "", "id" => "entire"},
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [
+          {"x-amz-checksum-sha256", :crypto.hash(:sha256, @entire) |> Base.encode64()}
+        ]
+      )
+      |> call()
+
+    assert ok_trailer.status == 200
+
+    assert {:ok, %{"Configurations" => [%{"Id" => "entire"}]}} =
+             BucketConfigs.get("analyticschunked", :analytics)
+
+    ok_chunked =
+      SigV4Request.signed_chunked_conn(:put, "/analyticschunked", @prefix,
+        query: %{"analytics" => "", "id" => "docs"}
+      )
+      |> call()
+
+    assert ok_chunked.status == 200
+
+    assert {:ok, %{"Configurations" => configs}} =
+             BucketConfigs.get("analyticschunked", :analytics)
+
+    assert Enum.map(configs, & &1["Id"]) == ["docs", "entire"]
+
+    oversized = String.duplicate("x", 131_073)
+
+    too_large =
+      SigV4Request.signed_chunked_conn(:put, "/analyticschunked", oversized,
+        query: %{"analytics" => "", "id" => "huge"},
+        chunk_size: byte_size(oversized),
+        decoded_length_override: 131_072
+      )
+      |> call()
+
+    assert too_large.status == 400
+    assert too_large.resp_body =~ "MalformedXML"
+    assert too_large.resp_body =~ "AnalyticsConfiguration exceeds 128KB"
+
+    assert {:ok, %{"Configurations" => configs}} =
+             BucketConfigs.get("analyticschunked", :analytics)
+
+    assert Enum.map(configs, & &1["Id"]) == ["docs", "entire"]
   end
 
   test "expected bucket owner missing bucket and method boundaries are enforced" do

@@ -23,6 +23,8 @@ defmodule Maxio.Cluster.SchedulerLiveRehearsalTest do
     assert "--json" in args
 
     artifact = artifact_path |> File.read!() |> Jason.decode!()
+    assert artifact["evidence_kind"] == "scheduler_live_rehearsal"
+    assert artifact["scenario"] == "scheduler_evidence_rehearsal"
     assert artifact["generated_at"] == "2026-06-14T12:00:00Z"
     assert artifact["git_sha"] == "test-sha"
     assert artifact["scheduler"] == "rebalance"
@@ -71,6 +73,29 @@ defmodule Maxio.Cluster.SchedulerLiveRehearsalTest do
 
     artifact = artifact_path |> File.read!() |> Jason.decode!()
     assert artifact["scheduler_evidence"]["blockers"] == [%{"reason" => "missing_expected_nodes"}]
+  end
+
+  test "evidence command exceptions still write a fail-closed artifact" do
+    artifact_path = artifact_path("command-exception")
+
+    runner = fn "fake-mix", _args, _opts ->
+      raise "scheduler boom"
+    end
+
+    {:error, result} =
+      SchedulerLiveRehearsal.run(base_args(artifact_path),
+        command_runner: runner,
+        git_sha_fun: fn -> "test-sha" end,
+        now_fun: fn -> @now end
+      )
+
+    assert result.exit_code == 1
+    assert result.stderr =~ "evidence gate failed"
+
+    artifact = artifact_path |> File.read!() |> Jason.decode!()
+    assert artifact["evidence_exit_status"] == nil
+    assert artifact["scheduler_evidence"] == nil
+    assert artifact["raw_output"] =~ "scheduler boom"
   end
 
   defp run_rehearsal(evidence, exit_status, artifact_path) do

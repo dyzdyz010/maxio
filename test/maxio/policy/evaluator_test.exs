@@ -26,9 +26,27 @@ defmodule Maxio.Policy.EvaluatorTest do
     }
   end
 
-  test "owner 短路放行（无视 statements）" do
+  test "owner 在没有显式 Deny 时补隐式 Allow" do
     ctx = %RequestContext{owner?: true, action: "s3:DeleteObject", resource: "arn:aws:s3:::b/k"}
     assert Evaluator.evaluate(ctx, []) == :allow
+  end
+
+  test "显式 Deny 优先于 owner 隐式 Allow" do
+    ctx = %RequestContext{
+      principal: %{type: :root, access_key: "ak", arn: "arn:aws:iam:::root"},
+      authenticated?: true,
+      owner?: true,
+      action: "s3:GetObject",
+      resource: "arn:aws:s3:::b/k",
+      conditions: %{}
+    }
+
+    stmts =
+      parse!(
+        ~s({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}})
+      )
+
+    assert Evaluator.evaluate(ctx, stmts) == {:deny, :explicit_deny}
   end
 
   test "默认拒绝（无 statement）" do

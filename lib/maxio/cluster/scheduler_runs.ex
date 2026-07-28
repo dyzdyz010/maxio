@@ -2816,9 +2816,11 @@ defmodule Maxio.Cluster.SchedulerRuns do
   defp trigger_name(trigger) when is_binary(trigger), do: trigger
 
   defp node_name(opts) do
-    opts
-    |> Keyword.get(:node, Node.self())
-    |> Atom.to_string()
+    case Keyword.get(opts, :node, Node.self()) do
+      node when is_atom(node) -> Atom.to_string(node)
+      node when is_binary(node) -> String.trim(node)
+      node -> node |> to_string() |> String.trim()
+    end
   end
 
   defp enabled?(opts), do: Keyword.get(opts, :enabled, true) == true

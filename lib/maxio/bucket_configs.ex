@@ -1,6 +1,6 @@
 defmodule Maxio.BucketConfigs do
   @moduledoc """
-  桶高级特性配置上下文（CORS / Lifecycle / 默认加密 / PublicAccessBlock / OwnershipControls）。
+  桶高级特性配置上下文（CORS / Lifecycle / 默认加密 / PublicAccessBlock / OwnershipControls / Quota）。
   每桶至多一行 bucket_configs；
   按 kind 读/写/删单个配置字段。get 返回已解析的结构（list 或 map）或 :none。
   """
@@ -24,6 +24,7 @@ defmodule Maxio.BucketConfigs do
           | :inventory
           | :replication
           | :object_lock
+          | :quota
 
   @kinds [
     :cors,
@@ -40,7 +41,8 @@ defmodule Maxio.BucketConfigs do
     :analytics,
     :inventory,
     :replication,
-    :object_lock
+    :object_lock,
+    :quota
   ]
 
   @doc "取某桶某类配置。未配置（行不存在或该列为 nil）→ :none。"

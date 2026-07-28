@@ -2,8 +2,9 @@ defmodule Maxio.S3.Inventory do
   @moduledoc """
   Bucket Inventory configuration helpers.
 
-  This slice stores and returns the S3 inventory control-plane configuration.
-  It does not generate inventory report objects.
+  This module stores and returns the S3 inventory control-plane configuration.
+  Report object generation lives in `Maxio.S3.Inventory.Report` and can be run
+  explicitly through `mix maxio.inventory.run`.
   """
 
   alias Maxio.BucketConfigs
@@ -193,10 +194,10 @@ defmodule Maxio.S3.Inventory do
     encryption = value(destination, ["Encryption", "encryption"])
 
     %{
-      "AccountId" => normalize_non_empty_string(account_id),
       "Bucket" => normalize_non_empty_string(bucket),
       "Format" => normalize_enum(format, @valid_formats)
     }
+    |> maybe_put_non_empty_string("AccountId", account_id)
     |> maybe_put_normalized_string("Prefix", prefix)
     |> maybe_put_encryption(normalize_encryption(encryption))
   end
@@ -281,6 +282,11 @@ defmodule Maxio.S3.Inventory do
 
   defp maybe_put_normalized_string(map, key, value),
     do: Map.put(map, key, normalize_string(value))
+
+  defp maybe_put_non_empty_string(map, _key, nil), do: map
+
+  defp maybe_put_non_empty_string(map, key, value),
+    do: Map.put(map, key, normalize_non_empty_string(value))
 
   defp normalize_string(value) when is_binary(value), do: value
   defp normalize_string(_value), do: invalid_stored!()

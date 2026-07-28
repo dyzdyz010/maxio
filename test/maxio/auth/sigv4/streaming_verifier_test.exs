@@ -188,6 +188,23 @@ defmodule Maxio.Auth.SigV4.StreamingVerifierTest do
       assert {:error, :incomplete_body} = StreamingVerifier.finalize(v2)
     end
 
+    test "decoded_limit rejects an oversized frame from the header before the frame is complete" do
+      v =
+        StreamingVerifier.init(
+          k_signing: k_signing(),
+          date: @amz_date,
+          scope: @scope,
+          seed_signature: @seed,
+          expected_decoded_len: nil,
+          decoded_limit: 10,
+          flavor: :signed
+        )
+
+      header = "b;chunk-signature=#{String.duplicate("0", 64)}\r\n"
+
+      assert {:error, :decoded_length_exceeded} = StreamingVerifier.feed(v, header)
+    end
+
     test "unsigned trailer rejects extra bytes after trailer block" do
       v =
         StreamingVerifier.init(

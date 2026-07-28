@@ -21,7 +21,7 @@ defmodule Maxio.Cluster.Scrubber do
   @usage_keys [:object_count, :total_size]
 
   @type summary :: %{
-          status: :ok,
+          status: :ok | :partial,
           backend: atom(),
           buckets: non_neg_integer(),
           scanned: non_neg_integer(),
@@ -144,7 +144,8 @@ defmodule Maxio.Cluster.Scrubber do
       "scrubber round complete",
       action: :scrubber,
       reason:
-        "backend=#{inspect(backend)} buckets=#{summary.buckets} scanned=#{summary.scanned} " <>
+        "status=#{summary.status} backend=#{inspect(backend)} " <>
+          "buckets=#{summary.buckets} scanned=#{summary.scanned} " <>
           "damaged=#{summary.damaged} healed=#{summary.healed} unrecoverable=#{summary.unrecoverable} " <>
           "missing=#{summary.missing} skipped=#{summary.skipped} sampled_out=#{summary.sampled_out} " <>
           "index_status=#{summary.index_status} index_scanned=#{summary.index_scanned} " <>
@@ -319,7 +320,8 @@ defmodule Maxio.Cluster.Scrubber do
         reason: Exception.message(e)
       )
 
-      {zero_summary(backend), Keyword.get(cfg, :throttle, Throttle.new(no_throttle: true))}
+      {bucket_failure_summary(backend),
+       Keyword.get(cfg, :throttle, Throttle.new(no_throttle: true))}
   catch
     kind, reason ->
       Log.error("scrubber bucket scan caught",
@@ -328,7 +330,8 @@ defmodule Maxio.Cluster.Scrubber do
         reason: inspect({kind, reason})
       )
 
-      {zero_summary(backend), Keyword.get(cfg, :throttle, Throttle.new(no_throttle: true))}
+      {bucket_failure_summary(backend),
+       Keyword.get(cfg, :throttle, Throttle.new(no_throttle: true))}
   end
 
   defp scan_object(bucket, backend, cfg, object, {counts, throttle}) do
@@ -578,8 +581,9 @@ defmodule Maxio.Cluster.Scrubber do
         Maxio.Cluster.IOPressure.normalize_source(
           config_value(opts, cfg, :io_load_source, :cluster_combined)
         ),
-      throttle_sleep_fun: Keyword.get(opts, :throttle_sleep_fun),
-      throttle_now_fun: Keyword.get(opts, :throttle_now_fun),
+      throttle_sleep_fun:
+        Keyword.get(opts, :throttle_sleep_fun, Keyword.get(cfg, :throttle_sleep_fun)),
+      throttle_now_fun: Keyword.get(opts, :throttle_now_fun, Keyword.get(cfg, :throttle_now_fun)),
       drive_health_enabled:
         Keyword.get(
           opts,
@@ -721,6 +725,8 @@ defmodule Maxio.Cluster.Scrubber do
     }
   end
 
+  defp bucket_failure_summary(backend), do: %{zero_summary(backend) | status: :partial}
+
   defp zero_counts, do: Map.new(@count_keys, &{&1, 0})
   defp zero_usage, do: %{object_count: 0, total_size: 0}
 
@@ -734,9 +740,14 @@ defmodule Maxio.Cluster.Scrubber do
 
   defp merge_summary(left, right) do
     left
+    |> merge_status(right)
     |> merge_counts(right)
     |> merge_usage(right)
   end
+
+  defp merge_status(%{status: :partial} = summary, _right), do: summary
+  defp merge_status(summary, %{status: :partial}), do: %{summary | status: :partial}
+  defp merge_status(summary, _right), do: summary
 
   defp merge_counts(acc, counts) do
     Enum.reduce(@count_keys, acc, fn key, summary ->

@@ -13,11 +13,31 @@ defmodule MaxioWeb.Router do
     plug :fetch_current_principal
   end
 
+  pipeline :browser_download do
+    plug :accepts, ["html", "csv"]
+    plug :fetch_session
+    plug :protect_from_forgery
+    plug :put_secure_browser_headers
+    plug :fetch_current_principal
+  end
+
   pipeline :api do
     plug :accepts, ["json"]
   end
 
-  # ── 公共：登录页（plain controller）+ 会话 controller ──
+  pipeline :console_authenticated do
+    plug :require_authenticated
+  end
+
+  pipeline :console_json do
+    plug :accepts, ["json"]
+    plug :fetch_session
+    plug :protect_from_forgery
+    plug :put_secure_browser_headers
+    plug :fetch_current_principal
+    plug :require_authenticated
+  end
+
   scope "/", MaxioWeb do
     pipe_through :browser
 
@@ -26,51 +46,78 @@ defmodule MaxioWeb.Router do
     delete "/logout", SessionController, :delete
   end
 
-  # ── 受保护：Console 主体（LiveView）──
   scope "/", MaxioWeb do
-    pipe_through :browser
+    pipe_through [:browser, :console_authenticated]
 
     live_session :console_authenticated,
       on_mount: [{MaxioWeb.ConsoleAuth.OnMount, :require_authenticated}] do
       live "/", DashboardLive, :index
-
-      # 侧边栏导航目标路由（M5-2 装配 nav 链接需 ~p 编译期校验通过 + Phoenix 1.8
-      # __checks__ 校验 LiveView 模块存在）。故此处先挂最小占位 LiveView，
-      # 与 M5-1 的 DashboardLive 占位同模式；各自单元再「完整替换」：
-      #   BucketLive.Index → M5-4；AccessKeyLive.Index → M5-8。
       live "/buckets", BucketLive.Index, :index
       live "/buckets/:bucket/browse", ObjectLive.Index, :index
-      # M5-5 的 ObjectLive.Index 行内对象名链接用
-      # `~p"/buckets/#{bucket}/object/#{key}"`；Phoenix 1.8 验证路由 + __checks__ 要求
-      # 该路由与目标 LiveView 编译期即存在。故此处先挂最小占位 ObjectLive.Show
-      # （同 M5-1/M5-2/M5-3/M5-4 占位模式），M5-6 「完整替换」。
       live "/buckets/:bucket/object/*key", ObjectLive.Show, :show
-      # M5-4 的 buckets 列表行（及 M5-5 对象浏览器顶栏）用
-      # `~p"/buckets/#{bucket}/settings"` 设置链接；Phoenix 1.8 验证路由 + __checks__
-      # 要求该路由与目标 LiveView 模块编译期即存在。故此处先挂最小占位
-      # BucketLive.Settings（同 M5-1/M5-2/M5-3 占位模式），M5-7 「完整替换」。
       live "/buckets/:bucket/settings", BucketLive.Settings, :show
       live "/access-keys", AccessKeyLive.Index, :index
+      live "/users", UserLive.Index, :index
+      live "/groups", GroupLive.Index, :index
+      live "/roles", RoleLive.Index, :index
+      live "/idp", IdpLive.Index, :index
+      live "/sts-sessions", StsSessionLive.Index, :index
+      live "/ops/cluster", OpsClusterLive, :index
+      live "/ops/compat", OpsCompatLive, :index
+      live "/ops/gate", OpsGateLive, :index
+      live "/ops/observability", OpsObservabilityLive, :index
+      live "/ops/rebalance", OpsRebalanceLive, :index
+      live "/ops/recovery", OpsRecoveryLive, :index
+      live "/ops/replacement", OpsReplacementLive, :index
+      live "/ops/scan", OpsScanLive, :index
+      live "/ops/upgrade", OpsUpgradeLive, :index
     end
 
-    # 纯 controller（非 LiveView）流式下载（send_chunked + reduce_while，绝不全缓冲，
-    # 铁律 4）。live_session 外、:browser 管线内——M5-5 的 ObjectLive.Index 行内
-    # `~p"/buckets/#{bucket}/download/#{key}"` 链接需此路由编译期存在。
     get "/buckets/:bucket/download/*key", DownloadController, :show
+    get "/buckets/:bucket/preview/*key", DownloadController, :preview
   end
 
-  # Other scopes may use custom stacks.
-  # scope "/api", MaxioWeb do
-  #   pipe_through :api
-  # end
+  scope "/", MaxioWeb do
+    pipe_through [:browser_download, :console_authenticated]
 
-  # Enable LiveDashboard in development
+    get "/buckets/:bucket/direct-multipart/history.csv",
+        ConsoleDirectMultipartHistoryController,
+        :export
+  end
+
+  scope "/console/api", MaxioWeb do
+    pipe_through :console_json
+
+    post "/buckets/:bucket/direct-multipart/initiate/*key",
+         ConsoleMultipartUploadController,
+         :initiate
+
+    post "/buckets/:bucket/direct-multipart/sign-parts/*key",
+         ConsoleMultipartUploadController,
+         :sign_parts
+
+    post "/buckets/:bucket/direct-multipart/list-parts/*key",
+         ConsoleMultipartUploadController,
+         :list_parts
+
+    post "/buckets/:bucket/direct-multipart/register/*key",
+         ConsoleMultipartUploadController,
+         :register
+
+    post "/buckets/:bucket/direct-multipart/lookup/*key",
+         ConsoleMultipartUploadController,
+         :lookup
+
+    post "/buckets/:bucket/direct-multipart/complete/*key",
+         ConsoleMultipartUploadController,
+         :complete
+
+    post "/buckets/:bucket/direct-multipart/abort/*key",
+         ConsoleMultipartUploadController,
+         :abort
+  end
+
   if Application.compile_env(:maxio, :dev_routes) do
-    # If you want to use the LiveDashboard in production, you should put
-    # it behind authentication and allow only admins to access it.
-    # If your application does not have an admins-only section yet,
-    # you can use Plug.BasicAuth to set up some basic authentication
-    # as long as you are also using SSL (which you should anyway).
     import Phoenix.LiveDashboard.Router
 
     scope "/dev" do

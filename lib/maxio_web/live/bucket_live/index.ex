@@ -2,13 +2,17 @@ defmodule MaxioWeb.BucketLive.Index do
   @moduledoc """
   Buckets 列表 + 创建 + 删除（M5-4）。
   列表用 stream（`#buckets` 父 + `phx-update="stream"` + 子 `dom_id`），计数单独 assign；
-  创建走 `Maxio.Buckets.create/3`（名校验），删除走 `Maxio.Buckets.delete/1`（非空守卫）。
+  创建走 `Maxio.Buckets.create/3`（名校验），可选 Object Lock 时复用 S3 CreateBucket 语义
+  （versioning=Enabled + ObjectLockEnabled），删除走 `Maxio.Buckets.delete/1`（非空守卫）。
   所有 context 错误（:invalid_bucket_name / :already_owned / changeset / :not_empty / :not_found）
   必须显式 flash 呈现，绝不静默吞掉（铁律 3）。
   """
   use MaxioWeb, :live_view
 
   alias Maxio.Buckets
+  alias Maxio.S3.ObjectLock
+
+  require Logger
 
   @impl true
   def mount(_params, _session, socket) do
@@ -18,7 +22,7 @@ defmodule MaxioWeb.BucketLive.Index do
      socket
      |> assign(:page_title, "Buckets")
      |> assign(:bucket_count, length(buckets))
-     |> assign(:form, to_form(%{"name" => ""}, as: :bucket))
+     |> assign(:form, empty_form())
      |> stream(:buckets, buckets)}
   end
 
@@ -35,14 +39,23 @@ defmodule MaxioWeb.BucketLive.Index do
         for={@form}
         id="create-bucket-form"
         phx-submit="create_bucket"
-        class="flex gap-2 items-end mb-6"
+        class="mb-6"
       >
-        <div class="flex-1 max-w-sm">
-          <.input field={@form[:name]} type="text" label="新建桶名" placeholder="my-bucket" />
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-end">
+          <div class="flex-1 max-w-sm">
+            <.input field={@form[:name]} type="text" label="新建桶名" placeholder="my-bucket" />
+          </div>
+          <div class="sm:pb-2">
+            <.input
+              field={@form[:object_lock_enabled]}
+              type="checkbox"
+              label="启用 Object Lock（创建后不可关闭）"
+            />
+          </div>
+          <.button variant="primary" id="create-bucket-submit" type="submit">
+            <.icon name="hero-plus" class="size-4" /> 创建
+          </.button>
         </div>
-        <.button variant="primary" id="create-bucket-submit" type="submit">
-          <.icon name="hero-plus" class="size-4" /> 创建
-        </.button>
       </.form>
 
       <table class="table table-zebra">
@@ -107,17 +120,42 @@ defmodule MaxioWeb.BucketLive.Index do
   end
 
   @impl true
-  def handle_event("create_bucket", %{"bucket" => %{"name" => name}}, socket) do
+  def handle_event("create_bucket", %{"bucket" => params}, socket) do
+    name = Map.get(params, "name", "")
+    object_lock_enabled? = checkbox_checked?(Map.get(params, "object_lock_enabled"))
     owner = socket.assigns.current_principal.arn
 
     case Buckets.create(name, owner) do
       {:ok, bucket} ->
-        {:noreply,
-         socket
-         |> stream_insert(:buckets, bucket, at: 0)
-         |> update(:bucket_count, &(&1 + 1))
-         |> put_flash(:info, "已创建桶 #{bucket.name}")
-         |> assign(:form, to_form(%{"name" => ""}, as: :bucket))}
+        case maybe_enable_object_lock(bucket.name, object_lock_enabled?) do
+          :ok ->
+            bucket = reload_bucket!(bucket.name)
+
+            message =
+              if object_lock_enabled? do
+                "已创建桶 #{bucket.name}，已启用 Object Lock"
+              else
+                "已创建桶 #{bucket.name}"
+              end
+
+            {:noreply, insert_created_bucket(socket, bucket, :info, message)}
+
+          {:error, reason} ->
+            Logger.error("console create bucket object lock enable failed",
+              bucket: bucket.name,
+              reason: inspect(reason)
+            )
+
+            bucket = reload_bucket!(bucket.name)
+
+            {:noreply,
+             insert_created_bucket(
+               socket,
+               bucket,
+               :error,
+               "桶 #{bucket.name} 已创建，但启用 Object Lock 失败；请删除该桶后重新创建，并查看结构化日志"
+             )}
+        end
 
       {:error, :invalid_bucket_name} ->
         {:noreply,
@@ -162,4 +200,34 @@ defmodule MaxioWeb.BucketLive.Index do
         {:noreply, put_flash(socket, :error, "桶 #{name} 不存在")}
     end
   end
+
+  defp maybe_enable_object_lock(_bucket, false), do: :ok
+
+  defp maybe_enable_object_lock(bucket, true) do
+    object_lock_enabler().(bucket)
+  rescue
+    error -> {:error, error}
+  end
+
+  defp object_lock_enabler do
+    Application.get_env(:maxio, :console_object_lock_enabler, &ObjectLock.enable_bucket!/1)
+  end
+
+  defp insert_created_bucket(socket, bucket, level, message) do
+    socket
+    |> stream_insert(:buckets, bucket, at: 0)
+    |> update(:bucket_count, &(&1 + 1))
+    |> put_flash(level, message)
+    |> assign(:form, empty_form())
+  end
+
+  defp reload_bucket!(name) do
+    {:ok, bucket} = Buckets.lookup(name)
+    bucket
+  end
+
+  defp empty_form, do: to_form(%{"name" => "", "object_lock_enabled" => "false"}, as: :bucket)
+
+  defp checkbox_checked?(value) when value in [true, "true", "on", "1"], do: true
+  defp checkbox_checked?(_value), do: false
 end

@@ -25,6 +25,19 @@ defmodule Maxio.S3.RequestParsers.InventoryTest do
                <s3:Schedule><s3:Frequency>Weekly</s3:Frequency></s3:Schedule>
              </s3:InventoryConfiguration>
              """)
+
+    assert {:ok, config} =
+             Inventory.parse("""
+             <InventoryConfiguration>
+               <Destination><S3BucketDestination><Bucket>arn:aws:s3:::dest</Bucket><Format>CSV</Format></S3BucketDestination></Destination>
+               <IsEnabled>true</IsEnabled>
+               <Id>no-account</Id>
+               <IncludedObjectVersions>Current</IncludedObjectVersions>
+               <Schedule><Frequency>Daily</Frequency></Schedule>
+             </InventoryConfiguration>
+             """)
+
+    refute Map.has_key?(get_in(config, ["Destination", "S3BucketDestination"]), "AccountId")
   end
 
   test "parses filter optional fields and encryption" do

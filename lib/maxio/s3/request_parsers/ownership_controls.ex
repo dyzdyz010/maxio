@@ -1,92 +1,53 @@
 defmodule Maxio.S3.RequestParsers.OwnershipControls do
   @moduledoc "PutBucketOwnershipControls XML parser."
-  @behaviour Saxy.Handler
 
   alias Maxio.S3.OwnershipControls
+  alias Maxio.S3.RequestParsers.XMLTree
 
   @values ~w(BucketOwnerEnforced BucketOwnerPreferred ObjectWriter)
 
   @spec parse(binary()) :: {:ok, map()} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    init = %{
-      root?: false,
-      rule_depth: 0,
-      object_ownership: nil,
-      in: nil,
-      text: nil,
-      invalid?: false
-    }
+    case XMLTree.parse(xml) do
+      {:ok, {"OwnershipControls", _attrs, children}} ->
+        parse_root(children)
 
-    case Saxy.parse_string(xml, __MODULE__, init) do
-      {:ok, %{root?: true, invalid?: false, object_ownership: value}} when value in @values ->
-        {:ok, %{"ObjectOwnership" => value}}
-
-      _ ->
+      _other ->
         {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:start_document, _prolog, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:start_element, {name, _attrs}, state) do
-    case local(name) do
-      "OwnershipControls" ->
-        {:ok, %{state | root?: true, in: nil, text: nil}}
-
-      "Rule" ->
-        {:ok, %{state | rule_depth: state.rule_depth + 1, in: nil, text: nil}}
-
-      "ObjectOwnership" ->
-        {:ok, %{state | in: :object_ownership, text: ""}}
+  defp parse_root(children) do
+    case XMLTree.structural_children(children) do
+      [{"Rule", _attrs, children}] ->
+        parse_rule(children)
 
       _other ->
-        {:ok, %{state | in: nil, text: nil}}
+        {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:characters, chars, %{text: text} = state) when is_binary(text),
-    do: {:ok, %{state | text: text <> chars}}
+  defp parse_rule(children) do
+    case XMLTree.structural_children(children) do
+      [{"ObjectOwnership", _attrs, children}] ->
+        parse_object_ownership(children)
 
-  def handle_event(:characters, _chars, state), do: {:ok, state}
+      _other ->
+        {:error, :malformed_xml}
+    end
+  end
 
-  @impl true
-  def handle_event(:end_element, name, state) do
-    case local(name) do
-      "ObjectOwnership" ->
-        value = String.trim(state.text || "")
-
-        cond do
-          state.rule_depth != 1 ->
-            {:ok, %{state | invalid?: true, in: nil, text: nil}}
-
-          is_binary(state.object_ownership) ->
-            {:ok, %{state | invalid?: true, in: nil, text: nil}}
-
-          OwnershipControls.valid_value?(value) ->
-            {:ok, %{state | object_ownership: value, in: nil, text: nil}}
-
-          true ->
-            {:ok, %{state | invalid?: true, in: nil, text: nil}}
+  defp parse_object_ownership(children) do
+    case XMLTree.required_text(children, trim: true) do
+      {:ok, value} when value in @values ->
+        if OwnershipControls.valid_value?(value) do
+          {:ok, %{"ObjectOwnership" => value}}
+        else
+          {:error, :malformed_xml}
         end
 
-      "Rule" ->
-        {:ok, %{state | rule_depth: max(state.rule_depth - 1, 0), in: nil, text: nil}}
-
       _other ->
-        {:ok, %{state | in: nil, text: nil}}
-    end
-  end
-
-  @impl true
-  def handle_event(:end_document, _data, state), do: {:ok, state}
-
-  defp local(name) do
-    case String.split(name, ":") do
-      [_ns, local] -> local
-      [local] -> local
+        {:error, :malformed_xml}
     end
   end
 end

@@ -24,8 +24,9 @@ defmodule Maxio.Storage.ScannerTest do
 
   import ExUnit.CaptureLog
 
-  alias Maxio.{Buckets, Objects, Storage}
+  alias Maxio.{BucketConfigs, Buckets, Objects, Storage}
   alias Maxio.Cluster.Transport.InProcess
+  alias Maxio.S3.{NotificationDelivery, NotificationOutbox, NotificationRetainedLedger}
   alias Maxio.Storage.Scanner
   alias Maxio.Versioning.VersionId
 
@@ -118,6 +119,112 @@ defmodule Maxio.Storage.ScannerTest do
     etag
   end
 
+  defp put_notification_config! do
+    :ok =
+      BucketConfigs.put(@bucket, :notification, %{
+        "QueueConfigurations" => [
+          %{
+            "Id" => "scan-retained",
+            "Queue" => "arn:aws:sqs:us-east-1:000000000000:scan-retained",
+            "Events" => ["s3:ObjectCreated:Put"]
+          }
+        ],
+        "TopicConfigurations" => [],
+        "LambdaFunctionConfigurations" => [],
+        "EventBridgeConfiguration" => nil
+      })
+  end
+
+  defp put_restore_notification_config! do
+    :ok =
+      BucketConfigs.put(@bucket, :notification, %{
+        "QueueConfigurations" => [
+          %{
+            "Id" => "scan-retained-restore",
+            "Queue" => "arn:aws:sqs:us-east-1:000000000000:scan-retained-restore",
+            "Events" => ["s3:ObjectRestore:Post"]
+          }
+        ],
+        "TopicConfigurations" => [],
+        "LambdaFunctionConfigurations" => [],
+        "EventBridgeConfiguration" => nil
+      })
+  end
+
+  defp retained_put_ledger!(topo, key, etag, body) do
+    put_notification_config!()
+
+    attrs = %{
+      bucket: @bucket,
+      key: key,
+      size: byte_size(body),
+      etag: etag,
+      version_id: "null",
+      request_id: "scan-retained-request",
+      principal: :anonymous,
+      source_ip: {127, 0, 0, 1}
+    }
+
+    sidecar_ledger = NotificationDelivery.sidecar_ledger("s3:ObjectCreated:Put", attrs)
+
+    retained =
+      NotificationRetainedLedger.entries(sidecar_ledger,
+        bucket: @bucket,
+        key: key,
+        operation: :put_object,
+        predicate:
+          NotificationRetainedLedger.version_present("null",
+            entry_type: "object",
+            etag: etag,
+            size: byte_size(body)
+          ),
+        request_id: attrs.request_id
+      )
+
+    :ok = Storage.put_notification_ledgers(@bucket, key, retained, scan_opts(topo))
+    retained
+  end
+
+  defp retained_restore_ledger!(topo, key, etag, body, after_attrs) do
+    put_restore_notification_config!()
+
+    attrs = %{
+      bucket: @bucket,
+      key: key,
+      size: byte_size(body),
+      etag: etag,
+      version_id: "null",
+      storage_class: "GLACIER",
+      source_storage_class: "GLACIER",
+      restore_expiry: Map.get(after_attrs, :restore_expiry),
+      request_id: "scan-retained-restore-request",
+      principal: :anonymous,
+      source_ip: {127, 0, 0, 1}
+    }
+
+    sidecar_ledger = NotificationDelivery.sidecar_ledger("s3:ObjectRestore:Post", attrs)
+
+    retained =
+      NotificationRetainedLedger.entries(sidecar_ledger,
+        bucket: @bucket,
+        key: key,
+        operation: :restore_object,
+        predicate:
+          NotificationRetainedLedger.restore_state_transition(
+            "null",
+            %{restore_status: nil, restore_expiry: nil},
+            after_attrs,
+            entry_type: "object",
+            etag: etag,
+            size: byte_size(body)
+          ),
+        request_id: attrs.request_id
+      )
+
+    :ok = Storage.put_notification_ledgers(@bucket, key, retained, scan_opts(topo))
+    retained
+  end
+
   # 从任一端点读盘上真实写出的 sidecar（绝不手搓；B5-3 R1 取证 entry modtime 用）。
   defp read_disk_sidecar(eps, key, vid) do
     {:ok, rel} = Maxio.Cluster.Paths.object_rel(@bucket, key, vid)
@@ -158,6 +265,149 @@ defmodule Maxio.Storage.ScannerTest do
       assert row.is_latest == true
       assert row.is_delete_marker == false
       assert %DateTime{} = row.synced_at
+    end
+
+    test "invalid sidecar notification ledger is logged and does not crash scanner", %{
+      eps: eps,
+      topo: topo
+    } do
+      key = "k-invalid-notification-ledger"
+      _etag = disk_put!(topo, key, "null", "bad ledger body")
+      {:ok, rel} = Maxio.Cluster.Paths.object_rel(@bucket, key, "null")
+
+      Enum.each(eps, fn {_node, drive} ->
+        path = Path.join([drive, rel, "meta.json"])
+        meta = path |> File.read!() |> Maxio.Sidecar.decode!()
+        [entry] = meta["versions"]
+
+        meta =
+          Map.put(meta, "versions", [
+            Map.put(entry, "notification_outbox", %{"unexpected" => "shape"})
+          ])
+
+        File.write!(path, Maxio.Sidecar.encode(meta))
+      end)
+
+      {result, log} = with_log(fn -> Scanner.run_once(scan_opts(topo)) end)
+
+      assert {:ok, report} = result
+      assert report.status == :ok
+      assert report.upserted == 1
+      assert report.notification_replayed == 0
+      assert report.notification_replay_failed == 1
+      assert log =~ "sidecar notification ledger invalid"
+    end
+
+    test "retained notification ledger storage round-trips and prunes", %{topo: topo} do
+      entry = %{
+        "id" => Ecto.UUID.generate(),
+        "bucket" => @bucket,
+        "key" => "k-retained-storage",
+        "event_name" => "s3:ObjectCreated:Put",
+        "operation" => "put_object",
+        "payload" => %{"event_name" => "s3:ObjectCreated:Put"},
+        "commit_predicate" => %{"type" => "version_present", "version_id" => "null"}
+      }
+
+      assert :ok =
+               Storage.put_notification_ledgers(
+                 @bucket,
+                 "k-retained-storage",
+                 [entry],
+                 scan_opts(topo)
+               )
+
+      assert {:ok, [stored]} =
+               Storage.list_notification_ledgers(@bucket, "k-retained-storage", scan_opts(topo))
+
+      assert stored["id"] == entry["id"]
+      assert stored["payload"]["event_name"] == "s3:ObjectCreated:Put"
+
+      assert :ok =
+               Storage.delete_notification_ledgers(
+                 @bucket,
+                 "k-retained-storage",
+                 [entry["id"]],
+                 scan_opts(topo)
+               )
+
+      assert {:ok, []} =
+               Storage.list_notification_ledgers(@bucket, "k-retained-storage", scan_opts(topo))
+    end
+
+    test "scanner replays and prunes committed retained notification ledger", %{topo: topo} do
+      key = "k-retained-replay"
+      body = "retained body"
+      etag = disk_put!(topo, key, "null", body)
+      [%{"id" => outbox_id}] = retained_put_ledger!(topo, key, etag, body)
+
+      assert {:ok, report} = Scanner.run_once(scan_opts(topo))
+      assert report.notification_retained_scanned == 1
+      assert report.notification_replayed == 1
+      assert report.notification_retained_pruned == 1
+      assert report.notification_retained_ambiguous == 0
+
+      assert [%{id: ^outbox_id, event_name: "s3:ObjectCreated:Put", object_key: ^key}] =
+               NotificationOutbox.list(status: "pending")
+
+      assert {:ok, []} = Storage.list_notification_ledgers(@bucket, key, scan_opts(topo))
+    end
+
+    test "retained version-present predicate does not replay after null overwrite changes proof",
+         %{
+           topo: topo
+         } do
+      key = "k-retained-overwritten"
+      body = "first body"
+      etag = disk_put!(topo, key, "null", body)
+      _retained = retained_put_ledger!(topo, key, etag, body)
+      _new_etag = disk_put!(topo, key, "null", "second body")
+
+      assert {:ok, report} = Scanner.run_once(scan_opts(topo))
+      assert report.notification_retained_scanned == 1
+      assert report.notification_replayed == 0
+      assert report.notification_retained_pruned == 0
+      assert report.notification_retained_ambiguous == 1
+      assert NotificationOutbox.list(status: "pending") == []
+    end
+
+    test "retained RestoreObject predicate prunes aborted ledger when restore state did not commit",
+         %{topo: topo} do
+      key = "k-retained-restore-aborted"
+      body = "restore candidate"
+      etag = disk_put!(topo, key, "null", body)
+
+      [%{"id" => outbox_id}] =
+        retained_restore_ledger!(topo, key, etag, body, %{
+          restore_status: "restored",
+          restore_expiry: ~U[2026-07-01 00:00:00Z]
+        })
+
+      assert {:ok, report} = Scanner.run_once(scan_opts(topo))
+      assert report.notification_retained_scanned == 1
+      assert report.notification_retained_aborted == 1
+      assert report.notification_retained_pruned == 1
+      assert report.notification_replayed == 0
+      assert report.notification_replay_failed == 0
+      assert NotificationOutbox.list(status: "pending") == []
+      assert {:ok, []} = Storage.list_notification_ledgers(@bucket, key, scan_opts(topo))
+      assert_raise Ecto.NoResultsError, fn -> NotificationOutbox.get!(outbox_id) end
+    end
+
+    test "preflight recovery replays retained ledger before same-key overwrite", %{topo: topo} do
+      key = "k-retained-preflight"
+      body = "preflight body"
+      etag = disk_put!(topo, key, "null", body)
+      [%{"id" => outbox_id}] = retained_put_ledger!(topo, key, etag, body)
+
+      assert :ok = NotificationRetainedLedger.recover_key!(@bucket, key, scan_opts(topo))
+      assert [%{id: ^outbox_id, object_key: ^key}] = NotificationOutbox.list(status: "pending")
+      assert {:ok, []} = Storage.list_notification_ledgers(@bucket, key, scan_opts(topo))
+
+      _new_etag = disk_put!(topo, key, "null", "after preflight")
+
+      assert {:ok, %{notification_retained_scanned: 0, notification_replayed: 0}} =
+               Scanner.run_once(scan_opts(topo))
     end
 
     test "PG 缺行（盘上有，.versions 版本树）→ upsert 建行", %{topo: topo} do

@@ -6,89 +6,71 @@ defmodule Maxio.S3.RequestParsers.PublicAccessBlock do
   BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets.
   Missing booleans default to false.
   """
-  @behaviour Saxy.Handler
 
   alias Maxio.S3.PublicAccessBlock
+  alias Maxio.S3.RequestParsers.XMLTree
 
   @keys ~w(BlockPublicAcls IgnorePublicAcls BlockPublicPolicy RestrictPublicBuckets)
+  @unset {:__maxio_public_access_block_unset__, []}
 
   @spec parse(binary()) :: {:ok, map()} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    init = %{
-      config: PublicAccessBlock.defaults(),
-      root?: false,
-      in: nil,
-      text: nil,
-      invalid?: false
-    }
-
-    case Saxy.parse_string(xml, __MODULE__, init) do
-      {:ok, %{root?: true, invalid?: false, config: config}} -> {:ok, config}
-      _ -> {:error, :malformed_xml}
-    end
-  end
-
-  @impl true
-  def handle_event(:start_document, _prolog, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:start_element, {name, _attrs}, state) do
-    case local(name) do
-      "PublicAccessBlockConfiguration" ->
-        {:ok, %{state | root?: true, in: nil, text: nil}}
-
-      key when key in @keys ->
-        {:ok, %{state | in: key, text: ""}}
+    case XMLTree.parse(xml) do
+      {:ok, {"PublicAccessBlockConfiguration", _attrs, children}} ->
+        parse_root(children)
 
       _other ->
-        {:ok, %{state | in: nil, text: nil}}
+        {:error, :malformed_xml}
     end
   end
 
-  @impl true
-  def handle_event(:characters, chars, %{text: text} = state) when is_binary(text),
-    do: {:ok, %{state | text: text <> chars}}
+  defp parse_root(children) do
+    children
+    |> XMLTree.structural_children()
+    |> Enum.reduce_while({:ok, Map.new(@keys, &{&1, @unset})}, fn
+      {key, _attrs, children}, {:ok, config} when key in @keys ->
+        put_once(config, key, parse_bool(children))
 
-  def handle_event(:characters, _chars, state), do: {:ok, state}
+      _other, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, config} ->
+        {:ok, Map.merge(PublicAccessBlock.defaults(), normalize_unset_fields(config))}
 
-  @impl true
-  def handle_event(:end_element, name, state) do
-    key = local(name)
+      :error ->
+        {:error, :malformed_xml}
+    end
+  end
 
-    if key in @keys and state.in == key do
-      case parse_bool(state.text) do
-        {:ok, value} ->
-          {:ok,
-           %{
-             state
-             | config: Map.put(state.config, key, value),
-               in: nil,
-               text: nil
-           }}
-
-        :error ->
-          {:ok, %{state | invalid?: true, in: nil, text: nil}}
-      end
+  defp put_once(config, key, {:ok, value}) do
+    if Map.fetch!(config, key) == @unset do
+      {:cont, {:ok, Map.put(config, key, value)}}
     else
-      {:ok, %{state | in: nil, text: nil}}
+      {:halt, :error}
     end
   end
 
-  @impl true
-  def handle_event(:end_document, _data, state), do: {:ok, state}
+  defp put_once(_config, _key, :error), do: {:halt, :error}
 
-  defp parse_bool(value) do
-    case value |> to_string() |> String.trim() |> String.downcase() do
+  defp parse_bool(children) do
+    case XMLTree.required_text(children, trim: true) do
+      {:ok, value} -> parse_bool_text(value)
+      :error -> :error
+    end
+  end
+
+  defp parse_bool_text(value) do
+    case String.downcase(value) do
       "true" -> {:ok, true}
       "false" -> {:ok, false}
       _ -> :error
     end
   end
 
-  defp local(name) do
-    case String.split(name, ":") do
-      [_ns, local] -> local
-      [local] -> local
-    end
+  defp normalize_unset_fields(config) do
+    config
+    |> Enum.reject(&match?({_key, @unset}, &1))
+    |> Map.new()
   end
 end

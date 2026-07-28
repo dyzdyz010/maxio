@@ -357,6 +357,120 @@ defmodule Maxio.Cluster.RebalancePhysicalRemovalTest do
     assert updated.physical_removal_purge_roots_deleted == purged.roots_deleted
   end
 
+  test "physical purge blocks when secure erase evidence is required but missing", ctx do
+    {job, _bucket, _apply_report} = verified_empty_removal!("physical-purge-secure-missing", ctx)
+
+    assert {:ok, quarantine} =
+             PhysicalRemoval.apply(job.id,
+               confirm_job_id: job.id,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    assert {:error, {:physical_purge_preflight_blocked, report}} =
+             PhysicalPurge.apply(job.id,
+               confirm_job_id: job.id,
+               confirm_quarantine_id: quarantine.quarantine_id,
+               retention_seconds: 0,
+               require_secure_erase_evidence: true,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    assert {:secure_erase_evidence_invalid, :secure_erase_evidence_missing} in report.blockers
+    assert report.secure_erase_evidence["status"] == "missing"
+
+    assert {:ok, unchanged} = Jobs.get(job.id)
+    assert unchanged.physical_removal_purge_status == "not_started"
+  end
+
+  test "physical purge records sanitized secure erase evidence when required", ctx do
+    {job, _bucket, _apply_report} = verified_empty_removal!("physical-purge-secure-ok", ctx)
+
+    assert {:ok, quarantine} =
+             PhysicalRemoval.apply(job.id,
+               confirm_job_id: job.id,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    evidence = secure_erase_evidence(job, quarantine, ctx.topology)
+
+    assert {:ok, purged} =
+             PhysicalPurge.apply(job.id,
+               confirm_job_id: job.id,
+               confirm_quarantine_id: quarantine.quarantine_id,
+               retention_seconds: 0,
+               require_secure_erase_evidence: true,
+               secure_erase_evidence: evidence,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    assert purged.status == :purged
+    assert purged.secure_erase_evidence["status"] == "ok"
+    assert purged.secure_erase_evidence["secure_erase_gate"] == true
+    assert purged.secure_erase_evidence["method"] == "cryptographic_erase"
+    assert purged.secure_erase_evidence["endpoints"] == 2
+
+    assert Enum.all?(
+             purged.secure_erase_evidence["samples"],
+             &Map.has_key?(&1, "evidence_id_hash")
+           )
+
+    refute inspect(purged.secure_erase_evidence["samples"]) =~ "RAW-EVIDENCE-ID"
+    refute inspect(purged.results) =~ "SERIAL-SECRET"
+    refute inspect(purged.results) =~ "WWID-SECRET"
+    refute inspect(purged.results) =~ "RAW-EVIDENCE-ID"
+
+    assert {:ok, updated} = Jobs.get(job.id)
+    stored = updated.physical_removal_purge_results["secure_erase_evidence"]
+    assert stored["status"] == "ok"
+    assert stored["certificate_hash"] == purged.secure_erase_evidence["certificate_hash"]
+    refute inspect(updated.physical_removal_purge_results) =~ "SERIAL-SECRET"
+    refute inspect(updated.physical_removal_purge_results) =~ "WWID-SECRET"
+    refute inspect(updated.physical_removal_purge_results) =~ "RAW-EVIDENCE-ID"
+  end
+
+  test "physical purge records optional invalid secure erase evidence without blocking", ctx do
+    {job, _bucket, _apply_report} =
+      verified_empty_removal!("physical-purge-secure-optional-invalid", ctx)
+
+    assert {:ok, quarantine} =
+             PhysicalRemoval.apply(job.id,
+               confirm_job_id: job.id,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    evidence =
+      job
+      |> secure_erase_evidence(quarantine, ctx.topology)
+      |> Map.put("quarantine_id", "wrong-quarantine")
+
+    assert {:ok, purged} =
+             PhysicalPurge.apply(job.id,
+               confirm_job_id: job.id,
+               confirm_quarantine_id: quarantine.quarantine_id,
+               retention_seconds: 0,
+               secure_erase_evidence: evidence,
+               transport: InProcess,
+               lock_opts: [nodes: [Node.self()]]
+             )
+
+    assert purged.status == :purged
+    assert purged.secure_erase_evidence["status"] == "invalid"
+    assert purged.secure_erase_evidence["secure_erase_gate"] == false
+    assert purged.secure_erase_evidence["errors"] == [":quarantine_id_mismatch"]
+    refute inspect(purged.results) =~ "RAW-EVIDENCE-ID"
+
+    assert {:ok, updated} = Jobs.get(job.id)
+    stored = updated.physical_removal_purge_results["secure_erase_evidence"]
+    assert stored["status"] == "invalid"
+    assert stored["secure_erase_gate"] == false
+    assert updated.physical_removal_purge_status == "purged"
+  end
+
   test "physical purge is idempotent after successful purge", ctx do
     {job, _bucket, _apply_report} = verified_empty_removal!("physical-purge-idem", ctx)
 
@@ -535,6 +649,30 @@ defmodule Maxio.Cluster.RebalancePhysicalRemovalTest do
   end
 
   defp sha256(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
+
+  defp secure_erase_evidence(job, quarantine, topology) do
+    %{
+      "version" => 1,
+      "method" => "cryptographic_erase",
+      "issued_at" => "2026-07-04T00:00:00Z",
+      "operator" => "ops@example.test",
+      "job_id" => job.id,
+      "quarantine_id" => quarantine.quarantine_id,
+      "manifest_hash" => quarantine.manifest_hash,
+      "endpoints" =>
+        topology
+        |> Topology.endpoints_from(0)
+        |> Enum.map(fn {node, drive} ->
+          %{
+            "node" => Atom.to_string(node),
+            "drive" => drive,
+            "evidence_id" => "RAW-EVIDENCE-ID-#{Path.basename(drive)}",
+            "serial_hash" => sha256("SERIAL-SECRET-#{Path.basename(drive)}"),
+            "wwid_hash" => sha256("WWID-SECRET-#{Path.basename(drive)}")
+          }
+        end)
+    }
+  end
 
   defp restore_topology(:__maxio_no_topology__), do: :persistent_term.erase(@topology_key)
   defp restore_topology(topology), do: :persistent_term.put(@topology_key, topology)

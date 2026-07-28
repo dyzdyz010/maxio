@@ -3,34 +3,39 @@ defmodule Maxio.S3.Handlers.Notification do
   ?notification handler for PutBucketNotificationConfiguration and
   GetBucketNotificationConfiguration.
 
-  This slice stores the control-plane document only. Actual event delivery is
-  not implemented, so non-empty configs must opt out of destination validation
-  with x-amz-skip-destination-validation:true.
+  This handler stores the control-plane document. SNS/SQS/Lambda destination
+  validation is delegated to a configurable validator; without one, direct
+  destinations fail closed unless the request explicitly skips validation.
   """
   import Plug.Conn
 
   alias Maxio.{Buckets, BucketConfigs}
-  alias Maxio.S3.{Checksum, Error, Log, Notification}
+
+  alias Maxio.S3.{
+    ControlBody,
+    Error,
+    ExpectedBucketOwner,
+    Log,
+    Notification,
+    NotificationDestinationValidator
+  }
+
   alias Maxio.S3.RequestParsers.Notification, as: Parser
   alias Maxio.S3.Views.Notification, as: View
 
   @limit 131_072
-  @local_account_id "000000000000"
 
   @spec put(Plug.Conn.t()) :: Plug.Conn.t()
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
-    :ok = reject_streaming_body!(conn)
-    :ok = reject_checksum_trailers!(conn)
-    {conn, xml} = read_small_body!(conn)
-    :ok = validate_checksums!(conn, xml)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
+    {conn, xml} = read_xml_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, config} ->
         {:ok, config} = Notification.validate_client_config(config)
-        :ok = validate_delivery_boundary!(conn, config)
+        validation = validate_delivery_boundary!(conn, config)
         :ok = persist_config(bucket, config)
 
         Log.info("put bucket notification configuration",
@@ -40,10 +45,13 @@ defmodule Maxio.S3.Handlers.Notification do
           queue_configurations: length(config["QueueConfigurations"]),
           lambda_function_configurations: length(config["LambdaFunctionConfigurations"]),
           event_bridge_configuration?: not is_nil(config["EventBridgeConfiguration"]),
-          delivery_implemented?: false
+          destination_validation: validation[:status],
+          test_messages_sent: get_in(validation, [:metadata, :test_messages_sent])
         )
 
-        send_resp(conn, 200, "")
+        conn
+        |> maybe_put_sns_test_message_id(config, validation)
+        |> send_resp(200, "")
 
       {:error, :malformed_xml} ->
         raise Error.new(:malformed_xml, resource: "/" <> bucket)
@@ -54,7 +62,7 @@ defmodule Maxio.S3.Handlers.Notification do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     {:ok, config} = Notification.get_config(bucket)
 
     conn
@@ -71,15 +79,62 @@ defmodule Maxio.S3.Handlers.Notification do
   end
 
   defp validate_delivery_boundary!(conn, config) do
-    if Notification.empty_config?(config) or skip_destination_validation?(conn) do
-      :ok
-    else
-      raise Error.new(:not_implemented,
-              message:
-                "Bucket notification destination validation and event delivery are not implemented; retry with x-amz-skip-destination-validation:true to store configuration only",
-              resource: "/" <> conn.assigns.s3_bucket
+    bucket = conn.assigns.s3_bucket
+
+    cond do
+      Notification.empty_config?(config) ->
+        %{status: :empty}
+
+      skip_destination_validation?(conn) ->
+        %{status: :skipped}
+
+      true ->
+        case NotificationDestinationValidator.validate(bucket, config) do
+          {:ok, metadata} ->
+            %{status: :validated, metadata: metadata}
+
+          {:error, :no_validator} ->
+            raise Error.new(:not_implemented,
+                    message:
+                      "Bucket notification destination validation is not configured; retry with x-amz-skip-destination-validation:true to store direct SNS/SQS/Lambda destinations without validation",
+                    resource: "/" <> bucket
+                  )
+
+          {:error, reason} ->
+            Log.warn("bucket notification destination validation failed",
+              action: :put_bucket_notification,
+              bucket: bucket,
+              reason: inspect(reason)
             )
+
+            raise Error.new(:invalid_argument,
+                    message: "Unable to validate the following destination configurations",
+                    resource: "/" <> bucket
+                  )
+        end
     end
+  end
+
+  defp maybe_put_sns_test_message_id(conn, config, validation) do
+    message_id = get_in(validation, [:metadata, :sns_test_message_id])
+
+    if single_reduced_redundancy_topic?(config) and is_binary(message_id) and message_id != "" do
+      put_resp_header(conn, "x-amz-sns-test-message-id", message_id)
+    else
+      conn
+    end
+  end
+
+  defp single_reduced_redundancy_topic?(config) do
+    match?(
+      %{
+        "TopicConfigurations" => [%{"Events" => ["s3:ReducedRedundancyLostObject"]}],
+        "QueueConfigurations" => [],
+        "LambdaFunctionConfigurations" => [],
+        "EventBridgeConfiguration" => nil
+      },
+      config
+    )
   end
 
   defp skip_destination_validation?(conn) do
@@ -98,72 +153,7 @@ defmodule Maxio.S3.Handlers.Notification do
     end
   end
 
-  defp verify_expected_bucket_owner!(conn, bucket) do
-    case get_req_header(conn, "x-amz-expected-bucket-owner") do
-      [] ->
-        :ok
-
-      [owner] ->
-        if owner == account_id() do
-          :ok
-        else
-          raise Error.new(:access_denied, resource: "/" <> bucket)
-        end
-
-      _multiple ->
-        raise Error.new(:access_denied, resource: "/" <> bucket)
-    end
-  end
-
-  defp account_id do
-    :maxio
-    |> Application.get_env(:sts, [])
-    |> Keyword.get(:account_id, @local_account_id)
-    |> to_string()
-  end
-
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "NotificationConfiguration exceeds 128KB")
-
-      {:error, _reason} ->
-        raise Error.new(:malformed_xml)
-    end
-  end
-
-  defp reject_streaming_body!(conn) do
-    if conn.assigns[:payload_mode] == :streaming do
-      raise Error.new(:not_implemented,
-              message: "Bucket Notification aws-chunked XML bodies are not implemented",
-              resource: "/" <> conn.assigns.s3_bucket
-            )
-    end
-
-    :ok
-  end
-
-  defp validate_checksums!(conn, body) do
-    checksum = Checksum.from_conn!(conn)
-    {stream, get_context, _discard_context} = Checksum.wrap_stream([body], checksum)
-    _ = Enum.to_list(stream)
-    checksum = get_context.()
-    checksum.verify!.()
-  end
-
-  defp reject_checksum_trailers!(conn) do
-    case get_req_header(conn, "x-amz-trailer") do
-      [] ->
-        :ok
-
-      _trailers ->
-        raise Error.new(:not_implemented,
-                message: "Bucket Notification checksum trailers are not implemented",
-                resource: "/" <> conn.assigns.s3_bucket
-              )
-    end
+  defp read_xml_body!(conn) do
+    ControlBody.read_and_verify!(conn, @limit, "NotificationConfiguration exceeds 128KB")
   end
 end

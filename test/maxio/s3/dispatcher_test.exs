@@ -278,4 +278,15 @@ defmodule Maxio.S3.DispatcherTest do
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:service, "POST", keys([]))
     assert {:error, :method_not_allowed} = Dispatcher.resolve(:object, "POST", keys([]))
   end
+
+  test "object POST select resolves to SelectObjectContent" do
+    assert {:ok, :select_object_content} =
+             Dispatcher.resolve(:object, "POST", keys(["select", "select-type"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:bucket, "POST", keys(["select", "select-type"]))
+
+    assert {:error, :method_not_allowed} =
+             Dispatcher.resolve(:object, "GET", keys(["select", "select-type"]))
+  end
 end

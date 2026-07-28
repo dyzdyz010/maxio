@@ -2,8 +2,9 @@ defmodule Maxio.S3.Replication do
   @moduledoc """
   Bucket Replication configuration helpers.
 
-  This slice stores and returns the S3 replication control-plane
-  configuration. It does not replicate object writes in the data plane.
+  This module stores, normalizes, and matches S3 replication control-plane
+  configuration. Data-plane delivery is handled by `Maxio.S3.ReplicationDelivery`
+  through the durable replication outbox.
   """
 
   alias Maxio.BucketConfigs
@@ -15,7 +16,7 @@ defmodule Maxio.S3.Replication do
   @valid_statuses ~w(Enabled Disabled)
   @valid_storage_classes ~w(
     STANDARD REDUCED_REDUNDANCY STANDARD_IA ONEZONE_IA INTELLIGENT_TIERING
-    GLACIER DEEP_ARCHIVE OUTPOSTS GLACIER_IR SNOW EXPRESS_ONEZONE
+    GLACIER DEEP_ARCHIVE OUTPOSTS GLACIER_IR SNOW EXPRESS_ONEZONE FSX_ONTAP
   )
 
   @spec max_rules() :: pos_integer()
@@ -47,6 +48,30 @@ defmodule Maxio.S3.Replication do
   @spec delete_config(String.t()) :: :ok
   def delete_config(bucket) when is_binary(bucket), do: BucketConfigs.delete(bucket, :replication)
 
+  @doc """
+  Return enabled replication targets for one committed data-plane event.
+
+  The input `attrs` uses the same event shape as notification attrs:
+  `:bucket`, `:key`, `:version_id`, optional `:tags`, `:etag`, and `:size`.
+  Matching follows the stored ReplicationConfiguration and collapses overlapping
+  rules per destination bucket by the highest rule priority.
+  """
+  @spec matching_tasks(String.t(), map()) :: [map()]
+  def matching_tasks(event_name, attrs) when is_binary(event_name) and is_map(attrs) do
+    bucket = Map.fetch!(attrs, :bucket)
+    key = Map.fetch!(attrs, :key)
+
+    with {:ok, config} <- get_config(bucket) do
+      config
+      |> Map.get("Rules", [])
+      |> Enum.filter(&rule_matches?(&1, event_name, key, Map.get(attrs, :tags) || %{}))
+      |> collapse_overlapping_rules()
+      |> Enum.map(&task_from_rule(&1, event_name, attrs))
+    else
+      :none -> []
+    end
+  end
+
   @spec normalize_config(map()) :: map()
   def normalize_config(config) when is_map(config) do
     role = value(config, ["Role", "role"])
@@ -56,6 +81,7 @@ defmodule Maxio.S3.Replication do
       rules
       |> normalize_rules()
       |> validate_rule_count!()
+      |> validate_unique_ids!()
       |> validate_unique_priorities!()
 
     %{
@@ -81,6 +107,9 @@ defmodule Maxio.S3.Replication do
     delete_marker_replication =
       value(rule, ["DeleteMarkerReplication", "delete_marker_replication"])
 
+    delete_replication =
+      value(rule, ["DeleteReplication", "delete_replication"])
+
     existing_object_replication =
       value(rule, ["ExistingObjectReplication", "existing_object_replication"])
 
@@ -95,9 +124,10 @@ defmodule Maxio.S3.Replication do
     |> maybe_put_priority(priority)
     |> put_rule_filter(filter, prefix)
     |> maybe_put_delete_marker_replication(delete_marker_replication)
+    |> maybe_put_delete_replication(delete_replication)
     |> maybe_put_existing_object_replication(existing_object_replication)
     |> maybe_put_source_selection_criteria(source_selection_criteria)
-    |> validate_filter_rule_requirements!()
+    |> validate_replication_rule_requirements!()
   end
 
   defp normalize_rule(_rule), do: invalid_stored!()
@@ -138,7 +168,7 @@ defmodule Maxio.S3.Replication do
       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
 
     case keys do
-      [] -> invalid_stored!()
+      [] -> %{}
       [{"Prefix", prefix}] -> %{"Prefix" => normalize_string(prefix)}
       [{"Tag", tag}] -> %{"Tag" => normalize_tag(tag)}
       [{"And", and_operator}] -> %{"And" => normalize_and(and_operator)}
@@ -211,6 +241,7 @@ defmodule Maxio.S3.Replication do
     |> maybe_put_replication_time(replication_time)
     |> maybe_put_access_control_translation(access_control_translation)
     |> validate_replication_time_metrics!()
+    |> validate_access_control_translation_account!()
   end
 
   defp normalize_destination(_destination), do: invalid_stored!()
@@ -306,6 +337,18 @@ defmodule Maxio.S3.Replication do
 
   defp validate_replication_time_metrics!(destination), do: destination
 
+  defp validate_access_control_translation_account!(
+         %{"AccessControlTranslation" => _translation} = destination
+       ) do
+    if Map.has_key?(destination, "Account") do
+      destination
+    else
+      invalid_stored!()
+    end
+  end
+
+  defp validate_access_control_translation_account!(destination), do: destination
+
   defp maybe_put_access_control_translation(destination, nil), do: destination
 
   defp maybe_put_access_control_translation(destination, translation) when is_map(translation) do
@@ -332,6 +375,20 @@ defmodule Maxio.S3.Replication do
   end
 
   defp maybe_put_delete_marker_replication(_rule, _delete_marker_replication),
+    do: invalid_stored!()
+
+  defp maybe_put_delete_replication(rule, nil), do: rule
+
+  defp maybe_put_delete_replication(rule, delete_replication)
+       when is_map(delete_replication) do
+    status = value(delete_replication, ["Status", "status"])
+
+    Map.put(rule, "DeleteReplication", %{
+      "Status" => normalize_enum(status, @valid_statuses)
+    })
+  end
+
+  defp maybe_put_delete_replication(_rule, _delete_replication),
     do: invalid_stored!()
 
   defp maybe_put_existing_object_replication(rule, nil), do: rule
@@ -382,6 +439,19 @@ defmodule Maxio.S3.Replication do
   defp validate_rule_count!(rules) when length(rules) <= @max_rules, do: rules
   defp validate_rule_count!(_rules), do: invalid_stored!()
 
+  defp validate_unique_ids!(rules) do
+    ids =
+      rules
+      |> Enum.map(&Map.get(&1, "ID"))
+      |> Enum.reject(&is_nil/1)
+
+    if Enum.uniq(ids) == ids do
+      rules
+    else
+      invalid_stored!()
+    end
+  end
+
   defp validate_unique_priorities!(rules) do
     priorities =
       rules
@@ -395,6 +465,13 @@ defmodule Maxio.S3.Replication do
     end
   end
 
+  defp validate_replication_rule_requirements!(rule) do
+    rule
+    |> validate_filter_rule_requirements!()
+    |> validate_tag_delete_marker_replication!()
+    |> validate_source_selection_criteria_requirements!()
+  end
+
   defp validate_filter_rule_requirements!(%{"Filter" => _filter} = rule) do
     if Map.has_key?(rule, "Priority") and Map.has_key?(rule, "DeleteMarkerReplication") do
       rule
@@ -404,6 +481,34 @@ defmodule Maxio.S3.Replication do
   end
 
   defp validate_filter_rule_requirements!(rule), do: rule
+
+  defp validate_tag_delete_marker_replication!(
+         %{"Filter" => filter, "DeleteMarkerReplication" => %{"Status" => "Enabled"}} = rule
+       ) do
+    if filter_has_tag?(filter), do: invalid_stored!(), else: rule
+  end
+
+  defp validate_tag_delete_marker_replication!(rule), do: rule
+
+  defp validate_source_selection_criteria_requirements!(
+         %{"SourceSelectionCriteria" => criteria} = rule
+       ) do
+    cond do
+      not Map.has_key?(criteria, "SseKmsEncryptedObjects") ->
+        invalid_stored!()
+
+      Map.has_key?(criteria, "ReplicaModifications") and not Map.has_key?(rule, "Filter") ->
+        invalid_stored!()
+
+      is_nil(get_in(rule, ["Destination", "EncryptionConfiguration"])) ->
+        invalid_stored!()
+
+      true ->
+        rule
+    end
+  end
+
+  defp validate_source_selection_criteria_requirements!(rule), do: rule
 
   defp maybe_put_normalized_string(map, _key, nil), do: map
 
@@ -417,6 +522,10 @@ defmodule Maxio.S3.Replication do
 
   defp maybe_count(acc, nil), do: acc
   defp maybe_count(acc, _value), do: [:present | acc]
+
+  defp filter_has_tag?(%{"Tag" => _tag}), do: true
+  defp filter_has_tag?(%{"And" => %{"Tags" => tags}}) when is_list(tags), do: tags != []
+  defp filter_has_tag?(_filter), do: false
 
   defp normalize_string(value) when is_binary(value), do: value
   defp normalize_string(_value), do: invalid_stored!()
@@ -469,4 +578,99 @@ defmodule Maxio.S3.Replication do
 
   defp invalid_stored!,
     do: raise(Error.new(:internal_error, message: "Invalid stored ReplicationConfiguration"))
+
+  defp rule_matches?(%{"Status" => "Enabled"} = rule, event_name, key, tags) do
+    event_matches?(rule, event_name) and prefix_matches?(rule, key) and
+      tag_filter_matches?(rule, tags)
+  end
+
+  defp rule_matches?(_rule, _event_name, _key, _tags), do: false
+
+  defp event_matches?(_rule, "s3:ObjectCreated:" <> _suffix), do: true
+
+  defp event_matches?(rule, "s3:ObjectRemoved:DeleteMarkerCreated") do
+    get_in(rule, ["DeleteMarkerReplication", "Status"]) == "Enabled"
+  end
+
+  defp event_matches?(rule, "s3:ObjectRemoved:Delete") do
+    get_in(rule, ["DeleteReplication", "Status"]) == "Enabled"
+  end
+
+  defp event_matches?(_rule, _event_name), do: false
+
+  defp prefix_matches?(rule, key) do
+    prefix =
+      cond do
+        is_binary(Map.get(rule, "Prefix")) ->
+          Map.get(rule, "Prefix")
+
+        is_binary(get_in(rule, ["Filter", "Prefix"])) ->
+          get_in(rule, ["Filter", "Prefix"])
+
+        is_binary(get_in(rule, ["Filter", "And", "Prefix"])) ->
+          get_in(rule, ["Filter", "And", "Prefix"])
+
+        true ->
+          ""
+      end
+
+    String.starts_with?(key, prefix)
+  end
+
+  defp tag_filter_matches?(rule, tags) when is_map(tags) do
+    cond do
+      tag = get_in(rule, ["Filter", "Tag"]) ->
+        tag_matches?(tag, tags)
+
+      tag_list = get_in(rule, ["Filter", "And", "Tags"]) ->
+        Enum.all?(tag_list, &tag_matches?(&1, tags))
+
+      true ->
+        true
+    end
+  end
+
+  defp tag_filter_matches?(_rule, _tags), do: false
+
+  defp tag_matches?(%{"Key" => key, "Value" => value}, tags) do
+    Map.get(tags, key) == value or Map.get(tags, to_string(key)) == value
+  end
+
+  defp tag_matches?(_tag, _tags), do: false
+
+  defp collapse_overlapping_rules(rules) do
+    rules
+    |> Enum.group_by(&destination_bucket_name!/1)
+    |> Enum.map(fn {_bucket, candidates} ->
+      Enum.max_by(candidates, &rule_priority/1)
+    end)
+  end
+
+  defp task_from_rule(rule, event_name, attrs) do
+    destination_bucket = destination_bucket_name!(rule)
+    destination = Map.fetch!(rule, "Destination")
+
+    %{
+      source_bucket: Map.fetch!(attrs, :bucket),
+      source_key: Map.fetch!(attrs, :key),
+      source_version_id: Map.fetch!(attrs, :version_id),
+      event_name: event_name,
+      destination_bucket: destination_bucket,
+      rule_id: Map.get(rule, "ID"),
+      destination_storage_class: Map.get(destination, "StorageClass"),
+      source_etag: Map.get(attrs, :etag),
+      source_size: Map.get(attrs, :size)
+    }
+  end
+
+  defp destination_bucket_name!(%{"Destination" => %{"Bucket" => "arn:aws:s3:::" <> bucket}})
+       when bucket != "",
+       do: bucket
+
+  defp rule_priority(rule) do
+    case Map.get(rule, "Priority") do
+      priority when is_integer(priority) -> priority
+      nil -> 0
+    end
+  end
 end

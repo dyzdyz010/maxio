@@ -23,12 +23,28 @@ defmodule Maxio.ObjectLockSidecar do
 
   defp merge_object_lock_attrs(entry, attrs) do
     entry
-    |> put_or_delete("object_lock_mode", Map.get(attrs, :object_lock_mode))
-    |> put_or_delete(
+    |> maybe_put_or_delete(attrs, :object_lock_mode, "object_lock_mode", & &1)
+    |> maybe_put_or_delete(
+      attrs,
+      :object_lock_retain_until,
       "object_lock_retain_until",
-      datetime_to_iso8601(Map.get(attrs, :object_lock_retain_until))
+      &datetime_to_iso8601/1
     )
-    |> put_or_delete("object_lock_legal_hold", Map.get(attrs, :object_lock_legal_hold))
+    |> maybe_put_or_delete(attrs, :object_lock_legal_hold, "object_lock_legal_hold", & &1)
+  end
+
+  defp maybe_put_or_delete(entry, attrs, attr_key, sidecar_key, normalize) do
+    case fetch_attr(attrs, attr_key) do
+      {:ok, value} -> put_or_delete(entry, sidecar_key, normalize.(value))
+      :error -> entry
+    end
+  end
+
+  defp fetch_attr(attrs, key) do
+    case Map.fetch(attrs, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(attrs, Atom.to_string(key))
+    end
   end
 
   defp put_or_delete(entry, key, nil), do: Map.delete(entry, key)

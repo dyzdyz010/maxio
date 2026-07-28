@@ -26,6 +26,8 @@ defmodule Maxio.S3.OwnershipControlsTest do
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
 
+  defp checksum_b64(algorithm, body), do: :crypto.hash(algorithm, body) |> Base.encode64()
+
   defp create_acl_bucket(bucket) do
     SigV4Request.signed_conn(:put, "/#{bucket}",
       headers: [{"x-amz-object-ownership", "ObjectWriter"}]
@@ -135,6 +137,128 @@ defmodule Maxio.S3.OwnershipControlsTest do
     assert get2.resp_body =~ "OwnershipControlsNotFoundError"
   end
 
+  test "Put/Get/DeleteBucketOwnershipControls validate checksums, trailers, and expected owner" do
+    bucket = "ownchecksum"
+    preferred_xml = ownership_xml("BucketOwnerPreferred")
+    writer_xml = ownership_xml("ObjectWriter")
+
+    SigV4Request.signed_conn(:put, "/#{bucket}") |> call()
+
+    missing_integrity =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"ownershipControls" => ""},
+        body: preferred_xml,
+        auto_content_md5: false
+      )
+      |> call()
+
+    assert missing_integrity.status == 400
+    assert missing_integrity.resp_body =~ "<Code>MissingSecurityHeader</Code>"
+
+    assert {:ok, %{"ObjectOwnership" => "BucketOwnerEnforced"}} =
+             BucketConfigs.get(bucket, :ownership_controls)
+
+    good_header =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"ownershipControls" => ""},
+        body: preferred_xml,
+        auto_content_md5: false,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", checksum_b64(:sha256, preferred_xml)}
+        ]
+      )
+      |> call()
+
+    assert good_header.status == 200
+
+    assert {:ok, %{"ObjectOwnership" => "BucketOwnerPreferred"}} =
+             BucketConfigs.get(bucket, :ownership_controls)
+
+    bad_header =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"ownershipControls" => ""},
+        body: writer_xml,
+        auto_content_md5: false,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-checksum-sha256", checksum_b64(:sha256, "different")}
+        ]
+      )
+      |> call()
+
+    assert bad_header.status == 400
+    assert bad_header.resp_body =~ "<Code>BadDigest</Code>"
+
+    assert {:ok, %{"ObjectOwnership" => "BucketOwnerPreferred"}} =
+             BucketConfigs.get(bucket, :ownership_controls)
+
+    plain_trailer =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"ownershipControls" => ""},
+        body: writer_xml,
+        headers: [
+          {"x-amz-sdk-checksum-algorithm", "SHA256"},
+          {"x-amz-trailer", "x-amz-checksum-sha256"}
+        ]
+      )
+      |> call()
+
+    assert plain_trailer.status == 400
+    assert plain_trailer.resp_body =~ "<Code>InvalidRequest</Code>"
+
+    assert {:ok, %{"ObjectOwnership" => "BucketOwnerPreferred"}} =
+             BucketConfigs.get(bucket, :ownership_controls)
+
+    ok_trailer =
+      SigV4Request.signed_chunked_conn(:put, "/#{bucket}", writer_xml,
+        query: %{"ownershipControls" => ""},
+        auto_content_md5: false,
+        headers: [{"x-amz-sdk-checksum-algorithm", "SHA256"}],
+        trailer_headers: [{"x-amz-checksum-sha256", checksum_b64(:sha256, writer_xml)}]
+      )
+      |> call()
+
+    assert ok_trailer.status == 200
+
+    assert {:ok, %{"ObjectOwnership" => "ObjectWriter"}} =
+             BucketConfigs.get(bucket, :ownership_controls)
+
+    wrong_put =
+      SigV4Request.signed_conn(:put, "/#{bucket}",
+        query: %{"ownershipControls" => ""},
+        body: preferred_xml,
+        headers: [{"x-amz-expected-bucket-owner", "111111111111"}]
+      )
+      |> call()
+
+    assert wrong_put.status == 403
+
+    assert {:ok, %{"ObjectOwnership" => "ObjectWriter"}} =
+             BucketConfigs.get(bucket, :ownership_controls)
+
+    wrong_get =
+      SigV4Request.signed_conn(:get, "/#{bucket}",
+        query: %{"ownershipControls" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "111111111111"}]
+      )
+      |> call()
+
+    assert wrong_get.status == 403
+
+    wrong_delete =
+      SigV4Request.signed_conn(:delete, "/#{bucket}",
+        query: %{"ownershipControls" => ""},
+        headers: [{"x-amz-expected-bucket-owner", "111111111111"}]
+      )
+      |> call()
+
+    assert wrong_delete.status == 403
+
+    assert {:ok, %{"ObjectOwnership" => "ObjectWriter"}} =
+             BucketConfigs.get(bucket, :ownership_controls)
+  end
+
   test "PutBucketOwnershipControls validates XML and bucket existence" do
     missing = put_ownership("missing-own", "BucketOwnerEnforced")
     assert missing.status == 404
@@ -153,6 +277,33 @@ defmodule Maxio.S3.OwnershipControlsTest do
     assert bad.resp_body =~ "MalformedXML"
 
     assert {:ok, %{"ObjectOwnership" => "BucketOwnerEnforced"}} =
+             BucketConfigs.get("ownbad", :ownership_controls)
+
+    assert put_ownership("ownbad", "ObjectWriter").status == 200
+
+    malformed =
+      SigV4Request.signed_conn(:put, "/ownbad",
+        query: %{"ownershipControls" => ""},
+        body:
+          ~s(<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>)
+      )
+      |> call()
+
+    assert malformed.status == 400
+    assert malformed.resp_body =~ "MalformedXML"
+
+    unknown =
+      SigV4Request.signed_conn(:put, "/ownbad",
+        query: %{"ownershipControls" => ""},
+        body:
+          ~s(<OwnershipControls><Rule><Unknown>BucketOwnerEnforced</Unknown></Rule></OwnershipControls>)
+      )
+      |> call()
+
+    assert unknown.status == 400
+    assert unknown.resp_body =~ "MalformedXML"
+
+    assert {:ok, %{"ObjectOwnership" => "ObjectWriter"}} =
              BucketConfigs.get("ownbad", :ownership_controls)
   end
 

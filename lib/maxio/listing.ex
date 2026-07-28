@@ -324,7 +324,9 @@ defmodule Maxio.Listing do
       last_modified: modtime_to_datetime(entry["modtime"] || meta["modtime"]),
       etag: entry["etag"] || meta["etag"],
       size: entry["size"] || meta["size"],
-      storage_class: entry["storage_class"] || meta["storage_class"]
+      storage_class: entry["storage_class"] || meta["storage_class"],
+      restore_status: entry["restore_status"] || meta["restore_status"],
+      restore_expiry: parse_datetime(entry["restore_expiry"] || meta["restore_expiry"])
     }
   end
 
@@ -345,6 +347,18 @@ defmodule Maxio.Listing do
   end
 
   defp modtime_to_datetime(_), do: nil
+
+  defp parse_datetime(nil), do: nil
+  defp parse_datetime(%DateTime{} = dt), do: dt
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> dt
+      _other -> nil
+    end
+  end
+
+  defp parse_datetime(_value), do: nil
 
   # 当前版本是否为 delete marker：v2 entry type=="delete_marker"，或扁平 meta 顶层 is_delete_marker。
   # meta=nil（盘上无可判定信息）-> false（不剔除，见模块文档 delete marker 可见性边界）。
@@ -595,7 +609,9 @@ defmodule Maxio.Listing do
       last_modified: Map.get(attrs, :last_modified),
       etag: Map.get(attrs, :etag),
       size: Map.get(attrs, :size),
-      storage_class: Map.get(attrs, :storage_class)
+      storage_class: Map.get(attrs, :storage_class),
+      restore_status: Map.get(attrs, :restore_status),
+      restore_expiry: Map.get(attrs, :restore_expiry)
     }
   end
 

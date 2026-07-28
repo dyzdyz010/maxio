@@ -7,7 +7,7 @@ defmodule Maxio.S3.Handlers.Cors do
   """
   import Plug.Conn
   alias Maxio.{Buckets, BucketConfigs}
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.S3.{ControlBody, Error, ExpectedBucketOwner, Log}
   alias Maxio.S3.RequestParsers.Cors, as: Parser
   alias Maxio.S3.Views.Cors, as: View
 
@@ -18,7 +18,8 @@ defmodule Maxio.S3.Handlers.Cors do
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    {conn, xml} = read_small_body!(conn)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
+    {conn, xml} = read_xml_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, rules} ->
@@ -36,6 +37,7 @@ defmodule Maxio.S3.Handlers.Cors do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
 
     case BucketConfigs.get(bucket, :cors) do
       {:ok, rules} ->
@@ -50,6 +52,7 @@ defmodule Maxio.S3.Handlers.Cors do
   def delete(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     :ok = BucketConfigs.delete(bucket, :cors)
     Log.info("delete bucket cors", action: :delete_bucket_cors, bucket: bucket)
     send_resp(conn, 204, "")
@@ -59,6 +62,9 @@ defmodule Maxio.S3.Handlers.Cors do
   @spec validate!(term()) :: :ok
   def validate!(rules) when is_list(rules) do
     cond do
+      rules == [] ->
+        raise Error.new(:malformed_xml, message: "CORS configuration requires at least one rule")
+
       length(rules) > 100 ->
         raise Error.new(:malformed_xml, message: "Too many CORS rules (max 100)")
 
@@ -82,21 +88,23 @@ defmodule Maxio.S3.Handlers.Cors do
     id = Map.get(r, "id")
 
     methods != [] and origins != [] and
-      list_of_strings?(methods) and list_of_strings?(origins) and
-      list_of_strings?(headers) and list_of_strings?(expose_headers) and
+      list_of_non_empty_strings?(methods) and list_of_non_empty_strings?(origins) and
+      list_of_non_empty_strings?(headers) and list_of_non_empty_strings?(expose_headers) and
       Enum.all?(methods, &(&1 in @valid_methods)) and
       Enum.all?(origins, &at_most_one_star?/1) and
       Enum.all?(headers, &at_most_one_star?/1) and
-      optional_string?(id) and optional_non_negative_integer?(max_age)
+      optional_id?(id) and optional_non_negative_integer?(max_age)
   end
 
   defp valid_rule?(_r), do: false
 
-  defp list_of_strings?(values) when is_list(values), do: Enum.all?(values, &is_binary/1)
-  defp list_of_strings?(_values), do: false
+  defp list_of_non_empty_strings?(values) when is_list(values),
+    do: Enum.all?(values, &(is_binary(&1) and &1 != ""))
 
-  defp optional_string?(nil), do: true
-  defp optional_string?(value), do: is_binary(value)
+  defp list_of_non_empty_strings?(_values), do: false
+
+  defp optional_id?(nil), do: true
+  defp optional_id?(value), do: is_binary(value) and String.length(value) <= 255
 
   defp optional_non_negative_integer?(nil), do: true
   defp optional_non_negative_integer?(value) when is_integer(value), do: value >= 0
@@ -113,16 +121,9 @@ defmodule Maxio.S3.Handlers.Cors do
     end
   end
 
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "CORS configuration exceeds 64KB")
-
-      {:error, _} ->
-        raise Error.new(:malformed_xml)
-    end
+  defp read_xml_body!(conn) do
+    ControlBody.read_and_verify!(conn, @limit, "CORS configuration exceeds 64KB",
+      require_integrity: :content_md5
+    )
   end
 end

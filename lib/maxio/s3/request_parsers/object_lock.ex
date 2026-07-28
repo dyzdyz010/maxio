@@ -1,91 +1,44 @@
 defmodule Maxio.S3.RequestParsers.ObjectLock do
   @moduledoc "PutBucketObjectLockConfiguration ObjectLockConfiguration XML parser."
-  @behaviour Saxy.Handler
 
   alias Maxio.S3.ObjectLock
+  alias Maxio.S3.RequestParsers.XMLTree
 
   @unset {:__maxio_object_lock_unset__, []}
 
   @spec parse(binary()) :: {:ok, map()} | {:error, :malformed_xml}
   def parse(xml) when is_binary(xml) do
-    case Saxy.parse_string(xml, __MODULE__, %{stack: [], root: nil, invalid?: false}) do
-      {:ok, %{root: {"ObjectLockConfiguration", _attrs, children}, invalid?: false}} ->
-        build_config(children)
-
-      _other ->
-        {:error, :malformed_xml}
+    with {:ok, {"ObjectLockConfiguration", _attrs, children}} <- XMLTree.parse(xml),
+         {:ok, config} <- build_config(children) do
+      {:ok, config}
+    else
+      _other -> {:error, :malformed_xml}
     end
   end
 
   @spec parse_retention(binary()) :: {:ok, map()} | {:error, :malformed_xml}
   def parse_retention(xml) when is_binary(xml) do
-    case Saxy.parse_string(xml, __MODULE__, %{stack: [], root: nil, invalid?: false}) do
-      {:ok, %{root: {"Retention", _attrs, children}, invalid?: false}} ->
-        build_retention(children)
-
-      _other ->
-        {:error, :malformed_xml}
+    with {:ok, {"Retention", _attrs, children}} <- XMLTree.parse(xml),
+         {:ok, retention} <- build_retention(children) do
+      {:ok, retention}
+    else
+      _other -> {:error, :malformed_xml}
     end
   end
 
   @spec parse_legal_hold(binary()) :: {:ok, map()} | {:error, :malformed_xml}
   def parse_legal_hold(xml) when is_binary(xml) do
-    case Saxy.parse_string(xml, __MODULE__, %{stack: [], root: nil, invalid?: false}) do
-      {:ok, %{root: {"LegalHold", _attrs, children}, invalid?: false}} ->
-        build_legal_hold(children)
-
-      _other ->
-        {:error, :malformed_xml}
-    end
-  end
-
-  @impl true
-  def handle_event(:start_document, _prolog, state), do: {:ok, state}
-
-  @impl true
-  def handle_event(:start_element, {name, attrs}, state) do
-    tag = local(name)
-    attrs = Enum.map(attrs, fn {name, value} -> {local(name), value} end)
-    {:ok, %{state | stack: [{tag, attrs, []} | state.stack]}}
-  end
-
-  @impl true
-  def handle_event(:characters, chars, state) do
-    {:ok, append_child(state, {:text, chars})}
-  end
-
-  @impl true
-  def handle_event(:end_element, name, %{stack: [{tag, attrs, children} | rest]} = state) do
-    if local(name) == tag do
-      node = {tag, attrs, Enum.reverse(children)}
-
-      case rest do
-        [] ->
-          {:ok, %{state | root: node, stack: []}}
-
-        [{parent_tag, parent_attrs, parent_children} | parent_rest] ->
-          stack = [{parent_tag, parent_attrs, [node | parent_children]} | parent_rest]
-          {:ok, %{state | stack: stack}}
-      end
+    with {:ok, {"LegalHold", _attrs, children}} <- XMLTree.parse(xml),
+         {:ok, legal_hold} <- build_legal_hold(children) do
+      {:ok, legal_hold}
     else
-      {:ok, %{state | invalid?: true}}
+      _other -> {:error, :malformed_xml}
     end
-  end
-
-  def handle_event(:end_element, _name, state), do: {:ok, %{state | invalid?: true}}
-
-  @impl true
-  def handle_event(:end_document, _data, state), do: {:ok, state}
-
-  defp append_child(%{stack: []} = state, _child), do: %{state | invalid?: true}
-
-  defp append_child(%{stack: [{tag, attrs, children} | rest]} = state, child) do
-    %{state | stack: [{tag, attrs, [child | children]} | rest]}
   end
 
   defp build_config(children) do
     children
-    |> structural_children()
+    |> XMLTree.structural_children()
     |> Enum.reduce_while({:ok, %{"ObjectLockEnabled" => @unset, "Rule" => @unset}}, fn
       {"ObjectLockEnabled", _attrs, children}, {:ok, config} ->
         put_once(config, "ObjectLockEnabled", required_text(children))
@@ -117,7 +70,7 @@ defmodule Maxio.S3.RequestParsers.ObjectLock do
 
   defp parse_rule(children) do
     children
-    |> structural_children()
+    |> XMLTree.structural_children()
     |> Enum.reduce_while({:ok, %{"DefaultRetention" => @unset}}, fn
       {"DefaultRetention", _attrs, children}, {:ok, rule} ->
         with {:ok, retention} <- parse_default_retention(children),
@@ -135,10 +88,10 @@ defmodule Maxio.S3.RequestParsers.ObjectLock do
 
   defp parse_default_retention(children) do
     children
-    |> structural_children()
+    |> XMLTree.structural_children()
     |> Enum.reduce_while({:ok, %{"Mode" => @unset, "Days" => @unset, "Years" => @unset}}, fn
       {"Mode", _attrs, children}, {:ok, retention} ->
-        put_once(retention, "Mode", required_text(children))
+        put_once(retention, "Mode", mode_text(children))
 
       {"Days", _attrs, children}, {:ok, retention} ->
         put_once(retention, "Days", required_text(children))
@@ -154,10 +107,10 @@ defmodule Maxio.S3.RequestParsers.ObjectLock do
 
   defp build_retention(children) do
     children
-    |> structural_children()
+    |> XMLTree.structural_children()
     |> Enum.reduce_while({:ok, %{"Mode" => @unset, "RetainUntilDate" => @unset}}, fn
       {"Mode", _attrs, children}, {:ok, retention} ->
-        put_once(retention, "Mode", required_text(children))
+        put_once(retention, "Mode", mode_text(children))
 
       {"RetainUntilDate", _attrs, children}, {:ok, retention} ->
         put_once(retention, "RetainUntilDate", required_text(children))
@@ -181,10 +134,10 @@ defmodule Maxio.S3.RequestParsers.ObjectLock do
 
   defp build_legal_hold(children) do
     children
-    |> structural_children()
+    |> XMLTree.structural_children()
     |> Enum.reduce_while({:ok, %{"Status" => @unset}}, fn
       {"Status", _attrs, children}, {:ok, legal_hold} ->
-        put_once(legal_hold, "Status", required_text(children))
+        put_once(legal_hold, "Status", legal_hold_status_text(children))
 
       _other, _acc ->
         {:halt, :error}
@@ -223,36 +176,19 @@ defmodule Maxio.S3.RequestParsers.ObjectLock do
 
   defp put_once(_map, _key, :error), do: {:halt, :error}
 
-  defp required_text(children) do
-    case text(children) do
-      {:ok, ""} -> :error
-      other -> other
+  defp required_text(children), do: XMLTree.required_text(children, trim: true)
+
+  defp mode_text(children) do
+    case required_text(children) do
+      {:ok, mode} when mode in ["GOVERNANCE", "COMPLIANCE"] -> {:ok, mode}
+      _other -> :error
     end
   end
 
-  defp text([]), do: {:ok, ""}
-
-  defp text(children) when is_list(children) do
-    if Enum.all?(children, &match?({:text, value} when is_binary(value), &1)) do
-      {:ok, children |> Enum.map(fn {:text, value} -> value end) |> Enum.join() |> String.trim()}
-    else
-      :error
-    end
-  end
-
-  defp structural_children(children) do
-    Enum.reject(children, fn
-      {:text, value} -> String.trim(value) == ""
-      _node -> false
-    end)
-  end
-
-  defp local({_namespace, name}), do: local(name)
-
-  defp local(name) do
-    case String.split(to_string(name), ":") do
-      [_namespace, local] -> local
-      [local] -> local
+  defp legal_hold_status_text(children) do
+    case required_text(children) do
+      {:ok, status} when status in ["ON", "OFF"] -> {:ok, status}
+      _other -> :error
     end
   end
 end

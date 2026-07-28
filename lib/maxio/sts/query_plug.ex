@@ -25,9 +25,14 @@ defmodule Maxio.STS.QueryPlug do
   @tag_member_param_pattern ~r/\ATags\.member\.(\d+)\.(Key|Value)\z/
   @transitive_tag_key_param_pattern ~r/\ATransitiveTagKeys\.member\.(\d+)\z/
   @policy_arn_param_pattern ~r/\APolicyArns\.member\.(\d+)\.arn\z/
-  @local_account_id "000000000000"
+  @access_key_id_pattern ~r/\A[A-Za-z0-9_]{16,128}\z/
+  @sigv4_query_param_pattern ~r/\AX-Amz-(?:Algorithm|Credential|Date|Expires|SignedHeaders|Signature|Security-Token|Content-Sha256)\z/
+  @get_access_key_info_allowed_params ~w(Action Version AccessKeyId)
   @assume_role_allowed_params ~w(
     Action Version RoleArn RoleSessionName DurationSeconds ExternalId SourceIdentity SerialNumber TokenCode Policy
+  )
+  @web_identity_allowed_params ~w(
+    Action Version RoleArn RoleSessionName DurationSeconds WebIdentityToken Policy ProviderId
   )
 
   @impl true
@@ -89,7 +94,9 @@ defmodule Maxio.STS.QueryPlug do
     case action(conn) do
       "GetSessionToken" -> get_session_token(conn)
       "GetCallerIdentity" -> get_caller_identity(conn)
+      "GetAccessKeyInfo" -> get_access_key_info(conn)
       "AssumeRole" -> assume_role(conn)
+      "AssumeRoleWithWebIdentity" -> assume_role_with_web_identity(conn)
       _other -> reject(conn, Error.new(:invalid_action))
     end
   end
@@ -141,6 +148,30 @@ defmodule Maxio.STS.QueryPlug do
     end
   end
 
+  defp get_access_key_info(conn) do
+    with :ok <- require_version(conn),
+         :ok <- require_authenticated_principal(conn),
+         :ok <- require_sts_signature_scope(conn),
+         :ok <- reject_unsupported_get_access_key_info_parameters(conn),
+         {:ok, access_key_id} <- access_key_id(conn),
+         {:ok, account_id} <- access_key_account_id(access_key_id) do
+      request_id = request_id(conn)
+
+      Log.info("sts get-access-key-info returned",
+        action: :get_access_key_info,
+        requested_access_key_id: access_key_id,
+        account_id: account_id
+      )
+
+      conn
+      |> put_resp_content_type("text/xml")
+      |> send_resp(200, View.get_access_key_info_response(account_id, request_id))
+      |> halt()
+    else
+      {:error, %Error{} = error} -> reject(conn, error)
+    end
+  end
+
   defp assume_role(conn) do
     with :ok <- require_version(conn),
          :ok <- require_authenticated_principal(conn),
@@ -183,6 +214,46 @@ defmodule Maxio.STS.QueryPlug do
       conn
       |> put_resp_content_type("text/xml")
       |> send_resp(200, View.assume_role_response(session, request_id))
+      |> halt()
+    else
+      {:error, %Error{} = error} -> reject(conn, error)
+    end
+  end
+
+  defp assume_role_with_web_identity(conn) do
+    with :ok <- require_version(conn),
+         :ok <- reject_unsupported_web_identity_parameters(conn),
+         :ok <- reject_web_identity_provider_id(conn),
+         {:ok, role_arn} <- role_arn(conn),
+         {:ok, session_name} <- role_session_name(conn),
+         {:ok, web_identity_token} <- web_identity_token(conn),
+         {:ok, session_policy} <- session_policy(conn),
+         {:ok, policy_arns} <- policy_arns(conn),
+         {:ok, duration_seconds} <- duration_seconds(conn),
+         {:ok, role} <- fetch_role(role_arn),
+         {:ok, web_identity} <- verify_web_identity_token(conn, web_identity_token),
+         {:ok, session} <-
+           issue_assume_role_with_web_identity(conn, role, web_identity, session_name,
+             duration_seconds: duration_seconds,
+             session_policy: session_policy,
+             policy_arns: policy_arns
+           ) do
+      request_id = request_id(conn)
+
+      Log.info("sts assume-role-with-web-identity issued",
+        action: :assume_role_with_web_identity,
+        role_arn: role_arn,
+        session_name: session_name,
+        provider_arn: web_identity.provider_arn,
+        subject_hash: web_identity.subject_sha256,
+        audience: web_identity.audience,
+        source_identity: session.source_identity,
+        tag_keys: session.tags |> Map.keys() |> Enum.sort()
+      )
+
+      conn
+      |> put_resp_content_type("text/xml")
+      |> send_resp(200, View.assume_role_with_web_identity_response(session, request_id))
       |> halt()
     else
       {:error, %Error{} = error} -> reject(conn, error)
@@ -324,6 +395,56 @@ defmodule Maxio.STS.QueryPlug do
     end
   end
 
+  defp web_identity_token(conn) do
+    case Map.get(params(conn), "WebIdentityToken") do
+      value when is_binary(value) and value != "" ->
+        {:ok, value}
+
+      _other ->
+        {:error, Error.new(:invalid_parameter_value, message: "WebIdentityToken is required.")}
+    end
+  end
+
+  defp verify_web_identity_token(conn, token) do
+    opts =
+      case conn.private[:maxio_now] do
+        %DateTime{} = now -> [now: now]
+        _other -> []
+      end
+
+    case STS.WebIdentity.verify(token, opts) do
+      {:ok, web_identity} ->
+        {:ok, web_identity}
+
+      {:error, reason} ->
+        Log.warn("sts web identity token rejected",
+          action: :assume_role_with_web_identity,
+          reason: reason
+        )
+
+        {:error, web_identity_error(reason)}
+    end
+  end
+
+  defp web_identity_error(:expired),
+    do: Error.new(:expired_token, message: "The web identity token has expired.")
+
+  defp web_identity_error(:invalid_audience),
+    do: Error.new(:idp_rejected_claim, message: "The web identity token audience is rejected.")
+
+  defp web_identity_error(:unknown_identity_provider),
+    do:
+      Error.new(:invalid_identity_token, message: "No matching identity provider is configured.")
+
+  defp web_identity_error(:identity_provider_disabled),
+    do: Error.new(:invalid_identity_token, message: "The identity provider is disabled.")
+
+  defp web_identity_error(:invalid_signature),
+    do:
+      Error.new(:invalid_identity_token, message: "The web identity token signature is invalid.")
+
+  defp web_identity_error(_reason), do: Error.new(:invalid_identity_token)
+
   defp reject_unsupported_assume_role_parameters(conn) do
     unsupported =
       params(conn)
@@ -355,6 +476,106 @@ defmodule Maxio.STS.QueryPlug do
   defp unsupported_assume_role_param?(param) when is_binary(param), do: true
 
   defp unsupported_assume_role_param?(_param), do: true
+
+  defp reject_unsupported_web_identity_parameters(conn) do
+    unsupported =
+      params(conn)
+      |> Map.keys()
+      |> Enum.find(&unsupported_web_identity_param?/1)
+
+    if unsupported do
+      {:error,
+       Error.new(:invalid_parameter_value,
+         message: "#{unsupported} is not implemented for AssumeRoleWithWebIdentity."
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp unsupported_web_identity_param?(param) when param in @web_identity_allowed_params,
+    do: false
+
+  defp unsupported_web_identity_param?("PolicyArns.member." <> _rest = param),
+    do: not Regex.match?(@policy_arn_param_pattern, param)
+
+  defp unsupported_web_identity_param?(param) when is_binary(param), do: true
+
+  defp unsupported_web_identity_param?(_param), do: true
+
+  defp reject_unsupported_get_access_key_info_parameters(conn) do
+    unsupported =
+      params(conn)
+      |> Map.keys()
+      |> Enum.find(fn key ->
+        key not in @get_access_key_info_allowed_params and
+          not Regex.match?(@sigv4_query_param_pattern, key)
+      end)
+
+    if unsupported do
+      {:error,
+       Error.new(:invalid_parameter_value,
+         message: "#{unsupported} is not implemented for GetAccessKeyInfo."
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp access_key_id(conn) do
+    case Map.get(params(conn), "AccessKeyId") do
+      value when is_binary(value) ->
+        if valid_access_key_id?(value) do
+          {:ok, value}
+        else
+          {:error, Error.new(:invalid_parameter_value, message: "AccessKeyId is invalid.")}
+        end
+
+      _other ->
+        {:error, Error.new(:invalid_parameter_value, message: "AccessKeyId is required.")}
+    end
+  end
+
+  defp valid_access_key_id?(value) do
+    Regex.match?(@access_key_id_pattern, value) or configured_root_access_key?(value)
+  end
+
+  defp configured_root_access_key?(value) do
+    case Application.get_env(:maxio, :s3, []) |> Keyword.get(:root_user) do
+      root_access_key when is_binary(root_access_key) -> root_access_key == value
+      _other -> false
+    end
+  end
+
+  defp access_key_account_id(access_key_id) do
+    case STS.access_key_account_id(access_key_id) do
+      {:ok, account_id} ->
+        {:ok, account_id}
+
+      {:error, :access_key_not_found} ->
+        {:error,
+         Error.new(:invalid_client_token_id, message: "The access key ID does not exist.")}
+
+      {:error, :invalid_access_key_id} ->
+        {:error, Error.new(:invalid_parameter_value, message: "AccessKeyId is invalid.")}
+    end
+  end
+
+  defp reject_web_identity_provider_id(conn) do
+    case Map.get(params(conn), "ProviderId") do
+      nil ->
+        :ok
+
+      "" ->
+        :ok
+
+      _provider_id ->
+        {:error,
+         Error.new(:invalid_parameter_value,
+           message: "ProviderId is only valid for OAuth 2.0 access tokens."
+         )}
+    end
+  end
 
   defp fetch_role(role_arn) do
     case IAM.get_role_by_arn(role_arn) do
@@ -819,6 +1040,73 @@ defmodule Maxio.STS.QueryPlug do
     end
   end
 
+  defp issue_assume_role_with_web_identity(conn, role, web_identity, session_name, opts) do
+    duration_seconds = Keyword.get(opts, :duration_seconds)
+    session_policy = Keyword.get(opts, :session_policy)
+    policy_arns = Keyword.get(opts, :policy_arns, [])
+
+    issue_opts =
+      [
+        session_name: session_name,
+        session_policy: session_policy,
+        policy_arns: policy_arns,
+        secure_transport: conn.scheme == :https,
+        source_ip: source_ip(conn),
+        current_time: conn.private[:maxio_now] || DateTime.utc_now()
+      ]
+      |> maybe_put_duration(duration_seconds)
+
+    case STS.assume_role_with_web_identity(role, web_identity, issue_opts) do
+      {:ok, session} ->
+        {:ok, session}
+
+      {:error, {:assume_role_with_web_identity_denied, _reason}} ->
+        {:error, Error.new(:access_denied, message: "Cannot assume the requested role.")}
+
+      {:error, {:set_source_identity_denied, _reason}} ->
+        {:error,
+         Error.new(:access_denied, message: "Cannot set SourceIdentity for the requested role.")}
+
+      {:error, {:tag_session_denied, _reason}} ->
+        {:error, Error.new(:access_denied, message: "Cannot tag the requested role session.")}
+
+      {:error, :invalid_session_duration} ->
+        {:error,
+         Error.new(:invalid_parameter_value,
+           message: "DurationSeconds must be between 900 and the role maximum."
+         )}
+
+      {:error, :invalid_session_name} ->
+        {:error, Error.new(:invalid_parameter_value, message: "RoleSessionName is invalid.")}
+
+      {:error, :invalid_session_policy} ->
+        {:error, Error.new(:malformed_policy_document)}
+
+      {:error, :invalid_source_identity} ->
+        {:error, Error.new(:invalid_identity_token)}
+
+      {:error, :invalid_session_tags} ->
+        {:error, Error.new(:invalid_identity_token)}
+
+      {:error, :invalid_transitive_tag_keys} ->
+        {:error, Error.new(:invalid_identity_token)}
+
+      {:error, :malformed_trust_policy} ->
+        {:error, Error.new(:access_denied, message: "Cannot assume the requested role.")}
+
+      {:error, reason} ->
+        Log.warn("sts assume-role-with-web-identity failed",
+          action: :assume_role_with_web_identity,
+          role_arn: role.role_arn,
+          provider_arn: web_identity.provider_arn,
+          subject_hash: web_identity.subject_sha256,
+          reason: inspect(reason)
+        )
+
+        {:error, Error.new(:internal_failure)}
+    end
+  end
+
   defp caller_identity(%{type: :assumed_role, arn: role_arn} = principal) do
     session_name =
       principal[:session_name] ||
@@ -833,7 +1121,7 @@ defmodule Maxio.STS.QueryPlug do
 
     {:ok,
      %{
-       account: account_id(),
+       account: STS.account_id(),
        arn: STS.assumed_role_arn(role_arn, session_name),
        user_id: STS.assumed_role_id(role, session_name)
      }}
@@ -841,7 +1129,7 @@ defmodule Maxio.STS.QueryPlug do
 
   defp caller_identity(%{arn: arn, access_key: access_key})
        when is_binary(arn) and is_binary(access_key) do
-    {:ok, %{account: account_id(), arn: arn, user_id: access_key}}
+    {:ok, %{account: STS.account_id(), arn: arn, user_id: access_key}}
   end
 
   defp caller_identity(_principal), do: {:error, Error.new(:access_denied)}
@@ -852,12 +1140,19 @@ defmodule Maxio.STS.QueryPlug do
     do: Keyword.put(opts, :duration_seconds, duration_seconds)
 
   defp load_post_form(conn) do
-    with :ok <- require_header_auth(conn),
-         :ok <- verify_form_content_type(conn),
+    with :ok <- verify_form_content_type(conn),
          {:ok, conn, body} <- read_form_body(conn),
-         :ok <- verify_payload_hash(conn, body),
          {:ok, form_params} <- decode_form_params(body) do
-      {:ok, assign(conn, :sts_params, form_params)}
+      conn = assign(conn, :sts_params, form_params)
+
+      if web_identity_action?(conn) do
+        {:ok, conn}
+      else
+        with :ok <- require_header_auth(conn),
+             :ok <- verify_payload_hash(conn, body) do
+          {:ok, conn}
+        end
+      end
     end
   end
 
@@ -1006,11 +1301,15 @@ defmodule Maxio.STS.QueryPlug do
 
   defp action(conn), do: Map.get(params(conn), "Action")
 
+  defp web_identity_action?(conn), do: action(conn) == "AssumeRoleWithWebIdentity"
+
   defp sts_action_log_name(conn) do
     case action(conn) do
       "AssumeRole" -> :assume_role
+      "AssumeRoleWithWebIdentity" -> :assume_role_with_web_identity
       "GetSessionToken" -> :get_session_token
       "GetCallerIdentity" -> :get_caller_identity
+      "GetAccessKeyInfo" -> :get_access_key_info
       other -> other
     end
   end
@@ -1036,13 +1335,6 @@ defmodule Maxio.STS.QueryPlug do
 
   defp payload_hash?(value) when is_binary(value), do: String.match?(value, ~r/\A[0-9a-f]{64}\z/)
   defp payload_hash?(_value), do: false
-
-  defp account_id do
-    :maxio
-    |> Application.get_env(:sts, [])
-    |> Keyword.get(:account_id, @local_account_id)
-    |> to_string()
-  end
 
   defp request_id(conn) do
     get_resp_header(conn, "x-request-id") |> List.first() ||

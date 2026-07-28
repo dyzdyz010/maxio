@@ -33,6 +33,7 @@ defmodule Maxio.Cluster.ShardServer do
 
   alias Maxio.Cluster.{DriveHardwareEvidence, DriveIO, DriveIdentity, DriveStats}
   alias Maxio.Storage.Erasure.Meta
+  alias Maxio.Storage.{EpochStore, MutationBackup, ObjectEpoch}
 
   @part_file "part.0"
   @meta_file "meta.json"
@@ -136,8 +137,18 @@ defmodule Maxio.Cluster.ShardServer do
     end)
   end
 
-  # 走盘 LIST 须跳过的内部前缀（ROUTE B P3）：.versions（版本树）/.uploads（multipart parts）/.tmp（原子提交临时区）。
-  @internal_prefixes [".versions", ".uploads", ".tmp", @quarantine_root]
+  # 走盘 LIST 须跳过的内部前缀（ROUTE B P3）：.versions（版本树）/.uploads（multipart parts）/.tmp（原子提交临时区）
+  # + ObjectMutation 协议根（B1）：.maxio-object-epochs（durable fencing epoch）/
+  # .maxio-object-mutations（durable 备份 + manifest）——与 Paths.@layout_reserved 同源，两处必须同步改。
+  @internal_prefixes [
+    ".versions",
+    ".uploads",
+    ".tmp",
+    ".maxio-notification-ledger",
+    ".maxio-object-epochs",
+    ".maxio-object-mutations",
+    @quarantine_root
+  ]
 
   @doc """
   读单层目录 drive_dir 下的条目（ROUTE B P3 drive-walk LIST 原语，本机；被 :erpc 寻址，无 node 首参）。
@@ -518,6 +529,142 @@ defmodule Maxio.Cluster.ShardServer do
       bytes: bytes
     )
   end
+
+  # ── ObjectMutation per-endpoint epoch 原语（协议 Phase 1 B1）──
+  # 全部经 EpochStore 串行段执行（同一 epoch 路径恒同 worker：CAS read-validate-write 原子，
+  # 两步 rename 窗口对协议不可见）；请求/响应均为可 erpc 序列化的纯数据（Distributed 后端
+  # 经 Transport 直调本模块同名函数，B4）。EC 对 cfg.drives 逐盘直调 + quorum 计数（B3）。
+
+  @doc """
+  读该 drive 上 target 的 durable epoch。返回纯数据 payload map（maxio/object-epoch/1 同形）；
+  `{:ok, :absent}` 显式区分「不存在」——nil/:enoent 绝不当授权（协议 §3.3）。
+  损坏 epoch 上报 `{:error, {:corrupt, reason}}`，永不静默覆盖。
+  """
+  @spec read_epoch(String.t(), map(), keyword()) ::
+          {:ok, map()} | {:ok, :absent} | {:error, term()}
+  def read_epoch(drive_root, target, opts \\ []) do
+    DriveIO.track(:read, fn ->
+      with {:ok, %ObjectEpoch{} = epoch} <- EpochStore.read(drive_root, target, opts) do
+        EpochStore.payload(epoch)
+      end
+    end)
+  end
+
+  @doc """
+  epoch CAS。request = `%{next: epoch_payload_map, expect: {:claim, token} | {:exact, token, phases}}`；
+  `next` 为完整 maxio/object-epoch/1 payload（decode 全量重验，坏 payload 结构化拒绝）。
+  claim 仅接受严格更大 token（fence 全序）；exact 要求当前 token 精确相等且 phase 在允许集
+  （epoch absent → `{:error, :epoch_missing}`，绝不视为授权落点）。
+  """
+  @spec cas_epoch(String.t(), map(), keyword()) :: {:ok, :applied} | {:error, term()}
+  def cas_epoch(drive_root, request, opts \\ [])
+
+  def cas_epoch(drive_root, %{next: next_payload, expect: expect}, opts) do
+    DriveIO.track(:write, fn ->
+      with {:ok, next} <- decode_epoch_payload(next_payload) do
+        EpochStore.cas(drive_root, next, expect, opts)
+      end
+    end)
+  end
+
+  def cas_epoch(_drive_root, request, _opts), do: {:error, {:invalid_epoch_request, request}}
+
+  @doc """
+  per-endpoint 恢复原语（单次串行原子调用）：exact-token/phase 与 manifest 校验通过后，
+  fresh manifest 先幂等删除 final，再将 epoch 收敛为 rolled_back；overwrite 在 epoch 收敛后
+  把 backup rename 回 final，最后清 backup。request = `%{target, token, mutation_id, final_rel}`。
+  successor（当前 token 更大）→ `{:ok, :superseded}`，绝不触碰 final；`committed` epoch 即使
+  token 匹配也拒绝（`{:error, :epoch_committed}`，metadata_committed 禁回滚的端点级防线）；
+  epoch absent → `{:error, :epoch_missing}`，绝不删/恢复任何字节；`rolled_back` 幂等。
+  """
+  @spec restore_mutation(String.t(), map(), keyword()) ::
+          {:ok, :restored} | {:ok, :superseded} | {:error, term()}
+  def restore_mutation(drive_root, request, opts \\ []) do
+    DriveIO.track(:write, fn -> EpochStore.restore_mutation(drive_root, request, opts) end)
+  end
+
+  @doc """
+  per-endpoint 终结原语：token 精确匹配且 phase ∈ published/committed（幂等）→ epoch →
+  committed + 丢弃 backup 目录。request = `%{target, token, mutation_id}`；successor →
+  `{:ok, :superseded}`。
+  """
+  @spec finalize_mutation(String.t(), map(), keyword()) ::
+          {:ok, :finalized} | {:ok, :superseded} | {:error, term()}
+  def finalize_mutation(drive_root, request, opts \\ []) do
+    DriveIO.track(:write, fn -> EpochStore.finalize_mutation(drive_root, request, opts) end)
+  end
+
+  defp decode_epoch_payload(payload) when is_map(payload) do
+    with {:ok, bytes} <- Jason.encode(payload),
+         {:ok, epoch} <- ObjectEpoch.decode(bytes) do
+      {:ok, epoch}
+    else
+      {:error, reason} -> {:error, {:invalid_epoch_payload, reason}}
+    end
+  end
+
+  defp decode_epoch_payload(payload), do: {:error, {:invalid_epoch_payload, payload}}
+
+  @doc """
+  per-endpoint durable backup manifest 写原语（协议 §3.2，B4）：把 manifest 写到
+  `<drive_root>/.maxio-object-mutations/<mutation_id>/manifest.json` 并 fsync（文件 + 目录，
+  与 EC 本地盘 write_mutation_manifest 同级耐久——manifest 必须先于该盘任何 destructive IO
+  落盘，crash 后 recovery 仅凭 mutation_id 即可定位备份名单）。
+  request = `%{mutation_id, manifest: payload_map}`；payload 经 MutationBackup.decode 全量
+  重验（坏 payload 结构化拒绝），且 manifest.token 的 mutation_id 必须与请求 mutation_id
+  一致（备份目录由 mutation_id 定位、由 token 授权，与 EpochStore 同源纪律）。幂等覆盖。
+  """
+  @spec put_mutation_manifest(String.t(), map(), keyword()) :: :ok | {:error, term()}
+  def put_mutation_manifest(drive_root, request, opts \\ [])
+
+  def put_mutation_manifest(drive_root, %{mutation_id: mutation_id, manifest: payload}, opts)
+      when is_map(payload) do
+    DriveIO.track(:write, fn ->
+      with {:ok, bytes} <- encode_manifest_payload(payload),
+           {:ok, manifest} <- decode_manifest_bytes(bytes),
+           {:ok, id} <- validate_manifest_mutation_id(manifest, mutation_id) do
+        write_manifest_file(drive_root, id, bytes, opts)
+      end
+    end)
+  end
+
+  def put_mutation_manifest(_drive_root, request, _opts),
+    do: {:error, {:invalid_manifest_request, request}}
+
+  defp encode_manifest_payload(payload) do
+    case Jason.encode(payload) do
+      {:ok, bytes} -> {:ok, bytes}
+      {:error, reason} -> {:error, {:invalid_manifest_payload, reason}}
+    end
+  end
+
+  defp decode_manifest_bytes(bytes) do
+    case MutationBackup.decode(bytes) do
+      {:ok, manifest} -> {:ok, manifest}
+      {:error, reason} -> {:error, {:invalid_manifest_payload, reason}}
+    end
+  end
+
+  defp validate_manifest_mutation_id(manifest, mutation_id) do
+    with {:ok, id} <- MutationBackup.validate_mutation_id(mutation_id) do
+      if manifest.token["mutation_id"] == id, do: {:ok, id}, else: {:error, :mutation_id_mismatch}
+    end
+  end
+
+  defp write_manifest_file(drive_root, mutation_id, bytes, opts) do
+    fsync? = fsync?(opts)
+    backup_dir = Path.join(drive_root, MutationBackup.relative_dir(mutation_id))
+    path = Path.join(backup_dir, MutationBackup.manifest_name())
+
+    with :ok <- File.mkdir_p(backup_dir),
+         :ok <- File.write(path, bytes),
+         :ok <- maybe_sync_file(fsync?, path) do
+      maybe_sync_dir(fsync?, backup_dir)
+    end
+  end
+
+  defp maybe_sync_file(false, _path), do: :ok
+  defp maybe_sync_file(true, path), do: sync_path(path)
 
   defp validate_drive_root_for_quarantine(drive_root) when is_binary(drive_root) do
     expanded = Path.expand(drive_root)
@@ -1209,8 +1356,10 @@ defmodule Maxio.Cluster.ShardServer do
     end
   end
 
-  # 打开路径短持 + fsync（part.0 文件/meta.json 文件落盘）。
-  defp sync_path(path) do
+  # 打开路径短持 + fsync（part.0/meta.json/epoch.json 文件落盘）。B1 起为公开原语：
+  # EpochStore 复用同一 fsync 语义与遥测（提取而非重写第二份，风险 R3）。
+  @doc false
+  def sync_path(path) do
     case :file.open(String.to_charlist(path), [:read, :write, :binary, :raw]) do
       {:ok, fd} ->
         _ = sync_fd(fd)
@@ -1223,7 +1372,9 @@ defmodule Maxio.Cluster.ShardServer do
   end
 
   # fsync 目录 fd（POSIX：open dir + fsync；Windows：open 目录可能失败 -> best-effort :ok）。
-  defp sync_dir(dir) do
+  # B1 起为公开原语：EpochStore 复用（同 sync_path）。
+  @doc false
+  def sync_dir(dir) do
     case :file.open(String.to_charlist(dir), [:read, :raw]) do
       {:ok, fd} ->
         case :file.sync(fd) do

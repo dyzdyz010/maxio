@@ -31,8 +31,13 @@ defmodule Maxio.Test.SigV4Request do
   """
   def signed_conn(method, path, opts \\ []) do
     query = Keyword.get(opts, :query, %{})
-    extra_headers = Keyword.get(opts, :headers, [])
     body = Keyword.get(opts, :body, "")
+
+    extra_headers =
+      opts
+      |> Keyword.get(:headers, [])
+      |> maybe_auto_content_md5(method, path, query, body, opts)
+
     access_key = Keyword.get(opts, :access_key, @access_key)
     secret = Keyword.get(opts, :secret, @secret)
     session_token = Keyword.get(opts, :session_token)
@@ -105,12 +110,17 @@ defmodule Maxio.Test.SigV4Request do
   """
   def signed_chunked_conn(method, path, body, opts \\ []) do
     chunk_size = Keyword.get(opts, :chunk_size, max(byte_size(body), 1))
-    extra_headers = Keyword.get(opts, :headers, [])
+    query = Keyword.get(opts, :query, %{})
+
+    extra_headers =
+      opts
+      |> Keyword.get(:headers, [])
+      |> maybe_auto_content_md5(method, path, query, body, opts)
+
     access_key = Keyword.get(opts, :access_key, @access_key)
     secret = Keyword.get(opts, :secret, @secret)
     session_token = Keyword.get(opts, :session_token)
     service = Keyword.get(opts, :service, @service)
-    query = Keyword.get(opts, :query, %{})
 
     now = DateTime.utc_now()
     amz_date = Calendar.strftime(now, "%Y%m%dT%H%M%SZ")
@@ -298,6 +308,37 @@ defmodule Maxio.Test.SigV4Request do
 
   def access_key, do: @access_key
 
+  defp maybe_auto_content_md5(headers, method, _path, query, body, opts) do
+    body = IO.iodata_to_binary(body)
+
+    if Keyword.get(opts, :auto_content_md5, true) and
+         content_md5_required_control_request?(method, query, body) and
+         not header_present?(headers, "content-md5") do
+      [{"content-md5", md5_b64(body)} | headers]
+    else
+      headers
+    end
+  end
+
+  defp content_md5_required_control_request?(method, query, body) do
+    method = method |> to_string() |> String.upcase()
+
+    (method == "PUT" and
+       (Map.has_key?(query, "versioning") or Map.has_key?(query, "tagging") or
+          Map.has_key?(query, "encryption") or
+          Map.has_key?(query, "ownershipControls") or
+          Map.has_key?(query, "publicAccessBlock") or
+          Map.has_key?(query, "website") or
+          (Map.has_key?(query, "acl") and body != ""))) or
+      (method == "POST" and Map.has_key?(query, "delete") and body != "")
+  end
+
+  defp header_present?(headers, name) do
+    Enum.any?(headers, fn {header, _value} -> String.downcase(header) == name end)
+  end
+
+  defp md5_b64(body), do: :crypto.hash(:md5, body) |> Base.encode64()
+
   @doc """
   Builds a presigned request conn. `session_token`, when provided, is encoded as
   `X-Amz-Security-Token` and therefore participates in the canonical query.
@@ -353,8 +394,12 @@ defmodule Maxio.Test.SigV4Request do
   """
   def anon_conn(method, path, opts \\ []) do
     query = Keyword.get(opts, :query, %{})
-    extra_headers = Keyword.get(opts, :headers, [])
     body = Keyword.get(opts, :body, "")
+
+    extra_headers =
+      opts
+      |> Keyword.get(:headers, [])
+      |> maybe_auto_content_md5(method, path, query, body, opts)
 
     query_string = URI.encode_query(query)
     full_path = if query_string == "", do: path, else: path <> "?" <> query_string

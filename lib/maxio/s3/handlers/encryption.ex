@@ -8,7 +8,8 @@ defmodule Maxio.S3.Handlers.Encryption do
   """
   import Plug.Conn
   alias Maxio.{Buckets, BucketConfigs}
-  alias Maxio.S3.{Error, Log}
+  alias Maxio.KMS
+  alias Maxio.S3.{ControlBody, Error, ExpectedBucketOwner, Log}
   alias Maxio.S3.RequestParsers.Encryption, as: Parser
   alias Maxio.S3.Views.Encryption, as: View
 
@@ -18,9 +19,20 @@ defmodule Maxio.S3.Handlers.Encryption do
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
-    {conn, xml} = read_small_body!(conn)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
+    {conn, xml} = read_xml_body!(conn)
 
     case Parser.parse(xml) do
+      {:ok, %{unsupported_multiple_rules?: true}} ->
+        raise Error.new(:not_implemented,
+                message: "Multiple bucket encryption rules are not implemented"
+              )
+
+      {:ok, %{blocked_encryption_types: [_ | _]}} ->
+        raise Error.new(:not_implemented,
+                message: "BlockedEncryptionTypes is not implemented"
+              )
+
       {:ok, %{algorithm: "AES256", kms_key_id: kms, bucket_key_enabled: bk}} ->
         if kms not in [nil, ""] do
           raise Error.new(:invalid_argument,
@@ -42,10 +54,43 @@ defmodule Maxio.S3.Handlers.Encryption do
 
         send_resp(conn, 200, "")
 
-      {:ok, %{algorithm: alg}} when alg in ["aws:kms", "aws:kms:dsse"] ->
-        raise Error.new(:not_implemented,
-                message: "Only SSE-S3 (AES256) is supported; #{alg} not implemented"
-              )
+      {:ok, %{algorithm: "aws:kms", kms_key_id: kms, bucket_key_enabled: bk}} ->
+        :ok =
+          BucketConfigs.put(bucket, :encryption, %{
+            "algorithm" => "aws:kms",
+            "kms_key_id" => normalize_kms_key_id(kms),
+            "bucket_key_enabled" => bk
+          })
+
+        Log.info("put bucket encryption",
+          action: :put_bucket_encryption,
+          bucket: bucket,
+          reason: "aws:kms"
+        )
+
+        send_resp(conn, 200, "")
+
+      {:ok, %{algorithm: "aws:kms:dsse", kms_key_id: kms, bucket_key_enabled: bk}} ->
+        if bk do
+          raise Error.new(:invalid_argument,
+                  message: "S3 Bucket Keys are not supported with DSSE-KMS"
+                )
+        end
+
+        :ok =
+          BucketConfigs.put(bucket, :encryption, %{
+            "algorithm" => "aws:kms:dsse",
+            "kms_key_id" => normalize_kms_key_id(kms),
+            "bucket_key_enabled" => false
+          })
+
+        Log.info("put bucket encryption",
+          action: :put_bucket_encryption,
+          bucket: bucket,
+          reason: "aws:kms:dsse"
+        )
+
+        send_resp(conn, 200, "")
 
       {:ok, _other} ->
         raise Error.new(:malformed_xml, message: "Invalid SSEAlgorithm")
@@ -59,12 +104,14 @@ defmodule Maxio.S3.Handlers.Encryption do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
 
     case BucketConfigs.get(bucket, :encryption) do
       {:ok, %{"algorithm" => alg} = cfg} ->
         body =
           View.render(%{
             algorithm: alg,
+            kms_key_id: Map.get(cfg, "kms_key_id"),
             bucket_key_enabled: Map.get(cfg, "bucket_key_enabled", false)
           })
 
@@ -79,6 +126,7 @@ defmodule Maxio.S3.Handlers.Encryption do
   def delete(conn) do
     bucket = conn.assigns.s3_bucket
     _ = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     :ok = BucketConfigs.delete(bucket, :encryption)
     Log.info("delete bucket encryption", action: :delete_bucket_encryption, bucket: bucket)
     send_resp(conn, 204, "")
@@ -91,16 +139,13 @@ defmodule Maxio.S3.Handlers.Encryption do
     end
   end
 
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "Encryption config too large")
-
-      {:error, _} ->
-        raise Error.new(:malformed_xml)
-    end
+  defp read_xml_body!(conn) do
+    ControlBody.read_and_verify!(conn, @limit, "Encryption config too large",
+      require_integrity: :content_md5_or_flexible
+    )
   end
+
+  defp normalize_kms_key_id(nil), do: KMS.default_key_id()
+  defp normalize_kms_key_id(""), do: KMS.default_key_id()
+  defp normalize_kms_key_id(key_id) when is_binary(key_id), do: key_id
 end

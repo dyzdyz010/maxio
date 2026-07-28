@@ -48,12 +48,21 @@ defmodule Maxio.Cluster.Transport.InProcess do
   @doc "Fail put_sidecar for one drive while keeping probes online."
   def set_put_sidecar_down(node, drive), do: set_op_down(:put_sidecar, node, drive)
 
+  @doc "Fail get_sidecar for one drive while keeping list/probe operations online."
+  def set_get_sidecar_down(node, drive), do: set_op_down(:get_sidecar, node, drive)
+
   @doc "Fail delete_part_file for one drive while keeping probes online."
   def set_delete_part_file_down(node, drive), do: set_op_down(:delete_part_file, node, drive)
 
   @doc "Fail purge_quarantine_root for one drive while keeping preflight online."
   def set_purge_quarantine_root_down(node, drive),
     do: set_op_down(:purge_quarantine_root, node, drive)
+
+  @doc "Fail read_epoch for one drive while keeping other epoch operations online."
+  def set_read_epoch_down(node, drive), do: set_op_down(:read_epoch, node, drive)
+
+  @doc "Fail cas_epoch for one drive while keeping epoch reads online."
+  def set_cas_epoch_down(node, drive), do: set_op_down(:cas_epoch, node, drive)
 
   defp set_op_down(op, node, drive),
     do: :ets.insert(@table, {{:op, op, node, normalize_path(drive)}, true})
@@ -152,7 +161,9 @@ defmodule Maxio.Cluster.Transport.InProcess do
 
   @impl true
   def get_sidecar(node, dir) do
-    if down?(node, dir), do: {:error, :unavailable}, else: ShardServer.get_sidecar(dir)
+    if down?(node, dir) or op_down?(:get_sidecar, node, dir),
+      do: {:error, :unavailable},
+      else: ShardServer.get_sidecar(dir)
   end
 
   @impl true
@@ -232,6 +243,41 @@ defmodule Maxio.Cluster.Transport.InProcess do
     if down?(node, drive_dir),
       do: {:error, :unavailable},
       else: ShardServer.list_dir(drive_dir, opts)
+  end
+
+  @impl true
+  def read_epoch(node, drive_root, target) do
+    if down?(node, drive_root) or op_down?(:read_epoch, node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.read_epoch(drive_root, target)
+  end
+
+  @impl true
+  def cas_epoch(node, drive_root, request) do
+    if down?(node, drive_root) or op_down?(:cas_epoch, node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.cas_epoch(drive_root, request)
+  end
+
+  @impl true
+  def restore_mutation(node, drive_root, request) do
+    if down?(node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.restore_mutation(drive_root, request)
+  end
+
+  @impl true
+  def finalize_mutation(node, drive_root, request) do
+    if down?(node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.finalize_mutation(drive_root, request)
+  end
+
+  @impl true
+  def put_mutation_manifest(node, drive_root, request) do
+    if down?(node, drive_root),
+      do: {:error, :unavailable},
+      else: ShardServer.put_mutation_manifest(drive_root, request)
   end
 
   @impl true

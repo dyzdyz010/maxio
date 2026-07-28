@@ -59,6 +59,37 @@ defmodule Maxio.Storage.Backend do
   If the hook raises, backends must clean staged bytes and must not replace an
   existing final object. This keeps checksum and decoded-length failures
   fail-closed before object visibility.
+
+  Backends may also receive `opts[:around_object_commit]` for PutObject staging.
+  After the body has been fully consumed in the caller process and
+  `before_object_commit` has succeeded, the backend calls
+  `around_object_commit.(prepared, publish_fun)`. `prepared` contains the
+  computed write result plus precommit additions. The callback may acquire an
+  object lock, revalidate mutable state, and then call
+  `publish_fun.(commit_opts)` with the final `:version_id` and `:object_meta`.
+
+  A successful callback must publish exactly once. Returning `{:error, reason}`
+  without publishing aborts the staged write. Missing publication, callback
+  exceptions, and duplicate publication must discard only this invocation's
+  temp data and must never delete or replace an existing final object. This
+  option applies only to `put/5`; multipart part and assemble contracts are
+  unchanged.
+
+  ## `opts[:object_mutation]`（ObjectMutation 协议 Phase 1，B1 契约 / B2–B4 落地）
+
+  协议化 PutObject 提交可携带 `opts[:object_mutation]`（`%Maxio.Storage.MutationContext{}`，
+  含 mutation_id/token/target/final_rel）。存在时 publish 步骤必须：
+
+    * 在第一次 destructive IO 之前把旧值备份写入
+      `<drive>/.maxio-object-mutations/<mutation_id>/` 并落 durable manifest
+      （`Maxio.Storage.MutationBackup`，协议 §3.2——绝不再用 `.tmp/<uuid>` 备份）；
+    * 在 destructive rename **之前**对 target epoch 执行
+      `{:exact, token, ["claimed"]}` → `"published"`（携带精确 fingerprint）的 CAS；
+      CAS 失败（fenced）→ 不 rename，结构化返回；
+    * 注册进 Control 的 rollback/finalize 闭包改指向 `restore_if_current/2` /
+      `finalize_if_current/2`（所有权判定只认 epoch token，不再走 identity 比对）。
+
+  不传该 opt 的调用者保持现状路径逐字节不变（Copy/Multipart 等 Phase 2 迁移）。
   """
   @callback put(
               bucket(),
@@ -184,4 +215,91 @@ defmodule Maxio.Storage.Backend do
   """
   @callback delete_version(bucket(), key(), version_id :: String.t(), opts :: keyword()) ::
               :ok | {:error, :write_quorum | term()}
+
+  # ── bucket/key retained notification ledger（sidecar write authority recovery carrier）──
+
+  @type notification_ledger_entry :: %{optional(String.t()) => term()}
+
+  @doc """
+  Persist retained notification ledger entries outside the object/version carrier.
+
+  These entries are small JSON-safe maps; they never contain object body bytes.
+  A sidecar-authoritative handler must call this before acknowledging a
+  destructive/overwriting object mutation that may otherwise erase the
+  per-version `notification_outbox` carrier. Backends must return `:ok` only
+  after the ledger entry is durably present at write quorum; otherwise the
+  object mutation must not proceed.
+  """
+  @callback put_notification_ledgers(
+              bucket(),
+              key(),
+              [notification_ledger_entry()],
+              opts :: keyword()
+            ) :: :ok | {:error, term()}
+
+  @doc """
+  List retained notification ledger entries for a key or a whole bucket.
+
+  Passing `:all` as the key filter returns every retained entry under that
+  bucket. Backends should only return entries with a read-quorum canonical
+  replica; divergent/corrupt evidence may be logged and left in place for
+  operator repair.
+  """
+  @callback list_notification_ledgers(bucket(), key() | :all, opts :: keyword()) ::
+              {:ok, [notification_ledger_entry()]} | {:error, term()}
+
+  @doc """
+  Delete retained notification ledger entries after successful idempotent replay
+  or after a predicate proves the prepared mutation never committed.
+
+  Deletion is best-effort but must not raise; callers rely on stable outbox ids
+  for idempotency if a partial prune leaves evidence behind.
+  """
+  @callback delete_notification_ledgers(bucket(), key(), [String.t()], opts :: keyword()) ::
+              :ok | {:error, term()}
+
+  # ── ObjectMutation epoch CAS 回调（协议 §3.3，Phase 1 B1 契约 / B2–B4 落地，B4 起强制）──
+
+  @doc """
+  以 quorum 语义 claim target 的 fencing epoch（per-endpoint CAS 仅接受严格更大 token；
+  EC/Distributed 的破坏性 quorum = `max(write_quorum, ⌊n/2⌋+1)`，保证两个 write quorum
+  必有交集）。返回 claim 前的 previous epoch（quorum 读中最大 token；legacy 无 epoch →
+  nil——但 nil 绝不构成后续 destructive 授权）与成功端点数。
+
+  Distributed 后端额外返回 `:placement_snapshot`（`Placement.resolve_write/3` 快照的
+  durable 形状 `%{"set_id" | "pool_id" | "topology_hash"}`，B5 写入 journal
+  `placement_snapshot`）——`restore_if_current/2`、`finalize_if_current/2` 的恢复端点解析
+  **只认该快照**（核对 topology_hash，漂移 → `{:error, {:placement_drift, evidence}}`），
+  绝不按当前 router 猜测。
+  """
+  @callback claim_epoch(
+              Maxio.Storage.ObjectEpoch.target(),
+              Maxio.Storage.ObjectEpoch.token(),
+              operation :: String.t(),
+              opts :: keyword()
+            ) ::
+              {:ok,
+               %{
+                 :previous => Maxio.Storage.ObjectEpoch.t() | nil,
+                 :endpoints_ok => non_neg_integer(),
+                 optional(:placement_snapshot) => map()
+               }}
+              | {:error, term()}
+
+  @doc "quorum 读 target 当前 epoch；`:absent` 显式区分（nil/:enoent 绝不当授权）。"
+  @callback current_epoch(Maxio.Storage.ObjectEpoch.target(), opts :: keyword()) ::
+              {:ok, Maxio.Storage.ObjectEpoch.t() | :absent} | {:error, term()}
+
+  @doc """
+  仅当 ctx.token 仍为当前 epoch 时恢复旧值（epoch → rolled_back + backup rename 回 final +
+  清 backup）。遇 successor 只返回 `{:ok, :superseded}`，绝不触碰 successor；`committed`
+  epoch 拒绝（metadata_committed 禁回滚的端点级防线）；epoch absent/损坏/quorum 不足 →
+  结构化错误并保留 backup（不猜测、不破坏）。
+  """
+  @callback restore_if_current(Maxio.Storage.MutationContext.t(), opts :: keyword()) ::
+              {:ok, :restored | :superseded} | {:error, term()}
+
+  @doc "仅当 ctx.token 仍为当前 epoch 时终结（epoch → committed + 丢弃 backup）；幂等。"
+  @callback finalize_if_current(Maxio.Storage.MutationContext.t(), opts :: keyword()) ::
+              {:ok, :finalized | :superseded} | {:error, term()}
 end

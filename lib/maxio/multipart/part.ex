@@ -11,6 +11,7 @@ defmodule Maxio.Multipart.Part do
     field :part_number, :integer
     field :etag, :string
     field :size, :integer, default: 0
+    field :checksum, :map, default: %{}
 
     belongs_to :upload, Maxio.Multipart.Upload, foreign_key: :upload_id, references: :id
 
@@ -18,11 +19,12 @@ defmodule Maxio.Multipart.Part do
   end
 
   @required [:upload_id, :part_number, :etag, :size]
+  @optional [:checksum]
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(part, attrs) do
     part
-    |> cast(attrs, @required)
+    |> cast(attrs, @required ++ @optional)
     |> validate_required(@required)
     |> validate_inclusion(:part_number, 1..10_000)
     |> unique_constraint([:upload_id, :part_number],

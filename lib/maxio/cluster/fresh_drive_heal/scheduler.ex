@@ -87,6 +87,22 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
   def run_now(server, opts) when is_list(opts),
     do: GenServer.call(server, {:run_now, opts}, :infinity)
 
+  @doc """
+  Run one scheduled fresh-drive heal pass through the registered process.
+
+  This is intended for bounded operator workflows and tests that need to
+  exercise the same scheduler lock, backoff, and ledger path as the background
+  timer without waiting for a wall-clock tick.
+  """
+  @spec run_scheduled_now(keyword()) :: {:ok, FreshDriveHeal.report()} | {:error, term()}
+  def run_scheduled_now(opts \\ []), do: run_scheduled_now(__MODULE__, opts)
+
+  @doc "Run one scheduled fresh-drive heal pass through `server`."
+  @spec run_scheduled_now(GenServer.server(), keyword()) ::
+          {:ok, FreshDriveHeal.report()} | {:error, term()}
+  def run_scheduled_now(server, opts) when is_list(opts),
+    do: GenServer.call(server, {:run_scheduled_now, opts}, :infinity)
+
   @doc "Return scheduler runtime status and the most recent outcome."
   @spec status() :: map()
   def status, do: status(__MODULE__)
@@ -128,6 +144,11 @@ defmodule Maxio.Cluster.FreshDriveHeal.Scheduler do
   @impl true
   def handle_call({:run_now, opts}, _from, state) do
     {result, state} = run_cycle(state, opts, :manual)
+    {:reply, result, state}
+  end
+
+  def handle_call({:run_scheduled_now, opts}, _from, state) do
+    {result, state} = run_cycle(state, opts, :scheduled)
     {:reply, result, state}
   end
 

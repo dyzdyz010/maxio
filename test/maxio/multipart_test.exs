@@ -2,6 +2,7 @@ defmodule Maxio.MultipartTest do
   use Maxio.DataCase, async: true
 
   alias Maxio.{Buckets, Multipart}
+  alias Maxio.S3.Checksum
 
   setup do
     {:ok, _} = Buckets.create("mp-bucket", "arn:aws:iam:::root")
@@ -21,7 +22,19 @@ defmodule Maxio.MultipartTest do
   end
 
   describe "initiate/get_upload/put_part/complete（注入 min_part_size: 1）" do
-    test "完整闭环：发起→传两块→完成，返回 multipart ETag 与总大小" do
+    test "initiate_with rolls back the upload row when the callback fails" do
+      assert {:error, :registry_failed} =
+               Multipart.initiate_with(
+                 "mp-bucket",
+                 "rollback",
+                 %{owner: "arn:aws:iam:::root"},
+                 fn _upload -> {:error, :registry_failed} end
+               )
+
+      assert Multipart.list_uploads("mp-bucket", %{prefix: "rollback"}).uploads == []
+    end
+
+    test "complete returns multipart etag and size for uploaded parts" do
       {:ok, up} = Multipart.initiate("mp-bucket", "obj", %{owner: "arn:aws:iam:::root"})
 
       {:ok, r1} = Maxio.Storage.put_part("mp-bucket", "obj", up.upload_id, 1, ["AAAAA"])
@@ -86,6 +99,34 @@ defmodule Maxio.MultipartTest do
                Multipart.complete(up, requested, min_part_size: 5_242_880)
     end
 
+    test "CRC64NVME FULL_OBJECT completes by hashing assembled object bytes" do
+      {:ok, up} =
+        Multipart.initiate("mp-bucket", "o-crc64", %{
+          owner: "arn:aws:iam:::root",
+          checksum_algorithm: "CRC64NVME",
+          checksum_type: "FULL_OBJECT"
+        })
+
+      {:ok, r1} = Maxio.Storage.put_part("mp-bucket", "o-crc64", up.upload_id, 1, ["X"])
+
+      {:ok, _} = Multipart.put_part(up, 1, %{etag: r1.etag, size: r1.size})
+
+      requested = [
+        %{
+          part_number: 1,
+          etag: "\"#{r1.etag}\""
+        }
+      ]
+
+      expected = checksum_metadata!("CRC64NVME", ["X"])
+
+      assert {:ok, %{checksum: ^expected, size: 1}} =
+               Multipart.complete(up, requested, min_part_size: 1)
+
+      assert {:ok, stream} = Maxio.Storage.get("mp-bucket", "o-crc64", "null", nil)
+      assert IO.iodata_to_binary(Enum.to_list(stream)) == "X"
+    end
+
     test "abort 删会话且 get_upload 报 not_found" do
       {:ok, up} = Multipart.initiate("mp-bucket", "o5", %{owner: "arn:aws:iam:::root"})
       assert :ok = Multipart.abort(up)
@@ -99,5 +140,101 @@ defmodule Maxio.MultipartTest do
       res = Multipart.list_parts(up, %{part_number_marker: 1})
       assert Enum.map(res.parts, & &1.part_number) == [2, 3]
     end
+
+    test "list_uploads uses initiation time before upload_id for same-key pagination" do
+      {:ok, first} = Multipart.initiate("mp-bucket", "same-key", %{owner: "arn:aws:iam:::root"})
+      {:ok, second} = Multipart.initiate("mp-bucket", "same-key", %{owner: "arn:aws:iam:::root"})
+
+      first_upload_id = "z-first-upload-id"
+      second_upload_id = "a-second-upload-id"
+      first_initiated = ~U[2026-01-01 00:00:00.000000Z]
+      second_initiated = ~U[2026-01-01 00:00:01.000000Z]
+
+      Repo.update_all(
+        from(u in Maxio.Multipart.Upload, where: u.id == ^first.id),
+        set: [
+          upload_id: first_upload_id,
+          inserted_at: first_initiated,
+          updated_at: first_initiated
+        ]
+      )
+
+      Repo.update_all(
+        from(u in Maxio.Multipart.Upload, where: u.id == ^second.id),
+        set: [
+          upload_id: second_upload_id,
+          inserted_at: second_initiated,
+          updated_at: second_initiated
+        ]
+      )
+
+      page1 = Multipart.list_uploads("mp-bucket", %{max_uploads: 1})
+      assert Enum.map(page1.uploads, & &1.upload_id) == [first_upload_id]
+      assert page1.is_truncated
+      assert page1.next_key_marker == "same-key"
+      assert page1.next_upload_id_marker == first_upload_id
+
+      page2 =
+        Multipart.list_uploads("mp-bucket", %{
+          max_uploads: 1,
+          key_marker: page1.next_key_marker,
+          upload_id_marker: page1.next_upload_id_marker
+        })
+
+      assert Enum.map(page2.uploads, & &1.upload_id) == [second_upload_id]
+      refute page2.is_truncated
+    end
+
+    test "list_uploads delimiter marker does not repeat a returned common prefix" do
+      {:ok, _} = Multipart.initiate("mp-bucket", "photos/2006/a.jpg")
+      {:ok, _} = Multipart.initiate("mp-bucket", "photos/2006/b.jpg")
+      {:ok, _} = Multipart.initiate("mp-bucket", "photos/2007/a.jpg")
+
+      page1 =
+        Multipart.list_uploads("mp-bucket", %{
+          prefix: "photos/",
+          delimiter: "/",
+          max_uploads: 1
+        })
+
+      assert page1.uploads == []
+      assert page1.common_prefixes == ["photos/2006/"]
+      assert page1.is_truncated
+      assert page1.next_key_marker == "photos/2006/"
+      assert page1.next_upload_id_marker == nil
+
+      page2 =
+        Multipart.list_uploads("mp-bucket", %{
+          prefix: "photos/",
+          delimiter: "/",
+          max_uploads: 1,
+          key_marker: page1.next_key_marker
+        })
+
+      assert page2.uploads == []
+      assert page2.common_prefixes == ["photos/2007/"]
+      refute page2.is_truncated
+    end
+
+    test "list_uploads normalizes nonpositive internal max_uploads to a progressable page" do
+      {:ok, _} = Multipart.initiate("mp-bucket", "internal/a")
+      {:ok, _} = Multipart.initiate("mp-bucket", "internal/b")
+
+      page = Multipart.list_uploads("mp-bucket", %{prefix: "internal/", max_uploads: 0})
+
+      assert Enum.map(page.uploads, & &1.key) == ["internal/a", "internal/b"]
+      refute page.is_truncated
+      assert page.next_key_marker == nil
+      assert page.next_upload_id_marker == nil
+    end
+  end
+
+  defp checksum_metadata!(algorithm, chunks) do
+    checksum = Checksum.full_object_multipart_context!(algorithm, %{})
+    {stream, get_context, _discard} = Checksum.wrap_stream(chunks, checksum)
+    _ = Enum.to_list(stream)
+    context = get_context.()
+    :ok = context.verify!.()
+    Checksum.object_metadata(context)
   end
 end

@@ -7,7 +7,7 @@ defmodule Maxio.Sidecar do
 
   字段对齐 MinIO xl.meta v2：version_id / type(object|delete_marker) / is_latest（派生自 max modtime，
   存为缓存）/ modtime（int64 纳秒，latest 排序键）/ generation（单调，元数据变更冲突解析）/
-  content_type / content_encoding / content_disposition / cache_control / expires / user_metadata
+  content_type / content_encoding / content_disposition / cache_control / expires / website_redirect_location / user_metadata
   / tags / sse / acl_canned / acl_grants / storage_class / data_dir / inline。
 
   铁律 3：latest 由 max(modtime) 派生（绝不让两版本都 latest）；signature 是版本体 hash（分歧检测）。
@@ -54,7 +54,7 @@ defmodule Maxio.Sidecar do
   @doc """
   把旧 v1 meta（或已 v2 的 meta）升级为 maxio/2 形态（**幂等**）。已 v2 直接原样返回。
   opts 提供版本头字段（version_id / modtime / generation / content_type / content_encoding /
-  content_disposition / cache_control / expires / tags / sse / acl_canned / acl_grants / storage_class /
+  content_disposition / cache_control / expires / website_redirect_location / tags / sse / acl_canned / acl_grants / storage_class /
   user_metadata / data_dir / inline / etag / size）。耐久字段 ec/shards/size/etag/sha256/parts
   逐字保留（绝不污染）。
 
@@ -85,7 +85,10 @@ defmodule Maxio.Sidecar do
       "content_disposition" => Keyword.get(opts, :content_disposition),
       "cache_control" => Keyword.get(opts, :cache_control),
       "expires" => Keyword.get(opts, :expires),
+      "website_redirect_location" => Keyword.get(opts, :website_redirect_location),
       "user_metadata" => Keyword.get(opts, :user_metadata, %{}),
+      "checksum" => Keyword.get(opts, :checksum, %{}),
+      "object_parts" => Keyword.get(opts, :object_parts, %{}),
       "tags" => Keyword.get(opts, :tags, %{}),
       "sse" => Keyword.get(opts, :sse),
       "acl_canned" => Keyword.get(opts, :acl_canned, "private"),
@@ -97,6 +100,8 @@ defmodule Maxio.Sidecar do
       "object_lock_legal_hold" => Keyword.get(opts, :object_lock_legal_hold),
       "restore_status" => Keyword.get(opts, :restore_status),
       "restore_expiry" => datetime_to_iso8601(Keyword.get(opts, :restore_expiry)),
+      "replication_status" => Keyword.get(opts, :replication_status),
+      "notification_outbox" => Keyword.get(opts, :notification_outbox, []),
       "inline" => Keyword.get(opts, :inline)
     }
 
@@ -173,17 +178,22 @@ defmodule Maxio.Sidecar do
         "content_disposition",
         "cache_control",
         "expires",
+        "website_redirect_location",
         "acl_canned",
         "acl_grants",
         "storage_class",
         "tags",
         "user_metadata",
+        "checksum",
+        "object_parts",
         "sse",
         "object_lock_mode",
         "object_lock_retain_until",
         "object_lock_legal_hold",
         "restore_status",
-        "restore_expiry"
+        "restore_expiry",
+        "replication_status",
+        "notification_outbox"
       ]
       |> Enum.map(fn k -> {k, Map.get(entry, k)} end)
 
@@ -217,7 +227,10 @@ defmodule Maxio.Sidecar do
       content_disposition: e["content_disposition"],
       cache_control: e["cache_control"],
       expires: e["expires"],
+      website_redirect_location: e["website_redirect_location"],
       metadata: e["user_metadata"] || %{},
+      checksum: e["checksum"] || %{},
+      object_parts: e["object_parts"] || %{},
       storage_class: e["storage_class"] || "STANDARD",
       acl_canned: e["acl_canned"] || "private",
       acl_grants: e["acl_grants"] || %{"grants" => []},
@@ -227,6 +240,7 @@ defmodule Maxio.Sidecar do
       object_lock_legal_hold: e["object_lock_legal_hold"],
       restore_status: e["restore_status"],
       restore_expiry: parse_datetime(e["restore_expiry"]),
+      replication_status: e["replication_status"],
       sse_algorithm: get_in(e, ["sse", "algo"]),
       sse_envelope: e["sse"] && e["sse"]["envelope"],
       version_id: e["version_id"],
@@ -251,7 +265,10 @@ defmodule Maxio.Sidecar do
       content_disposition: e["content_disposition"],
       cache_control: e["cache_control"],
       expires: e["expires"],
+      website_redirect_location: e["website_redirect_location"],
       metadata: e["user_metadata"] || %{},
+      checksum: e["checksum"] || %{},
+      object_parts: e["object_parts"] || %{},
       storage_class: e["storage_class"] || "STANDARD",
       acl_canned: e["acl_canned"] || "private",
       acl_grants: e["acl_grants"] || %{"grants" => []},
@@ -261,6 +278,7 @@ defmodule Maxio.Sidecar do
       object_lock_legal_hold: e["object_lock_legal_hold"],
       restore_status: e["restore_status"],
       restore_expiry: parse_datetime(e["restore_expiry"]),
+      replication_status: e["replication_status"],
       sse_algorithm: get_in(e, ["sse", "algo"]),
       # SSE-S3/-C 的封装信封（含 wrapped DEK）。必须随读视图携带——否则 sidecar 读权威下
       # 加密对象 GET 会拿到 sse_algorithm="AES256" 却缺信封，解密时 unwrap_dek(nil) 炸（铁律 3）。

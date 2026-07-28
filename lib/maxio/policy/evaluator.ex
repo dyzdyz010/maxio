@@ -4,23 +4,22 @@ defmodule Maxio.Policy.Evaluator do
   evaluate(ctx, statements) :: :allow | {:deny, :explicit_deny | :implicit_deny}
 
   算法（官方核验，§RESEARCH bake-in）：
-    Rule 0: ctx.owner? → :allow（root/资源所有者短路）
     Step 1: 任一 applicable Deny → {:deny, :explicit_deny}
-    Step 2: 任一 applicable Allow → :allow
-    Step 3: 否则 → {:deny, :implicit_deny}
+    Step 2: ctx.owner? → :allow（资源所有者补隐式允许，但不覆盖显式拒绝）
+    Step 3: 任一 applicable Allow → :allow
+    Step 4: 否则 → {:deny, :implicit_deny}
   applicable ⇔ principal ∧ action ∧ resource ∧ conditions 全部命中（effect 不参与 applicable）。
   """
   alias Maxio.Policy.{Condition, RequestContext, Statement}
 
   @spec evaluate(RequestContext.t(), [Statement.t()]) ::
           :allow | {:deny, :explicit_deny | :implicit_deny}
-  def evaluate(%RequestContext{owner?: true}, _statements), do: :allow
-
   def evaluate(%RequestContext{} = ctx, statements) when is_list(statements) do
     applicable = Enum.filter(statements, &statement_applies?(&1, ctx))
 
     cond do
       Enum.any?(applicable, &(&1.effect == :deny)) -> {:deny, :explicit_deny}
+      ctx.owner? -> :allow
       Enum.any?(applicable, &(&1.effect == :allow)) -> :allow
       true -> {:deny, :implicit_deny}
     end
@@ -46,6 +45,23 @@ defmodule Maxio.Policy.Evaluator do
   defp principal_selector_match?({:aws, list}, %RequestContext{principal: %{arn: arn}}) do
     # AWS Principal 精确匹配（区分大小写）；不做 glob（policy variable 未实现）。Statement 已把纯 "*" 归一化为 :any。
     Enum.any?(list, fn pat -> pat == arn end)
+  end
+
+  defp principal_selector_match?({:federated, list}, %RequestContext{
+         principal: %{type: :federated, arn: arn}
+       }) do
+    Enum.any?(list, fn pat -> pat == arn end)
+  end
+
+  defp principal_selector_match?({:federated, _list}, _ctx), do: false
+
+  defp principal_selector_match?({:mixed, categories}, %RequestContext{} = ctx) do
+    categories
+    |> Enum.any?(fn
+      {:aws, list} -> principal_selector_match?({:aws, list}, ctx)
+      {:federated, list} -> principal_selector_match?({:federated, list}, ctx)
+      {_other, _list} -> false
+    end)
   end
 
   defp principal_selector_match?(_principals, _ctx), do: false

@@ -7,25 +7,20 @@ defmodule Maxio.S3.Handlers.ObjectLock do
   """
   import Plug.Conn
 
-  alias Maxio.{Buckets, ObjectLockSidecar, ObjectMeta, Objects}
-  alias Maxio.Policy.{Arn, Evaluator, RequestContext}
-  alias Maxio.S3.{Checksum, Error, Log, ObjectLock}
+  alias Maxio.{Buckets, ObjectLockMetadata, Objects}
+  alias Maxio.S3.{Authz, ControlBody, Error, ExpectedBucketOwner, Log, ObjectLock, RequestPayer}
   alias Maxio.S3.RequestParsers.ObjectLock, as: Parser
   alias Maxio.S3.Views.ObjectLock, as: View
 
   @limit 131_072
-  @local_account_id "000000000000"
 
   @spec put(Plug.Conn.t()) :: Plug.Conn.t()
   def put(conn) do
     bucket = conn.assigns.s3_bucket
     bucket_meta = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
     :ok = require_bucket_object_lock_enabled!(bucket_meta)
-    :ok = reject_streaming_body!(conn)
-    :ok = reject_checksum_trailers!(conn)
-    {conn, xml} = read_small_body!(conn)
-    :ok = validate_checksums!(conn, xml)
+    {conn, xml} = read_config_body!(conn)
 
     case Parser.parse(xml) do
       {:ok, config} ->
@@ -48,7 +43,7 @@ defmodule Maxio.S3.Handlers.ObjectLock do
   def get(conn) do
     bucket = conn.assigns.s3_bucket
     _bucket_meta = ensure_bucket!(bucket)
-    :ok = verify_expected_bucket_owner!(conn, bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket)
 
     case ObjectLock.get_config(bucket) do
       {:ok, config} ->
@@ -64,21 +59,25 @@ defmodule Maxio.S3.Handlers.ObjectLock do
   @spec put_retention(Plug.Conn.t()) :: Plug.Conn.t()
   def put_retention(conn) do
     {conn, bucket, key, version_id} = object_request!(conn)
-    :ok = require_bucket_object_lock_enabled!(ensure_bucket!(bucket))
-    :ok = reject_streaming_body!(conn)
-    :ok = reject_checksum_trailers!(conn)
-    {conn, xml} = read_small_body!(conn)
-    :ok = validate_optional_checksums!(conn, xml)
+    bucket_meta = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: object_resource(bucket, key))
+    charge = RequestPayer.require!(conn, bucket, resource: object_resource(bucket, key))
+    :ok = require_bucket_object_lock_enabled!(bucket_meta)
+    {conn, xml} = read_optional_checksum_body!(conn)
 
     case Parser.parse_retention(xml) do
       {:ok, attrs} ->
         object =
-          with_object_metadata_lock!(bucket, key, fn ->
-            object = object_or_raise!(bucket, key, version_id)
-            :ok = reject_locked_object_change!(conn, object, attrs)
-            :ok = commit_object_lock!(bucket, key, object.version_id, attrs)
-            object
-          end)
+          case ObjectLockMetadata.put_retention(bucket, key, version_id, attrs,
+                 now: now(conn),
+                 bypass_governance?: retention_change_bypass_authorized?(conn, bucket, key)
+               ) do
+            {:ok, object} ->
+              object
+
+            {:error, reason} ->
+              raise_object_lock_mutation_error!(reason, bucket, key)
+          end
 
         Log.info("put object retention",
           action: :put_object_retention,
@@ -87,7 +86,9 @@ defmodule Maxio.S3.Handlers.ObjectLock do
           version_id: object.version_id
         )
 
-        send_resp(conn, 200, "")
+        conn
+        |> RequestPayer.put_charged_header(charge)
+        |> send_resp(200, "")
 
       {:error, :malformed_xml} ->
         raise Error.new(:malformed_xml, resource: object_resource(bucket, key))
@@ -98,31 +99,36 @@ defmodule Maxio.S3.Handlers.ObjectLock do
   def get_retention(conn) do
     {conn, bucket, key, version_id} = object_request!(conn)
     _bucket_meta = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: object_resource(bucket, key))
+    charge = RequestPayer.require!(conn, bucket, resource: object_resource(bucket, key))
     object = object_or_raise!(bucket, key, version_id)
 
     conn
     |> maybe_put_version_id(object.version_id)
     |> put_resp_content_type("application/xml")
+    |> RequestPayer.put_charged_header(charge)
     |> send_resp(200, View.render_retention(object))
   end
 
   @spec put_legal_hold(Plug.Conn.t()) :: Plug.Conn.t()
   def put_legal_hold(conn) do
     {conn, bucket, key, version_id} = object_request!(conn)
-    :ok = require_bucket_object_lock_enabled!(ensure_bucket!(bucket))
-    :ok = reject_streaming_body!(conn)
-    :ok = reject_checksum_trailers!(conn)
-    {conn, xml} = read_small_body!(conn)
-    :ok = validate_optional_checksums!(conn, xml)
+    bucket_meta = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: object_resource(bucket, key))
+    charge = RequestPayer.require!(conn, bucket, resource: object_resource(bucket, key))
+    :ok = require_bucket_object_lock_enabled!(bucket_meta)
+    {conn, xml} = read_optional_checksum_body!(conn)
 
     case Parser.parse_legal_hold(xml) do
       {:ok, attrs} ->
         object =
-          with_object_metadata_lock!(bucket, key, fn ->
-            object = object_or_raise!(bucket, key, version_id)
-            :ok = commit_object_lock!(bucket, key, object.version_id, attrs)
-            object
-          end)
+          case ObjectLockMetadata.put_legal_hold(bucket, key, version_id, attrs) do
+            {:ok, object} ->
+              object
+
+            {:error, reason} ->
+              raise_object_lock_mutation_error!(reason, bucket, key)
+          end
 
         Log.info("put object legal hold",
           action: :put_object_legal_hold,
@@ -131,7 +137,9 @@ defmodule Maxio.S3.Handlers.ObjectLock do
           version_id: object.version_id
         )
 
-        send_resp(conn, 200, "")
+        conn
+        |> RequestPayer.put_charged_header(charge)
+        |> send_resp(200, "")
 
       {:error, :malformed_xml} ->
         raise Error.new(:malformed_xml, resource: object_resource(bucket, key))
@@ -142,11 +150,14 @@ defmodule Maxio.S3.Handlers.ObjectLock do
   def get_legal_hold(conn) do
     {conn, bucket, key, version_id} = object_request!(conn)
     _bucket_meta = ensure_bucket!(bucket)
+    :ok = ExpectedBucketOwner.verify!(conn, bucket, resource: object_resource(bucket, key))
+    charge = RequestPayer.require!(conn, bucket, resource: object_resource(bucket, key))
     object = object_or_raise!(bucket, key, version_id)
 
     conn
     |> maybe_put_version_id(object.version_id)
     |> put_resp_content_type("application/xml")
+    |> RequestPayer.put_charged_header(charge)
     |> send_resp(200, View.render_legal_hold(object))
   end
 
@@ -178,42 +189,17 @@ defmodule Maxio.S3.Handlers.ObjectLock do
           )
   end
 
-  defp verify_expected_bucket_owner!(conn, bucket) do
-    case get_req_header(conn, "x-amz-expected-bucket-owner") do
-      [] ->
-        :ok
-
-      [owner] ->
-        if owner == account_id() do
-          :ok
-        else
-          raise Error.new(:access_denied, resource: "/" <> bucket)
-        end
-
-      _multiple ->
-        raise Error.new(:access_denied, resource: "/" <> bucket)
-    end
+  defp read_config_body!(conn) do
+    ControlBody.read_and_verify!(
+      conn,
+      @limit,
+      "ObjectLockConfiguration exceeds 128KB",
+      require_integrity: :content_md5_or_flexible
+    )
   end
 
-  defp account_id do
-    :maxio
-    |> Application.get_env(:sts, [])
-    |> Keyword.get(:account_id, @local_account_id)
-    |> to_string()
-  end
-
-  defp read_small_body!(conn) do
-    case read_body(conn, length: @limit, read_length: @limit) do
-      {:ok, body, conn} ->
-        {conn, body}
-
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: "ObjectLockConfiguration exceeds 128KB")
-
-      {:error, _reason} ->
-        raise Error.new(:malformed_xml)
-    end
-  end
+  defp read_optional_checksum_body!(conn),
+    do: ControlBody.read_and_verify!(conn, @limit, "ObjectLockConfiguration exceeds 128KB")
 
   defp object_request!(conn) do
     bucket = conn.assigns.s3_bucket
@@ -280,208 +266,51 @@ defmodule Maxio.S3.Handlers.ObjectLock do
     end
   end
 
-  defp reject_locked_object_change!(conn, object, _attrs) do
-    if ObjectLock.locked?(object,
-         now: now(conn),
-         bypass_governance?: retention_change_bypass_authorized?(conn, object)
-       ) do
-      raise Error.new(:access_denied, resource: object_resource(object.bucket_name, object.key))
-    end
-
-    :ok
-  end
-
-  defp with_object_metadata_lock!(bucket, key, fun) when is_function(fun, 0) do
-    case Maxio.Lock.with_object_lock({bucket, key}, fun) do
-      {:ok, result} ->
-        result
-
-      {:error, :locked} ->
-        raise Error.new(:request_timeout, resource: object_resource(bucket, key))
-    end
-  end
-
-  defp retention_change_bypass_authorized?(conn, object) do
+  defp retention_change_bypass_authorized?(conn, bucket, key) do
     bypass_governance_header?(conn) and
-      bypass_governance_authorized?(conn, object.bucket_name, object.key)
+      bypass_governance_authorized?(conn, bucket, key)
   end
 
   defp bypass_governance_authorized?(conn, bucket, key) do
     principal = conn.assigns[:principal]
     authenticated? = principal != :anonymous
-    conditions = Maxio.S3.Authz.conditions_for(conn, authenticated?)
-    resource = Arn.object_arn(bucket, key)
+    conditions = Authz.conditions_for(conn, authenticated?)
     action = "s3:BypassGovernanceRetention"
 
-    cond do
-      Maxio.S3.Authz.owner?(principal, bucket) ->
-        Maxio.S3.Authz.session_policy_allows?(principal, action, resource, conditions)
-
-      true ->
-        statements = Maxio.S3.Authz.object_statements(bucket, key, principal)
-
-        ctx = %RequestContext{
-          principal: principal,
-          authenticated?: authenticated?,
-          owner?: false,
-          action: action,
-          resource: resource,
-          conditions: conditions
-        }
-
-        Evaluator.evaluate(ctx, statements) == :allow and
-          Maxio.S3.Authz.session_policy_allows?(principal, action, resource, conditions)
-    end
+    Authz.object_action_allowed?(
+      bucket,
+      key,
+      action,
+      principal,
+      authenticated?,
+      Authz.owner?(principal, bucket),
+      conditions
+    )
   end
 
-  defp commit_object_lock!(bucket, key, version_id, attrs) do
-    case ObjectMeta.authoritative_source(:write) do
-      :sidecar -> commit_object_lock_sidecar!(bucket, key, version_id, attrs)
-      _pg -> commit_object_lock_pg!(bucket, key, version_id, attrs)
-    end
-  end
+  defp raise_object_lock_mutation_error!(reason, bucket, key) do
+    case reason do
+      :no_such_version ->
+        raise Error.new(:no_such_version, resource: object_resource(bucket, key))
 
-  defp commit_object_lock_sidecar!(bucket, key, version_id, attrs) do
-    case ObjectLockSidecar.update(bucket, key, version_id, attrs) do
-      {:ok, generation} ->
-        best_effort_object_lock_index_update(bucket, key, version_id, attrs, generation)
-
-      {:error, :not_found} ->
+      :not_found ->
         raise Error.new(:no_such_key, resource: object_resource(bucket, key))
 
-      {:error, :read_quorum} ->
+      :locked ->
+        raise Error.new(:access_denied, resource: object_resource(bucket, key))
+
+      :lock_timeout ->
+        raise Error.new(:request_timeout, resource: object_resource(bucket, key))
+
+      :slow_down_read ->
         raise Error.new(:slow_down_read, resource: object_resource(bucket, key))
 
-      {:error, reason} when reason in [:write_quorum, :no_topology] ->
+      :slow_down_write ->
         raise Error.new(:slow_down_write, resource: object_resource(bucket, key))
 
-      {:error, :invalid_key} ->
+      :invalid_key ->
         raise Error.new(:invalid_object_name, resource: object_resource(bucket, key))
     end
-  end
-
-  defp commit_object_lock_pg!(bucket, key, version_id, attrs) do
-    case Objects.put_object_lock(bucket, key, version_id, attrs) do
-      {:ok, _object} ->
-        mirror_object_lock_sidecar(bucket, key, version_id, attrs)
-        :ok
-
-      {:error, :not_found} ->
-        raise Error.new(:no_such_key, resource: object_resource(bucket, key))
-    end
-  end
-
-  defp best_effort_object_lock_index_update(bucket, key, version_id, attrs, generation) do
-    case Objects.put_object_lock(bucket, key, version_id, attrs, generation) do
-      {:ok, _object} ->
-        :ok
-
-      {:error, reason} ->
-        Log.error("pg index object lock update failed (object lock durably stored in sidecar)",
-          action: :put_object_lock_metadata,
-          bucket: bucket,
-          key: key,
-          reason: inspect(reason)
-        )
-
-        :ok
-    end
-  end
-
-  defp mirror_object_lock_sidecar(bucket, key, version_id, attrs) do
-    try do
-      case ObjectLockSidecar.update(bucket, key, version_id, attrs) do
-        {:ok, generation} ->
-          case Objects.put_object_lock(bucket, key, version_id, attrs, generation) do
-            {:ok, _object} ->
-              :ok
-
-            {:error, reason} ->
-              Log.warn("pg object lock generation sync failed after sidecar mirror",
-                action: :put_object_lock_metadata,
-                bucket: bucket,
-                key: key,
-                reason: inspect(reason)
-              )
-          end
-
-        {:error, reason} ->
-          Log.warn("sidecar object lock mirror failed (PG remains authoritative)",
-            action: :put_object_lock_metadata,
-            bucket: bucket,
-            key: key,
-            reason: inspect(reason)
-          )
-      end
-    rescue
-      e ->
-        Log.warn("sidecar object lock mirror raised (PG remains authoritative)",
-          action: :put_object_lock_metadata,
-          bucket: bucket,
-          key: key,
-          reason: inspect(e)
-        )
-    catch
-      kind, reason ->
-        Log.warn("sidecar object lock mirror caught (PG remains authoritative)",
-          action: :put_object_lock_metadata,
-          bucket: bucket,
-          key: key,
-          reason: inspect({kind, reason})
-        )
-    end
-  end
-
-  defp reject_streaming_body!(conn) do
-    if conn.assigns[:payload_mode] == :streaming do
-      raise Error.new(:not_implemented,
-              message: "Bucket Object Lock aws-chunked XML bodies are not implemented",
-              resource: "/" <> conn.assigns.s3_bucket
-            )
-    end
-
-    :ok
-  end
-
-  defp reject_checksum_trailers!(conn) do
-    case get_req_header(conn, "x-amz-trailer") do
-      [] ->
-        :ok
-
-      _trailers ->
-        raise Error.new(:not_implemented,
-                message: "Bucket Object Lock checksum trailers are not implemented",
-                resource: "/" <> conn.assigns.s3_bucket
-              )
-    end
-  end
-
-  defp validate_checksums!(conn, body) do
-    case get_req_header(conn, "content-md5") do
-      [_value] ->
-        checksum = Checksum.from_conn!(conn)
-        {stream, get_context, _discard_context} = Checksum.wrap_stream([body], checksum)
-        _ = Enum.to_list(stream)
-        checksum = get_context.()
-        checksum.verify!.()
-
-      [] ->
-        raise Error.new(:missing_security_header,
-                message: "Missing required Content-MD5 header",
-                resource: "/" <> conn.assigns.s3_bucket
-              )
-
-      _multiple ->
-        raise Error.new(:bad_digest, resource: "/" <> conn.assigns.s3_bucket)
-    end
-  end
-
-  defp validate_optional_checksums!(conn, body) do
-    checksum = Checksum.from_conn!(conn)
-    {stream, get_context, _discard_context} = Checksum.wrap_stream([body], checksum)
-    _ = Enum.to_list(stream)
-    checksum = get_context.()
-    checksum.verify!.()
   end
 
   defp bypass_governance_header?(conn) do

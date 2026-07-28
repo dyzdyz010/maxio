@@ -34,6 +34,8 @@ defmodule Maxio.Cluster.PathsTest do
       "a/.uploads/b",
       "a/.tmp/b",
       "a/.maxio-removal-quarantine/b",
+      "a/.maxio-object-epochs/b",
+      "a/.maxio-object-mutations/b",
       "dir/",
       "a/b/",
       "a//b",
@@ -70,8 +72,16 @@ defmodule Maxio.Cluster.PathsTest do
 
     test "编码段永不等于盘上布局名/内部目录名（结构化无碰撞，对齐 MinIO 结构避碰）" do
       for key <- @tricky_keys,
-          layout <-
-            ["meta.json", "part.0", ".versions", ".uploads", ".tmp", ".maxio-removal-quarantine"] do
+          layout <- [
+            "meta.json",
+            "part.0",
+            ".versions",
+            ".uploads",
+            ".tmp",
+            ".maxio-removal-quarantine",
+            ".maxio-object-epochs",
+            ".maxio-object-mutations"
+          ] do
         {:ok, rel} = Paths.encode_key(key)
 
         refute layout in String.split(rel, "/"),
@@ -104,7 +114,9 @@ defmodule Maxio.Cluster.PathsTest do
             ".versions/x",
             ".uploads/x",
             "a/.tmp/b",
-            "a/.maxio-removal-quarantine/b"
+            "a/.maxio-removal-quarantine/b",
+            "a/.maxio-object-epochs/b",
+            "a/.maxio-object-mutations/b"
           ] do
         assert :ok = Paths.validate_key(key), "#{key} must be a valid key"
       end

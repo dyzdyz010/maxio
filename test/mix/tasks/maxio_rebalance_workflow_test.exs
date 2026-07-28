@@ -43,12 +43,16 @@ defmodule Mix.Tasks.MaxioRebalanceWorkflowTest do
     assert output =~ "job_id=#{job.id}"
     assert output =~ "kind=decommission"
     assert output =~ "phase=copy_pass"
+    assert output =~ "gate_status=attention"
+    assert output =~ "[maxio rebalance.workflow.warning] reason=workflow_next_action_required"
     assert output =~ "pool_retired=false"
 
     decoded = run_workflow(["--job-id", job.id, "--json"]) |> Jason.decode!()
     assert decoded["job_id"] == job.id
     assert decoded["phase"] == "copy_pass"
     assert decoded["status"] == "in_progress"
+    assert decoded["gate_status"] == "attention"
+    assert decoded["warnings"] == ["workflow_next_action_required"]
     assert decoded["destructive_next_action?"] == false
     assert decoded["next_action"] =~ "mix maxio.rebalance.run"
     assert decoded["runtime_topology"]["pool_ids"] == [0]
@@ -62,6 +66,7 @@ defmodule Mix.Tasks.MaxioRebalanceWorkflowTest do
     assert output =~ "job_id=#{job.id}"
     assert output =~ "kind=rebalance"
     assert output =~ "phase=copy_pass"
+    assert output =~ "gate_status=attention"
     assert output =~ "rebalance_complete=false"
     assert output =~ "rebalance_audit_status=not_checked"
     assert output =~ "rebalance_audit_reason=rebalance_not_at_closure"
@@ -73,6 +78,8 @@ defmodule Mix.Tasks.MaxioRebalanceWorkflowTest do
     assert decoded["job_kind"] == "rebalance"
     assert decoded["phase"] == "copy_pass"
     assert decoded["status"] == "in_progress"
+    assert decoded["gate_status"] == "attention"
+    assert decoded["warnings"] == ["workflow_next_action_required"]
     assert decoded["rebalance_complete?"] == false
     assert decoded["rebalance_audit"]["status"] == "not_checked"
     assert decoded["next_action"] =~ "mix maxio.rebalance.run"
@@ -95,12 +102,14 @@ defmodule Mix.Tasks.MaxioRebalanceWorkflowTest do
 
     output = run_workflow(["--job-id", job.id])
     assert output =~ "status=blocked"
+    assert output =~ "gate_status=blocked"
     assert output =~ "phase=rebalance_closure"
     assert output =~ "active_job_exists"
     assert output =~ "next_action=\"mix maxio.rebalance.workflow --job-id #{active.id} --json\""
 
     decoded = run_workflow(["--job-id", job.id, "--json"]) |> Jason.decode!()
     assert decoded["status"] == "blocked"
+    assert decoded["gate_status"] == "blocked"
     assert decoded["phase"] == "rebalance_closure"
     assert decoded["next_action"] == "mix maxio.rebalance.workflow --job-id #{active.id} --json"
     assert decoded["destructive_next_action?"] == false
@@ -108,11 +117,120 @@ defmodule Mix.Tasks.MaxioRebalanceWorkflowTest do
   end
 
   test "reports not_started when no job exists" do
-    assert run_workflow([]) =~ "status=not_started"
+    output = run_workflow([])
+    assert output =~ "status=not_started"
+    assert output =~ "gate_status=ok"
 
     decoded = run_workflow(["--json"]) |> Jason.decode!()
     assert decoded["status"] == "not_started"
+    assert decoded["gate_status"] == "ok"
+    assert decoded["blockers"] == []
+    assert decoded["warnings"] == []
     assert decoded["jobs"] == []
+  end
+
+  test "fail-on-attention prints JSON before returning a non-zero gate", ctx do
+    {:ok, job} = seed_decommission_job(ctx.topology)
+
+    output =
+      capture_io(fn ->
+        assert_raise Mix.Error, ~r/rebalance workflow attention/, fn ->
+          Workflow.run(["--job-id", job.id, "--json", "--fail-on-attention"])
+        end
+      end)
+
+    decoded = Jason.decode!(output)
+    assert decoded["status"] == "in_progress"
+    assert decoded["gate_status"] == "attention"
+    assert decoded["warnings"] == ["workflow_next_action_required"]
+  end
+
+  test "fail-on-blocked prints JSON before returning a non-zero gate", ctx do
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(j in Job, where: j.id == ^job.id),
+               set: [
+                 status: "complete",
+                 data_movement_status: "complete",
+                 source_cleanup_status: "complete"
+               ]
+             )
+
+    {:ok, active} = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
+
+    output =
+      capture_io(fn ->
+        assert_raise Mix.Error, ~r/rebalance workflow blocked/, fn ->
+          Workflow.run(["--job-id", job.id, "--json", "--fail-on-blocked"])
+        end
+      end)
+
+    decoded = Jason.decode!(output)
+    assert decoded["status"] == "blocked"
+    assert decoded["gate_status"] == "blocked"
+    assert decoded["next_action"] == "mix maxio.rebalance.workflow --job-id #{active.id} --json"
+    assert "active_job_exists" in decoded["blockers"]
+  end
+
+  test "fail-on-attention also fails blocked gates after printing evidence", ctx do
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    assert {1, _rows} =
+             Repo.update_all(
+               from(j in Job, where: j.id == ^job.id),
+               set: [
+                 status: "complete",
+                 data_movement_status: "complete",
+                 source_cleanup_status: "complete"
+               ]
+             )
+
+    _active = Jobs.start_decommission(0, topology: ctx.topology, include_drive_stats: false)
+
+    output =
+      capture_io(fn ->
+        assert_raise Mix.Error, ~r/rebalance workflow blocked/, fn ->
+          Workflow.run(["--job-id", job.id, "--json", "--fail-on-attention"])
+        end
+      end)
+
+    decoded = Jason.decode!(output)
+    assert decoded["gate_status"] == "blocked"
+  end
+
+  test "default audit starts minimal runtime without full app schedulers" do
+    code = """
+    Application.put_env(:maxio, :fresh_drive_heal_scheduler, enabled: true, initial_delay_ms: 0, interval_ms: 1)
+    Application.put_env(:maxio, :rebalance_scheduler, enabled: true, initial_delay_ms: 0, interval_ms: 1)
+    Application.put_env(:maxio, :lifecycle_scheduler, enabled: true, initial_delay_ms: 0, interval_ms: 1)
+    Mix.Task.run("maxio.rebalance.workflow", ["--json"])
+    IO.puts("FRESH_SCHEDULER=\#{inspect(Process.whereis(Maxio.Cluster.FreshDriveHeal.Scheduler))}")
+    IO.puts("REBALANCE_SCHEDULER=\#{inspect(Process.whereis(Maxio.Cluster.Rebalance.Scheduler))}")
+    IO.puts("LIFECYCLE_SCHEDULER=\#{inspect(Process.whereis(Maxio.Lifecycle.Scheduler))}")
+    """
+
+    File.mkdir_p!("tmp")
+
+    script_path =
+      Path.join(
+        "tmp",
+        "maxio_rebalance_workflow_probe_#{System.unique_integer([:positive])}.exs"
+      )
+
+    File.write!(script_path, code)
+    on_exit(fn -> File.rm(script_path) end)
+
+    {cmd, args} = mix_run_no_start_script(script_path)
+
+    {output, status} =
+      System.cmd(cmd, args, env: [{"MIX_ENV", "test"}], stderr_to_stdout: true)
+
+    assert status == 0, output
+    assert output =~ "FRESH_SCHEDULER=nil"
+    assert output =~ "REBALANCE_SCHEDULER=nil"
+    assert output =~ "LIFECYCLE_SCHEDULER=nil"
   end
 
   defp seed_decommission_job(topology) do
@@ -124,6 +242,13 @@ defmodule Mix.Tasks.MaxioRebalanceWorkflowTest do
   defp run_workflow(args) do
     Mix.Task.reenable(@task)
     capture_io(fn -> Workflow.run(args) end)
+  end
+
+  defp mix_run_no_start_script(script_path) do
+    case :os.type() do
+      {:win32, _} -> {"cmd", ["/c", "mix", "run", "--no-start", script_path]}
+      _other -> {System.find_executable("mix") || "mix", ["run", "--no-start", script_path]}
+    end
   end
 
   defp topology do

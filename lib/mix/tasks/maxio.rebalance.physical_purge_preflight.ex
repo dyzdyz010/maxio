@@ -5,9 +5,12 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurgePreflight do
 
       mix maxio.rebalance.physical_purge_preflight --job-id <uuid>
       mix maxio.rebalance.physical_purge_preflight <uuid> --retention-hours 168 --json
+      mix maxio.rebalance.physical_purge_preflight <uuid> \
+        --require-secure-erase-evidence --secure-erase-evidence evidence.json
 
   This command does not delete files. It validates the stored physical removal
-  manifest, endpoint quarantine markers, and retention window.
+  manifest, endpoint quarantine markers, retention window, and optional
+  operator-attested secure erase evidence.
   """
   use Mix.Task
 
@@ -20,6 +23,8 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurgePreflight do
         strict: [
           job_id: :string,
           retention_hours: :integer,
+          secure_erase_evidence: :string,
+          require_secure_erase_evidence: :boolean,
           json: :boolean
         ]
       )
@@ -34,7 +39,7 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurgePreflight do
 
     Mix.Task.run("app.start")
 
-    purge_opts = retention_opts(opts)
+    purge_opts = retention_opts(opts) ++ secure_erase_opts(opts)
 
     case PhysicalPurge.preflight(job_id, purge_opts) do
       {:ok, report} -> print_or_json(opts, report)
@@ -44,7 +49,17 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurgePreflight do
 
   defp usage do
     "usage: mix maxio.rebalance.physical_purge_preflight " <>
-      "[JOB_ID|--job-id <uuid>] [--retention-hours N] [--json]"
+      "[JOB_ID|--job-id <uuid>] [--retention-hours N] " <>
+      "[--secure-erase-evidence PATH] [--require-secure-erase-evidence] [--json]"
+  end
+
+  defp secure_erase_opts(opts) do
+    []
+    |> maybe_put(:secure_erase_evidence, Keyword.get(opts, :secure_erase_evidence))
+    |> maybe_put(
+      :require_secure_erase_evidence,
+      Keyword.get(opts, :require_secure_erase_evidence, false)
+    )
   end
 
   defp retention_opts(opts) do
@@ -64,10 +79,15 @@ defmodule Mix.Tasks.Maxio.Rebalance.PhysicalPurgePreflight do
           "status=#{report.status} quarantine_id=#{report.quarantine_id} " <>
           "retention_seconds=#{report.retention_seconds} " <>
           "retention_elapsed?=#{report.retention_elapsed?} blockers=#{inspect(report.blockers)} " <>
+          "secure_erase_evidence_status=#{report.secure_erase_evidence["status"]} " <>
           "purge=false"
       )
     end
   end
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, _key, false), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp json_ready(nil), do: nil
   defp json_ready(value) when is_boolean(value), do: value

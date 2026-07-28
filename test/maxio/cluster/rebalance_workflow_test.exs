@@ -73,6 +73,8 @@ defmodule Maxio.Cluster.RebalanceWorkflowTest do
     assert planned.job_kind == "rebalance"
     assert planned.phase == "copy_pass"
     assert planned.status == "in_progress"
+    assert planned.gate_status == "attention"
+    assert "workflow_next_action_required" in planned.warnings
     assert planned.next_action =~ "mix maxio.rebalance.run"
     assert planned.rebalance_complete? == false
     assert planned.rebalance_audit.status == "not_checked"
@@ -106,12 +108,14 @@ defmodule Maxio.Cluster.RebalanceWorkflowTest do
 
     assert {:ok, final} = Workflow.summary(fixture.job.id, audit_page_size: 1)
     assert final.status == "complete"
+    assert final.gate_status == "ok"
     assert final.phase == "rebalance_closure"
     assert final.next_action == "none"
     assert final.rebalance_complete? == true
     assert final.set_retired? == false
     assert final.pool_retired? == false
     assert final.blockers == []
+    assert final.warnings == []
 
     assert final.rebalance_audit.status == "ok"
     assert final.rebalance_audit.versions_scanned == 2
@@ -148,6 +152,8 @@ defmodule Maxio.Cluster.RebalanceWorkflowTest do
     assert {:ok, blocked} = Workflow.summary(fixture.job.id)
     assert blocked.phase == "rebalance_closure"
     assert blocked.status == "blocked"
+    assert blocked.gate_status == "blocked"
+    assert blocked.warnings == []
     assert blocked.rebalance_complete? == false
     assert "routing_mismatch" in blocked.blockers
     assert blocked.next_action == "mix maxio.rebalance.start --json"
