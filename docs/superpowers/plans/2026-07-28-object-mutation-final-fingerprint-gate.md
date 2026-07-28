@@ -182,11 +182,25 @@ and `nil/nil`. Keep the wrapper at or below 60 KiB before Journal's 64 KiB gate.
 
 Both proof and finalize failed aggregates require `verified < required`; fenced is never a failed
 class, corrupt/mismatch retains an owned same-class endpoint witness, and placement drift uses
-canonical zero counts plus a retained drift witness. Both proof and finalize superseded aggregates
+canonical zero counts plus a retained non-owned drift witness; public constructors reject
+`placement_drift` with `owned=true`. Both proof and finalize superseded aggregates
 have no outer class, retain a strict endpoint `superseded/fenced/owned=false` witness, and normalize
 `verified/observed_owned/unavailable` to zero (including finalize `finalized/orphaned`). The witness
 is retained in `degraded`, so `debt == length(degraded) + omitted >= 1`. Durable evidence validation
 re-derives these relations from retained bounded details.
+
+Finalize conservation additionally requires `verified - finalized <= debt`.
+`cleanup_pending` requires proof quorum and `debt > 0`; terminal finalized with zero debt therefore
+has `verified == finalized == observed_owned`. Reject a status/count rewrite that loses an
+unfinalized endpoint or claims cleanup pending without debt.
+
+The 32-detail limit is wrapper-wide across published proof degraded details, last-failure degraded
+details, and last-failure orphan hints. Initial successful proof persistence retains at most 31
+details and moves the rest to its omitted count, reserving one slot for a future mandatory failure
+witness. Merge preserves that published proof byte-for-byte, retains the first mandatory
+decisive/debt witness from last failure, fills remaining capacity from last-failure degraded then
+orphan details in deterministic order, and updates omitted counts without changing debt/orphan
+totals. A nil-proof pre-published failure may use all 32 slots.
 
 ### Step 3: Implement standalone `EpochStore.verify_mutation/3`
 

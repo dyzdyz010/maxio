@@ -137,6 +137,12 @@ length(degraded) + length(orphan_hints) <= 32
 否则 proof quorum 已过但仍有清理债务才是 `cleanup_pending`。`orphaned > 0` 不阻塞已有
 真实 finalized quorum；orphan-only 且未达 quorum 仍是全局 unavailable failure。
 
+finalize aggregate 还必须满足 `verified - finalized <= debt`。因此
+`cleanup_pending` 必须 `verified >= required && debt > 0`，并保留至少一条 cleanup/debt
+witness；`finalized` 在 `debt == 0` 时必然
+`verified == finalized == observed_owned`。不能只改 status/finalized 计数伪造无债务的
+cleanup pending，也不能让 proof-passed/unfinalized endpoint 从 terminal summary 消失。
+
 classifier 必须在计票前完整预检 expected identity、响应 identity、scope/mode、tuple/status/
 class 与 aggregate 重入。任一结构漂移均生成规范化 `placement_drift` failure，固定
 `verified=0, observed_owned=0, unavailable=0`；finalize 另固定
@@ -151,7 +157,8 @@ proof/finalize failed:
   verified < required
   fenced 不得作为 failed class
   corrupt/mismatch 必须保留 owned=true、同 class endpoint witness
-  placement_drift 必须使用上述 canonical zero counts，并保留 drift witness
+  placement_drift endpoint witness 必须 owned=false
+  placement_drift aggregate 必须使用上述 canonical zero counts，并保留 drift witness
 
 proof/finalize superseded:
   aggregate 无 outer class
@@ -162,6 +169,8 @@ proof/finalize superseded:
 ```
 
 validator 必须从保留的有界 detail 重验这些关系；不能只相信 aggregate outer status/class。
+public endpoint constructor 对 `placement_drift, owned=true` 必须拒绝；结构预检生成的 drift
+witness 必须重新构造为非 owned 的有界 canonical detail，不能原样保留不可信 observation。
 
 `finalize_if_current/2` 的新唯一返回契约是：
 
@@ -395,10 +404,25 @@ failed/cleanup_pending/superseded；endpoint summary、proof success 与 finaliz
 - finalize-mode last failure 必须同时存在成功 published proof，且只允许在 metadata/finalize
   后续 phase。`nil/nil` 不是合法 proof evidence。
 
-有界 endpoint detail 合计最多 32 条，其余放对应 omitted；PublishedProof wrapper 的编码结果
-必须不超过 60 KiB，并继续通过 Journal 既有 JSON-safe/64 KiB gate。后续
-`mark_error`/quarantine 必须用 phase-aware merge 更新 `"last_failure"`，保留初始
-`"published_proof"`，不得整图覆盖。
+一个 journal evidence wrapper 中，`published_proof.degraded`、
+`last_failure.degraded` 与 finalize `last_failure.orphan_hints` 合计最多保留 32 条。
+为了让后续 merge 保持初始 `"published_proof"` byte-for-byte 不变，初次持久化成功 proof
+时最多保留 31 条 detail，并把其余精确计入 proof `"omitted"`，为未来 last failure 的强制
+witness 预留一条。若 published proof 少于 31 条，未用预算可供 last failure 使用。
+
+wrapper 分配规则固定为：
+
+1. 已持久化的 published proof 不再裁剪或重排；
+2. last failure 先保留其状态/class 所需的第一条 canonical decisive/debt witness；
+3. 剩余预算按 `last_failure.degraded`、再 `last_failure.orphan_hints` 的既有确定顺序填充；
+4. 每次裁剪都保持 `debt`/`orphaned` 总数不变，并精确增加对应
+   `omitted`/`orphan_omitted`；
+5. pre-published 的 nil-proof failure 可独占全部 32 条预算。
+
+若 mandatory witness 缺失，必须拒绝 evidence，不能仅靠 omitted 合成决定性事实。
+PublishedProof wrapper 的编码结果必须不超过 60 KiB，并继续通过 Journal 既有
+JSON-safe/64 KiB gate。后续 `mark_error`/quarantine 必须用 phase-aware merge 更新
+`"last_failure"`，保留初始 `"published_proof"`，不得整图覆盖。
 
 ### D7 — Recovery 复用同一 callback
 
