@@ -48,9 +48,10 @@ Maxio.Storage.verify_published(ctx, opts)
 
 endpoint wire observation 与 backend aggregate proof 是两个不可混用的域：
 
-- summary 必须带 `"scope" => "endpoint" | "aggregate"`；endpoint summary 另带稳定
-  `"endpoint"` identity。FS identity 固定为 `"local"`，shard identity 固定为冻结 placement
-  的全局 `"ordinal:N"`，不含 node/drive 路径。
+- summary 必须带 `"scope" => "endpoint" | "aggregate"` 与
+  `"mode" => "proof" | "finalize"`；endpoint summary 另带稳定 `"endpoint"` identity。
+  FS identity 固定为 `"local"`，shard identity 固定为冻结 placement 的全局
+  `"ordinal:N"`，不含 node/drive 路径。
 - `EpochStore` / `ShardServer` / `Transport.verify_mutation` 只返回 endpoint result；
   `Storage.Backend.verify_published` 才返回 aggregate result。endpoint wire 不允许自报
   `:degraded`，且 endpoint summary 根本不携带
@@ -59,9 +60,10 @@ endpoint wire observation 与 backend aggregate proof 是两个不可混用的�
 - 聚合入口接收 `{expected_identity, endpoint_result}`，expected identity 必须唯一且与响应
   identity 精确相等。重复、错配、aggregate 重入或 outcome/status/class/count 不一致均在计票前
   fail closed 为 `:placement_drift`，绝不静默去重或接受自报 quorum。
-- aggregate summary 明示 `"debt"`；它等于有界 `degraded` 条目数加 `"omitted"`。journal
-  只接受 aggregate 的 verified/degraded 成功 summary，endpoint summary 永远不能作为 durable
-  published evidence 或再次参与 quorum。
+- aggregate summary 明示 `"debt"`；它等于有界 `degraded` 条目数加 `"omitted"`。finalize
+  aggregate 另以 `"orphaned"`、`"orphan_hints"`、`"orphan_omitted"` 单列 absent/旧 token
+  的非破坏性提示；orphan 不投票、不计 debt，也不授权删除。journal 只接受合法 aggregate
+  summary，endpoint summary 永远不能作为 durable evidence 或再次参与 quorum。
 
 低层与聚合返回联合逐项冻结为：
 
@@ -75,15 +77,16 @@ endpoint wire observation 与 backend aggregate proof 是两个不可混用的�
   | {:error, {:published_proof_failed, class, aggregate_summary}}
 
 @type endpoint_finalize_result ::
-  {:ok, {:finalized | :cleanup_pending | :superseded, endpoint_finalize_summary}}
-  | {:error, {:published_proof_failed, class, endpoint_summary}}
+  {:ok, {:finalized | :cleanup_pending | :orphan | :superseded,
+         endpoint_finalize_summary}}
+  | {:error, {:published_proof_failed, class, endpoint_finalize_summary}}
 
 @type aggregate_finalize_result ::
   {:ok, {:finalized | :cleanup_pending | :superseded, aggregate_finalize_summary}}
-  | {:error, {:published_proof_failed, class, aggregate_summary}}
+  | {:error, {:published_proof_failed, class, aggregate_finalize_summary}}
 ```
 
-endpoint proof summary 的合法语义只有三种：
+endpoint proof summary 固定带 `scope="endpoint", mode="proof"`，合法语义只有三种：
 
 | tuple outcome | endpoint `status` | `owned` | `class` |
 | --- | --- | --- | --- |
@@ -91,26 +94,55 @@ endpoint proof summary 的合法语义只有三种：
 | `:superseded` | `"superseded"` | `false` | `"fenced"` |
 | error | `"failed"` | exact requested token 已确认时才为 `true` | 必须与 outer class 相同 |
 
-outcome/status、outer/detail class 或 identity 任一不一致即结构漂移。endpoint finalize summary
-额外带 boolean `proof_passed` 与 `finalized`：
-`:finalized` 必须 `status="finalized", owned=true, proof_passed=true, finalized=true`
-且 class 不存在；`:cleanup_pending` 必须
-`status="cleanup_pending", owned=true, proof_passed=true, finalized=false`
-且 class 不存在；`:superseded` 必须
-`status="superseded", owned=false, proof_passed=false, finalized=false`。
+outcome/status、outer/detail class、mode 或 identity 任一不一致即结构漂移。endpoint finalize
+summary 固定带 `scope="endpoint", mode="finalize"`，并额外带 boolean `proof_passed` 与
+`finalized`：
+
+| tuple outcome | `status` | `owned` | `proof_passed` | `finalized` | class/reason |
+| --- | --- | ---: | ---: | ---: | --- |
+| `:finalized` | `"finalized"` | `true` | `true` | `true` | 均不存在 |
+| `:cleanup_pending` | `"cleanup_pending"` | `true` | `true` | `false` | 均不存在 |
+| `:orphan` | `"orphan"` | `false` | `false` | `false` | `orphan_reason="epoch_absent"|"older_token"` |
+| `:superseded` | `"superseded"` | `false` | `false` | `false` | `class="fenced"` |
+| error | `"failed"` | exact requested token 已确认时才为 `true` | `false` | `false` | outer/detail class 必须一致 |
+
+`:orphan` 只能由 finalize 阶段对 clean epoch read 的 absent，或 target 完全一致且 token
+严格更旧的 endpoint 显式构造；禁止从任意 `owned=false` failure/code 推导 orphan。
 未通过 endpoint proof 的 claimed/缺失/分叉不能伪装 cleanup-only debt，仍以
 endpoint proof error 进入 backend 聚合，由健康 quorum 决定全局是 proof failure 还是
 `cleanup_pending`。
 
-aggregate proof summary 由 classifier 唯一生成：`required > 0`，所有计数非负，
+aggregate proof summary 固定带 `scope="aggregate", mode="proof"`，由 classifier 唯一生成：
+`required > 0`，所有计数非负，
 `debt == length(degraded) + omitted`，`unavailable <= debt`，
 `verified <= observed_owned <= verified + debt`。`verified` 状态要求
 `verified >= required && debt == 0`；`degraded` 要求
 `verified >= required && debt > 0`；`failed` 要求 `verified < required` 且 tuple/summary
-class 一致。aggregate finalize summary 另带 `finalized`，且
-`0 <= finalized <= verified`；终态要求
+class 一致。`corrupt`/`mismatch` failure 还必须保留至少一条同 class、`owned=true`
+的决定性 endpoint witness；只改 outer class 的 forged summary 一律拒绝。
+
+aggregate finalize summary 固定带 `scope="aggregate", mode="finalize"`，另带
+`finalized`、`orphaned`、`orphan_hints`、`orphan_omitted`，并满足：
+
+```text
+debt == length(degraded) + omitted
+orphaned == length(orphan_hints) + orphan_omitted
+finalized <= verified <= observed_owned <= verified + debt
+unavailable <= debt
+length(degraded) + length(orphan_hints) <= 32
+```
+
+`degraded` 与 `orphan_hints` 的 identity 必须各自唯一且互斥。终态要求
 `verified >= required && finalized >= required && debt == 0 && unavailable == 0`；
-否则 proof quorum 已过但仍有清理债务才是 `cleanup_pending`。
+否则 proof quorum 已过但仍有清理债务才是 `cleanup_pending`。`orphaned > 0` 不阻塞已有
+真实 finalized quorum；orphan-only 且未达 quorum 仍是全局 unavailable failure。
+
+classifier 必须在计票前完整预检 expected identity、响应 identity、scope/mode、tuple/status/
+class 与 aggregate 重入。任一结构漂移均生成规范化 `placement_drift` failure，固定
+`verified=0, observed_owned=0, unavailable=0`；finalize 另固定
+`finalized=0, orphaned=0`，只保留一条有界脱敏 witness。只有输入集结构合法后才进入
+successor 与 D5 的语义裁决。identity 只允许 `"local"` 或 `"ordinal:N"`；整数 ordinal
+必须先限制十进制表示，使最终 identity 总长不超过 128 bytes。
 
 `finalize_if_current/2` 的新唯一返回契约是：
 
@@ -208,7 +240,10 @@ endpoint 内按固定顺序：
 
 `finalize_mutation` 在同一个 `EpochStore` 串行闭包内复用步骤 1–8。proof 成功后才写 committed epoch，再删除 backup。committed 幂等重放也必须先复验，不能直接删 backup。
 
-Transport 只新增有界 proof RPC，不回传对象/shard 内容。Distributed 只使用 `ctx.placement_snapshot` 的历史 set/topology；禁止回退当前 router。
+Transport 只新增有界 proof RPC，不回传对象/shard 内容。Distributed 只使用
+`ctx.placement_snapshot` 的历史 set/topology；禁止回退当前 router。invalid request/root 等
+外围失败必须返回结构化 endpoint failure 而不是抛异常；shard request 即使尚未打开 root 也
+保留请求中的冻结 ordinal。ERPC 的远端调用与 local `apply` 必须位于同一异常/exit 归一化边界。
 
 target 与路径身份另有硬约束：
 
@@ -225,8 +260,11 @@ target 与路径身份另有硬约束：
   分别通过 wrapper 委托。静态 reparse detector 只用 Rust std，不新增 dependency，也不能
   污染 `Maxio.Native.ErasureCoding` 的公开职责。
 - sidecar 采用 opened-handle 复验：pre-lstat → raw open → fstat/path-lstat identity 对照 →
-  limit+1 read → fstat/path-lstat/ancestor 二次对照。任一身份或大小漂移 fail closed；part 仍只做
-  stat/shape proof，不读取对象字节。
+  limit+1 read → fstat/path-lstat/ancestor 二次对照。sidecar handle/path 比较稳定 identity、
+  size 与时间信息；祖先目录只比较 type/device/inode/可用 file-id 等稳定 identity，并在前后
+  重复 type/reparse 检查，禁止比较 size/mtime/ctime/links/mode，以免同 bucket 其他 key 的
+  正常并发目录变化被误判为 corrupt。任一相关身份或 sidecar 大小漂移 fail closed；part
+  仍只做 stat/shape proof，不读取对象字节。
 - 标准 OTP 没有跨平台 `openat2/O_NOFOLLOW` 或 Windows reparse-point handle 能力。本批保证受控
   数据盘、Maxio writer 经 EpochStore 串行下的静态 link/junction、常见换链与布局损坏检测；
   native scan 与 opened-handle 复验之间仍不能消除 hostile concurrent junction swap/ABA。
@@ -255,18 +293,17 @@ degraded success 不能把 journal 直接标成 `finalized`：尚未证明的 en
 
 epoch absent、旧 token 或从未参与的 endpoint 不构成 destructive 授权，也不阻塞 journal 终态；若它持有 manifest-only/backup-only 残留，本批只记录有界 orphan hint，交后续 mutation-backup orphan GC。禁止为了“清干净”而在 absent/旧 token 上删除 backup。same-token `claimed` 则不是 orphan：它由 exact-final repair 收敛；在 heal 前一直保持 `finalize_pending`。精确 participant 持久化不塞入本批，也不与 P1-CLOSEOUT-C 的 placement durability 混做。
 
-全局 proof 分类顺序固定，禁止因遍历/返回顺序不同而把同一证据随机映射成 500 或 503：
+全局 proof 分类顺序固定，禁止因遍历/返回顺序不同而把同一证据随机映射成 500 或 503。
+先对完整输入集做上述结构预检；结构合法后再执行：
 
 1. 合法 endpoint 观察到 successor：全局 `:superseded`，立即短路/重新裁决，绝不能把
    successor 当少数 degraded failure；successor 不算 same-token owned。
-2. expected identity 重复/错配、aggregate 重入或 frozen placement 结构漂移：
-   `:placement_drift`。
-3. `verified >= epoch_quorum`：proof 成功；有失败 endpoint 时是 degraded success。
-4. `verified + unavailable >= epoch_quorum`：当前证据仍可能在端点恢复后达到 quorum，分类
+2. `verified >= epoch_quorum`：proof 成功；有失败 endpoint 时是 degraded success。
+3. `verified + unavailable >= epoch_quorum`：当前证据仍可能在端点恢复后达到 quorum，分类
    `:unavailable`。
-5. 否则若存在 owned-token `:corrupt`，分类 `:corrupt`；再考虑 owned-token
+4. 否则若存在 owned-token `:corrupt`，分类 `:corrupt`；再考虑 owned-token
    `:mismatch`。epoch absent/旧 token 的 non-owned corrupt 不参与确定性 integrity 选择。
-6. 其余不足 quorum：分类 `:unavailable`。
+5. 其余不足 quorum：分类 `:unavailable`。
 
 因此下表中的 mismatch/corrupt 指“按上述全局顺序裁决后的整体 proof failure”，不是健康 quorum 之外的少数坏副本。
 
@@ -274,6 +311,7 @@ finalize 聚合必须区分：
 
 - `proof_passed`：endpoint proof 已通过，但 epoch 写入或 backup 删除失败；
 - `finalized`：proof 与清理均成功；
+- `orphan`：仅 clean absent/older-token 的 finalize-only 非破坏性提示，不投票、不计 debt；
 - `proof_failed`：unavailable/mismatch/corrupt/fenced。
 
 若 proof-passed endpoint 不足 quorum，整体是 proof failure；若 proof-passed 达 quorum但 finalized 不足 quorum，或仍有 unresolved/owned endpoint debt，整体是 `cleanup_pending`。只有达到上面的可证明终态集合才返回 `finalized`。这样不会把证据不足伪装成“只是删 backup 失败”，也不会越过 absent-token destructive 防线。
@@ -303,20 +341,45 @@ successor 的阶段语义固定：
 | --- | --- |
 | timeout、节点失联、`:eacces`、`:eperm`、`:eio`、`:enodev`、`:estale`、`:etimedout`、`:ebusy` 等暂时失败 | `:unavailable` |
 | raw fingerprint、core etag/size、part/shard size 与 expected 不同 | `:mismatch` |
-| meta/part 缺失、JSON/shape 非法、symlink/junction/非 regular、`:enotdir`、`:eloop`、sidecar 超 16 MiB、invalid internal request、epoch absent/旧 token | `:corrupt` |
+| meta/part 缺失、JSON/shape 非法、symlink/junction/非 regular、`:enotdir`、`:eloop`、sidecar 超 16 MiB、invalid internal request、initial proof 的 epoch absent/旧 token | `:corrupt` |
 | greater token / successor | `:fenced`，折叠为全局 superseded |
 | frozen placement 非法或 topology hash 漂移 | `:placement_drift` |
 
-所有 evidence 先经 `PublishedProof` 限界/脱敏。journal 固定保存：
+Rust raw errno 必须按 `target_os` 分表，或只使用稳定 `ErrorKind` 加 OS-specific raw
+whitelist；未知/瞬态 errno 必须映射 unavailable，不能因不同 Unix 数值复用而误报 corrupt。
+
+所有 evidence 先经 `PublishedProof` 限界/脱敏。API 必须 phase-aware：
+
+```elixir
+journal_evidence(target_phase, published_proof_or_nil, last_failure_or_nil)
+merge_failure(target_phase, evidence, last_failure)
+```
+
+journal 固定只保存：
 
 ```elixir
 %{
-  "published_proof" => proof_summary,
+  "published_proof" => aggregate_proof_success_or_nil,
   "last_failure" => failure_summary_or_nil
 }
 ```
 
-`degraded` 最多 32 条，额外数量放 `"omitted"`；整体必须通过 Journal 既有 JSON-safe/64 KiB gate。后续 `mark_error`/quarantine 必须 merge 更新 `"last_failure"`，保留初始 `"published_proof"`，不得整图覆盖。
+`published_proof` 只允许 aggregate proof 的 verified/degraded success。`last_failure` 只允许
+aggregate proof 的 failed/superseded，或 aggregate finalize 的
+failed/cleanup_pending/superseded；endpoint summary、proof success 与 finalize finalized 均拒绝。
+
+- `published_proof=nil` 时，`last_failure` 必须是 proof-mode failed/superseded；初始 proof
+  失败要把 `claimed → rollback_pending` 与该 evidence 原子持久化，fingerprint 保持 nil。
+- `published`/`metadata_committed`/`finalize_pending`/`finalized` 必须已有成功 published proof。
+- `rollback_pending`/`rolled_back`/`quarantined` 可在 proof 前或后产生；nil proof 时仍必须满足
+  上述初始 proof failure 形态。
+- finalize-mode last failure 必须同时存在成功 published proof，且只允许在 metadata/finalize
+  后续 phase。`nil/nil` 不是合法 proof evidence。
+
+有界 endpoint detail 合计最多 32 条，其余放对应 omitted；PublishedProof wrapper 的编码结果
+必须不超过 60 KiB，并继续通过 Journal 既有 JSON-safe/64 KiB gate。后续
+`mark_error`/quarantine 必须用 phase-aware merge 更新 `"last_failure"`，保留初始
+`"published_proof"`，不得整图覆盖。
 
 ### D7 — Recovery 复用同一 callback
 
