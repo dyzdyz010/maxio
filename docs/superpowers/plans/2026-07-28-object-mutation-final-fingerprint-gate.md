@@ -18,7 +18,14 @@
 - `Commit` and `Recovery` know only the backend proof contract; layout/placement knowledge stays behind `Maxio.Storage.Backend`.
 - A journal may become `published` only after the initial proof succeeds.
 - Exact comparison is `request/journal fingerprint == epoch fingerprint == ObjectEpoch.fingerprint(top-level core etag, top-level core size, raw final meta.json bytes)`.
+- Endpoint wire observations and backend aggregate summaries are separate domains. Every summary
+  carries `"scope"`, every endpoint summary carries a stable `"endpoint"`, and quorum aggregation
+  accepts unique `{expected_identity, endpoint_result}` pairs only. No wire count is trusted.
 - Never use a `versions` entry for durable core ETag/size. Zero-byte objects still require zero-length `part.0`.
+- The final sidecar must nevertheless be a valid ordinary-object `maxio/2` envelope, including
+  top-level SHA256 and exactly one object entry for the target version. Duplicate same-version
+  entries, including object/delete-marker conflicts, are corrupt. SSE/multipart-visible
+  ETag/size may legitimately differ from the durable core.
 - EC/Distributed proof success requires verified endpoints `>= epoch_quorum`; minority failure is bounded degraded evidence and keeps its backup.
 - Distributed proof/finalize resolves endpoints only from the frozen journal placement snapshot.
 - Successor/fence short-circuits before reading or touching final/backup; successor observed during endpoint proof triggers global re-adjudication, never minority degradation.
@@ -37,6 +44,12 @@ finalize_if_current(ctx, opts) ::
 
 - A `finalized` journal requires all currently observable same-token participants clean, no unresolved endpoint, and finalized quorum. A same-token `claimed` endpoint is finalized only by exact-final claimed repair after metadata commit; absent/old-token manifest-only debris is never destructive authority and gets only an orphan hint for later GC.
 - Raw sidecars are `lstat`-checked; symlinks/non-regular files are rejected; reads are hard-limited to 16 MiB and never read object/shard contents.
+- `request.target`, decoded epoch target, and canonical `final_rel` are one identity. Check the
+  absolute drive root and every final-directory ancestor before/after proof; reject links,
+  junctions/reparse points and non-directory components. On Windows, use the native Rust-std
+  reparse detector rather than trusting OTP `lstat`; a missing native detector fails closed.
+  Read the sidecar through an opened handle with fstat/path-lstat identity rechecks and a
+  `limit + 1` read.
 - Journal proof evidence uses `%{"published_proof" => summary, "last_failure" => summary_or_nil}`, at most 32 degraded entries plus an omitted count, string keys, and the existing 64 KiB JSON gate. Later error/quarantine updates merge rather than erase the initial proof.
 - S3 XML uses stable public messages; never expose `inspect(reason)`, drive paths, backup paths, body, credentials, or SSE envelope.
 - No migration, Phase2A caller migration, delete/meta-only work, placement-durability work, participant bitmap, orphan GC implementation, or scrub/heal expansion.
@@ -64,11 +77,18 @@ $env:ERL_FLAGS="+S 4:4 +SDcpu 2 +SDio 2 -kernel standard_io_encoding unicode"
 **Files:**
 
 - Create: `lib/maxio/storage/published_proof.ex`
+- Modify: `lib/maxio/sidecar.ex`
+- Create: `lib/maxio/native.ex`
+- Create: `lib/maxio/native/path_safety.ex`
+- Modify: `lib/maxio/native/erasure_coding.ex`
+- Modify: `native/maxio_native/src/lib.rs`
 - Modify: `lib/maxio/storage/epoch_store.ex`
 - Modify: `lib/maxio/cluster/shard_server.ex`
 - Modify: `lib/maxio/cluster/transport.ex`
 - Modify: `test/support/transport_in_process.ex`
 - Create: `test/maxio/storage/epoch_store_published_proof_test.exs`
+- Modify: `test/maxio/sidecar_test.exs`
+- Create: `test/maxio/native/path_safety_test.exs`
 - Modify: `test/maxio/cluster/shard_server_mutation_test.exs`
 - Modify: `test/maxio/cluster/transport_in_process_test.exs`
 
@@ -87,6 +107,14 @@ Cover:
 - standalone proof does not count `claimed`; finalize can repair same-token claimed only after actual final exactly matches expected;
 - successor returns before a final probe;
 - invalid `final_rel`, fingerprint, value type and request shape fail closed.
+- forged endpoint counts, endpoint/aggregate scope confusion, duplicate or mismatched identities,
+  outcome/status/class inconsistencies, and non-owned integrity observations;
+- request/epoch target mismatch and a lexically-safe cross-key/version `final_rel`;
+- real leaf/ancestor symlinks plus deterministic file-op races between lstat/open/read;
+- Windows real mount-point junction/name-surrogate rejection, normal-directory acceptance and
+  native-not-loaded fail-closed behavior;
+- exact 16 MiB acceptance and lstat-then-grow-to-limit+1 rejection;
+- self-consistent fingerprint over a malformed/non-`maxio/2` sidecar.
 
 Use temporary drive roots and public EpochStore/ShardServer APIs. RED must be caused by missing `verify_mutation`, not a test typo.
 
@@ -94,40 +122,69 @@ Use temporary drive roots and public EpochStore/ShardServer APIs. RED must be ca
 
 This single module owns:
 
-- proof/finalize return types and constructors;
+- distinct endpoint-proof, aggregate-proof, endpoint-finalize and aggregate-finalize return types
+  and constructors;
 - proof-class predicates;
 - global quorum classification helpers;
 - JSON-safe evidence and merge helpers;
 - a maximum of 32 endpoint summaries plus `"omitted"`;
-- endpoint identities as ordinal/node labels only, never absolute drive/backup paths;
+- endpoint identities only as `"local"` / frozen `"ordinal:N"` labels, never node-only or
+  absolute drive/backup paths;
 - `%{"published_proof" => ..., "last_failure" => ...}` journal evidence.
 
 Do not nest modules. Validate all public constructors so invalid evidence cannot bypass Journal’s 64 KiB gate.
+Endpoint summaries carry no aggregate counters and never accept `:degraded`; the local classifier
+derives each 0/1 vote from the validated tuple/status/owned/class relationship. Aggregate
+classification uses unique expected identities and rejects response identity drift before
+counting. Successor has highest valid-observation priority; structural identity/placement drift
+is next; only same-token owned corrupt/mismatch participates in deterministic integrity selection.
+Use `classify(required, [{expected_identity, endpoint_result}])`; aggregate results are not valid
+inputs. Add `endpoint_finalized/2`, `endpoint_cleanup_pending/2` and
+`classify_finalize(required, [{expected_identity, endpoint_finalize_result}])` with the frozen
+finalize result types now, while leaving disk-mutating finalize wiring to Task 2.
+Reject forged endpoint-finalized results unless `status=finalized`, `owned=true`,
+`proof_passed=true`, `finalized=true`, and class is absent; aggregate `finalized` must never
+exceed `verified`.
 
 ### Step 3: Implement standalone `EpochStore.verify_mutation/3`
 
 Validate the D4 request. In the existing serialized closure:
 
 1. read epoch;
-2. compare token and short-circuit successor;
-3. validate phase/value type/request-vs-epoch fingerprint;
-4. `lstat` and bounded-read exact raw sidecar;
-5. decode top-level durable core and reconstruct actual fingerprint;
-6. compare request/epoch/actual;
-7. `lstat` the exact FS/shard part and validate its size.
+2. compare the decoded epoch target with the canonical request target; target mismatch is corrupt
+   and can never impersonate a successor;
+3. compare token and short-circuit a real successor;
+4. validate phase/value type/request-vs-epoch fingerprint;
+5. prove absolute-root/canonical-final containment and snapshot every ancestor without following
+   a symlink or junction; scan every configured-root prefix as well as every canonical-final
+   prefix. On Windows call the DirtyIo Rust-std reparse detector and reject every reparse point;
+6. pre-lstat, raw-open, fstat/path-lstat identity-check, bounded-read exact raw sidecar, then
+   repeat handle/path/ancestor checks;
+7. decode the ordinary-object `maxio/2` envelope through one non-raising `Maxio.Sidecar`
+   function and reconstruct the actual fingerprint from its top-level durable core;
+8. compare request/epoch/actual;
+9. `lstat` the exact FS/shard part and validate its size.
 
 Factor one private proof function for Task 2’s finalize reuse. Task 1 does not change the existing finalize request/return contract yet, so intermediate callers remain coherent.
+Expose low-level file operations behind a narrow deterministic test seam. Move the existing
+Rustler registration to a neutral `Maxio.Native` loader; ErasureCoding and `PathSafety` wrappers
+delegate to it. The static detector adds no Rust dependency and its absence is unavailable,
+never safe. Standard APIs still lack cross-platform `openat2/O_NOFOLLOW` and held Windows
+reparse handles, so document the controlled-data-drive threat boundary; do not claim protection
+against a hostile local ABA writer.
 
 Classify low-level errors exactly as design D6; no raw exception/path enters evidence.
 
 ### Step 4: Expose the primitive
 
 Add `ShardServer.verify_mutation/3`, the `Transport` callback/facade, `Erpc` implementation, and InProcess implementation. RPC responses contain bounded pure data only.
+Transport success and outage evidence use the same frozen `"ordinal:N"` identity; never use
+node-only or drive-root labels.
 
 ### Step 5: Focused verification and commit
 
 ```powershell
-mix test test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/cluster/shard_server_mutation_test.exs test/maxio/cluster/transport_in_process_test.exs
+mix test test/maxio/sidecar_test.exs test/maxio/native/path_safety_test.exs test/maxio/native/erasure_coding_test.exs test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/cluster/shard_server_mutation_test.exs test/maxio/cluster/transport_in_process_test.exs
 mix compile --warnings-as-errors
 mix format --check-formatted
 git diff --check
