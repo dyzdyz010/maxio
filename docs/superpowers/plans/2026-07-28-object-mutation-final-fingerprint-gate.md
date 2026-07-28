@@ -43,6 +43,13 @@ finalize_if_current(ctx, opts) ::
 - No `Process.sleep/1` in tests. Use `start_supervised!/1` for processes.
 - Use `apply_patch` for edits. Preserve unrelated work.
 - During tasks run focused tests/compile/format only. Do not run `mix precommit`; the final independent verifier runs it once.
+- Tasks 2 and 3 are one coherent implementation/review batch. The same implementation lane
+  completes both in sequence; the Task 2 commit is only a non-release internal checkpoint.
+  Do not claim that checkpoint is semantically runnable or full-suite green, and do not add
+  legacy tuple/`nil` fingerprint compatibility shims to make it appear standalone.
+- The independent code-review boundary for that batch is the reviewed Task 1 commit through
+  the completed Task 3 commit. Its focused gate includes endpoint, all backend mutation,
+  Commit/Recovery, PutObject e2e/CLI, compile, format, and diff checks together.
 - Every Mix command on Windows must clear `PGPORT` and set low-scheduler Unicode `ERL_FLAGS`:
 
 ```powershell
@@ -196,7 +203,7 @@ During protocol publish derive `%{ctx | published_fingerprint: fingerprint}` and
 
 Control adapts all three successful finalize outcomes to callback `:ok`; proof errors remain callback errors.
 
-### Step 5: Focused verification and commit
+### Step 5: Internal focused checkpoint and commit
 
 ```powershell
 mix test test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/storage/fs_mutation_test.exs test/maxio/storage/erasure_coded_mutation_test.exs test/maxio/storage/distributed_mutation_test.exs
@@ -207,9 +214,11 @@ git diff --check
 
 Commit subject: `feat(storage): gate backend publish with final proof`
 
----
+This commit is not a release or independent-review boundary. Continue directly to Task 3
+in the same implementation lane. The old Commit/Recovery semantics are intentionally removed
+only when the coherent batch is complete; do not run or cite a full-suite verdict here.
 
-## Task 3: Enforce proof ordering, Recovery and S3 semantics
+## Task 3: Complete the coherent batch with proof ordering, Recovery and S3 semantics
 
 **Files:**
 
@@ -288,6 +297,8 @@ At real Bandit level cover ordinary signed PUT and existing self-signed aws-chun
 ### Step 5: Focused verification and commit
 
 ```powershell
+mix test test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/cluster/shard_server_mutation_test.exs test/maxio/cluster/transport_in_process_test.exs
+mix test test/maxio/storage/fs_mutation_test.exs test/maxio/storage/erasure_coded_mutation_test.exs test/maxio/storage/distributed_mutation_test.exs
 mix test test/maxio/object_mutation/commit_test.exs test/maxio/object_mutation/recovery_test.exs
 mix test test/maxio/s3/put_object_mutation_e2e_test.exs test/mix/tasks/maxio_object_mutations_test.exs
 mix compile --warnings-as-errors
@@ -297,11 +308,20 @@ git diff --check
 
 Commit subject: `feat(object-mutation): require final proof before commit`
 
+Generate one combined review package from the independently approved Task 1 commit through
+this Task 3 commit. The reviewer must inspect the Task 2 and Task 3 diff as one unit, with
+special attention to all backend behaviour implementations, fresh published context,
+error propagation, cleanup debt, Recovery convergence, frozen placement, and evidence
+redaction.
+
 ---
 
 ## Task 4: Close documentation and verification evidence
 
-**Entry gate:** The controller first completes the whole-code independent review and the one allowed full `mix precommit` verification for Tasks 1–3. Start this documentation task only after those reports and exact command/count/exit evidence exist.
+**Entry gate:** The controller first completes the Task 1 review, the combined Task 2+3
+independent review, the whole-code independent review, and the one allowed full
+`mix precommit` verification for Tasks 1–3. Start this documentation task only after those
+reports and exact command/count/exit evidence exist.
 
 **Files:**
 
