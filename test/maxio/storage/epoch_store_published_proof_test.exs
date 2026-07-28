@@ -1327,6 +1327,235 @@ defmodule Maxio.Storage.EpochStorePublishedProofTest do
     assert_endpoint_verified(EpochStore.verify_mutation(dir, site.request, lstat: lstat))
   end
 
+  test "PublishedProof binds the finalize gap to typed cleanup evidence in both directions" do
+    published = published_proof!()
+    finalized = PublishedProof.endpoint_finalized("ordinal:0", %{phase: "committed"})
+
+    non_owned_mismatch =
+      PublishedProof.endpoint_finalize_failed(:mismatch, "ordinal:1", %{owned: false})
+
+    cleanup = PublishedProof.endpoint_cleanup_pending("ordinal:1", %{phase: "committed"})
+
+    {:ok, {:cleanup_pending, mismatch_base}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", finalized},
+        {"ordinal:1", non_owned_mismatch}
+      ])
+
+    {:ok, {:cleanup_pending, cleanup_base}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", finalized},
+        {"ordinal:1", cleanup}
+      ])
+
+    # classifier 基准本身必须仍可持久化，确保下面的拒绝来自伪造而非 fixture 失效。
+    assert %{"verified" => 1, "finalized" => 1, "debt" => 1, "omitted" => 0} = mismatch_base
+    assert %{"verified" => 2, "finalized" => 1, "debt" => 1, "omitted" => 0} = cleanup_base
+
+    for base <- [mismatch_base, cleanup_base] do
+      assert {:ok, %{"last_failure" => ^base}} =
+               PublishedProof.journal_evidence("finalize_pending", published, base)
+    end
+
+    # 上界：proof-passed/未 finalize 的 endpoint 只能由可见 cleanup detail 或 omitted 名额承担，
+    # 不能由无关的 proof-failure debt 顶替。
+    gap_without_cleanup = %{mismatch_base | "finalized" => 0}
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, gap_without_cleanup)
+
+    # 下界：可见 cleanup detail 不能被计数改写成"不存在的 gap"。
+    cleanup_outside_gap = %{cleanup_base | "finalized" => 2}
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, cleanup_outside_gap)
+  end
+
+  test "PublishedProof rejects an omitted slot claimed as both hidden cleanup and hidden unavailable" do
+    published = published_proof!()
+    finalized = PublishedProof.endpoint_finalized("ordinal:0", %{phase: "committed"})
+
+    non_owned_mismatch =
+      PublishedProof.endpoint_finalize_failed(:mismatch, "ordinal:1", %{owned: false})
+
+    {:ok, {:cleanup_pending, base}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", finalized},
+        {"ordinal:1", non_owned_mismatch}
+      ])
+
+    assert {:ok, _evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, base)
+
+    # hidden_cleanup = 1、hidden_unavailable = 1，二者互斥却只有一个 omitted 名额；
+    # 逐项标量关系全部成立，唯有联合可实现性不成立。
+    joint =
+      Map.merge(base, %{
+        "finalized" => 0,
+        "unavailable" => 1,
+        "omitted" => 1,
+        "debt" => 2
+      })
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, joint)
+  end
+
+  test "PublishedProof rejects fallback unavailable whose hidden owned failures are not unavailable" do
+    published = published_proof!()
+
+    {:error, {:published_proof_failed, :unavailable, proof_fallback}} =
+      PublishedProof.classify(3, [
+        {"ordinal:1", PublishedProof.failed(:unavailable, 1, %{owned: false})}
+      ])
+
+    {:error, {:published_proof_failed, :unavailable, finalize_fallback}} =
+      PublishedProof.classify_finalize(3, [
+        {"ordinal:1",
+         PublishedProof.endpoint_finalize_failed(:unavailable, "ordinal:1", %{owned: false})}
+      ])
+
+    # fallback unavailable 分支：verified + unavailable < required。
+    assert %{"verified" => 0, "unavailable" => 1, "required" => 3} = proof_fallback
+    assert %{"verified" => 0, "unavailable" => 1, "required" => 3} = finalize_fallback
+
+    assert {:ok, _evidence} =
+             PublishedProof.journal_evidence("rollback_pending", nil, proof_fallback)
+
+    assert {:ok, _evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, finalize_fallback)
+
+    # hidden_owned_failure = 1 > hidden_unavailable = 0：至少一个隐藏 owned failure 不是
+    # unavailable，classifier 只会选出更高优先级的 corrupt/mismatch，绝不会产出该 outer class。
+    forged_proof =
+      Map.merge(proof_fallback, %{"observed_owned" => 1, "omitted" => 1, "debt" => 2})
+
+    forged_finalize =
+      Map.merge(finalize_fallback, %{"observed_owned" => 1, "omitted" => 1, "debt" => 2})
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("rollback_pending", nil, forged_proof)
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, forged_finalize)
+  end
+
+  test "PublishedProof validates the source aggregate before any wrapper normalization" do
+    maxed = maxed_published_proof!()
+    assert length(maxed["degraded"]) == 32
+    assert maxed["omitted"] == 0
+    assert maxed["debt"] == 32
+
+    {:error, {:published_proof_failed, :placement_drift, drift_detail}} =
+      PublishedProof.failed(:placement_drift, 32, %{owned: false})
+
+    {:ok, {:superseded, successor_detail}} = PublishedProof.superseded("ordinal:32")
+
+    # 优先级短路 detail 落在被裁掉的第 32 槽：裁剪绝不能把它洗成匿名 omitted debt。
+    for tail_detail <- [drift_detail, successor_detail] do
+      forged = Map.put(maxed, "degraded", List.replace_at(maxed["degraded"], 31, tail_detail))
+
+      assert {:error, :invalid_proof_evidence} =
+               PublishedProof.journal_evidence("published", forged, nil)
+    end
+
+    # 负 omitted 只能被拒绝，不能被裁剪算术"修好"成 0。
+    negative_omitted = Map.merge(maxed, %{"omitted" => -1, "debt" => 31})
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("published", negative_omitted, nil)
+
+    # 尾部重复 identity 必须在裁剪前就被拒绝。
+    duplicate_tail =
+      Map.put(
+        maxed,
+        "degraded",
+        List.replace_at(maxed["degraded"], 31, Enum.at(maxed["degraded"], 0))
+      )
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("published", duplicate_tail, nil)
+
+    # 已持久化 31 条 proof 只剩一个名额时，cleanup summary 里的 successor 不能靠"只留第一条
+    # debt detail"被洗掉。
+    {:ok, persisted} = PublishedProof.journal_evidence("finalize_pending", maxed, nil)
+    assert length(persisted["published_proof"]["degraded"]) == 31
+
+    finalized = PublishedProof.endpoint_finalized("ordinal:0", %{phase: "committed"})
+    cleanup = PublishedProof.endpoint_cleanup_pending("ordinal:1", %{phase: "committed"})
+
+    {:ok, {:superseded, finalize_successor}} =
+      PublishedProof.endpoint_finalize_superseded("ordinal:2")
+
+    {:ok, {:cleanup_pending, cleanup_base}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", finalized},
+        {"ordinal:1", cleanup}
+      ])
+
+    one_slot_cleanup =
+      Map.merge(cleanup_base, %{
+        "degraded" => cleanup_base["degraded"] ++ [finalize_successor],
+        "debt" => 2
+      })
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence(
+               "finalize_pending",
+               persisted["published_proof"],
+               one_slot_cleanup
+             )
+  end
+
+  test "PublishedProof merge rejects a forged 32-detail already-persisted proof" do
+    maxed = maxed_published_proof!()
+    finalized = PublishedProof.endpoint_finalized("ordinal:0", %{phase: "committed"})
+    cleanup = PublishedProof.endpoint_cleanup_pending("ordinal:1", %{phase: "committed"})
+
+    {:ok, {:cleanup_pending, cleanup_base}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", finalized},
+        {"ordinal:1", cleanup}
+      ])
+
+    # 合法的已持久化 wrapper（31 条 proof）仍必须可 merge，且 proof 逐字节不变。
+    {:ok, persisted} = PublishedProof.journal_evidence("finalize_pending", maxed, nil)
+    persisted_proof = persisted["published_proof"]
+
+    assert {:ok, %{"published_proof" => merged_proof}} =
+             PublishedProof.merge_failure("finalize_pending", persisted, cleanup_base)
+
+    assert merged_proof == persisted_proof
+    assert Jason.encode!(merged_proof) == Jason.encode!(persisted_proof)
+
+    # 伪造的 32 条"已持久化" proof 必须被 merge 拒绝，而不是被静默裁成 31 条。
+    forged = %{"published_proof" => maxed, "last_failure" => nil}
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.merge_failure("finalize_pending", forged, cleanup_base)
+  end
+
+  defp published_proof!() do
+    {:ok, {:verified, published}} =
+      PublishedProof.classify(1, [{"local", PublishedProof.verified("local", %{})}])
+
+    published
+  end
+
+  defp maxed_published_proof!() do
+    failures =
+      for index <- 1..32 do
+        {"ordinal:#{index}", PublishedProof.failed(:mismatch, index, %{owned: false})}
+      end
+
+    {:ok, {:degraded, maxed}} =
+      PublishedProof.classify(1, [
+        {"local", PublishedProof.verified("local", %{})} | failures
+      ])
+
+    maxed
+  end
+
   defp published_site!(dir, key, part, opts \\ []) do
     target = target(key)
     final_rel = final_rel(key)

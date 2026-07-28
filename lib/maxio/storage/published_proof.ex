@@ -242,26 +242,29 @@ defmodule Maxio.Storage.PublishedProof do
   def classify_finalize(required, results),
     do: structural_failure(safe_required(required), :finalize, first_expected_identity(results))
 
-  @doc "构造 phase-aware journal evidence，并执行 sum type/JSON-safe/大小门。"
+  @doc """
+  构造 phase-aware journal evidence。两阶段事务：先按完整 aggregate sum type 校验**未经
+  任何改写的源 summary**（stage A），再规范化 wrapper 预算（stage B），最后对规范化结果
+  重跑同一套 durable 校验并执行 JSON-safe/大小门。omitted 计数永远不能替代决定性事实。
+  """
   @spec journal_evidence(String.t(), map() | nil, map() | nil) ::
           {:ok, map()} | {:error, :invalid_proof_evidence}
   def journal_evidence(target_phase, proof_summary, failure_summary) do
-    proof_summary = trim_published_proof(proof_summary)
-    failure_summary = trim_last_failure(failure_summary, wrapper_budget(proof_summary))
-
-    evidence = %{
-      "published_proof" => proof_summary,
-      "last_failure" => failure_summary
-    }
-
-    with true <- valid_journal_combination?(target_phase, proof_summary, failure_summary) do
-      validate_evidence(evidence)
+    with true <- valid_journal_combination?(target_phase, proof_summary, failure_summary),
+         {:ok, proof, failure} <- normalize_wrapper(proof_summary, failure_summary),
+         true <- valid_journal_combination?(target_phase, proof, failure),
+         true <- retained_allocation_valid?(proof, failure) do
+      validate_evidence(%{"published_proof" => proof, "last_failure" => failure})
     else
-      false -> {:error, :invalid_proof_evidence}
+      _invalid -> {:error, :invalid_proof_evidence}
     end
   end
 
-  @doc "保留初始 aggregate published proof，只按目标 phase 替换 last_failure。"
+  @doc """
+  保留初始 aggregate published proof，只按目标 phase 替换 last_failure。输入必须已经是
+  持久化形态（proof 至多 31 条 detail），因此这里绝不重新裁剪 proof：伪造的 32 条
+  "已持久化" proof 只能被拒绝，不能被静默改写成 31 条。
+  """
   @spec merge_failure(String.t(), map(), map() | nil) ::
           {:ok, map()} | {:error, :invalid_proof_evidence}
   def merge_failure(
@@ -270,7 +273,11 @@ defmodule Maxio.Storage.PublishedProof do
         failure_summary
       )
       when map_size(evidence) == 2 do
-    journal_evidence(target_phase, proof_summary, failure_summary)
+    if persisted_published_proof?(proof_summary) do
+      journal_evidence(target_phase, proof_summary, failure_summary)
+    else
+      {:error, :invalid_proof_evidence}
+    end
   end
 
   def merge_failure(_target_phase, _evidence, _failure),
@@ -823,9 +830,99 @@ defmodule Maxio.Storage.PublishedProof do
 
   defp valid_identity?(value), do: match?({:ok, _identity}, normalize_identity(value))
 
-  # 冻结的 wrapper 预算分配：published proof 先裁到 31 条（裁剪幂等，故 merge 时逐字节不变），
-  # 剩余名额按 last failure 的 degraded、再 orphan_hints 的既有确定顺序填充。decisive/debt
-  # witness 已由 classifier 置于 degraded 首位，因此始终随首名额保留。
+  # 冻结的 wrapper 预算分配（stage B，只作用于已通过 stage A 的源 summary）：published proof
+  # 先裁到 31 条（裁剪幂等，故 merge 时逐字节不变），剩余名额先显式按语义选出 last failure 的
+  # 强制 witness、再按既有稳定顺序填充 degraded 与 orphan_hints。
+  defp normalize_wrapper(proof_summary, failure_summary) do
+    proof = trim_published_proof(proof_summary)
+
+    case normalize_last_failure(failure_summary, wrapper_budget(proof)) do
+      {:ok, failure} -> {:ok, proof, failure}
+      :error -> :error
+    end
+  end
+
+  defp normalize_last_failure(nil, _budget), do: {:ok, nil}
+
+  defp normalize_last_failure(%{"degraded" => degraded} = summary, budget)
+       when is_list(degraded) do
+    case promote_mandatory_witness(summary) do
+      {:ok, promoted} -> {:ok, trim_last_failure(promoted, budget)}
+      :error -> :error
+    end
+  end
+
+  defp normalize_last_failure(summary, _budget), do: {:ok, summary}
+
+  # 强制 witness 由 status/class 语义选出，绝不只相信调用方给的列表位置。
+  defp promote_mandatory_witness(summary) do
+    case mandatory_witness_predicate(summary) do
+      nil ->
+        {:ok, summary}
+
+      predicate ->
+        degraded = summary["degraded"]
+
+        case Enum.find_index(degraded, predicate) do
+          nil ->
+            :error
+
+          index ->
+            {witness, rest} = List.pop_at(degraded, index)
+            {:ok, Map.put(summary, "degraded", [witness | rest])}
+        end
+    end
+  end
+
+  defp mandatory_witness_predicate(%{"status" => "failed", "class" => "placement_drift"}) do
+    &(&1["status"] == "failed" and &1["class"] == "placement_drift" and &1["owned"] == false)
+  end
+
+  defp mandatory_witness_predicate(%{"status" => "failed", "class" => class})
+       when class in ~w(corrupt mismatch) do
+    &(&1["status"] == "failed" and &1["class"] == class and &1["owned"] == true)
+  end
+
+  defp mandatory_witness_predicate(%{"status" => "superseded"}) do
+    &(&1["status"] == "superseded" and &1["owned"] == false and &1["class"] == "fenced")
+  end
+
+  # cleanup pending 必须留下一条 debt witness；gap 为正时优先留可见 cleanup detail。
+  defp mandatory_witness_predicate(%{"status" => "cleanup_pending"} = summary) do
+    if finalize_gap(summary) > 0 and visible_cleanup_count(summary) > 0,
+      do: &cleanup_detail?/1,
+      else: fn _detail -> true end
+  end
+
+  # fallback unavailable 之类没有强制 witness 的 status 绝不凭空发明 witness。
+  defp mandatory_witness_predicate(_summary), do: nil
+
+  defp retained_allocation_valid?(proof, failure) do
+    proof_details = detail_count(proof, "degraded")
+
+    failure_details =
+      detail_count(failure, "degraded") + detail_count(failure, "orphan_hints")
+
+    proof_details <= @max_published_details and
+      proof_details + failure_details <= @max_wrapper_details
+  end
+
+  defp detail_count(summary, key) when is_map(summary) do
+    case Map.get(summary, key) do
+      details when is_list(details) -> length(details)
+      _other -> 0
+    end
+  end
+
+  defp detail_count(_summary, _key), do: 0
+
+  defp persisted_published_proof?(nil), do: true
+
+  defp persisted_published_proof?(%{"degraded" => degraded}) when is_list(degraded),
+    do: length(degraded) <= @max_published_details
+
+  defp persisted_published_proof?(_summary), do: false
+
   defp trim_published_proof(summary),
     do: trim_details(summary, "degraded", "omitted", @max_published_details)
 
@@ -928,7 +1025,7 @@ defmodule Maxio.Storage.PublishedProof do
     expected_keys = keys_with_optional_class(@aggregate_proof_keys, class)
 
     aggregate_common_valid?(summary, expected_keys, :proof) and
-      aggregate_proof_status_valid?(summary)
+      conservation_valid?(summary, :proof) and aggregate_proof_status_valid?(summary)
   end
 
   defp valid_aggregate_finalize_summary?(summary) when is_map(summary) do
@@ -936,7 +1033,8 @@ defmodule Maxio.Storage.PublishedProof do
     expected_keys = keys_with_optional_class(@aggregate_finalize_keys, class)
 
     aggregate_common_valid?(summary, expected_keys, :finalize) and
-      finalize_common_valid?(summary) and aggregate_finalize_status_valid?(summary)
+      finalize_common_valid?(summary) and conservation_valid?(summary, :finalize) and
+      aggregate_finalize_status_valid?(summary)
   end
 
   defp keys_with_optional_class(keys, nil), do: keys
@@ -979,6 +1077,63 @@ defmodule Maxio.Storage.PublishedProof do
       length(degraded) + length(orphan_hints) <= @max_endpoints and
       unique_detail_identities?(orphan_hints) and
       disjoint_detail_identities?(degraded, orphan_hints)
+  end
+
+  # 类型化守恒：verified/finalized 的 gap 只能由可见 cleanup detail 或 omitted 名额承担，
+  # 绝不能拿 mismatch/corrupt/unavailable/drift/superseded 债务顶替；隐藏计数还必须**联合**
+  # 可实现——一个 omitted 名额不能同时充当互斥的多种 endpoint 结局。
+  defp conservation_valid?(summary, mode) do
+    omitted = summary["omitted"]
+    hidden_cleanup = hidden_cleanup(summary, mode)
+    hidden_owned_failure = hidden_owned_failure(summary)
+    hidden_unavailable = hidden_unavailable(summary)
+
+    hidden_cleanup >= 0 and hidden_owned_failure >= 0 and hidden_unavailable >= 0 and
+      hidden_cleanup + max(hidden_owned_failure, hidden_unavailable) <= omitted and
+      fallback_unavailable_realizable?(summary, hidden_owned_failure, hidden_unavailable)
+  end
+
+  # proof endpoint detail 没有 proof_passed 字段，proof 模式下隐藏 cleanup 恒为零。
+  defp hidden_cleanup(_summary, :proof), do: 0
+
+  defp hidden_cleanup(summary, :finalize),
+    do: finalize_gap(summary) - visible_cleanup_count(summary)
+
+  defp hidden_owned_failure(summary) do
+    summary["observed_owned"] - summary["verified"] - visible_owned_failure_count(summary)
+  end
+
+  defp hidden_unavailable(summary),
+    do: summary["unavailable"] - visible_unavailable_count(summary)
+
+  defp finalize_gap(summary), do: summary["verified"] - summary["finalized"]
+
+  defp visible_cleanup_count(summary),
+    do: Enum.count(summary["degraded"], &cleanup_detail?/1)
+
+  defp cleanup_detail?(detail) do
+    detail["status"] == "cleanup_pending" and detail["proof_passed"] == true and
+      detail["finalized"] == false
+  end
+
+  # owned/unavailable 的可见口径在 proof 与 finalize 两种模式下完全一致。
+  defp visible_owned_failure_count(summary) do
+    Enum.count(summary["degraded"], &(&1["status"] == "failed" and &1["owned"] == true))
+  end
+
+  defp visible_unavailable_count(summary),
+    do: Enum.count(summary["degraded"], &(&1["class"] == "unavailable"))
+
+  # fallback unavailable（verified + unavailable < required）要求隐藏 owned failure 全部是
+  # unavailable；否则至少有一个隐藏 owned corrupt/mismatch，classifier 只会选出更高优先级的
+  # 完整性 class，绝不会产出该 outer class。
+  defp fallback_unavailable_realizable?(summary, hidden_owned_failure, hidden_unavailable) do
+    if summary["status"] == "failed" and summary["class"] == "unavailable" and
+         summary["verified"] + summary["unavailable"] < summary["required"] do
+      hidden_owned_failure <= hidden_unavailable
+    else
+      true
+    end
   end
 
   defp visible_counters_valid?(summary, mode) do
