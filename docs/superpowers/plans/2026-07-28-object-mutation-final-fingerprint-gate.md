@@ -121,6 +121,11 @@ Cover:
   debt; invalid orphan reason/flags or any arbitrary non-owned failure can never become orphan;
 - proof/finalize `last_failure` variants and the complete phase matrix for nil/non-nil
   `published_proof`;
+- finalize typed conservation in both directions, including rejection when one omitted slot would
+  have to represent mutually exclusive hidden cleanup and hidden unavailable outcomes, or when
+  fallback unavailable would require a hidden owned non-unavailable integrity failure;
+- source validation before normalization: negative omitted, duplicate/invalid tail, and
+  successor/placement-drift tail details cannot be trimmed into valid durable evidence;
 - oversized integer ordinal identities, relative-root shard failure retaining its frozen
   ordinal, and duplicate identities failing before any vote is counted;
 - aggregate detail truncation plus exact omitted counts and a proof wrapper never exceeding
@@ -192,6 +197,15 @@ re-derives these relations from retained bounded details.
 Finalize conservation is type-aware. Let `gap = verified - finalized` and let
 `visible_cleanup` count retained cleanup-pending details; require
 `visible_cleanup <= gap <= visible_cleanup + omitted` in addition to the generic debt relations.
+The hidden slots must also be jointly realizable: with hidden cleanup, hidden owned-failure, and
+hidden unavailable counts derived by subtracting their visible counts, require all nonnegative and
+`hidden_cleanup + max(hidden_owned_failure, hidden_unavailable) <= omitted`. Owned failure and
+unavailable may overlap; cleanup and every proof failure are mutually exclusive. Define visible
+owned failure by `status=failed && owned=true` in both modes because proof details have no
+`proof_passed` field; proof mode sets hidden cleanup to zero.
+For a failed/unavailable fallback where `verified + unavailable < required`, additionally require
+`hidden_owned_failure <= hidden_unavailable`; otherwise the hidden counts force an owned
+corrupt/mismatch endpoint that outranks fallback unavailable.
 `cleanup_pending` requires proof quorum, `debt > 0`, and a retained debt witness; terminal
 finalized with zero debt therefore has `verified == finalized == observed_owned`. Reject a
 status/count rewrite that uses unrelated failure debt for an unfinalized endpoint, loses a visible

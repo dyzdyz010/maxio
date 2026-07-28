@@ -152,6 +152,49 @@ witness；`finalized` 在 `debt == 0` 时必然
 `verified == finalized == observed_owned`。不能只改 status/finalized 计数伪造无债务的
 cleanup pending，也不能让 proof-passed/unfinalized endpoint 从 terminal summary 消失。
 
+独立区间还不够：同一个 omitted slot 不能同时代表互斥 endpoint outcome。令
+`visible_owned_failure` 为 retained degraded 中 `status="failed" && owned=true` 的条数，
+`visible_unavailable` 为 retained unavailable detail 条数，并定义：
+
+```text
+hidden_cleanup = gap - visible_cleanup
+hidden_owned_failure =
+  observed_owned - verified - visible_owned_failure
+hidden_unavailable = unavailable - visible_unavailable
+```
+
+三者都必须非负，且：
+
+```text
+hidden_cleanup + max(hidden_owned_failure, hidden_unavailable) <= omitted
+```
+
+`visible/hidden_owned_failure` 与 `visible/hidden_unavailable` 在 proof/finalize 两种 mode
+使用同一定义；proof endpoint detail 没有 `proof_passed` 字段，禁止用该字段识别 owned
+failure。`hidden_cleanup` 只属于 finalize；proof mode 的 slot 方程将其视为零。
+
+owned failure 与 unavailable 可由同一 omitted failure 重叠解释，故取 `max`；cleanup
+proof 已通过，与所有 proof failure 互斥，必须另占 slot。Stage A 与 normalization 后的
+Stage B 都必须重验这一联合可实现性。
+
+outer failure class 也必须可实现。proof/finalize 若：
+
+```text
+status == "failed"
+class == "unavailable"
+verified + unavailable < required
+```
+
+则处于 fallback unavailable 分支，必须另满足：
+
+```text
+hidden_owned_failure <= hidden_unavailable
+```
+
+否则至少一个 hidden owned failure 不是 unavailable；owned placement drift/successor
+均被禁止后，它只能是 corrupt/mismatch，classifier 必须优先选择 integrity class，不可能
+落入 fallback unavailable。
+
 classifier 必须在计票前完整预检 expected identity、响应 identity、scope/mode、tuple/status/
 class 与 aggregate 重入。任一结构漂移均生成规范化 `placement_drift` failure，固定
 `verified=0, observed_owned=0, unavailable=0`；finalize 另固定
