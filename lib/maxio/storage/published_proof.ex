@@ -261,19 +261,19 @@ defmodule Maxio.Storage.PublishedProof do
   end
 
   @doc """
-  保留初始 aggregate published proof，只按目标 phase 替换 last_failure。输入必须已经是
-  持久化形态（proof 至多 31 条 detail），因此这里绝不重新裁剪 proof：伪造的 32 条
-  "已持久化" proof 只能被拒绝，不能被静默改写成 31 条。
+  保留初始 aggregate published proof，只按目标 phase 替换 last_failure。merge 是对**可信
+  持久态**的替换，不是修复 API：在看 replacement 之前先对原样的 old wrapper 做无规范化的
+  完整校验，任何从来就不可能被本契约发出的 old wrapper 一律拒绝，绝不用新 failure 洗白。
   """
   @spec merge_failure(String.t(), map(), map() | nil) ::
           {:ok, map()} | {:error, :invalid_proof_evidence}
   def merge_failure(
         target_phase,
-        %{"published_proof" => proof_summary, "last_failure" => _old} = evidence,
+        %{"published_proof" => proof_summary, "last_failure" => old_failure} = evidence,
         failure_summary
       )
       when map_size(evidence) == 2 do
-    if persisted_published_proof?(proof_summary) do
+    if persisted_wrapper?(target_phase, evidence, proof_summary, old_failure) do
       journal_evidence(target_phase, proof_summary, failure_summary)
     else
       {:error, :invalid_proof_evidence}
@@ -916,6 +916,15 @@ defmodule Maxio.Storage.PublishedProof do
 
   defp detail_count(_summary, _key), do: 0
 
+  # 严格 persisted-wrapper 判定：由既有的语义、配额、JSON-safe 与编码大小门组合而成，
+  # 不另造弱 schema，也绝不调用 normalizer——不裁剪、不重排、不调整 omitted。
+  defp persisted_wrapper?(target_phase, evidence, proof_summary, old_failure) do
+    valid_journal_combination?(target_phase, proof_summary, old_failure) and
+      persisted_published_proof?(proof_summary) and
+      retained_allocation_valid?(proof_summary, old_failure) and
+      match?({:ok, _evidence}, validate_evidence(evidence))
+  end
+
   defp persisted_published_proof?(nil), do: true
 
   defp persisted_published_proof?(%{"degraded" => degraded}) when is_list(degraded),
@@ -1057,9 +1066,43 @@ defmodule Maxio.Storage.PublishedProof do
       length(degraded) <= @max_endpoints and
       Enum.all?(degraded, &valid_degraded_endpoint?(&1, mode)) and
       unique_detail_identities?(degraded) and
+      retained_priority_valid?(summary) and
       debt == length(degraded) + omitted and unavailable <= debt and
       visible_counters_valid?(summary, mode)
   end
+
+  # 保留证据的优先级重放：successor > placement drift > 其余。这是 proof/finalize 全部
+  # aggregate 状态共用的**同一条**不变量，决定哪个 outer sum type 分支才有资格；具体分支的
+  # canonical 零计数与强制 witness 仍由 status 专属校验器证明。Stage A 与 Stage B 调用的是
+  # 同一批 aggregate 校验器，因此两阶段自动执行，规范化绝不可能抹掉或降级已保留的事实。
+  defp retained_priority_valid?(summary) do
+    class = Map.get(summary, "class")
+
+    cond do
+      retained_successor?(summary) ->
+        summary["status"] == "superseded" and is_nil(class)
+
+      retained_placement_drift?(summary) ->
+        summary["status"] == "failed" and class == "placement_drift"
+
+      true ->
+        not claims_priority_shape?(summary["status"], class)
+    end
+  end
+
+  defp retained_successor?(summary),
+    do: Enum.any?(summary["degraded"], &(&1["status"] == "superseded"))
+
+  defp retained_placement_drift?(summary) do
+    Enum.any?(
+      summary["degraded"],
+      &(&1["status"] == "failed" and &1["class"] == "placement_drift")
+    )
+  end
+
+  defp claims_priority_shape?("superseded", _class), do: true
+  defp claims_priority_shape?("failed", "placement_drift"), do: true
+  defp claims_priority_shape?(_status, _class), do: false
 
   defp finalize_common_valid?(summary) do
     finalized = summary["finalized"]
@@ -1165,8 +1208,7 @@ defmodule Maxio.Storage.PublishedProof do
         verified >= required and debt == 0 and is_nil(class)
 
       "degraded" ->
-        verified >= required and debt > 0 and is_nil(class) and
-          no_priority_short_circuit_detail?(summary)
+        verified >= required and debt > 0 and is_nil(class)
 
       "failed" ->
         verified < required and class in Enum.map(@endpoint_failure_classes, &Atom.to_string/1) and
@@ -1199,8 +1241,7 @@ defmodule Maxio.Storage.PublishedProof do
 
       # cleanup pending 必须真的欠着可指认的清理债务，不能只靠 status/计数改写伪造。
       "cleanup_pending" ->
-        verified >= required and debt > 0 and summary["degraded"] != [] and is_nil(class) and
-          no_priority_short_circuit_detail?(summary)
+        verified >= required and debt > 0 and summary["degraded"] != [] and is_nil(class)
 
       "failed" ->
         verified < required and class in Enum.map(@endpoint_failure_classes, &Atom.to_string/1) and
@@ -1232,12 +1273,6 @@ defmodule Maxio.Storage.PublishedProof do
   defp canonical_drift_finalize_zero?(summary, :finalize) do
     summary["finalized"] == 0 and summary["orphaned"] == 0 and
       summary["orphan_hints"] == [] and summary["orphan_omitted"] == 0
-  end
-
-  defp no_priority_short_circuit_detail?(summary) do
-    Enum.all?(summary["degraded"], fn detail ->
-      detail["status"] != "superseded" and detail["class"] != "placement_drift"
-    end)
   end
 
   defp valid_failure_relation?(summary) do

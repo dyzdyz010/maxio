@@ -1535,6 +1535,228 @@ defmodule Maxio.Storage.EpochStorePublishedProofTest do
              PublishedProof.merge_failure("finalize_pending", forged, cleanup_base)
   end
 
+  # --- Fix round 3：universal retained priority + strict merge input ---
+
+  @tag :task1_fix_round3
+  test "round3 defect: proof failed aggregate must not launder a retained successor" do
+    persisted = persisted_proof!()
+
+    {:error, {:published_proof_failed, :corrupt, base}} =
+      PublishedProof.classify(3, [
+        {"ordinal:1", PublishedProof.failed(:corrupt, 1, %{owned: true})}
+      ])
+
+    {:ok, {:superseded, successor}} = PublishedProof.superseded("ordinal:2")
+
+    # 基准本身合法且可持久化，确保拒绝来自 successor 而非坏 fixture。
+    assert %{"status" => "failed", "class" => "corrupt", "omitted" => 0, "debt" => 1} = base
+
+    assert {:ok, _evidence} =
+             PublishedProof.journal_evidence("rollback_pending", persisted, base)
+
+    # 只追加一条更高优先级的 successor：任何保留的 successor 都只能由 canonical
+    # aggregate superseded 承载，绝不能被 31+1 预算把它裁成匿名 omitted debt。
+    forged =
+      base
+      |> Map.put("degraded", base["degraded"] ++ [successor])
+      |> Map.put("debt", 2)
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("rollback_pending", persisted, forged)
+  end
+
+  @tag :task1_fix_round3
+  test "round3 defect: finalize failed aggregate must not launder a retained successor" do
+    persisted = persisted_proof!()
+
+    {:error, {:published_proof_failed, :corrupt, base}} =
+      PublishedProof.classify_finalize(3, [
+        {"ordinal:1",
+         PublishedProof.endpoint_finalize_failed(:corrupt, "ordinal:1", %{owned: true})}
+      ])
+
+    {:ok, {:superseded, successor}} = PublishedProof.endpoint_finalize_superseded("ordinal:2")
+
+    assert %{"status" => "failed", "class" => "corrupt", "omitted" => 0, "debt" => 1} = base
+
+    assert {:ok, _evidence} =
+             PublishedProof.journal_evidence("finalize_pending", persisted, base)
+
+    forged =
+      base
+      |> Map.put("degraded", base["degraded"] ++ [successor])
+      |> Map.put("debt", 2)
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", persisted, forged)
+  end
+
+  @tag :task1_fix_round3
+  test "round3 defect: merge rejects an old wrapper whose last_failure is not a durable aggregate" do
+    persisted = persisted_proof!()
+    cleanup_failure = cleanup_failure!()
+
+    # 老 wrapper 的 last_failure 是 endpoint 残片，从来就不可能是持久化过的 durable 形态；
+    # merge 是对可信持久态的替换，不是修复 API，必须拒绝而不是用新 failure 洗白。
+    invalid_old = %{
+      "published_proof" => persisted,
+      "last_failure" => %{
+        "scope" => "endpoint",
+        "mode" => "finalize",
+        "status" => "failed"
+      }
+    }
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.merge_failure("finalize_pending", invalid_old, cleanup_failure)
+  end
+
+  @tag :task1_fix_round3
+  test "round3 defect: merge rejects an old wrapper exceeding the 32 retained detail budget" do
+    persisted = persisted_proof!()
+    maxed_failure = maxed_failure!()
+
+    assert length(persisted["degraded"]) == 31
+    assert length(maxed_failure["degraded"]) == 32
+
+    # 31 + 32 = 63 条 retained detail，绝不可能是本契约发出过的 durable wrapper。
+    over_budget_old = %{
+      "published_proof" => persisted,
+      "last_failure" => maxed_failure
+    }
+
+    {:error, {:published_proof_failed, :corrupt, replacement}} =
+      PublishedProof.classify(3, [
+        {"ordinal:1", PublishedProof.failed(:corrupt, 1, %{owned: true})}
+      ])
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.merge_failure("rollback_pending", over_budget_old, replacement)
+  end
+
+  @tag :task1_fix_round3
+  test "round3 control: an independently malformed truncated-tail detail is rejected before trimming" do
+    maxed = maxed_published_proof!()
+    tail = Enum.at(maxed["degraded"], 31)
+
+    # 非重复、独立畸形的尾部 detail（failed 却没有 class），必须在裁剪之前被拒绝。
+    malformed = Map.delete(tail, "class")
+
+    forged = Map.put(maxed, "degraded", List.replace_at(maxed["degraded"], 31, malformed))
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("published", forged, nil)
+  end
+
+  @tag :task1_fix_round3
+  test "round3 control: a later owned decisive witness is selected into the sole failure slot" do
+    persisted = persisted_proof!()
+
+    mismatches =
+      for index <- 1..3 do
+        {"ordinal:#{index}", PublishedProof.failed(:mismatch, index, %{owned: false})}
+      end
+
+    {:error, {:published_proof_failed, :corrupt, base}} =
+      PublishedProof.classify(
+        50,
+        mismatches ++ [{"ordinal:4", PublishedProof.failed(:corrupt, 4, %{owned: true})}]
+      )
+
+    [witness | rest] = base["degraded"]
+    assert witness["class"] == "corrupt" and witness["owned"] == true
+
+    # 把决定性 owned witness 挪到列表中段，模拟公共边界上的非 classifier 顺序。
+    shuffled =
+      Map.put(base, "degraded", Enum.slice(rest, 0, 2) ++ [witness] ++ Enum.drop(rest, 2))
+
+    # 唯一名额必须按语义选出 owned corrupt witness，而不是列表首位。
+    {:ok, one_slot} = PublishedProof.journal_evidence("rollback_pending", persisted, shuffled)
+
+    assert [retained] = one_slot["last_failure"]["degraded"]
+    assert retained["class"] == "corrupt" and retained["owned"] == true
+    assert one_slot["last_failure"]["debt"] == base["debt"]
+    assert one_slot["last_failure"]["omitted"] == base["debt"] - 1
+
+    # 预算充足时：witness 前移，其余 detail 保持稳定相对顺序。
+    {:ok, full} = PublishedProof.journal_evidence("rollback_pending", nil, shuffled)
+
+    assert Enum.map(full["last_failure"]["degraded"], & &1["endpoint"]) ==
+             [witness["endpoint"] | Enum.map(rest, & &1["endpoint"])]
+  end
+
+  @tag :task1_fix_round3
+  test "round3 control: canonical superseded stays valid when lower-priority drift is retained" do
+    {:ok, {:superseded, base}} =
+      PublishedProof.classify(1, [{"ordinal:2", PublishedProof.superseded("ordinal:2")}])
+
+    {:error, {:published_proof_failed, :placement_drift, drift}} =
+      PublishedProof.failed(:placement_drift, 3, %{owned: false})
+
+    # successor 优先于 placement drift：保留了更低优先级 drift 的 canonical superseded
+    # 依然合法，修复不得把优先级顺序反过来。
+    with_drift =
+      base
+      |> Map.put("degraded", base["degraded"] ++ [drift])
+      |> Map.put("debt", 2)
+
+    assert {:ok, %{"last_failure" => ^with_drift}} =
+             PublishedProof.journal_evidence("rollback_pending", nil, with_drift)
+  end
+
+  @tag :task1_fix_round3
+  test "round3 control: a valid old wrapper merges and preserves the proof term and bytes" do
+    persisted = persisted_proof!()
+
+    {:error, {:published_proof_failed, :corrupt, old_failure}} =
+      PublishedProof.classify(3, [
+        {"ordinal:1", PublishedProof.failed(:corrupt, 1, %{owned: true})}
+      ])
+
+    {:ok, valid_old} =
+      PublishedProof.journal_evidence("rollback_pending", persisted, old_failure)
+
+    assert length(valid_old["published_proof"]["degraded"]) +
+             length(valid_old["last_failure"]["degraded"]) <= 32
+
+    assert {:ok, merged} =
+             PublishedProof.merge_failure("finalize_pending", valid_old, cleanup_failure!())
+
+    assert merged["published_proof"] == valid_old["published_proof"]
+
+    assert Jason.encode!(merged["published_proof"]) ==
+             Jason.encode!(valid_old["published_proof"])
+  end
+
+  defp persisted_proof!() do
+    {:ok, evidence} =
+      PublishedProof.journal_evidence("finalize_pending", maxed_published_proof!(), nil)
+
+    evidence["published_proof"]
+  end
+
+  defp maxed_failure!() do
+    failures =
+      for index <- 1..40 do
+        {"ordinal:#{index}", PublishedProof.failed(:unavailable, index, %{owned: false})}
+      end
+
+    {:error, {:published_proof_failed, :unavailable, failure}} =
+      PublishedProof.classify(50, failures)
+
+    failure
+  end
+
+  defp cleanup_failure!() do
+    {:ok, {:cleanup_pending, cleanup_failure}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", PublishedProof.endpoint_finalized("ordinal:0", %{phase: "committed"})},
+        {"ordinal:1", PublishedProof.endpoint_cleanup_pending("ordinal:1", %{phase: "committed"})}
+      ])
+
+    cleanup_failure
+  end
+
   defp published_proof!() do
     {:ok, {:verified, published}} =
       PublishedProof.classify(1, [{"local", PublishedProof.verified("local", %{})}])
