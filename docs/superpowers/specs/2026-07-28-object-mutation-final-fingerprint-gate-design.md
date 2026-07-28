@@ -2,7 +2,7 @@
 
 > 日期：2026-07-28  
 > 状态：批准实施  
-> 范围：普通、PG 写权威的 PutObject；FS / ErasureCoded / Distributed 三后端  
+> 范围：所有已接入 `ObjectMutation.Commit` 的普通对象、PG 写权威路径；FS / ErasureCoded / Distributed 三后端
 > 上位协议：`docs/superpowers/plans/2026-07-10-object-mutation-protocol.md`  
 > 本文是对上位协议“所有 finalize 失败均可成功返回”表述的收窄修订：只有 final 已获 durable proof 后的纯清理失败才可延后。
 
@@ -16,6 +16,12 @@ AWS S3 对成功 PutObject 的约束是：成功响应表示完整对象已经�
 2. finalize 在删除 backup 前复用同一 proof，抵御发布 proof 与最终清理之间的漂移。
 3. 区分 proof failure 与 proof 后的 cleanup failure，避免继续吞掉所有 finalize 错误。
 4. 保持 backend 插件边界、对象字节流式管线、fencing/quorum 与历史 placement 不变量。
+
+本批的编排范围固定为现有八个 `ObjectMutation.Commit` 生产 caller：PutObject、
+CopyObject、Console upload、ObjectWriter、inventory、access-log、replication 与 rebalance。
+八条路径共用同一个 gate 和稳定公共错误适配器。本批不新增 multipart assemble/complete、
+delete、meta-only 或 tombstone caller；这些 Phase2A/后续路径不得顺手迁入。sidecar authority
+继续作为独立 legacy 收敛分支，不冒充 PG proof wrapper。
 
 官方语义依据：
 
@@ -45,6 +51,21 @@ Maxio.Storage.verify_published(ctx, opts)
 ```
 
 `class` 只允许 `:unavailable | :mismatch | :corrupt | :fenced | :placement_drift`。`proof_summary` 是有界、可 JSON 化、无对象内容/密钥/完整绝对路径的纯数据；至少含 string-key 的 `status`、`required`、`verified`、`observed_owned`、`unavailable` 与有界 `degraded` endpoint 摘要。
+
+backend callback 必须返回 Task 1 的精确 aggregate sum type。`Maxio.Storage` facade 是插件
+trust boundary：每个 proof/finalize 返回都先经
+`PublishedProof.validate_callback_result(mode, result)` 非变异验证，其中
+`mode in [:proof, :finalize]`。它只接受
+所选 mode 的 canonical aggregate result，绝不裁剪、重排、修复或返回替代值。obsolete tuple、
+wrong scope/mode 或伪造 status/class/count 一律转换为：
+
+```elixir
+{:error, {:published_proof_contract_violation, mode}}
+```
+
+其中 `mode in [:proof, :finalize]`。该 facade-only 错误不扩宽 backend behaviour union，
+且按 integrity fail closed；不得删除
+backup，也不得持久化、记录或公开 raw callback term。
 
 endpoint wire observation 与 backend aggregate proof 是两个不可混用的域：
 
@@ -269,6 +290,35 @@ proof 在 journal `published` 之前运行的理由：
 
 同步路径必须在写入 `published_fingerprint` 后从 fresh journal 重新构造 `MutationContext`；不得继续使用 claimed 阶段的旧 context。三个 backend 注册进 `ObjectCommit.Control` 的 finalize 闭包也必须捕获带 fingerprint 的 context。
 
+metadata 前 proof failure/superseded 必须在同一个 id/phase/attempt/lease CAS 中写入
+`rollback_pending`、`published_fingerprint: nil`、phase-valid recovery evidence 与 bounded
+`last_error`。公开 API 固定为
+`request_rollback(journal, attrs, opts \\ [])`；`attrs` 仅允许
+`published_fingerprint`、`recovery_evidence`、`last_error`，旧 keyword-opts arity 不保留。
+`rollback_pending` 幂等重放要求所有 supplied attrs 与持久值 term-equal，冲突零写入；
+`rolled_back` 是不可重写的终态。generic Journal evidence 的 65,536/65,537-byte 门与
+PublishedProof 的 60 KiB 门分别测试，不能把二者混为一个上限。
+
+request-level successor 形状固定为
+`{:published_proof_superseded, aggregate_summary}`；禁止伪造
+`{:published_proof_failed, :fenced, summary}`。
+
+Storage facade contract violation 没有 canonical aggregate summary，不是 proof result。
+metadata 前的 proof-mode contract violation 不得调用 `journal_evidence/3` 或伪造 failed
+summary；它经同一 rollback CAS 写 nil fingerprint、exact stable last error
+`"published_proof_contract_violation:proof"` 与以下 bounded generic Journal evidence：
+
+```elixir
+%{
+  "authority_mode" => "pg",
+  "stage" => "verify_published",
+  "outcome" => "contract_violation",
+  "mode" => "proof"
+}
+```
+
+随后 best-effort restore；无 metadata，restore 失败仍保留 backup 并由 Recovery 收敛。
+
 ### D3 — A+ 热路径 proof；bitrot 全量校验留给 scrub/heal
 
 现有 fingerprint 定义为：
@@ -409,6 +459,7 @@ finalize 聚合必须区分：
 | metadata 前 proof mismatch/corrupt | request rollback；详细证据只进结构化日志 | 500 `InternalError` |
 | metadata 后 defense proof unavailable | 不回滚；`finalize_pending` + retry | 503，绝不 200 |
 | metadata 后 defense proof mismatch/corrupt | 不回滚；quarantine；保留 backup | 500，绝不 200 |
+| Storage callback contract violation | metadata 前 rollback；metadata 后/sidecar quarantine；保留 backup | 500 `InternalError` |
 | proof 已达 quorum，但有少数 endpoint 尚未证明/清理，或 epoch 写/backup 删除失败 | `finalize_pending`，Recovery/heal 后重试 | 可返回 200 |
 | successor | 不读/不碰 successor；按既有 superseded evidence 收敛 | 请求路径 503 |
 
@@ -433,14 +484,25 @@ successor 的阶段语义固定：
 Rust raw errno 必须按 `target_os` 分表，或只使用稳定 `ErrorKind` 加 OS-specific raw
 whitelist；未知/瞬态 errno 必须映射 unavailable，不能因不同 Unix 数值复用而误报 corrupt。
 
-所有 evidence 先经 `PublishedProof` 限界/脱敏。API 必须 phase-aware：
+`recovery_evidence` 有两个互斥 domain，绝不互相伪装：
+
+1. canonical PublishedProof wrapper：只承载 aggregate proof/finalize 事实，经
+   `PublishedProof` phase-aware trust boundary；
+2. generic non-PublishedProof evidence：包括 PG 的 pre-proof/rollback operational facts
+   （含 exact contract-violation subshape），以及 legacy sidecar recovery 的
+   `current_epoch` pre-adapter 与 finalize adapter 两个 exact bounded scalar subshape。它们经
+   Journal 既有 string-key/JSON-safe/depth/64-KiB gate 和各调用点的
+   authority/phase/keys/value validator，不调用 PublishedProof normalize/merge，也不消费
+   31/32/60-KiB proof budget。
+
+PublishedProof API 固定为：
 
 ```elixir
 journal_evidence(target_phase, published_proof_or_nil, last_failure_or_nil)
 merge_failure(target_phase, evidence, last_failure)
 ```
 
-journal 固定只保存：
+canonical PublishedProof domain 固定只保存：
 
 ```elixir
 %{
@@ -453,13 +515,41 @@ journal 固定只保存：
 aggregate proof 的 failed/superseded，或 aggregate finalize 的
 failed/cleanup_pending/superseded；endpoint summary、proof success 与 finalize finalized 均拒绝。
 
-- `published_proof=nil` 时，`last_failure` 必须是 proof-mode failed/superseded；初始 proof
+- 在 canonical wrapper 内，`published_proof=nil` 时，`last_failure` 必须是 proof-mode
+  failed/superseded；初始 proof
   失败要把 `claimed → rollback_pending` 与该 evidence 原子持久化，fingerprint 保持 nil。
-- `published`/`metadata_committed`/`finalize_pending`/`finalized` 必须已有成功 published proof。
-- `rollback_pending`/`rolled_back`/`quarantined` 可在 proof 前或后产生；nil proof 时仍必须满足
-  上述初始 proof failure 形态。
+- PG authority 的 `published`/`metadata_committed`/`finalize_pending`/`finalized` 必须已有
+  成功 canonical published proof。
+- PG `rollback_pending`/`rolled_back`/`quarantined` 可持有 canonical wrapper 或合法 generic
+  operational evidence；只有声称自己是 canonical wrapper 的 nil proof 才必须满足上述
+  proof failure/superseded 形态。
 - finalize-mode last failure 必须同时存在成功 published proof，且只允许在 metadata/finalize
   后续 phase。`nil/nil` 不是合法 proof evidence。
+- sidecar authority 不要求 PG wrapper：`published` 进入 D7 的 existing current-epoch
+  adjudication；`finalize_pending`/`finalized`/`quarantined` 服从 D7 exact legacy scalar
+  subshape 与 authority/phase validator。sidecar `metadata_committed` 始终非法。
+
+本批新增的 PG contract-violation generic evidence 只能由
+`authority_mode="pg"`、observed phase `claimed` 的
+`request_rollback(journal, attrs, opts)` 生成；target phase 必须是 `rollback_pending`，
+fingerprint 必须 nil，`last_error` 必须精确为
+`"published_proof_contract_violation:proof"`，evidence 必须 map-size 4 且逐字匹配：
+
+```elixir
+%{
+  "authority_mode" => "pg",
+  "stage" => "verify_published",
+  "outcome" => "contract_violation",
+  "mode" => "proof"
+}
+```
+
+`request_rollback` 在 SQL 前先执行上述 phase/authority/fingerprint/keys/value validator，
+再用 `Journal.changeset` 执行 JSON-safe/depth/65,536-byte gate；任一步失败均零写入。该
+evidence 可随 rollback 收敛保留在 `rollback_pending`、`rolled_back` 或 `quarantined`，
+restore/lease/generic error 只用 evidence-preserving operational update 改 attempts/backoff/
+last_error，不覆盖它。它在 `published`/metadata/finalize phase 永不合法，也不参与
+PublishedProof 的 31/32/60-KiB 预算。
 
 一个 journal evidence wrapper 中，`published_proof.degraded`、
 `last_failure.degraded` 与 finalize `last_failure.orphan_hints` 合计最多保留 32 条。
@@ -493,19 +583,92 @@ Stage B 只对已通过 Stage A 的 source 执行 wrapper 分配：
 `published_proof` 不得再次裁剪/重排，只允许新 last failure 走 Stage A/Stage B，返回的
 proof term 与编码必须和输入完全一致。伪造的 32-detail “已持久化 proof”直接拒绝。
 PublishedProof wrapper 的编码结果必须不超过 60 KiB，并继续通过 Journal 既有
-JSON-safe/64 KiB gate。后续 `mark_error`/quarantine 必须用 phase-aware merge 更新
-`"last_failure"`，保留初始 `"published_proof"`，不得整图覆盖。
+JSON-safe/64 KiB gate。canonical proof/finalize outcome 才能用 phase-aware merge 更新
+`"last_failure"`，并保留初始 `"published_proof"`。lock、lease、restore、generic exception
+等 operational error 不能伪装 aggregate proof failure。凡现有 evidence 必须原样保留
+（valid wrapper、invalid wrapper 取证、或上述 exact generic contract evidence），分别使用精确
+`mark_operational_error(journal, reason, opts \\ [])` 与
+`quarantine_preserving_evidence(journal, reason, opts \\ [])`。前者 SQL update set 仅含
+`attempts`、`next_attempt_at`、bounded `last_error`、`updated_at`；后者仅含 quarantine
+phase/timestamp/lease cleanup 与 bounded `last_error`。二者都不得更新 fingerprint 或
+recovery evidence。invalid-proof quarantine 同样保留 malformed source evidence 的 term 与
+JSON 编码，供取证使用。
 
 ### D7 — Recovery 复用同一 callback
 
-Recovery 不实现第二套 proof：
+Recovery 不实现第二套 proof，且必须先按 authority/phase 精确分流：
 
-- 进入 finalize 前先调用 `Storage.verify_published/2`；
-- unavailable → `mark_error` 可重试；
-- 全局 proof 分类为 mismatch/corrupt/placement drift → quarantine；少数 mismatch 已被健康 quorum 覆盖时只记录 degraded debt，不隔离整条 mutation；
-- successor → 既有 superseded 收敛；
-- finalize 返回 proof failure 时沿同一分类；
-- cleanup failure 只 `mark_error`，保留 `finalize_pending`。
+1. PG `metadata_committed` / `finalize_pending`：先调用非变异
+   `PublishedProof.validate_durable_evidence(target_phase, evidence)`；合法 wrapper 才执行
+   `Storage.verify_published/2`，随后调用 proof-aware finalize。
+2. sidecar `published`：保留既有 `current_epoch` 裁决，转 `finalize_pending` 后调用
+   sidecar finalize adapter。
+3. sidecar `finalize_pending`：直接继续同一个 sidecar finalize adapter；backend finalize
+   内部会 re-proof，不额外调用 standalone verify，也不要求 PG wrapper。
+4. sidecar `metadata_committed`：不可能状态，任何 endpoint I/O 前 fail closed。
+
+PG 分支中 unavailable 可重试；全局 mismatch/corrupt/placement drift quarantine；少数
+mismatch 已被健康 quorum 覆盖时只记录 cleanup debt；successor 短路 finalize 并终态记录；
+cleanup pending 保留 `finalize_pending`。durable validator 只返回
+`:ok | {:error, :invalid_proof_evidence}`，不裁剪、不重排、不修 omitted，也不返回 replacement
+map。缺失/畸形 wrapper 在 endpoint 调用前 quarantine，并保留原 evidence 取证。
+
+metadata 后的 proof/finalize facade contract violation 不得进入 aggregate merge；使用
+`quarantine_preserving_evidence/3`，以 exact stable last error
+`"published_proof_contract_violation:proof"` 或
+`"published_proof_contract_violation:finalize"` 隔离，同时保持既有 valid wrapper 与
+fingerprint term/编码不变、保留 backup、绝不 rollback。同步请求返回 500，Recovery 同样
+收敛为 quarantine。
+
+sidecar 有三个可选方向：伪造 PG wrapper 会混淆 authority，持久化完整 raw aggregate 会扩大
+泄漏/预算面，冻结 sidecar Recovery 又会破坏现存合法 `finalize_pending`。因此选择独立、固定
+scalar adapter：只消费已经由 backend classifier/Storage trust boundary 裁决的 union，不复制
+quorum 逻辑，也不把 legacy sidecar evidence 伪装成 PG proof。
+
+sidecar `published` 的 `current_epoch` 裁决先使用独立 pre-adapter 表：
+
+| `current_epoch` 结果 | action | exact outcome / last_error |
+| --- | --- | --- |
+| exact target/token，phase 为 `published`/`committed`，或 exact-target greater token | 进入 proof-aware finalize adapter | 不写 pre-adapter evidence |
+| `:absent` | quarantine，保留 backup | `missing` / `"sidecar_current_epoch:missing"` |
+| read/RPC error | quarantine，保留 backup | `unavailable` / `"sidecar_current_epoch:unavailable"` |
+| same/older token 的非法 phase、target/token conflict | quarantine，保留 backup | `conflict` / `"sidecar_current_epoch:conflict"` |
+| malformed/obsolete return 或 exception | quarantine，保留 backup | `contract_violation` / `"sidecar_current_epoch:contract_violation"` |
+
+四个失败 outcome 均只持久化 exact map-size 3：
+
+```elixir
+%{
+  "authority_mode" => "sidecar",
+  "stage" => "current_epoch",
+  "outcome" => outcome
+}
+```
+
+validator 只允许 observed `authority_mode="sidecar", phase="published"` 到
+`quarantined`，逐字校验三个 key、allowed outcome 与对应 stable last_error，再跑 Journal
+generic JSON/depth/64-KiB gate；phase、last_error 与 evidence 在同一个既有
+phase/attempt/lease CAS 写入，任一步失败零写入。禁止存 endpoint、node/drive/path、token
+generation/mutation id、raw/inspected reason 或 placement payload。带上述 sentinel 的
+absent/unavailable/conflict/contract-violation 测试必须证明 journal、log、CLI 均不泄漏。
+
+两个合法 sidecar entry state 共用以下完整 finalize union 适配表：
+
+| backend result | sidecar journal action |
+| --- | --- |
+| `{:ok, {:finalized, summary}}` | 写 bounded sidecar evidence，终态 `finalized` |
+| `{:ok, {:cleanup_pending, summary}}` | 保持 `finalize_pending`，写 evidence，backoff retry |
+| `{:ok, {:superseded, summary}}` | 写 evidence，按既有语义终态 `finalized`，outcome 为 superseded |
+| `{:error, {:published_proof_failed, :unavailable, summary}}` | 保持 `finalize_pending`，写 evidence，backoff retry |
+| mismatch/corrupt/placement-drift proof error | quarantine，保留 backup |
+| `{:error, {:published_proof_contract_violation, :finalize}}` 或任意 obsolete/malformed/wrong-mode tuple | contract violation quarantine；不删除 backup，不记录 raw tuple |
+
+sidecar evidence 是独立 generic Journal shape，不调用 PG
+`journal_evidence/3`、`merge_failure/3` 或 `validate_durable_evidence/2`。canonical summary
+只投影 `authority_mode="sidecar"`、`stage="finalize"`、outcome、可选 class、mode/status、
+required/verified/finalized/debt/unavailable/omitted/orphaned 标量；不存 detail、path、
+node/drive、endpoint identity、raw tuple 或 inspected reason。malformed callback 只存
+`authority_mode`、`stage` 与 `outcome="contract_violation"`。
 
 CLI 继续读取 journal 的 `published_fingerprint` / `recovery_evidence`，展示 proof 阶段、required/verified 与降级摘要；无需 migration。
 
@@ -537,6 +700,18 @@ CLI 继续读取 journal 的 `published_fingerprint` / `recovery_evidence`，展
 - metadata 前 proof 失败：旧 bytes 恢复、PG 无新行、backup/epoch/journal 按 rollback 收敛。
 - metadata 后 defense mismatch：不回滚、不返回 200、backup 保留、journal quarantined。
 - proof 后 cleanup-only failure：请求成功、journal `finalize_pending`，Recovery 最终 finalized。
+- durable validator：canonical wrapper 返回 `:ok` 且调用前后 term/Jason bytes 完全相同；
+  missing/extra key、非法 phase、已持久化 32-detail、非法 hidden counter/witness、超过 60 KiB
+  全部拒绝，且不得 trim/reorder/repair。
+- sidecar `published` 与合法 `finalize_pending` 均覆盖 finalized、cleanup-pending、
+  superseded、unavailable、integrity failure 与 malformed/obsolete callback；所有非 finalized
+  分支保留 backup。
+- lock、lease、restore、generic exception、invalid-proof quarantine 用 sentinel 证明
+  recovery evidence term 与 `Jason.encode!/1` bytes 不变。
+- pre-metadata callback contract violation 用 exact generic PG evidence 原子 rollback 且不伪造
+  proof summary；post-metadata proof/finalize violation 与 Recovery 均保留 canonical wrapper
+  term/bytes 后 quarantine。
+- exact eight shared-Commit callers 均有回归覆盖，且没有新增 Phase2A caller。
 - 普通 signed PUT 与自签 aws-chunked PUT 覆盖 200/503/500，断言 XML 不泄露内部 reason/path。
 - 测试用 monitor、消息或 `:sys.get_state/1` 同步，禁止 `Process.sleep/1`。
 
