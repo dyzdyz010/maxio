@@ -48,3 +48,6 @@ npm-debug.log
 /priv/maxio_data/
 /priv/s3_data/
 
+# Codex 隔离工作树与 Superpowers SDD 临时产物（均可由源码/计划重建）。
+/.worktrees/
+/.superpowers/
