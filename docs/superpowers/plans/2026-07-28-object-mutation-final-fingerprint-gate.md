@@ -19,8 +19,9 @@
 - A journal may become `published` only after the initial proof succeeds.
 - Exact comparison is `request/journal fingerprint == epoch fingerprint == ObjectEpoch.fingerprint(top-level core etag, top-level core size, raw final meta.json bytes)`.
 - Endpoint wire observations and backend aggregate summaries are separate domains. Every summary
-  carries `"scope"`, every endpoint summary carries a stable `"endpoint"`, and quorum aggregation
-  accepts unique `{expected_identity, endpoint_result}` pairs only. No wire count is trusted.
+  carries `"scope"` and `"mode" => "proof" | "finalize"`, every endpoint summary carries a
+  stable `"endpoint"`, and quorum aggregation accepts unique
+  `{expected_identity, endpoint_result}` pairs only. No wire count is trusted.
 - Never use a `versions` entry for durable core ETag/size. Zero-byte objects still require zero-length `part.0`.
 - The final sidecar must nevertheless be a valid ordinary-object `maxio/2` envelope, including
   top-level SHA256 and exactly one object entry for the target version. Duplicate same-version
@@ -42,15 +43,20 @@ finalize_if_current(ctx, opts) ::
   | {:error, {:published_proof_failed, proof_class, evidence}}
 ```
 
-- A `finalized` journal requires all currently observable same-token participants clean, no unresolved endpoint, and finalized quorum. A same-token `claimed` endpoint is finalized only by exact-final claimed repair after metadata commit; absent/old-token manifest-only debris is never destructive authority and gets only an orphan hint for later GC.
+- A `finalized` journal requires all currently observable same-token participants clean, no unresolved endpoint, and finalized quorum. A same-token `claimed` endpoint is finalized only by exact-final claimed repair after metadata commit; absent/old-token manifest-only debris is never destructive authority and gets a finalize-only explicit orphan hint for later GC. Orphans do not vote, do not add debt, do not block a separately proven finalized quorum, and never authorize deletion.
 - Raw sidecars are `lstat`-checked; symlinks/non-regular files are rejected; reads are hard-limited to 16 MiB and never read object/shard contents.
 - `request.target`, decoded epoch target, and canonical `final_rel` are one identity. Check the
   absolute drive root and every final-directory ancestor before/after proof; reject links,
   junctions/reparse points and non-directory components. On Windows, use the native Rust-std
   reparse detector rather than trusting OTP `lstat`; a missing native detector fails closed.
   Read the sidecar through an opened handle with fstat/path-lstat identity rechecks and a
-  `limit + 1` read.
-- Journal proof evidence uses `%{"published_proof" => summary, "last_failure" => summary_or_nil}`, at most 32 degraded entries plus an omitted count, string keys, and the existing 64 KiB JSON gate. Later error/quarantine updates merge rather than erase the initial proof.
+  `limit + 1` read. Ancestor snapshots compare stable identity plus type/reparse only, never
+  mutable directory size/time/link metadata.
+- Journal proof evidence is phase-aware and uses
+  `%{"published_proof" => success_summary_or_nil, "last_failure" => failure_or_nil}`.
+  Pre-published failures alone may use a nil published proof; published and later phases require
+  a successful aggregate proof. Bounded endpoint details total at most 32, the wrapper is at most
+  60 KiB, and the existing Journal 64 KiB JSON gate remains authoritative.
 - S3 XML uses stable public messages; never expose `inspect(reason)`, drive paths, backup paths, body, credentials, or SSE envelope.
 - No migration, Phase2A caller migration, delete/meta-only work, placement-durability work, participant bitmap, orphan GC implementation, or scrub/heal expansion.
 - No `Process.sleep/1` in tests. Use `start_supervised!/1` for processes.
@@ -109,12 +115,26 @@ Cover:
 - invalid `final_rel`, fingerprint, value type and request shape fail closed.
 - forged endpoint counts, endpoint/aggregate scope confusion, duplicate or mismatched identities,
   outcome/status/class inconsistencies, and non-owned integrity observations;
+- proof/finalize mode confusion, outer/detail class forgery, and a failed aggregate whose
+  forged counts meet quorum;
+- finalized quorum plus explicit `epoch_absent`/`older_token` orphan stays finalized with zero
+  debt; invalid orphan reason/flags or any arbitrary non-owned failure can never become orphan;
+- proof/finalize `last_failure` variants and the complete phase matrix for nil/non-nil
+  `published_proof`;
+- oversized integer ordinal identities, relative-root shard failure retaining its frozen
+  ordinal, and duplicate identities failing before any vote is counted;
+- aggregate detail truncation plus exact omitted counts and a proof wrapper never exceeding
+  60 KiB;
 - request/epoch target mismatch and a lexically-safe cross-key/version `final_rel`;
 - real leaf/ancestor symlinks plus deterministic file-op races between lstat/open/read;
+- sibling-key directory mutation between ancestor snapshots does not cause a false corrupt result;
 - Windows real mount-point junction/name-surrogate rejection, normal-directory acceptance and
   native-not-loaded fail-closed behavior;
+- OS-specific raw errno mapping never treats Linux `ETIME` as `ELOOP`;
 - exact 16 MiB acceptance and lstat-then-grow-to-limit+1 rejection;
-- self-consistent fingerprint over a malformed/non-`maxio/2` sidecar.
+- self-consistent fingerprint over a malformed/non-`maxio/2` sidecar;
+- nil/invalid `final_rel` and ERPC local apply exception/exit are normalized into bounded endpoint
+  failures rather than escaping.
 
 Use temporary drive roots and public EpochStore/ShardServer APIs. RED must be caused by missing `verify_mutation`, not a test typo.
 
@@ -126,25 +146,39 @@ This single module owns:
   and constructors;
 - proof-class predicates;
 - global quorum classification helpers;
-- JSON-safe evidence and merge helpers;
-- a maximum of 32 endpoint summaries plus `"omitted"`;
+- phase-aware JSON-safe evidence and merge helpers;
+- a maximum of 32 total degraded/orphan endpoint details plus separate omitted counts;
 - endpoint identities only as `"local"` / frozen `"ordinal:N"` labels, never node-only or
   absolute drive/backup paths;
 - `%{"published_proof" => ..., "last_failure" => ...}` journal evidence.
 
 Do not nest modules. Validate all public constructors so invalid evidence cannot bypass Journal’s 64 KiB gate.
-Endpoint summaries carry no aggregate counters and never accept `:degraded`; the local classifier
+Every summary carries an exact proof/finalize mode. Endpoint summaries carry no aggregate counters
+and never accept `:degraded`; the local classifier
 derives each 0/1 vote from the validated tuple/status/owned/class relationship. Aggregate
-classification uses unique expected identities and rejects response identity drift before
-counting. Successor has highest valid-observation priority; structural identity/placement drift
-is next; only same-token owned corrupt/mismatch participates in deterministic integrity selection.
+classification prevalidates the whole input set and rejects invalid/duplicate expected identities,
+response identity drift, mode/scope drift, aggregate re-entry and tuple/status/class inconsistency
+before counting. A structural failure emits a canonical placement-drift aggregate with zero vote
+counts. Successor has highest priority among structurally valid observations; only same-token owned
+corrupt/mismatch participates in deterministic integrity selection, and integrity failures retain a
+same-class owned decisive witness.
 Use `classify(required, [{expected_identity, endpoint_result}])`; aggregate results are not valid
-inputs. Add `endpoint_finalized/2`, `endpoint_cleanup_pending/2` and
+inputs. Add `endpoint_finalized/2`, `endpoint_cleanup_pending/2`, explicit
+`endpoint_orphan/2`, and
 `classify_finalize(required, [{expected_identity, endpoint_finalize_result}])` with the frozen
 finalize result types now, while leaving disk-mutating finalize wiring to Task 2.
 Reject forged endpoint-finalized results unless `status=finalized`, `owned=true`,
 `proof_passed=true`, `finalized=true`, and class is absent; aggregate `finalized` must never
-exceed `verified`.
+exceed `verified`. Orphan accepts only `epoch_absent`/`older_token`, all ownership/proof/finalized
+flags false, contributes no vote/debt, and cannot by itself satisfy quorum. Decimal ordinal
+identities must satisfy the same 128-byte bound as binary identities.
+
+`journal_evidence/3` and `merge_failure/3` validate the target phase. Published proof is either a
+verified/degraded aggregate proof success or nil; nil is legal only with a proof-mode
+failed/superseded last failure in a pre-published rollback path. Last failure accepts only exact
+aggregate proof failed/superseded or aggregate finalize failed/cleanup_pending/superseded. Reject
+endpoint summaries, cross-mode summaries, proof successes in last failure, finalize finalized,
+and `nil/nil`. Keep the wrapper at or below 60 KiB before Journal's 64 KiB gate.
 
 ### Step 3: Implement standalone `EpochStore.verify_mutation/3`
 
@@ -157,7 +191,9 @@ Validate the D4 request. In the existing serialized closure:
 4. validate phase/value type/request-vs-epoch fingerprint;
 5. prove absolute-root/canonical-final containment and snapshot every ancestor without following
    a symlink or junction; scan every configured-root prefix as well as every canonical-final
-   prefix. On Windows call the DirtyIo Rust-std reparse detector and reject every reparse point;
+   prefix. Ancestor pre/post comparison uses stable identity and repeated type/reparse checks only,
+   never mutable size/time/link/mode metadata. On Windows call the DirtyIo Rust-std reparse detector
+   and reject every reparse point;
 6. pre-lstat, raw-open, fstat/path-lstat identity-check, bounded-read exact raw sidecar, then
    repeat handle/path/ancestor checks;
 7. decode the ordinary-object `maxio/2` envelope through one non-raising `Maxio.Sidecar`
@@ -173,13 +209,17 @@ never safe. Standard APIs still lack cross-platform `openat2/O_NOFOLLOW` and hel
 reparse handles, so document the controlled-data-drive threat boundary; do not claim protection
 against a hostile local ABA writer.
 
-Classify low-level errors exactly as design D6; no raw exception/path enters evidence.
+Classify low-level errors exactly as design D6; Rust raw errno mapping is target-OS-specific and
+unknown/transient values are unavailable, never corrupt. Invalid request fields must return a
+structured endpoint failure rather than raise. A shard request that fails before opening its root
+still retains its frozen ordinal identity.
 
 ### Step 4: Expose the primitive
 
 Add `ShardServer.verify_mutation/3`, the `Transport` callback/facade, `Erpc` implementation, and InProcess implementation. RPC responses contain bounded pure data only.
 Transport success and outage evidence use the same frozen `"ordinal:N"` identity; never use
-node-only or drive-root labels.
+node-only or drive-root labels. Both remote calls and local `apply` execute inside the same
+exception/exit normalization boundary.
 
 ### Step 5: Focused verification and commit
 
@@ -225,6 +265,8 @@ Cover:
 - degraded quorum stays cleanup-pending until every currently observed owned endpoint is safe;
 - same-token claimed + missing/mismatched final stays cleanup-pending; after simulated heal writes the exact final, finalize promotes it to fingerprinted committed and cleans backup;
 - absent/old-token manifest-only debris is not deleted and yields only a bounded orphan hint;
+- finalized quorum remains terminal in the presence of valid orphan hints, while orphan-only or
+  arbitrary non-owned failure cannot satisfy quorum;
 - no absolute path/raw sidecar is returned.
 
 ### Step 2: Add the mandatory backend callback and facade
@@ -245,6 +287,8 @@ Refactor `EpochStore.finalize_mutation` to require the full proof request and re
 
 - `published` and `committed` both re-prove;
 - same-token `claimed` is a finalize-only repair case: exact actual final match writes a fingerprinted committed epoch and may then clean backup; otherwise it remains cleanup debt;
+- only a clean absent epoch read, or an exact-target strictly older token, returns explicit
+  endpoint orphan; target mismatch, corrupt epoch, IO failure and same-token claimed never do;
 - proof failure leaves epoch/backup untouched;
 - proof success precedes committed epoch write and backup discard;
 - epoch write/discard errors become proof-passed cleanup debt.
@@ -281,8 +325,12 @@ only when the coherent batch is complete; do not run or cite a full-suite verdic
 
 - Modify: `lib/maxio/object_mutation/commit.ex`
 - Modify: `lib/maxio/object_mutation/recovery.ex`
+- Modify: `lib/maxio/object_mutation.ex`
+- Modify: `lib/maxio/object_mutation/log.ex`
 - Modify: `lib/maxio/s3/handlers/object.ex`
-- Modify: `lib/mix/tasks/maxio.object_mutations.status.ex` only if evidence rendering needs a narrow addition
+- Modify: `config/config.exs`
+- Modify: `lib/mix/tasks/maxio.object_mutations.status.ex`
+- Modify: `test/maxio/object_mutation_test.exs`
 - Modify: `test/maxio/object_mutation/commit_test.exs`
 - Modify: `test/maxio/object_mutation/recovery_test.exs`
 - Modify: `test/maxio/s3/put_object_mutation_e2e_test.exs`
@@ -294,6 +342,9 @@ Cover:
 
 - exact order `publish → verify_published → journal published → metadata_tx → finalize`;
 - initial proof failure restores old bytes, writes no PG object and never transitions published;
+- initial proof failure atomically persists
+  `%{"published_proof" => nil, "last_failure" => proof_failure}` with rollback phase and a nil
+  fingerprint;
 - journal fingerprint/proof evidence becomes durable only after proof;
 - fresh journal rehydrates the synchronous finalize context;
 - pre-metadata successor rolls back/supersedes without published/metadata and returns retryable error;
@@ -313,7 +364,8 @@ After publish returns `epoch_fingerprint`:
 3. call `Storage.verify_published/2`;
 4. on verified/degraded success transition to `published` with fingerprint and `%{"published_proof" => summary, "last_failure" => nil}`;
 5. reconstruct context from the fresh journal before metadata/finalize;
-6. on proof failure/superseded request rollback, record evidence and return the structured error.
+6. on proof failure/superseded atomically transition to rollback pending with phase-valid evidence
+   and a nil fingerprint, then return the structured error.
 
 Refactor finalize to return an explicit request outcome:
 
@@ -337,6 +389,10 @@ Recovery first calls `Storage.verify_published/2`, then calls proof-aware finali
 - preserves initial proof evidence while updating `"last_failure"`.
 
 It contains no layout/shard proof logic.
+
+All `mark_error`/quarantine paths use the phase-aware evidence helper; they never hand-build or
+overwrite `"published_proof"`. Structured proof logging adds only bounded class/count metadata
+to the formatter whitelist, never a raw evidence map.
 
 ### Step 4: Add safe HTTP mappings and deterministic e2e faults
 
