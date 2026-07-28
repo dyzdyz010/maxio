@@ -73,4 +73,7 @@ defmodule Maxio.Test.StorageAbortFailBackend do
 
   @impl true
   def finalize_if_current(ctx, opts), do: FS.finalize_if_current(ctx, opts)
+
+  @impl true
+  def verify_published(ctx, opts), do: FS.verify_published(ctx, opts)
 end

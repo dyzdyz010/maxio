@@ -224,15 +224,19 @@ defmodule Maxio.Storage.FSMutationTest do
           result
         end)
 
-      assert {:ok, %{epoch_fingerprint: _fingerprint}} = put_result
+      assert {:ok, %{epoch_fingerprint: fingerprint}} = put_result
 
       # put 成功收口：Control.finalize → finalize_if_current → epoch=committed、backup 消失
       assert {:ok, %ObjectEpoch{phase: "committed"}} = FS.current_epoch(ctx.target, o)
       refute File.exists?(backup)
       assert File.read!(Path.join(final, "part.0")) == "new-bytes"
 
-      # 重复 finalize 幂等
-      assert {:ok, :finalized} = FS.finalize_if_current(ctx, o)
+      # 重复 finalize 幂等（proof-aware：committed 重放必须先复验才收敛）
+      proof_ctx = %MutationContext{ctx | published_fingerprint: fingerprint}
+
+      assert {:ok, {:finalized, %{"status" => "finalized", "verified" => 1, "finalized" => 1}}} =
+               FS.finalize_if_current(proof_ctx, o)
+
       assert {:ok, %ObjectEpoch{phase: "committed"}} = FS.current_epoch(ctx.target, o)
 
       # committed 后 restore 被端点级防线拒绝（metadata_committed 禁回滚落点）
@@ -525,6 +529,192 @@ defmodule Maxio.Storage.FSMutationTest do
       refute File.exists?(Path.join(dir, ".maxio-object-epochs"))
       assert {:ok, :absent} = FS.current_epoch(target("plain"), o)
       assert tmp_entries(dir) == []
+    end
+  end
+
+  describe "Task 2 backend proof aggregation（RED）" do
+    @tag :task2_red_backend
+    test "task2 red: FS verify_published aggregates a verified 1/1 endpoint proof", %{dir: dir} do
+      o = opts(dir)
+      :ok = FS.put_bucket(@bucket, o)
+
+      {ctx, {:ok, %{epoch_fingerprint: fingerprint}}} =
+        drive_mutation_put(dir, "k", ["new-bytes"], 1, @id_a, fn _ctx, result -> result end)
+
+      assert function_exported?(FS, :verify_published, 2)
+
+      proof_ctx = %MutationContext{ctx | published_fingerprint: fingerprint}
+
+      assert {:ok,
+              {:verified,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "verified",
+                 "required" => 1,
+                 "verified" => 1,
+                 "observed_owned" => 1,
+                 "unavailable" => 0,
+                 "debt" => 0,
+                 "degraded" => [],
+                 "omitted" => 0
+               } = summary}} = FS.verify_published(proof_ctx, o)
+
+      # 精确有界 aggregate：无路径 / node / raw sidecar 泄漏。
+      refute Enum.any?(~w(path root drive node final_rel), &Map.has_key?(summary, &1))
+      refute inspect(summary) =~ dir
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: FS verify_published maps every endpoint proof error to a bounded aggregate",
+         %{dir: dir} do
+      o = opts(dir)
+      :ok = FS.put_bucket(@bucket, o)
+
+      publish = fn key ->
+        {ctx, {:ok, %{epoch_fingerprint: fingerprint}}} =
+          drive_mutation_put(dir, key, ["new-bytes"], 1, @id_a, fn _ctx, result -> result end)
+
+        %MutationContext{ctx | published_fingerprint: fingerprint}
+      end
+
+      mismatch_ctx = publish.("k-mismatch")
+      meta = Path.join(final_dir(dir, "k-mismatch"), "meta.json")
+      File.write!(meta, File.read!(meta) <> "\n")
+
+      assert {:error,
+              {:published_proof_failed, :mismatch,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "failed",
+                 "verified" => 0
+               }}} = FS.verify_published(mismatch_ctx, o)
+
+      corrupt_ctx = publish.("k-corrupt")
+      File.rm!(Path.join(final_dir(dir, "k-corrupt"), "part.0"))
+
+      assert {:error,
+              {:published_proof_failed, :corrupt, %{"scope" => "aggregate", "verified" => 0}}} =
+               FS.verify_published(corrupt_ctx, o)
+
+      # successor 短路为全局 superseded，绝不降级成少数 failure。
+      superseded_ctx = publish.("k-superseded")
+      successor = token(2, @id_b)
+
+      {:ok, claimed} =
+        ObjectEpoch.new(superseded_ctx.target, successor, %{
+          operation: "put",
+          phase: "claimed",
+          value_type: "object",
+          updated_at: DateTime.utc_now()
+        })
+
+      assert {:ok, :applied} = EpochStore.cas(dir, claimed, {:claim, successor})
+
+      assert {:ok, {:superseded, %{"scope" => "aggregate", "status" => "superseded"}}} =
+               FS.verify_published(superseded_ctx, o)
+
+      # nil published fingerprint 必须失败关闭，不得当作「无需比较」。endpoint 事实是
+      # non-owned corrupt（invalid request）；但 D5 只让 owned corrupt/mismatch 参与全局
+      # integrity 选择，verified < required 时外层落 fallback unavailable。
+      nil_ctx = %MutationContext{publish.("k-nil") | published_fingerprint: nil}
+
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "failed",
+                 "class" => "unavailable",
+                 "verified" => 0,
+                 "degraded" => [nil_detail]
+               }}} = FS.verify_published(nil_ctx, o)
+
+      assert nil_detail["class"] == "corrupt"
+      assert nil_detail["owned"] == false
+      assert nil_detail["code"] == "invalid_request"
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: FS finalize_if_current returns the proof-aware aggregate union", %{dir: dir} do
+      o = opts(dir)
+      :ok = FS.put_bucket(@bucket, o)
+
+      {ctx, {:ok, %{epoch_fingerprint: fingerprint}}} =
+        drive_mutation_put(dir, "k", ["new-bytes"], 1, @id_a, fn _ctx, result -> result end)
+
+      proof_ctx = %MutationContext{ctx | published_fingerprint: fingerprint}
+
+      assert {:ok,
+              {:finalized,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "finalize",
+                 "status" => "finalized",
+                 "required" => 1,
+                 "verified" => 1,
+                 "finalized" => 1,
+                 "debt" => 0,
+                 "orphaned" => 0
+               }}} = FS.finalize_if_current(proof_ctx, o)
+
+      # committed 幂等重放必须先复验：final 漂移后不得再宣告 finalized。
+      meta = Path.join(final_dir(dir, "k"), "meta.json")
+      File.write!(meta, File.read!(meta) <> "\n")
+
+      assert {:error, {:published_proof_failed, :mismatch, %{"mode" => "finalize"}}} =
+               FS.finalize_if_current(proof_ctx, o)
+    end
+
+    @tag :task2_red_backend
+    test "task2 control: FS publish still yields the epoch fingerprint and backup manifest", %{
+      dir: dir
+    } do
+      o = opts(dir)
+      :ok = FS.put_bucket(@bucket, o)
+      {:ok, _} = FS.put(@bucket, "k", "null", ["old-bytes"], o)
+
+      backup = backup_dir(dir, @id_a)
+
+      {_ctx, put_result} =
+        drive_mutation_put(dir, "k", ["new-bytes"], 1, @id_a, fn _ctx, result ->
+          assert {:ok, %{epoch_fingerprint: fingerprint}} = result
+          assert is_map(fingerprint)
+
+          assert {:ok, manifest} =
+                   MutationBackup.decode(File.read!(Path.join(backup, "manifest.json")))
+
+          assert Enum.sort(MutationBackup.entry_names(manifest)) == ["meta.json", "part.0"]
+          result
+        end)
+
+      assert {:ok, %{epoch_fingerprint: _fingerprint}} = put_result
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: FS Control finalize 闭包捕获带 published fingerprint 的 proof 上下文",
+         %{dir: dir} do
+      o = opts(dir)
+      :ok = FS.put_bucket(@bucket, o)
+      {:ok, _} = FS.put(@bucket, "k", "null", ["old-bytes"], o)
+
+      {ctx, put_result} =
+        drive_mutation_put(dir, "k", ["new-bytes"], 1, @id_a, fn _ctx, result -> result end)
+
+      assert {:ok, %{epoch_fingerprint: fingerprint}} = put_result
+
+      # register 时的 ctx 没有 fingerprint；只有 finalize 闭包捕获 proof_ctx 时，
+      # Control.finalize 的 proof-aware finalize 才可能取证通过并写 committed + 清 backup。
+      assert ctx.published_fingerprint == nil
+
+      assert {:ok, %ObjectEpoch{phase: "committed", fingerprint: ^fingerprint}} =
+               FS.current_epoch(ctx.target, o)
+
+      refute File.exists?(backup_dir(dir, @id_a))
+
+      # restore 闭包捕获的仍是原始 ctx：committed 之后由既有端点级防线拒绝回滚。
+      assert {:error, :epoch_committed} = FS.restore_if_current(ctx, o)
     end
   end
 end

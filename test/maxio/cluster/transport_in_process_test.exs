@@ -226,6 +226,282 @@ defmodule Maxio.Cluster.TransportInProcessTest do
              InProcess.quarantine_layout_roots(node, drive, ["bucket-a"], "q-1", %{})
   end
 
+  # --- Task 2 R1：Transport / InProcess endpoint union RED ---
+
+  @tag :task2_red_endpoint
+  test "task2 red: InProcess finalize_mutation returns the endpoint union bound to the captured ordinal",
+       %{base: base} do
+    node = :maxio@n2
+
+    for {name, layout, endpoint} <- [
+          {"fs", %{kind: "fs"}, "local"},
+          {"shard", %{kind: "shard", index: 1}, "ordinal:1"}
+        ] do
+      drive = Path.join(base, "t2-finalize-drive-#{name}")
+      request = published_proof_request!(drive, "t2-key-#{name}", layout)
+
+      assert {:ok,
+              {:finalized,
+               %{
+                 "scope" => "endpoint",
+                 "mode" => "finalize",
+                 "status" => "finalized",
+                 "endpoint" => ^endpoint,
+                 "owned" => true,
+                 "proof_passed" => true,
+                 "finalized" => true
+               }}} = InProcess.finalize_mutation(node, drive, request)
+
+      # 端点不可用时仍绑定捕获到的 ordinal，成为该 ordinal 的 unavailable。
+      InProcess.set_drive_down(node, drive)
+
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "scope" => "endpoint",
+                 "mode" => "finalize",
+                 "status" => "failed",
+                 "endpoint" => ^endpoint,
+                 "owned" => false
+               }}} = InProcess.finalize_mutation(node, drive, request)
+
+      InProcess.set_drive_up(node, drive)
+    end
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: erpc finalize outage binds the captured ordinal without node or drive paths" do
+    unreachable = :maxio_proof_unreachable@localhost
+
+    for {layout, endpoint} <- [
+          {%{kind: "fs"}, "local"},
+          {%{kind: "shard", index: 5}, "ordinal:5"}
+        ] do
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "scope" => "endpoint",
+                 "mode" => "finalize",
+                 "status" => "failed",
+                 "endpoint" => ^endpoint,
+                 "owned" => false
+               } = summary}} =
+               Erpc.finalize_mutation(unreachable, "private-drive-path", %{layout: layout})
+
+      refute Map.has_key?(summary, "node")
+      refute Map.has_key?(summary, "path")
+      refute inspect(summary) =~ "private-drive-path"
+    end
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 control: verify outage evidence already binds the captured ordinal", %{base: base} do
+    node = :maxio@n2
+    drive = Path.join(base, "t2-control-drive")
+    request = published_proof_request!(drive, "t2-control-key", %{kind: "shard", index: 2})
+
+    InProcess.set_drive_down(node, drive)
+
+    assert {:error,
+            {:published_proof_failed, :unavailable,
+             %{"endpoint" => "ordinal:2", "mode" => "proof", "owned" => false} = summary}} =
+             InProcess.verify_mutation(node, drive, request)
+
+    refute Map.has_key?(summary, "node")
+    refute Map.has_key?(summary, "path")
+    refute inspect(summary) =~ drive
+
+    InProcess.set_drive_up(node, drive)
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: transport normalizes non-envelope wire returns to captured-identity unavailable" do
+    alias Maxio.Cluster.Transport
+
+    for {layout, endpoint} <- [
+          {%{kind: "fs"}, "local"},
+          {%{kind: "shard", index: 4}, "ordinal:4"}
+        ] do
+      request = %{layout: layout}
+
+      # 完全不具 endpoint wire envelope 的正常返回：旧 tuple、裸原子、裸错误。
+      for wire <- [
+            :bogus,
+            {:ok, :finalized},
+            {:ok, :superseded},
+            {:error, :unavailable},
+            {:error, {:unexpected_epoch_phase, "claimed"}},
+            nil
+          ] do
+        assert {:error,
+                {:published_proof_failed, :unavailable,
+                 %{
+                   "scope" => "endpoint",
+                   "mode" => "proof",
+                   "status" => "failed",
+                   "endpoint" => ^endpoint,
+                   "owned" => false
+                 } = proof}} = Transport.normalize_mutation_proof(request, wire)
+
+        assert {:error,
+                {:published_proof_failed, :unavailable,
+                 %{
+                   "scope" => "endpoint",
+                   "mode" => "finalize",
+                   "status" => "failed",
+                   "endpoint" => ^endpoint,
+                   "owned" => false,
+                   "proof_passed" => false,
+                   "finalized" => false
+                 } = finalize}} = Transport.normalize_mutation_finalize(request, wire)
+
+        # raw term / reason 绝不外泄。
+        for summary <- [proof, finalize] do
+          refute Map.has_key?(summary, "node")
+          refute Map.has_key?(summary, "path")
+          refute inspect(summary) =~ "bogus"
+          refute inspect(summary) =~ "unexpected_epoch_phase"
+        end
+      end
+    end
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: transport lazy call boundary contains raise, exit, throw and pre-RPC faults" do
+    alias Maxio.Cluster.Transport
+
+    for {layout, endpoint} <- [
+          {%{kind: "fs"}, "local"},
+          {%{kind: "shard", index: 6}, "ordinal:6"}
+        ] do
+      request = %{layout: layout}
+
+      faults = [
+        fn -> raise "boom-secret-/private/drive/path" end,
+        fn -> exit({:shutdown, "exit-secret-/private/drive/path"}) end,
+        fn -> throw({:thrown, "throw-secret-/private/drive/path"}) end,
+        # pre-RPC failure：连 outage 判定本身都在闭包内炸掉。
+        fn -> Path.expand(nil) end
+      ]
+
+      for fault <- faults do
+        assert {:error,
+                {:published_proof_failed, :unavailable,
+                 %{
+                   "scope" => "endpoint",
+                   "mode" => "proof",
+                   "status" => "failed",
+                   "endpoint" => ^endpoint,
+                   "owned" => false
+                 } = proof}} = Transport.call_mutation_proof(request, fault)
+
+        assert {:error,
+                {:published_proof_failed, :unavailable,
+                 %{
+                   "scope" => "endpoint",
+                   "mode" => "finalize",
+                   "status" => "failed",
+                   "endpoint" => ^endpoint,
+                   "owned" => false,
+                   "proof_passed" => false,
+                   "finalized" => false
+                 } = finalize}} = Transport.call_mutation_finalize(request, fault)
+
+        for summary <- [proof, finalize] do
+          rendered = inspect(summary)
+          refute rendered =~ "secret"
+          refute rendered =~ "private"
+          refute Map.has_key?(summary, "node")
+          refute Map.has_key?(summary, "path")
+        end
+      end
+
+      # 闭包内的正常 term 仍交既有 outer-envelope normalizer：合法值逐字透传。
+      legal = Maxio.Storage.PublishedProof.verified(endpoint, %{})
+      assert Transport.call_mutation_proof(request, fn -> legal end) === legal
+    end
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: transport passes endpoint-envelope terms through untouched for the classifier" do
+    alias Maxio.Cluster.Transport
+    alias Maxio.Storage.PublishedProof
+
+    request = %{layout: %{kind: "shard", index: 4}}
+
+    # outer envelope 合法但内部 identity/scope/mode/outcome/status/class/count 伪造，
+    # 或 aggregate 重入：Transport 必须原样透传，由公共 classifier 判成 placement_drift。
+    forged_identity =
+      {:ok,
+       {:verified,
+        %{
+          "scope" => "endpoint",
+          "mode" => "proof",
+          "endpoint" => "ordinal:9",
+          "status" => "verified",
+          "owned" => true
+        }}}
+
+    forged_counts =
+      {:ok,
+       {:verified,
+        %{
+          "scope" => "endpoint",
+          "mode" => "proof",
+          "endpoint" => "ordinal:4",
+          "status" => "verified",
+          "owned" => true,
+          "verified" => 9
+        }}}
+
+    forged_outcome =
+      {:ok,
+       {:degraded,
+        %{
+          "scope" => "endpoint",
+          "mode" => "proof",
+          "endpoint" => "ordinal:4",
+          "status" => "verified",
+          "owned" => true
+        }}}
+
+    forged_class =
+      {:error,
+       {:published_proof_failed, :mismatch,
+        %{
+          "scope" => "endpoint",
+          "mode" => "proof",
+          "endpoint" => "ordinal:4",
+          "status" => "failed",
+          "owned" => true,
+          "class" => "corrupt"
+        }}}
+
+    {:ok, {:verified, aggregate}} =
+      PublishedProof.classify(1, [{"local", PublishedProof.verified("local", %{})}])
+
+    aggregate_reentry = {:ok, {:verified, aggregate}}
+
+    forged = [forged_identity, forged_counts, forged_outcome, forged_class, aggregate_reentry]
+
+    for wire <- forged do
+      assert Transport.normalize_mutation_proof(request, wire) === wire
+    end
+
+    # 合法 endpoint 结果同样 term-identical 透传。
+    legal = PublishedProof.verified("ordinal:4", %{})
+    assert Transport.normalize_mutation_proof(request, legal) === legal
+
+    legal_finalize = PublishedProof.endpoint_finalize_superseded("ordinal:4")
+    assert Transport.normalize_mutation_finalize(request, legal_finalize) === legal_finalize
+
+    # 透传后由公共 classifier 收口为 placement_drift，Transport 不复制语义校验。
+    for wire <- forged do
+      assert {:error, {:published_proof_failed, :placement_drift, _summary}} =
+               PublishedProof.classify(1, [{"ordinal:4", wire}])
+    end
+  end
+
   defp published_proof_request!(drive, key, layout) do
     {:ok, target} = ObjectEpoch.object_target("inprocess-proof", key, "null")
     {:ok, final_rel} = Paths.object_rel("inprocess-proof", key, "null")

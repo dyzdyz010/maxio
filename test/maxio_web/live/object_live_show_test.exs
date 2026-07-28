@@ -60,6 +60,9 @@ defmodule MaxioWeb.ObjectLiveShowTest do
     def restore_if_current(ctx, o), do: Maxio.Storage.FS.restore_if_current(ctx, o)
     @impl true
     def finalize_if_current(ctx, o), do: Maxio.Storage.FS.finalize_if_current(ctx, o)
+
+    @impl true
+    def verify_published(ctx, o), do: Maxio.Storage.FS.verify_published(ctx, o)
   end
 
   defmodule SessionCredentialBackend do

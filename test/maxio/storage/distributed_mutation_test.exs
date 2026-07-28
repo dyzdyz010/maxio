@@ -6,9 +6,11 @@ defmodule Maxio.Storage.DistributedMutationTest do
   # set_down(:maxio@n0) 恰好击落 2 个 endpoint（e0/e3）。
   use ExUnit.Case, async: false
 
-  alias Maxio.Cluster.{Paths, ShardServer, Topology, Transport.InProcess}
+  alias Maxio.Cluster.{Paths, Placement, ShardServer, Topology, Transport.InProcess}
   alias Maxio.Storage.{Distributed, EpochStore, MutationBackup, MutationContext, ObjectEpoch}
   alias Maxio.Storage.ObjectCommit.Control
+  alias Maxio.Storage.PublishedProof
+  alias Maxio.Test.TransportProofRecorder, as: Recorder
 
   @bucket "dist-mutation-test"
   @id_a "00000000-0000-0000-0000-00000000000a"
@@ -318,7 +320,7 @@ defmodule Maxio.Storage.DistributedMutationTest do
           result
         end)
 
-      assert {:ok, %{epoch_fingerprint: _fingerprint}} = put_result
+      assert {:ok, %{epoch_fingerprint: fingerprint}} = put_result
 
       # put 成功收口：Control.finalize → finalize_if_current → epoch=committed、backup 消失
       assert {:ok, %ObjectEpoch{phase: "committed"}} = Distributed.current_epoch(mctx.target, o)
@@ -328,8 +330,12 @@ defmodule Maxio.Storage.DistributedMutationTest do
       assert body(ctx, "k") == "new-bytes"
       assert Enum.all?(ctx.endpoints, &temp_empty?/1)
 
-      # 重复 finalize 幂等
-      assert {:ok, :finalized} = Distributed.finalize_if_current(mctx, o)
+      # 重复 finalize 幂等（proof-aware：committed 重放必须先复验才收敛）
+      proof_ctx = %MutationContext{mctx | published_fingerprint: fingerprint}
+
+      assert {:ok, {:finalized, %{"status" => "finalized", "verified" => 6, "finalized" => 6}}} =
+               Distributed.finalize_if_current(proof_ctx, o)
+
       assert {:ok, %ObjectEpoch{phase: "committed"}} = Distributed.current_epoch(mctx.target, o)
 
       # committed 后 restore 被 quorum 级防线拒绝（metadata_committed 禁回滚落点）
@@ -717,7 +723,22 @@ defmodule Maxio.Storage.DistributedMutationTest do
 
       mctx = build_ctx(ctx, "k", 1, @id_a, nil, "null")
       assert {:error, :epoch_missing} = Distributed.restore_if_current(mctx, o)
-      assert {:error, :epoch_missing} = Distributed.finalize_if_current(mctx, o)
+
+      # proof-aware finalize：该 ctx 没有 published fingerprint —— 非法 request 在读取
+      # epoch 之前就 fail closed 成 non-owned corrupt（因此不是 orphan）；owned corrupt
+      # 才参与全局 integrity 选择，故外层落 fallback unavailable。绝不删任何字节。
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "mode" => "finalize",
+                 "verified" => 0,
+                 "finalized" => 0,
+                 "orphaned" => 0,
+                 "debt" => 6,
+                 "degraded" => details
+               }}} = Distributed.finalize_if_current(mctx, o)
+
+      assert Enum.all?(details, &(&1["class"] == "corrupt" and &1["owned"] == false))
       assert_finals(old, "k")
     end
 
@@ -748,7 +769,22 @@ defmodule Maxio.Storage.DistributedMutationTest do
       assert evidence.snapshot_topology_hash == "drifted-hash"
       assert evidence.current_topology_hash == Topology.fingerprint(ctx.topology)
 
-      assert {:error, {:placement_drift, _evidence}} = Distributed.finalize_if_current(drifted, o)
+      # proof-aware finalize 的漂移出口是 canonical、脱敏、零端点 RPC 的 aggregate
+      # placement drift（绝不回传 node/drive/hash 明细）。
+      assert {:error,
+              {:published_proof_failed, :placement_drift,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "finalize",
+                 "class" => "placement_drift",
+                 "verified" => 0,
+                 "observed_owned" => 0,
+                 "unavailable" => 0,
+                 "finalized" => 0,
+                 "orphaned" => 0
+               } = drift}} = Distributed.finalize_if_current(drifted, o)
+
+      refute inspect(drift) =~ "drifted-hash"
 
       # 不触任何端点：final 与 epoch 逐字节不变
       assert_finals(finals, "k")
@@ -768,7 +804,9 @@ defmodule Maxio.Storage.DistributedMutationTest do
 
       malformed = %MutationContext{mctx | placement_snapshot: %{"set_id" => "0"}}
 
-      assert {:error, {:invalid_placement_snapshot, _snapshot}} =
+      assert {:error,
+              {:published_proof_failed, :placement_drift,
+               %{"scope" => "aggregate", "mode" => "finalize", "verified" => 0}}} =
                Distributed.finalize_if_current(malformed, o)
     end
   end
@@ -843,6 +881,807 @@ defmodule Maxio.Storage.DistributedMutationTest do
       # 旧 final 逐字节不动、对象仍可读（错误发生在任何破坏性 rename 之前）
       assert_finals(old, "k")
       assert body(ctx, "k") == "old-bytes"
+    end
+  end
+
+  describe "Task 2 backend proof aggregation（RED）" do
+    defp dist_published_ctx!(ctx, key) do
+      {mctx, {:ok, %{epoch_fingerprint: fingerprint}}} =
+        drive_mutation_put(ctx, key, ["new-bytes"], 1, @id_a, fn _mctx, result -> result end)
+
+      %MutationContext{mctx | published_fingerprint: fingerprint}
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: Distributed verify_published resolves only the frozen placement snapshot",
+         ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      assert function_exported?(Distributed, :verify_published, 2)
+
+      assert {:ok,
+              {:verified,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "verified",
+                 "required" => 4,
+                 "verified" => 6,
+                 "debt" => 0,
+                 "degraded" => [],
+                 "omitted" => 0
+               } = summary}} = Distributed.verify_published(proof_ctx, o)
+
+      refute Enum.any?(~w(path root drive node endpoints), &Map.has_key?(summary, &1))
+
+      refute Enum.any?(ctx.endpoints, fn {node, drive} ->
+               inspect(summary) =~ drive or inspect(summary) =~ Atom.to_string(node)
+             end)
+
+      # topology hash 漂移 → canonical placement drift，绝不退回当前 router。
+      drifted = %MutationContext{
+        proof_ctx
+        | placement_snapshot:
+            Map.put(proof_ctx.placement_snapshot, "topology_hash", "drifted-hash")
+      }
+
+      assert {:error,
+              {:published_proof_failed, :placement_drift,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "failed",
+                 "class" => "placement_drift",
+                 "verified" => 0,
+                 "observed_owned" => 0,
+                 "unavailable" => 0
+               } = drift}} = Distributed.verify_published(drifted, o)
+
+      refute inspect(drift) =~ "drifted-hash"
+
+      # placement snapshot 缺失同样在任何 RPC 之前失败关闭。
+      missing = %MutationContext{proof_ctx | placement_snapshot: nil}
+
+      assert {:error, {:published_proof_failed, :placement_drift, %{"verified" => 0}}} =
+               Distributed.verify_published(missing, o)
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: every Distributed failure path stays bound to its captured ordinal", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      {down_node, down_drive} = Enum.at(ctx.endpoints, 5)
+
+      # down 状态存活于 setup 创建、随测试进程消亡的 ETS 表；无需（也不能）在 on_exit
+      # 里回滚——那时表已随属主进程销毁。
+      InProcess.set_drive_down(down_node, down_drive)
+
+      assert {:ok,
+              {:degraded,
+               %{
+                 "scope" => "aggregate",
+                 "status" => "degraded",
+                 "required" => 4,
+                 "verified" => 5,
+                 "unavailable" => 1,
+                 "debt" => 1,
+                 "degraded" => [detail]
+               }}} = Distributed.verify_published(proof_ctx, o)
+
+      # 结果按捕获的 expected ordinal 归位，而不是完成顺序 / node / drive。
+      assert detail["endpoint"] == "ordinal:5"
+      assert detail["class"] == "unavailable"
+      assert detail["owned"] == false
+      refute Enum.any?(~w(path drive node), &Map.has_key?(detail, &1))
+      refute inspect(detail) =~ down_drive
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: Distributed finalize returns the proof-aware union with orphan hints", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+
+      terminal_ctx = dist_published_ctx!(ctx, "k-terminal")
+
+      assert {:ok,
+              {:finalized,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "finalize",
+                 "status" => "finalized",
+                 "required" => 4,
+                 "verified" => 6,
+                 "finalized" => 6,
+                 "debt" => 0,
+                 "orphaned" => 0
+               }}} = Distributed.finalize_if_current(terminal_ctx, o)
+
+      orphan_ctx = dist_published_ctx!(ctx, "k-orphan")
+      orphan_endpoint = Enum.at(ctx.endpoints, 5)
+      File.rm_rf!(epoch_path(orphan_endpoint, orphan_ctx.target))
+
+      assert {:ok,
+              {:finalized,
+               %{
+                 "status" => "finalized",
+                 "verified" => 5,
+                 "finalized" => 5,
+                 "debt" => 0,
+                 "orphaned" => 1,
+                 "orphan_hints" => [hint]
+               }}} = Distributed.finalize_if_current(orphan_ctx, o)
+
+      assert hint["endpoint"] == "ordinal:5"
+      assert hint["orphan_reason"] == "epoch_absent"
+      # manifest-only 残留绝不被 orphan 授权删除。
+      assert File.exists?(Path.join(final_dir(orphan_endpoint, "k-orphan"), "part.0"))
+    end
+
+    @tag :task2_red_backend
+    test "task2 control: frozen placement guards already reject drift before endpoint IO", ctx do
+      o = opts(ctx)
+      mctx = build_ctx(ctx, "k", 1, @id_a, nil, "null")
+
+      drifted = %MutationContext{
+        mctx
+        | placement_snapshot: Map.put(mctx.placement_snapshot, "topology_hash", "drifted-hash")
+      }
+
+      assert {:error, {:placement_drift, evidence}} = Distributed.restore_if_current(drifted, o)
+      assert evidence.snapshot_topology_hash == "drifted-hash"
+
+      missing = %MutationContext{mctx | placement_snapshot: nil}
+
+      assert {:error, {:invalid_placement_snapshot, nil}} =
+               Distributed.restore_if_current(missing, o)
+    end
+  end
+
+  describe "Task 2 G3 Distributed 冻结 placement 与捕获 ordinal（RED）" do
+    setup do
+      start_supervised!(Recorder)
+      :ok
+    end
+
+    defp recorder_opts(ctx), do: [topology: ctx.topology, transport: Recorder]
+
+    # 直接构造一个 set 0 含重复 {node, drive} 的 topology map（绕过 parse 校验），并让
+    # snapshot 携带它的精确 fingerprint：hash 一致，唯一的漂移事实就是重复端点身份。
+    defp duplicated_topology(ctx) do
+      endpoints = ctx.topology.sets[0].endpoints
+      duplicated = List.replace_at(endpoints, 5, Enum.at(endpoints, 4))
+      put_in(ctx.topology, [:sets, 0, :endpoints], duplicated)
+    end
+
+    defp snapshot_for(topology, set_id \\ 0) do
+      %{"set_id" => set_id, "pool_id" => 0, "topology_hash" => Topology.fingerprint(topology)}
+    end
+
+    defp force_claimed_endpoint!({_node, drive}, mctx) do
+      {:ok, claimed} =
+        ObjectEpoch.new(mctx.target, mctx.token, %{
+          operation: "put",
+          phase: "claimed",
+          value_type: "object",
+          updated_at: DateTime.utc_now()
+        })
+
+      assert {:ok, :applied} =
+               EpochStore.cas(drive, claimed, {:exact, mctx.token, ["published", "committed"]})
+    end
+
+    defp heal_endpoint_final!(source, target, key) do
+      source_dir = final_dir(source, key)
+      target_dir = final_dir(target, key)
+      File.mkdir_p!(target_dir)
+
+      Enum.each(["meta.json", "part.0"], fn name ->
+        File.write!(Path.join(target_dir, name), File.read!(Path.join(source_dir, name)))
+      end)
+    end
+
+    defp break_endpoint_meta!(endpoint, key) do
+      meta = Path.join(final_dir(endpoint, key), "meta.json")
+      File.write!(meta, File.read!(meta) <> "\n")
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: 重复 {node, drive} 身份与未知 set 都在零 RPC 下折叠为 canonical drift",
+         ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      dup_topology = duplicated_topology(ctx)
+      dup_ctx = %MutationContext{proof_ctx | placement_snapshot: snapshot_for(dup_topology)}
+      dup_opts = [topology: dup_topology, transport: Recorder]
+
+      Recorder.reset_calls()
+
+      assert {:error,
+              {:published_proof_failed, :placement_drift,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "failed",
+                 "class" => "placement_drift",
+                 "verified" => 0,
+                 "observed_owned" => 0,
+                 "unavailable" => 0,
+                 "degraded" => [witness]
+               }}} = Distributed.verify_published(dup_ctx, dup_opts)
+
+      assert Recorder.call_count() == 0
+      assert witness["owned"] == false
+      # shard 域身份：绝不使用 FS 专属的 "local"。
+      assert witness["endpoint"] == "ordinal:0"
+
+      refute Enum.any?(ctx.endpoints, fn {node, drive} ->
+               inspect(witness) =~ drive or inspect(witness) =~ Atom.to_string(node)
+             end)
+
+      # 冻结 snapshot 指向捕获 topology 中不存在的 set：结构化漂移，绝不回退当前 router。
+      unknown_ctx = %MutationContext{
+        proof_ctx
+        | placement_snapshot: snapshot_for(ctx.topology, 7)
+      }
+
+      Recorder.reset_calls()
+
+      assert {:error, {:published_proof_failed, :placement_drift, %{"verified" => 0}}} =
+               Distributed.verify_published(unknown_ctx, recorder_opts(ctx))
+
+      assert Recorder.call_count() == 0
+
+      # finalize 侧同样零 RPC：每端点 epoch 逐字段不变。
+      Recorder.reset_calls()
+      before = Enum.map(ctx.endpoints, &endpoint_epoch(&1, proof_ctx.target))
+
+      assert {:error, {:published_proof_failed, :placement_drift, %{"finalized" => 0}}} =
+               Distributed.finalize_if_current(unknown_ctx, recorder_opts(ctx))
+
+      assert Recorder.call_count() == 0
+      assert Enum.map(ctx.endpoints, &endpoint_epoch(&1, proof_ctx.target)) == before
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: 伪造 endpoint 信封交公共 classifier 判 drift，畸形返回/异常仍绑捕获 ordinal",
+         ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      # 1) 响应 identity 与捕获 ordinal 不符：结构漂移，绝不静默去重或接受自报身份。
+      {:ok, {:verified, forged_identity}} =
+        PublishedProof.verified("ordinal:0", %{layout: "shard:0"})
+
+      Recorder.script(3, {:return, {:ok, {:verified, forged_identity}}})
+
+      assert {:error, {:published_proof_failed, :placement_drift, %{"verified" => 0}}} =
+               Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+
+      # 2) aggregate 重入：endpoint wire 绝不能自报聚合计数。
+      {:ok, {:verified, aggregate}} =
+        PublishedProof.classify(1, [{"local", PublishedProof.verified("local", %{layout: "fs"})}])
+
+      Recorder.script(3, {:return, {:ok, {:verified, aggregate}}})
+
+      assert {:error, {:published_proof_failed, :placement_drift, %{"verified" => 0}}} =
+               Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+
+      # 3) 完全畸形的外层返回 → 该捕获 ordinal 的 canonical unavailable（raw term 不外泄）。
+      Recorder.script(3, {:return, {:ok, :finalized}})
+
+      assert {:ok, {:degraded, %{"verified" => 5, "unavailable" => 1, "degraded" => [detail]}}} =
+               Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+
+      assert detail["endpoint"] == "ordinal:3"
+      assert detail["class"] == "unavailable"
+      refute inspect(detail) =~ "finalized"
+
+      # 4) RPC 超时 / call-time raise / exit / throw：同样只绑捕获 ordinal，raw reason 不外泄。
+      Recorder.script(3, :delegate)
+
+      for action <- [{:return, {:error, :timeout}}, :raise, :exit, :throw] do
+        Recorder.script(2, action)
+
+        assert {:ok, {:degraded, %{"verified" => 5, "unavailable" => 1, "degraded" => [d]}}} =
+                 Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+
+        assert d["endpoint"] == "ordinal:2"
+        assert d["class"] == "unavailable"
+        assert d["owned"] == false
+      end
+
+      # 控制组：无脚本时六个端点全部 verified，证明上面每一条都是脚本注入的结果。
+      Recorder.script(2, :delegate)
+
+      assert {:ok, {:verified, %{"verified" => 6, "debt" => 0}}} =
+               Distributed.verify_published(proof_ctx, o)
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: Distributed 精确 quorum、低于 quorum 与 successor 的确定性全局顺序", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+
+      exact_ctx = dist_published_ctx!(ctx, "k-exact")
+      Enum.each([4, 5], &break_endpoint_meta!(Enum.at(ctx.endpoints, &1), "k-exact"))
+
+      assert {:ok,
+              {:degraded, %{"required" => 4, "verified" => 4, "debt" => 2, "degraded" => details}}} =
+               Distributed.verify_published(exact_ctx, o)
+
+      assert Enum.map(details, & &1["endpoint"]) |> Enum.sort() == ["ordinal:4", "ordinal:5"]
+
+      below_ctx = dist_published_ctx!(ctx, "k-below")
+      Enum.each([3, 4, 5], &break_endpoint_meta!(Enum.at(ctx.endpoints, &1), "k-below"))
+
+      assert {:error,
+              {:published_proof_failed, :mismatch,
+               %{"scope" => "aggregate", "status" => "failed", "verified" => 3}}} =
+               Distributed.verify_published(below_ctx, o)
+
+      # successor 优先于任何少数派降级。
+      successor_ctx = dist_published_ctx!(ctx, "k-successor")
+      break_endpoint_meta!(Enum.at(ctx.endpoints, 4), "k-successor")
+
+      claim_on_endpoints!(
+        [Enum.at(ctx.endpoints, 5)],
+        successor_ctx.target,
+        token(2, @id_b)
+      )
+
+      assert {:ok,
+              {:superseded,
+               %{
+                 "scope" => "aggregate",
+                 "status" => "superseded",
+                 "verified" => 0,
+                 "observed_owned" => 0,
+                 "unavailable" => 0
+               }}} = Distributed.verify_published(successor_ctx, o)
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: Distributed finalize —— claimed 债务、heal 收敛与 orphan-only 不投票", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+
+      debt_ctx = dist_published_ctx!(ctx, "k-claimed")
+      claimed_endpoint = Enum.at(ctx.endpoints, 5)
+      break_endpoint_meta!(claimed_endpoint, "k-claimed")
+      force_claimed_endpoint!(claimed_endpoint, debt_ctx)
+
+      assert {:ok,
+              {:cleanup_pending,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "finalize",
+                 "status" => "cleanup_pending",
+                 "verified" => 5,
+                 "finalized" => 5,
+                 "orphaned" => 0,
+                 "degraded" => [debt_detail]
+               }}} = Distributed.finalize_if_current(debt_ctx, o)
+
+      assert debt_detail["endpoint"] == "ordinal:5"
+      assert debt_detail["owned"] == true
+
+      assert %ObjectEpoch{phase: "claimed", fingerprint: nil} =
+               endpoint_epoch(claimed_endpoint, debt_ctx.target)
+
+      assert File.exists?(Path.join(final_dir(claimed_endpoint, "k-claimed"), "part.0"))
+
+      heal_endpoint_final!(Enum.at(ctx.endpoints, 0), claimed_endpoint, "k-claimed")
+
+      assert {:ok, {:finalized, %{"verified" => 6, "finalized" => 6, "debt" => 0}}} =
+               Distributed.finalize_if_current(debt_ctx, o)
+
+      assert %ObjectEpoch{phase: "committed", fingerprint: fingerprint} =
+               endpoint_epoch(claimed_endpoint, debt_ctx.target)
+
+      assert fingerprint == debt_ctx.published_fingerprint
+
+      # orphan-only：全部端点 epoch 缺失 → 不投票、不计 debt，整体 unavailable failure。
+      orphan_ctx = dist_published_ctx!(ctx, "k-orphan-only")
+      Enum.each(ctx.endpoints, &File.rm_rf!(epoch_path(&1, orphan_ctx.target)))
+
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{"mode" => "finalize", "verified" => 0, "finalized" => 0, "orphaned" => 6}}} =
+               Distributed.finalize_if_current(orphan_ctx, o)
+
+      Enum.each(ctx.endpoints, fn endpoint ->
+        assert File.exists?(Path.join(final_dir(endpoint, "k-orphan-only"), "part.0"))
+      end)
+    end
+
+    # 在受监督进程里按序执行若干步；每步结果以 `{:step, label, result}` 回传，并在收到
+    # `{:ack, label}` 前不前进——这让「每步之后单独取证」成为确定性屏障（无 sleep/轮询）。
+    # worker 死亡绝不能连坐这个 runner。
+    defp run_steps!(id, steps) do
+      owner = self()
+
+      runner =
+        start_supervised!(
+          {Task,
+           fn ->
+             receive do
+               {:go, ^owner} -> :ok
+             end
+
+             Enum.each(steps, fn {label, fun} ->
+               send(owner, {:step, label, fun.()})
+
+               receive do
+                 {:ack, ^label} -> :ok
+               after
+                 5_000 -> :ok
+               end
+             end)
+           end},
+          id: id
+        )
+
+      {runner, Process.monitor(runner)}
+    end
+
+    defp run_aggregate!(id, fun) do
+      {runner, ref} = run_steps!(id, [{:aggregate, fun}])
+      send(runner, {:go, self()})
+      {runner, ref}
+    end
+
+    # worker 与 caller 之间是 nolink，但它必然 link 到 call-scoped `Task.Supervisor`；
+    # 因此 worker 的 links 就是识别该 scoped supervisor 的唯一稳定入口（无生产全局状态）。
+    # 该 supervisor 必须**不是** runner 本身（那正是被禁止的 linked fan-out 形态），
+    # 且其 parent 必须是发起本次调用的 runner——即「每次调用一个」的作用域边界。
+    defp scoped_supervisor!(worker, runner) do
+      assert {:links, links} = Process.info(worker, :links)
+      assert [supervisor] = Enum.filter(links, &is_pid/1)
+      refute supervisor == runner
+
+      assert {:dictionary, dictionary} = Process.info(supervisor, :dictionary)
+      assert [^runner | _] = Keyword.fetch!(dictionary, :"$ancestors")
+
+      supervisor
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: proof worker 被 kill —— runner 存活，归位为该捕获 ordinal 的 unavailable",
+         ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      # 真正的 `Process.exit(self(), :kill)`：`Transport.guarded_call/1` 捕获不到，
+      # 只能由 scoped nolink fan-out 的 `{:exit, _}` 分支收敛。
+      Recorder.script(2, :kill)
+
+      {runner, ref} =
+        run_aggregate!(:proof_kill_runner, fn ->
+          Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+        end)
+
+      assert_receive {:step, :aggregate,
+                      {:ok,
+                       {:degraded,
+                        %{
+                          "required" => 4,
+                          "verified" => 5,
+                          "unavailable" => 1,
+                          "debt" => 1,
+                          "degraded" => [detail]
+                        } = summary}}}
+
+      assert detail["endpoint"] == "ordinal:2"
+      assert detail["class"] == "unavailable"
+      assert detail["owned"] == false
+      refute inspect(summary) =~ "killed"
+
+      refute Enum.any?(ctx.endpoints, fn {node, drive} ->
+               inspect(summary) =~ drive or inspect(summary) =~ Atom.to_string(node)
+             end)
+
+      send(runner, {:ack, :aggregate})
+      assert_receive {:DOWN, ^ref, :process, ^runner, :normal}
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: finalize worker 被 kill —— runner 存活，债务归位到该捕获 ordinal", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      Recorder.script(2, :kill)
+
+      {runner, ref} =
+        run_aggregate!(:finalize_kill_runner, fn ->
+          Distributed.finalize_if_current(proof_ctx, recorder_opts(ctx))
+        end)
+
+      assert_receive {:step, :aggregate,
+                      {:ok,
+                       {:cleanup_pending,
+                        %{
+                          "mode" => "finalize",
+                          "required" => 4,
+                          "verified" => 5,
+                          "finalized" => 5,
+                          "unavailable" => 1,
+                          "degraded" => [detail]
+                        } = summary}}}
+
+      assert detail["endpoint"] == "ordinal:2"
+      assert detail["class"] == "unavailable"
+      refute inspect(summary) =~ "killed"
+
+      send(runner, {:ack, :aggregate})
+      assert_receive {:DOWN, ^ref, :process, ^runner, :normal}
+    end
+
+    # caller 被强杀时 scoped supervisor 随之终止属预期路径，OTP 会记一条 terminating 日志。
+    @tag :task2_red_backend
+    @tag capture_log: true
+    test "task2 g3: caller 死亡时 scoped supervisor 连带清理被阻塞的 worker", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      gate = make_ref()
+      Recorder.script(1, {:gate, self(), gate, :delegate})
+
+      {runner, runner_ref} =
+        run_aggregate!(:caller_death_runner, fn ->
+          Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+        end)
+
+      assert_receive {:entered, ^gate, 1, worker}
+      worker_ref = Process.monitor(worker)
+      supervisor = scoped_supervisor!(worker, runner)
+      supervisor_ref = Process.monitor(supervisor)
+
+      # 杀掉请求 caller；**绝不**释放 gate，也不 sleep/轮询。
+      Process.exit(runner, :kill)
+
+      assert_receive {:DOWN, ^runner_ref, :process, ^runner, :killed}
+      assert_receive {:DOWN, ^supervisor_ref, :process, ^supervisor, _reason}
+      assert_receive {:DOWN, ^worker_ref, :process, ^worker, _reason}
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: 正常完成的 fan-out 结束后 scoped supervisor 已同步停止", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      gate = make_ref()
+      Recorder.script(0, {:gate, self(), gate, :delegate})
+
+      {runner, runner_ref} =
+        run_aggregate!(:lifecycle_runner, fn ->
+          Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+        end)
+
+      assert_receive {:entered, ^gate, 0, worker}
+      supervisor = scoped_supervisor!(worker, runner)
+      supervisor_ref = Process.monitor(supervisor)
+
+      send(worker, {:release, gate})
+      assert_receive {:completed, ^gate, 0, ^worker}
+
+      assert_receive {:step, :aggregate, {:ok, {:verified, %{"verified" => 6}}}}
+      send(runner, {:ack, :aggregate})
+
+      # `try/after` 里的同步 stop：fan-out 一结束，scoped supervisor 必然已经消失。
+      assert_receive {:DOWN, ^supervisor_ref, :process, ^supervisor, _reason}
+      assert_receive {:DOWN, ^runner_ref, :process, ^runner, :normal}
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: 乱序完成不改变归位——高 ordinal 先完成，低 ordinal 仍带自己的 ordinal",
+         ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      owner = self()
+      slow = make_ref()
+      fast = make_ref()
+
+      # ordinal 1 被闸住；释放后返回完全畸形的外层返回（→ 该 ordinal 的 unavailable）。
+      Recorder.script(1, {:gate, owner, slow, {:return, {:ok, :finalized}}})
+      # ordinal 5 正常完成并通报——它必然早于被闸住的 ordinal 1 完成。
+      Recorder.script(5, {:notify, owner, fast, :delegate})
+
+      {runner, ref} =
+        run_aggregate!(:ooo_runner, fn ->
+          Distributed.verify_published(proof_ctx, recorder_opts(ctx))
+        end)
+
+      # 确定性屏障：无 sleep、无轮询。
+      assert_receive {:entered, ^slow, 1, worker}
+      assert_receive {:completed, ^fast, 5, _fast_worker}
+      refute_received {:completed, ^slow, 1, _}
+
+      send(worker, {:release, slow})
+      assert_receive {:completed, ^slow, 1, ^worker}
+
+      assert_receive {:step, :aggregate,
+                      {:ok,
+                       {:degraded, %{"verified" => 5, "unavailable" => 1, "degraded" => [detail]}}}}
+
+      # 归位只认枚举 ordinal：完成顺序是 5 先于 1，失败标签仍是 ordinal:1。
+      assert detail["endpoint"] == "ordinal:1"
+      assert detail["class"] == "unavailable"
+
+      send(runner, {:ack, :aggregate})
+      assert_receive {:DOWN, ^ref, :process, ^runner, :normal}
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: 默认运行时 topology 在 proof 与 finalize 各只捕获一次", ctx do
+      :ok = Distributed.put_bucket(@bucket, opts(ctx))
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      previous = :persistent_term.get({Topology, :topology}, :no_topology)
+      Topology.install_runtime!(ctx.topology)
+
+      traced = [
+        {Topology, :current, 0},
+        {Topology, :ec_params, 0},
+        {Placement, :topology_hash_for_opts, 1},
+        {Placement, :resolve, 3}
+      ]
+
+      Enum.each(traced, &:erlang.trace_pattern(&1, true, [:local]))
+
+      on_exit(fn ->
+        Enum.each(traced, &:erlang.trace_pattern(&1, false, [:local]))
+
+        case previous do
+          :no_topology -> :persistent_term.erase({Topology, :topology})
+          topology -> :persistent_term.put({Topology, :topology}, topology)
+        end
+      end)
+
+      # 不传 opts[:topology]：走默认运行时 topology 路径。
+      runtime_opts = [transport: Recorder]
+
+      {runner, ref} =
+        run_steps!(:topology_runner, [
+          {:proof, fn -> Distributed.verify_published(proof_ctx, runtime_opts) end},
+          {:finalize, fn -> Distributed.finalize_if_current(proof_ctx, runtime_opts) end}
+        ])
+
+      :erlang.trace(runner, true, [:call, {:tracer, self()}])
+      send(runner, {:go, self()})
+
+      # proof 单独取证。
+      assert_receive {:step, :proof, {:ok, {:verified, %{"verified" => 6}}}}
+      assert_topology_reads(runner, 1)
+      send(runner, {:ack, :proof})
+
+      # finalize 单独取证。
+      assert_receive {:step, :finalize, {:ok, {:finalized, %{"finalized" => 6}}}}
+      assert_topology_reads(runner, 1)
+      send(runner, {:ack, :finalize})
+
+      assert_receive {:DOWN, ^ref, :process, ^runner, :normal}
+    end
+
+    # `:erlang.trace_delivered/1` 屏障：确保该 tracee 的全部 trace 消息已投递完毕，
+    # 再按 MFA 计数——不靠 `after 0` 排空猜测。
+    defp assert_topology_reads(runner, expected_current) do
+      calls = drain_traced_calls(runner)
+
+      assert Enum.count(calls, &match?({Topology, :current, _}, &1)) == expected_current
+      assert Enum.count(calls, &match?({Topology, :ec_params, _}, &1)) == 0
+      assert Enum.count(calls, &match?({Placement, :topology_hash_for_opts, _}, &1)) == 0
+      assert Enum.count(calls, &match?({Placement, :resolve, _}, &1)) == 0
+    end
+
+    defp drain_traced_calls(pid) do
+      delivery = :erlang.trace_delivered(pid)
+
+      receive do
+        {:trace_delivered, ^pid, ^delivery} -> :ok
+      after
+        5_000 -> flunk("trace messages were not delivered for #{inspect(pid)}")
+      end
+
+      collect_traced_calls(pid, [])
+    end
+
+    defp collect_traced_calls(pid, acc) do
+      receive do
+        {:trace, ^pid, :call, {module, fun, args}} ->
+          collect_traced_calls(pid, [{module, fun, args} | acc])
+      after
+        0 -> Enum.reverse(acc)
+      end
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: 畸形显式 topology 绝不抛异常，零 RPC 折叠为脱敏 canonical drift", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      proof_ctx = dist_published_ctx!(ctx, "k")
+
+      malformed = [
+        %{},
+        %{sets: :bogus},
+        %{sets: %{0 => %{endpoints: [{:maxio@n0, "d"}]}}, data_shards: 4},
+        %{
+          sets: %{0 => %{id: 0, endpoints: :not_a_list, pool_id: 0}},
+          data_shards: 4,
+          parity_shards: 2,
+          block_size: 1024
+        }
+      ]
+
+      Enum.each(malformed, fn topology ->
+        broken_opts = [topology: topology, transport: Recorder]
+        Recorder.reset_calls()
+
+        assert {:error,
+                {:published_proof_failed, :placement_drift,
+                 %{
+                   "scope" => "aggregate",
+                   "mode" => "proof",
+                   "status" => "failed",
+                   "verified" => 0,
+                   "observed_owned" => 0,
+                   "unavailable" => 0,
+                   "degraded" => [proof_witness]
+                 }}} = Distributed.verify_published(proof_ctx, broken_opts)
+
+        assert proof_witness["endpoint"] == "ordinal:0"
+        assert proof_witness["owned"] == false
+        assert Recorder.call_count() == 0
+
+        Recorder.reset_calls()
+
+        assert {:error,
+                {:published_proof_failed, :placement_drift,
+                 %{
+                   "mode" => "finalize",
+                   "verified" => 0,
+                   "finalized" => 0,
+                   "orphaned" => 0,
+                   "degraded" => [finalize_witness]
+                 }}} = Distributed.finalize_if_current(proof_ctx, broken_opts)
+
+        assert finalize_witness["endpoint"] == "ordinal:0"
+        assert Recorder.call_count() == 0
+      end)
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: Distributed Control finalize 闭包捕获带 fingerprint 的 proof 上下文", ctx do
+      o = opts(ctx)
+      :ok = Distributed.put_bucket(@bucket, o)
+      {:ok, _} = Distributed.put(@bucket, "k", "null", ["old-bytes"], o)
+
+      {mctx, put_result} =
+        drive_mutation_put(ctx, "k", ["new-bytes"], 1, @id_a, fn _mctx, result -> result end)
+
+      assert {:ok, %{epoch_fingerprint: fingerprint}} = put_result
+      assert mctx.published_fingerprint == nil
+
+      Enum.each(ctx.endpoints, fn endpoint ->
+        assert %ObjectEpoch{phase: "committed", fingerprint: ^fingerprint} =
+                 endpoint_epoch(endpoint, mctx.target)
+
+        refute File.exists?(backup_dir(endpoint, @id_a))
+      end)
+
+      assert {:error, :epoch_committed} = Distributed.restore_if_current(mctx, o)
     end
   end
 end

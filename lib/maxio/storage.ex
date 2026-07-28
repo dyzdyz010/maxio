@@ -147,10 +147,38 @@ defmodule Maxio.Storage do
   def restore_if_current(ctx, opts \\ []), do: backend().restore_if_current(ctx, opts)
 
   @doc """
-  仅当 ctx.token 仍为当前 epoch 时终结（epoch → committed + 丢弃 backup）；幂等。
+  proof-aware 终结：仅当 ctx.token 仍为当前 epoch 时重新取证并终结；幂等。与
+  `verify_published/2` 共用同一个非变异 callback trust boundary，非法/obsolete/跨 mode
+  返回折叠为 `{:error, {:published_proof_contract_violation, :finalize}}`。
   见 `Maxio.Storage.Backend.finalize_if_current/2`。
   """
   @spec finalize_if_current(Maxio.Storage.MutationContext.t(), keyword()) ::
-          {:ok, :finalized | :superseded} | {:error, term()}
-  def finalize_if_current(ctx, opts \\ []), do: backend().finalize_if_current(ctx, opts)
+          Maxio.Storage.PublishedProof.aggregate_finalize_result()
+          | {:error, {:published_proof_contract_violation, :finalize}}
+  def finalize_if_current(ctx, opts \\ []) do
+    guard_callback_result(:finalize, backend().finalize_if_current(ctx, opts))
+  end
+
+  @doc """
+  取得已发布 final 的 backend aggregate proof（设计 D1）。本函数是插件 trust boundary：
+  backend 返回先经非变异的
+  `Maxio.Storage.PublishedProof.validate_callback_result/2` 复核，合法值原样透传，
+  非法/obsolete/wrong-mode 值一律折叠为
+  `{:error, {:published_proof_contract_violation, :proof}}`。raw callback term 绝不
+  被持久化、记录或对外暴露；调用方按 integrity fail closed 处理，不得当作可重试的
+  unavailable，也不得删除 backup。
+  """
+  @spec verify_published(Maxio.Storage.MutationContext.t(), keyword()) ::
+          Maxio.Storage.PublishedProof.aggregate_proof_result()
+          | {:error, {:published_proof_contract_violation, :proof}}
+  def verify_published(ctx, opts \\ []) do
+    guard_callback_result(:proof, backend().verify_published(ctx, opts))
+  end
+
+  defp guard_callback_result(mode, result) do
+    case Maxio.Storage.PublishedProof.validate_callback_result(mode, result) do
+      :ok -> result
+      {:error, :invalid_proof_result} -> {:error, {:published_proof_contract_violation, mode}}
+    end
+  end
 end

@@ -283,6 +283,25 @@ defmodule Maxio.Storage.PublishedProof do
   def merge_failure(_target_phase, _evidence, _failure),
     do: {:error, :invalid_proof_evidence}
 
+  @doc """
+  `Maxio.Storage` facade 的**非变异** callback trust boundary：只判定 backend 返回是否
+  是所选 mode 的 canonical aggregate result。它复用 Task 1 的 source semantic validator，
+  绝不裁剪、规范化、重排、修复，也绝不返回替代值——合法 term 由调用方原样透传。
+
+  obsolete tuple、endpoint scope、跨 mode summary、伪造 status/class/counts 与
+  `:fenced` failed class 一律 `{:error, :invalid_proof_result}`；调用方据此折叠为
+  `{:error, {:published_proof_contract_violation, mode}}`，raw term 不出现在返回值里。
+  """
+  @spec validate_callback_result(:proof | :finalize, term()) ::
+          :ok | {:error, :invalid_proof_result}
+  def validate_callback_result(mode, result) when mode in [:proof, :finalize] do
+    if callback_result_valid?(mode, result),
+      do: :ok,
+      else: {:error, :invalid_proof_result}
+  end
+
+  def validate_callback_result(_mode, _result), do: {:error, :invalid_proof_result}
+
   @spec proof_class?(term()) :: boolean()
   def proof_class?(class), do: class in @classes
 
@@ -291,6 +310,33 @@ defmodule Maxio.Storage.PublishedProof do
 
   @spec integrity_class?(term()) :: boolean()
   def integrity_class?(class), do: class in @integrity_classes
+
+  # tuple outcome 与 summary status 必须逐一对应；随后由完整 aggregate validator 复核语义。
+  defp callback_result_valid?(:proof, {:ok, {outcome, summary}})
+       when outcome in [:verified, :degraded, :superseded] do
+    outcome_status?(summary, outcome) and valid_aggregate_proof_summary?(summary)
+  end
+
+  defp callback_result_valid?(:finalize, {:ok, {outcome, summary}})
+       when outcome in [:finalized, :cleanup_pending, :superseded] do
+    outcome_status?(summary, outcome) and valid_aggregate_finalize_summary?(summary)
+  end
+
+  # fenced 永远不是 failed class；它只能表达为 superseded。
+  defp callback_result_valid?(mode, {:error, {:published_proof_failed, class, summary}})
+       when class in @endpoint_failure_classes do
+    outcome_status?(summary, :failed) and
+      Map.get(summary, "class") == Atom.to_string(class) and
+      callback_summary_valid?(mode, summary)
+  end
+
+  defp callback_result_valid?(_mode, _result), do: false
+
+  defp outcome_status?(summary, outcome),
+    do: is_map(summary) and Map.get(summary, "status") == Atom.to_string(outcome)
+
+  defp callback_summary_valid?(:proof, summary), do: valid_aggregate_proof_summary?(summary)
+  defp callback_summary_valid?(:finalize, summary), do: valid_aggregate_finalize_summary?(summary)
 
   defp classify_proof_observations(required, observations) do
     cond do

@@ -41,7 +41,8 @@ defmodule Maxio.Storage.Distributed do
     MutationContext,
     NotificationLedger,
     ObjectCommit,
-    ObjectEpoch
+    ObjectEpoch,
+    PublishedProof
   }
 
   alias Maxio.Storage.ObjectCommit.Control
@@ -130,6 +131,9 @@ defmodule Maxio.Storage.Distributed do
 
   @impl true
   def finalize_if_current(ctx, opts \\ []), do: do_finalize_if_current(ctx, opts)
+
+  @impl true
+  def verify_published(ctx, opts \\ []), do: do_verify_published(ctx, opts)
 
   # ── 端点解析（对象 -> set -> [{node, drive}]）──
 
@@ -583,8 +587,11 @@ defmodule Maxio.Storage.Distributed do
          {:ok, plans} <- plan_mutation_backups(commit_targets, ctx),
          {:ok, fingerprint} <- staged_mutation_fingerprint(meta, committed),
          {:ok, published_payload} <- published_epoch_payload(ctx, fingerprint) do
+      # 设计 D2：proof_ctx 在 Control.register 之前派生。restore 闭包捕获原始 ctx；
+      # finalize 闭包捕获带 published fingerprint 的 proof_ctx。
+      proof_ctx = %MutationContext{ctx | published_fingerprint: fingerprint}
       rollback = fn -> mutation_control_result(do_restore_if_current(ctx, opts)) end
-      finalize = fn -> mutation_control_result(do_finalize_if_current(ctx, opts)) end
+      finalize = fn -> mutation_control_result(do_finalize_if_current(proof_ctx, opts)) end
 
       case Control.register(control, identity, rollback, finalize) do
         :ok ->
@@ -963,28 +970,293 @@ defmodule Maxio.Storage.Distributed do
     end
   end
 
-  defp do_finalize_if_current(%MutationContext{} = ctx, opts) do
-    cfg = cfg(opts)
-    tx = transport(opts)
+  # ── proof-aware backend 聚合（设计 D1/D4/D5，Task 2 G3）──
+  #
+  # 与旧的「全局 epoch 预裁决 + 三字段 finalize 请求」彻底替换。
+  #
+  # 唯一真相来源是**一次捕获的 topology**：显式 `opts[:topology]` 优先，否则整次调用只读
+  # 一次 `Topology.current/0`。EC 参数/quorum、冻结快照 hash、set 解析、端点校验与不可变
+  # 参与者枚举全部从那**同一份** map 派生——绝不允许「config 来自 topology A、endpoints
+  # 来自 topology B」。枚举之后绝不再读 Topology / Placement / Router。
+  #
+  # `mutation_setup/2` 是唯一的**非抛出**前置边界：畸形/不可用 topology 以及任何
+  # parse / fingerprint / config 异常或 exit，都在任何端点 RPC 之前 fail closed 成脱敏的
+  # canonical aggregate placement drift。restore 路径不受影响。
+  defp do_verify_published(%MutationContext{} = ctx, opts) do
+    case mutation_setup(ctx, opts) do
+      {:ok, setup} ->
+        PublishedProof.classify(
+          setup.cfg.epoch_quorum,
+          proof_endpoint_observations(setup, ctx, :proof)
+        )
 
-    with {:ok, endpoints} <- mutation_endpoints(ctx, opts) do
-      case adjudicate_mutation_epoch(tx, endpoints, ctx, :finalize, cfg.epoch_quorum) do
-        :superseded ->
-          {:ok, :superseded}
-
-        :proceed ->
-          request = %{target: ctx.target, token: ctx.token, mutation_id: ctx.mutation_id}
-
-          endpoints
-          |> epoch_endpoint_results(fn node, drive ->
-            tx.finalize_mutation(node, drive, request)
-          end)
-          |> conclude_mutation_quorum(:finalized, cfg.epoch_quorum)
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      {:error, required, code} ->
+        placement_drift_aggregate(required, :proof, code)
     end
+  end
+
+  defp do_finalize_if_current(%MutationContext{} = ctx, opts) do
+    case mutation_setup(ctx, opts) do
+      {:ok, setup} ->
+        PublishedProof.classify_finalize(
+          setup.cfg.epoch_quorum,
+          proof_endpoint_observations(setup, ctx, :finalize)
+        )
+
+      {:error, required, code} ->
+        placement_drift_aggregate(required, :finalize, code)
+    end
+  end
+
+  # 无法从畸形 topology 派生可信 quorum 时，只用最小 canonical 正整数 required 构造失败
+  # 的 preflight wrapper——它永远不可能让任何观察获得选票（drift 的 verified 恒为 0）。
+  @drift_required 1
+
+  defp mutation_setup(%MutationContext{} = ctx, opts) do
+    captured_setup(ctx, opts)
+  rescue
+    _error -> {:error, @drift_required, :placement_setup_failed}
+  catch
+    _kind, _reason -> {:error, @drift_required, :placement_setup_failed}
+  end
+
+  defp captured_setup(%MutationContext{placement_snapshot: snapshot}, opts) do
+    with {:ok, set_id, snapshot_hash} <- frozen_placement(snapshot),
+         {:ok, topology} <- captured_topology(opts),
+         {:ok, cfg} <- captured_config(topology) do
+      # cfg 已可信：后续校验失败用真实 epoch_quorum 构造 drift wrapper。
+      case resolve_participants(topology, set_id, snapshot_hash, cfg) do
+        {:ok, participants} ->
+          {:ok, %{cfg: cfg, transport: transport(opts), participants: participants}}
+
+        {:error, code} ->
+          {:error, cfg.epoch_quorum, code}
+      end
+    else
+      {:error, code} -> {:error, @drift_required, code}
+    end
+  end
+
+  defp resolve_participants(topology, set_id, snapshot_hash, cfg) do
+    with :ok <- match_topology_hash(topology, snapshot_hash),
+         {:ok, endpoints} <- captured_set_endpoints(topology, set_id),
+         :ok <- validate_endpoint_set(endpoints, cfg) do
+      {:ok,
+       endpoints
+       |> Enum.with_index()
+       |> Enum.map(fn {{node, drive}, ordinal} ->
+         %{ordinal: ordinal, identity: "ordinal:#{ordinal}", node: node, drive: drive}
+       end)}
+    end
+  end
+
+  # EC 参数/quorum 只从捕获的那一份 topology 派生（绝不再调 `cfg/1` → `Topology.ec_params/0`）。
+  defp captured_config(topology) do
+    {:ok,
+     topology
+     |> Topology.ec_params_from()
+     |> with_placeholder_drives()
+     |> Config.load!()}
+  end
+
+  defp frozen_placement(%{"set_id" => set_id, "topology_hash" => hash})
+       when is_integer(set_id) and is_binary(hash),
+       do: {:ok, set_id, hash}
+
+  defp frozen_placement(_snapshot), do: {:error, :invalid_placement_snapshot}
+
+  # 每次调用最多读一次 topology：显式 opts[:topology] 优先，否则读一次当前 topology。
+  defp captured_topology(opts) do
+    case Keyword.fetch(opts, :topology) do
+      {:ok, topology} when is_map(topology) ->
+        {:ok, topology}
+
+      {:ok, _other} ->
+        {:error, :topology_unavailable}
+
+      :error ->
+        case Topology.current() do
+          {:ok, topology} when is_map(topology) -> {:ok, topology}
+          _unavailable -> {:error, :topology_unavailable}
+        end
+    end
+  end
+
+  defp match_topology_hash(topology, snapshot_hash) do
+    if Topology.fingerprint(topology) == snapshot_hash,
+      do: :ok,
+      else: {:error, :topology_hash_drift}
+  end
+
+  defp captured_set_endpoints(%{sets: sets}, set_id) when is_map(sets) do
+    case Map.fetch(sets, set_id) do
+      {:ok, %{endpoints: endpoints}} when is_list(endpoints) -> {:ok, endpoints}
+      _missing -> {:error, :unknown_placement_set}
+    end
+  end
+
+  defp captured_set_endpoints(_topology, _set_id), do: {:error, :invalid_topology_shape}
+
+  defp validate_endpoint_set(endpoints, cfg) do
+    expected = cfg.data_shards + cfg.parity_shards
+
+    cond do
+      not Enum.all?(endpoints, &endpoint_shape?/1) -> {:error, :invalid_endpoint_shape}
+      length(endpoints) != expected -> {:error, :endpoint_count_drift}
+      length(Enum.uniq(endpoints)) != length(endpoints) -> {:error, :duplicate_endpoint}
+      length(endpoints) < cfg.epoch_quorum -> {:error, :insufficient_participants}
+      true -> :ok
+    end
+  end
+
+  defp endpoint_shape?({node, drive}) when is_atom(node) and is_binary(drive), do: drive != ""
+  defp endpoint_shape?(_endpoint), do: false
+
+  # 每个结果绑回**枚举时捕获的**参与者：完成顺序、node、drive 与响应自报 identity 都不能
+  # 定义 ordinal。
+  #
+  # 并发模型（设计 D5 的进程边界）：**每次 proof/finalize 调用一个 call-scoped 匿名
+  # `Task.Supervisor`**。
+  #
+  #   * 普通 `Task.async_stream/3` 把 worker link 到请求进程，任一 worker 被不可捕获地
+  #     杀死（`Process.exit(pid, :kill)`、OOM）都会连坐整个请求，使「worker 死亡 → 该
+  #     捕获 ordinal 的 canonical unavailable」这条契约根本无法成立；
+  #   * 全局具名 `Task.Supervisor` 也不够：stream 正常收束时会清理 nolink 子进程，但请求
+  #     进程**突然死亡**时它只把退出传播给 linked worker，可能留下全局 supervisor 下的
+  #     nolink worker 存活。
+  #
+  # 因此 scoped supervisor 本身保持与 caller 的 link，充当结构化生命周期边界：caller 死亡
+  # → 它随之死亡 → 连带终止全部 nolink worker；而单个 worker 被杀只被隔离在 supervisor
+  # 内部，经 `{:exit, _}` 收敛成该捕获 ordinal 的 canonical unavailable。绝不使用全局
+  # TaskSupervisor、裸 `spawn_monitor` fan-out、独立 owner guardian，也绝不切换 caller 的
+  # `trap_exit`。
+  defp proof_endpoint_observations(setup, %MutationContext{} = ctx, mode) do
+    # 派发之前先冻结不可变 work entries：捕获的 participant、捕获的 identity、完整 request。
+    entries =
+      Enum.map(setup.participants, fn participant ->
+        %{
+          participant: participant,
+          identity: participant.identity,
+          request: shard_proof_request(ctx, participant.ordinal)
+        }
+      end)
+
+    case start_scoped_supervisor(length(entries)) do
+      {:ok, supervisor} ->
+        try do
+          run_scoped_fan_out(supervisor, setup, entries, mode)
+        after
+          stop_scoped_supervisor(supervisor)
+        end
+
+      :error ->
+        # scoped supervisor 起不来：零 RPC，并为**每个**捕获 participant 生成 canonical
+        # unavailable；raw 启动原因绝不外泄，也绝不记录。
+        Enum.map(entries, fn entry ->
+          {entry.identity, unavailable_observation(entry.request, mode)}
+        end)
+    end
+  end
+
+  defp run_scoped_fan_out(supervisor, setup, entries, mode) do
+    supervisor
+    |> Task.Supervisor.async_stream_nolink(
+      entries,
+      fn entry ->
+        proof_endpoint_call(setup.transport, entry.participant, entry.request, mode)
+      end,
+      ordered: true,
+      max_concurrency: max(length(entries), 1),
+      # Transport/:erpc 已把远端调用限在 5s，本地 EpochStore 串行段有 30s 预算——这里
+      # 显式 :infinity，不叠加第三层超时；真出现有限超时时 :kill_task 保证不连坐 caller。
+      timeout: :infinity,
+      on_timeout: :kill_task,
+      shutdown: :brutal_kill
+    )
+    |> Enum.zip(entries)
+    |> Enum.map(fn
+      {{:ok, observation}, entry} ->
+        {entry.identity, observation}
+
+      # worker 死亡（含不可捕获 kill）：用**捕获的 request** 合成 canonical unavailable，
+      # raw exit reason 绝不外泄、绝不记录。
+      {{:exit, _reason}, entry} ->
+        {entry.identity, unavailable_observation(entry.request, mode)}
+    end)
+  end
+
+  defp start_scoped_supervisor(count) do
+    case Task.Supervisor.start_link(max_children: max(count, 1)) do
+      {:ok, supervisor} -> {:ok, supervisor}
+      _other -> :error
+    end
+  rescue
+    _error -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  # 同步停止；只吞「进程已经不在了」这一精确竞态，绝不吞任意 stop 失败。
+  defp stop_scoped_supervisor(supervisor) do
+    Supervisor.stop(supervisor, :normal, :infinity)
+  catch
+    :exit, :noproc -> :ok
+    :exit, {:noproc, _call} -> :ok
+  end
+
+  # 复用 Transport 的惰性 outer-envelope 边界：call-time raise/exit/throw、pre-RPC 组装
+  # 失败与完全畸形的外层返回都归一化为该捕获 ordinal 的 canonical unavailable；具备
+  # endpoint 信封的值（含伪造 identity/scope/mode/counts、aggregate 重入）原样透传给公共
+  # classifier 判 placement drift。
+  defp proof_endpoint_call(tx, participant, request, :proof) do
+    Transport.call_mutation_proof(request, fn ->
+      tx.verify_mutation(participant.node, participant.drive, request)
+    end)
+  end
+
+  defp proof_endpoint_call(tx, participant, request, :finalize) do
+    Transport.call_mutation_finalize(request, fn ->
+      tx.finalize_mutation(participant.node, participant.drive, request)
+    end)
+  end
+
+  defp unavailable_observation(request, :proof), do: Transport.mutation_proof_unavailable(request)
+
+  defp unavailable_observation(request, :finalize),
+    do: Transport.mutation_finalize_unavailable(request)
+
+  # 设计 D4 的完整 endpoint request（含捕获的 `layout.index`）。
+  defp shard_proof_request(%MutationContext{} = ctx, ordinal) do
+    %{
+      target: ctx.target,
+      token: ctx.token,
+      mutation_id: ctx.mutation_id,
+      final_rel: ctx.final_rel,
+      expected_fingerprint: ctx.published_fingerprint,
+      layout: %{kind: "shard", index: ordinal}
+    }
+  end
+
+  # preflight 漂移的唯一出口：canonical、脱敏、零端点 RPC 的 aggregate placement drift。
+  # 身份用 shard 域的稳定 `"ordinal:0"`（`"local"` 是 FS 专属身份，分片后端不得借用）；
+  # expected identity 与 endpoint summary 同源，再经公共 classifier 规范化。
+  @drift_identity "ordinal:0"
+
+  defp placement_drift_aggregate(required, :proof, code) do
+    witness =
+      PublishedProof.failed(:placement_drift, @drift_identity, %{code: code, owned: false})
+
+    PublishedProof.classify(required, [{@drift_identity, witness}])
+  end
+
+  defp placement_drift_aggregate(required, :finalize, code) do
+    witness =
+      PublishedProof.endpoint_finalize_failed(:placement_drift, @drift_identity, %{
+        code: code,
+        owned: false
+      })
+
+    PublishedProof.classify_finalize(required, [{@drift_identity, witness}])
   end
 
   # 恢复端点解析只认 journal 保存的历史 placement（协议 §3.3）：核对 topology_hash，

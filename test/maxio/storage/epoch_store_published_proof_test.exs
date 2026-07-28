@@ -3,7 +3,7 @@ defmodule Maxio.Storage.EpochStorePublishedProofTest do
 
   alias Maxio.Cluster.Paths
   alias Maxio.Native.PathSafety
-  alias Maxio.Storage.{EpochStore, ObjectEpoch, PublishedProof}
+  alias Maxio.Storage.{EpochStore, MutationBackup, ObjectEpoch, PublishedProof}
 
   @bucket "epoch-proof-test"
   @id_a "00000000-0000-0000-0000-00000000000a"
@@ -1776,6 +1776,369 @@ defmodule Maxio.Storage.EpochStorePublishedProofTest do
       ])
 
     maxed
+  end
+
+  # --- Task 2 R1：endpoint / trust-boundary RED ---
+
+  @tag :task2_red_endpoint
+  test "task2 red: Storage facade and Backend behaviour expose mandatory verify_published" do
+    for module <- [
+          Maxio.Storage,
+          Maxio.Storage.Backend,
+          Maxio.Storage.FS,
+          Maxio.Storage.ErasureCoded,
+          Maxio.Storage.Distributed
+        ] do
+      assert Code.ensure_loaded?(module)
+    end
+
+    # proof 是 backend behaviour，Commit 不得获得布局知识（design D1）。
+    assert {:verify_published, 2} in Maxio.Storage.Backend.behaviour_info(:callbacks)
+
+    # facade 是插件 trust boundary，必须经配置 backend 委派。
+    assert function_exported?(Maxio.Storage, :verify_published, 2)
+
+    for backend <- [Maxio.Storage.FS, Maxio.Storage.ErasureCoded, Maxio.Storage.Distributed] do
+      assert function_exported?(backend, :verify_published, 2)
+    end
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: validate_callback_result fails closed on obsolete, wrong-mode and forged results" do
+    assert function_exported?(Maxio.Storage.PublishedProof, :validate_callback_result, 2)
+
+    {:ok, {:verified, proof}} =
+      PublishedProof.classify(1, [{"local", PublishedProof.verified("local", %{})}])
+
+    {:ok, {:finalized, finalize}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", PublishedProof.endpoint_finalized("ordinal:0", %{})}
+      ])
+
+    {:ok, {:verified, endpoint}} = PublishedProof.verified("local", %{})
+
+    # canonical aggregate 原样接受，绝不裁剪/重排/替换。
+    assert :ok = PublishedProof.validate_callback_result(:proof, {:ok, {:verified, proof}})
+    assert :ok = PublishedProof.validate_callback_result(:finalize, {:ok, {:finalized, finalize}})
+
+    for {mode, result} <- [
+          # obsolete tuple
+          {:proof, {:ok, :verified}},
+          {:finalize, {:ok, :finalized}},
+          {:finalize, {:ok, :superseded}},
+          # wrong mode
+          {:proof, {:ok, {:finalized, finalize}}},
+          {:finalize, {:ok, {:verified, proof}}},
+          # wrong scope：endpoint summary 永远不是 aggregate callback 结果
+          {:proof, {:ok, {:verified, endpoint}}},
+          # forged status/class/counts
+          {:proof, {:ok, {:verified, %{proof | "verified" => 99}}}},
+          {:proof, {:ok, {:verified, Map.put(proof, "class", "corrupt")}}},
+          {:proof, {:error, {:published_proof_failed, :fenced, proof}}},
+          {:proof, :ok},
+          {:proof, nil}
+        ] do
+      assert {:error, :invalid_proof_result} =
+               PublishedProof.validate_callback_result(mode, result)
+    end
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: obsolete three-field finalize request is rejected before epoch or backup mutation",
+       %{dir: dir} do
+    site = published_site!(dir, "t2-obsolete-request", "payload")
+    backup_dir = materialize_backup!(dir, site)
+
+    obsolete = %{target: site.target, token: site.token, mutation_id: @id_a}
+
+    assert {:error,
+            {:published_proof_failed, :corrupt,
+             %{"scope" => "endpoint", "mode" => "finalize", "status" => "failed"}}} =
+             EpochStore.finalize_mutation(dir, obsolete)
+
+    assert {:ok, %ObjectEpoch{phase: "published"}} = EpochStore.read(dir, site.target)
+    assert File.dir?(backup_dir)
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: nil published fingerprint fails closed before epoch or backup mutation", %{
+    dir: dir
+  } do
+    site = published_site!(dir, "t2-nil-fingerprint", "payload")
+    backup_dir = materialize_backup!(dir, site)
+
+    assert {:error,
+            {:published_proof_failed, :corrupt,
+             %{"scope" => "endpoint", "mode" => "finalize", "status" => "failed"}}} =
+             EpochStore.finalize_mutation(
+               dir,
+               finalize_request(site, expected_fingerprint: nil)
+             )
+
+    assert {:ok, %ObjectEpoch{phase: "published"}} = EpochStore.read(dir, site.target)
+    assert File.dir?(backup_dir)
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: finalize re-proves published and committed endpoints before backup cleanup", %{
+    dir: dir
+  } do
+    published = published_site!(dir, "t2-reproof-published", "payload")
+    published_backup = materialize_backup!(dir, published)
+    File.write!(published.meta_path, published.raw_meta <> "\n")
+
+    assert {:error, {:published_proof_failed, :mismatch, %{"mode" => "finalize"}}} =
+             EpochStore.finalize_mutation(dir, finalize_request(published))
+
+    assert {:ok, %ObjectEpoch{phase: "published"}} = EpochStore.read(dir, published.target)
+    assert File.dir?(published_backup)
+
+    # committed 幂等重放同样必须先复验，不能直接删 backup。
+    committed = published_site!(dir, "t2-reproof-committed", "payload", phase: "committed")
+    committed_backup = materialize_backup!(dir, committed)
+    File.rm!(committed.part_path)
+
+    assert {:error, {:published_proof_failed, :corrupt, %{"mode" => "finalize"}}} =
+             EpochStore.finalize_mutation(dir, finalize_request(committed))
+
+    assert File.dir?(committed_backup)
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: finalize returns the endpoint union for finalized and superseded", %{dir: dir} do
+    site = published_site!(dir, "t2-finalized", "payload")
+    backup_dir = materialize_backup!(dir, site)
+
+    assert {:ok,
+            {:finalized,
+             %{
+               "scope" => "endpoint",
+               "mode" => "finalize",
+               "status" => "finalized",
+               "owned" => true,
+               "proof_passed" => true,
+               "finalized" => true
+             }}} = EpochStore.finalize_mutation(dir, finalize_request(site))
+
+    assert {:ok, %ObjectEpoch{phase: "committed"}} = EpochStore.read(dir, site.target)
+    refute File.exists?(backup_dir)
+
+    superseded = published_site!(dir, "t2-superseded", "payload")
+    superseded_backup = materialize_backup!(dir, superseded)
+    establish_successor!(dir, superseded)
+
+    assert {:ok,
+            {:superseded,
+             %{
+               "scope" => "endpoint",
+               "mode" => "finalize",
+               "status" => "superseded",
+               "owned" => false,
+               "class" => "fenced"
+             }}} = EpochStore.finalize_mutation(dir, finalize_request(superseded))
+
+    assert File.dir?(superseded_backup)
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: same-token claimed is repaired only by an exact final, otherwise proof error",
+       %{dir: dir} do
+    debt = published_site!(dir, "t2-claimed-debt", "payload", phase: "claimed")
+    debt_backup = materialize_backup!(dir, debt)
+    File.write!(debt.meta_path, debt.raw_meta <> "\n")
+
+    # heal 之前这是真实的 endpoint proof failure（same-token 故 owned=true，
+    # proof_passed=false），绝不能伪装成 proof-passed 的 cleanup debt。
+    assert {:error,
+            {:published_proof_failed, :mismatch,
+             %{
+               "scope" => "endpoint",
+               "mode" => "finalize",
+               "status" => "failed",
+               "class" => "mismatch",
+               "owned" => true,
+               "proof_passed" => false,
+               "finalized" => false
+             }}} = EpochStore.finalize_mutation(dir, finalize_request(debt))
+
+    assert {:ok, %ObjectEpoch{phase: "claimed"}} = EpochStore.read(dir, debt.target)
+    assert File.dir?(debt_backup)
+
+    # 写回 exact final 后重试必须收敛为 finalized。
+    File.write!(debt.meta_path, debt.raw_meta)
+
+    assert {:ok, {:finalized, %{"mode" => "finalize", "finalized" => true}}} =
+             EpochStore.finalize_mutation(dir, finalize_request(debt))
+
+    assert {:ok, %ObjectEpoch{phase: "committed", fingerprint: healed_fingerprint}} =
+             EpochStore.read(dir, debt.target)
+
+    assert healed_fingerprint == debt.fingerprint
+    refute File.exists?(debt_backup)
+
+    # heal 写回 exact final 后，claimed repair 才可收敛为带 fingerprint 的 committed。
+    healed = published_site!(dir, "t2-claimed-heal", "payload", phase: "claimed")
+    healed_backup = materialize_backup!(dir, healed)
+
+    assert {:ok, {:finalized, %{"mode" => "finalize", "finalized" => true}}} =
+             EpochStore.finalize_mutation(dir, finalize_request(healed))
+
+    assert {:ok, %ObjectEpoch{phase: "committed", fingerprint: fingerprint}} =
+             EpochStore.read(dir, healed.target)
+
+    assert fingerprint == healed.fingerprint
+    refute File.exists?(healed_backup)
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: finalize emits bounded orphan evidence for absent and older-token epochs", %{
+    dir: dir
+  } do
+    absent_target = target("t2-orphan-absent")
+    {:ok, absent_rel} = Paths.object_rel(@bucket, "t2-orphan-absent", "null")
+
+    absent_request = %{
+      target: absent_target,
+      token: token(1, @id_a),
+      mutation_id: @id_a,
+      final_rel: absent_rel,
+      expected_fingerprint: ObjectEpoch.fingerprint("etag-absent", 0, "meta"),
+      layout: %{kind: "fs"}
+    }
+
+    assert {:ok,
+            {:orphan,
+             %{
+               "scope" => "endpoint",
+               "mode" => "finalize",
+               "status" => "orphan",
+               "owned" => false,
+               "proof_passed" => false,
+               "finalized" => false,
+               "orphan_reason" => "epoch_absent"
+             }}} = EpochStore.finalize_mutation(dir, absent_request)
+
+    # exact target 且 epoch token 严格更旧 → 该端点从未参与本次 mutation。
+    older = published_site!(dir, "t2-orphan-older", "payload")
+    older_backup = materialize_backup!(dir, older)
+
+    newer_request =
+      finalize_request(older, token: token(2, @id_b), mutation_id: @id_b)
+
+    assert {:ok, {:orphan, %{"orphan_reason" => "older_token", "owned" => false}}} =
+             EpochStore.finalize_mutation(dir, newer_request)
+
+    # orphan 绝不授权删除。
+    assert File.dir?(older_backup)
+    assert File.exists?(older.part_path)
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 red: a same-token claimed proof failure votes as real owned debt in the aggregate",
+       %{dir: dir} do
+    shards = [
+      %{"drive" => 0, "shard_file_size" => 7, "block_hashes" => []},
+      %{"drive" => 1, "shard_file_size" => 7, "block_hashes" => []}
+    ]
+
+    claimed =
+      published_site!(dir, "t2-agg-claimed", "payload",
+        phase: "claimed",
+        layout: %{kind: "shard", index: 1},
+        shards: shards
+      )
+
+    claimed_backup = materialize_backup!(dir, claimed)
+    File.rm_rf!(claimed.final_dir)
+
+    assert {:error, {:published_proof_failed, _class, claimed_detail}} =
+             claimed_result = EpochStore.finalize_mutation(dir, finalize_request(claimed))
+
+    assert claimed_detail["endpoint"] == "ordinal:1"
+    assert claimed_detail["owned"] == true
+    assert claimed_detail["proof_passed"] == false
+    assert {:ok, %ObjectEpoch{phase: "claimed"}} = EpochStore.read(dir, claimed.target)
+    assert File.dir?(claimed_backup)
+
+    # 没有任何健康 proof quorum 时，整体必须是 proof failure。
+    assert {:error, {:published_proof_failed, _global_class, %{"verified" => 0}}} =
+             PublishedProof.classify_finalize(1, [{"ordinal:1", claimed_result}])
+
+    healthy =
+      published_site!(dir, "t2-agg-healthy", "payload",
+        layout: %{kind: "shard", index: 0},
+        shards: shards
+      )
+
+    assert {:ok, {:finalized, _}} =
+             healthy_result = EpochStore.finalize_mutation(dir, finalize_request(healthy))
+
+    # 只有在另有真实健康 proof quorum 时，同一 owned debt 才让整体成为 cleanup_pending；
+    # 票数全部来自真实 endpoint 结果，未手工伪造。
+    assert {:ok,
+            {:cleanup_pending,
+             %{"verified" => 1, "finalized" => 1, "observed_owned" => 2, "debt" => 1}}} =
+             PublishedProof.classify_finalize(1, [
+               {"ordinal:0", healthy_result},
+               {"ordinal:1", claimed_result}
+             ])
+  end
+
+  @tag :task2_red_endpoint
+  test "task2 control: endpoint proof evidence exposes no absolute path or raw sidecar", %{
+    dir: dir
+  } do
+    site = published_site!(dir, "t2-no-leak", "payload")
+
+    assert {:ok, {:verified, summary}} = EpochStore.verify_mutation(dir, site.request)
+
+    refute Enum.any?(~w(path root drive node final_rel backup), &Map.has_key?(summary, &1))
+
+    rendered = inspect(summary)
+    refute rendered =~ dir
+    refute rendered =~ site.raw_meta
+    refute rendered =~ "part.0"
+  end
+
+  defp finalize_request(site, overrides \\ []) do
+    %{
+      target: site.target,
+      token: site.token,
+      mutation_id: @id_a,
+      final_rel: site.final_rel,
+      expected_fingerprint: site.fingerprint,
+      # 继承该 site 的冻结 layout（fs 或 shard:N），identity 才与聚合期望一致。
+      layout: site.request.layout
+    }
+    |> Map.merge(Map.new(overrides))
+  end
+
+  defp materialize_backup!(dir, site) do
+    mutation_id = Map.get(site, :mutation_id, @id_a)
+    backup_dir = Path.join(dir, MutationBackup.relative_dir(mutation_id))
+    File.mkdir_p!(backup_dir)
+
+    {:ok, manifest} =
+      MutationBackup.manifest(site.target, site.token, nil, [%{"name" => "part.0"}])
+
+    {:ok, bytes} = MutationBackup.encode(manifest)
+    File.write!(Path.join(backup_dir, MutationBackup.manifest_name()), bytes)
+    backup_dir
+  end
+
+  defp establish_successor!(dir, site) do
+    successor = token(2, @id_b)
+
+    {:ok, epoch} =
+      ObjectEpoch.new(site.target, successor, %{
+        operation: "put",
+        phase: "claimed",
+        value_type: "object",
+        updated_at: DateTime.utc_now()
+      })
+
+    assert {:ok, :applied} = EpochStore.cas(dir, epoch, {:claim, successor})
+    successor
   end
 
   defp published_site!(dir, key, part, opts \\ []) do

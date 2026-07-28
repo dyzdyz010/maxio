@@ -594,12 +594,13 @@ defmodule Maxio.Cluster.ShardServer do
   end
 
   @doc """
-  per-endpoint 终结原语：token 精确匹配且 phase ∈ published/committed（幂等）→ epoch →
-  committed + 丢弃 backup 目录。request = `%{target, token, mutation_id}`；successor →
-  `{:ok, :superseded}`。
+  proof-aware per-endpoint 终结原语：与 `verify_mutation/3` 同形的完整 proof request，在同
+  一 EpochStore 串行段内复用同一 proof 核心，证明通过后才写 committed epoch 并丢弃 backup。
+  返回 `PublishedProof` 的精确 endpoint finalize union（finalized / cleanup_pending /
+  orphan / superseded / proof failure），响应有界且不含本机路径。
   """
   @spec finalize_mutation(String.t(), map(), keyword()) ::
-          {:ok, :finalized} | {:ok, :superseded} | {:error, term()}
+          Maxio.Storage.PublishedProof.endpoint_finalize_result()
   def finalize_mutation(drive_root, request, opts \\ []) do
     DriveIO.track(:write, fn -> EpochStore.finalize_mutation(drive_root, request, opts) end)
   end

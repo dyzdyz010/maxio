@@ -53,7 +53,7 @@ defmodule Maxio.Cluster.Transport do
   @callback verify_mutation(node(), String.t(), map()) ::
               Maxio.Storage.PublishedProof.endpoint_proof_result()
   @callback finalize_mutation(node(), String.t(), map()) ::
-              {:ok, :finalized} | {:ok, :superseded} | {:error, term()}
+              Maxio.Storage.PublishedProof.endpoint_finalize_result()
   # durable backup manifest 写原语（协议 §3.2）：Distributed 的协议化 publish 必须把每端点
   # manifest 落在**该端点 drive** 上并 fsync（先于该盘任何 destructive IO）；既有原语无法
   # 表达（put_sidecar 固定 meta.json 文件名且无 fsync 语义）。request 形状见
@@ -73,6 +73,79 @@ defmodule Maxio.Cluster.Transport do
     Keyword.get(opts, :transport) ||
       Application.get_env(:maxio, :shard_transport, Maxio.Cluster.Transport.Erpc)
   end
+
+  @doc """
+  Transport 的 wire outer-envelope seam（proof / finalize 共用）。它**只**守住线上外层信封，
+  绝不复制 classifier 的语义校验：
+
+    * 不具 endpoint result 外层信封的正常返回（旧 tuple、裸原子、裸 `{:error, reason}`）、
+      以及 error/exit/throw/pre-RPC 故障，一律归一化为该 request 捕获 identity 的 canonical
+      endpoint unavailable，raw term / reason 绝不外泄；
+    * 具备 endpoint result 外层信封的值——即使 identity/scope/mode/outcome/status/class/count
+      伪造或是 aggregate 重入——必须 **term-identical** 透传，交由公共
+      `PublishedProof` classifier 判成 `:placement_drift`，Transport 不得把它洗成 unavailable。
+  """
+  @spec normalize_mutation_proof(map(), term()) ::
+          Maxio.Storage.PublishedProof.endpoint_proof_result()
+  def normalize_mutation_proof(request, result) do
+    if endpoint_envelope?(result), do: result, else: mutation_proof_unavailable(request)
+  end
+
+  @doc "finalize 侧的同一 outer-envelope seam。见 `normalize_mutation_proof/2`。"
+  @spec normalize_mutation_finalize(map(), term()) ::
+          Maxio.Storage.PublishedProof.endpoint_finalize_result()
+  def normalize_mutation_finalize(request, result) do
+    if endpoint_envelope?(result), do: result, else: mutation_finalize_unavailable(request)
+  end
+
+  @doc """
+  proof 侧的**惰性调用边界**：整段端点调用（含 outage 判定与 pre-RPC 组装）都必须在 `fun`
+  内求值，使 error/exit/throw 无法在归一化之前逃逸。闭包内的正常 term 再交
+  `normalize_mutation_proof/2` 处理外层信封。
+
+  这是与 `normalize_mutation_proof/2` **分离**的 API：零元闭包与普通 wire term 绝不混用，
+  避免把远端传来的 function term 当作代码执行。
+  """
+  @spec call_mutation_proof(map(), (-> term())) ::
+          Maxio.Storage.PublishedProof.endpoint_proof_result()
+  def call_mutation_proof(request, fun) when is_function(fun, 0) do
+    case guarded_call(fun) do
+      {:wire, result} -> normalize_mutation_proof(request, result)
+      :transport_fault -> mutation_proof_unavailable(request)
+    end
+  end
+
+  @doc "finalize 侧的同一惰性调用边界。见 `call_mutation_proof/2`。"
+  @spec call_mutation_finalize(map(), (-> term())) ::
+          Maxio.Storage.PublishedProof.endpoint_finalize_result()
+  def call_mutation_finalize(request, fun) when is_function(fun, 0) do
+    case guarded_call(fun) do
+      {:wire, result} -> normalize_mutation_finalize(request, result)
+      :transport_fault -> mutation_finalize_unavailable(request)
+    end
+  end
+
+  # 三类异常统一收敛为 transport fault；raw reason / stacktrace 永不离开本函数。
+  defp guarded_call(fun) do
+    {:wire, fun.()}
+  rescue
+    _error -> :transport_fault
+  catch
+    :exit, _reason -> :transport_fault
+    :throw, _value -> :transport_fault
+  end
+
+  # 只判定外层信封形状：`{:ok, {outcome_atom, map}}` 与
+  # `{:error, {:published_proof_failed, class_atom, map}}`。内部字段一律不看。
+  defp endpoint_envelope?({:ok, {outcome, summary}})
+       when is_atom(outcome) and is_map(summary),
+       do: true
+
+  defp endpoint_envelope?({:error, {:published_proof_failed, class, summary}})
+       when is_atom(class) and is_map(summary),
+       do: true
+
+  defp endpoint_envelope?(_result), do: false
 
   @doc false
   @spec mutation_proof_unavailable(map()) :: Maxio.Storage.PublishedProof.endpoint_proof_result()
@@ -96,6 +169,34 @@ defmodule Maxio.Cluster.Transport do
 
   def mutation_proof_unavailable(_request) do
     Maxio.Storage.PublishedProof.failed(:placement_drift, "local", %{
+      code: :invalid_endpoint_layout,
+      owned: false
+    })
+  end
+
+  @doc false
+  @spec mutation_finalize_unavailable(map()) ::
+          Maxio.Storage.PublishedProof.endpoint_finalize_result()
+  def mutation_finalize_unavailable(%{layout: %{kind: "fs"} = layout})
+      when map_size(layout) == 1 do
+    Maxio.Storage.PublishedProof.endpoint_finalize_failed(:unavailable, "local", %{
+      code: :rpc_unavailable,
+      layout: "fs",
+      owned: false
+    })
+  end
+
+  def mutation_finalize_unavailable(%{layout: %{kind: "shard", index: index} = layout})
+      when map_size(layout) == 2 and is_integer(index) and index >= 0 do
+    Maxio.Storage.PublishedProof.endpoint_finalize_failed(:unavailable, index, %{
+      code: :rpc_unavailable,
+      layout: "shard:#{index}",
+      owned: false
+    })
+  end
+
+  def mutation_finalize_unavailable(_request) do
+    Maxio.Storage.PublishedProof.endpoint_finalize_failed(:placement_drift, "local", %{
       code: :invalid_endpoint_layout,
       owned: false
     })
@@ -230,14 +331,17 @@ defmodule Maxio.Cluster.Transport.Erpc do
 
   @impl true
   def verify_mutation(node, drive_root, request) do
-    call(node, :verify_mutation, [drive_root, request], fn ->
-      Maxio.Cluster.Transport.mutation_proof_unavailable(request)
+    Maxio.Cluster.Transport.call_mutation_proof(request, fn ->
+      call(node, :verify_mutation, [drive_root, request], fn -> :rpc_unavailable end)
     end)
   end
 
+  # 正常 malformed 返回与 error/exit/throw/pre-RPC 故障走同一个 outer-envelope seam。
   @impl true
   def finalize_mutation(node, drive_root, request) do
-    call(node, :finalize_mutation, [drive_root, request], fn -> {:error, :unavailable} end)
+    Maxio.Cluster.Transport.call_mutation_finalize(request, fn ->
+      call(node, :finalize_mutation, [drive_root, request], fn -> :rpc_unavailable end)
+    end)
   end
 
   @impl true

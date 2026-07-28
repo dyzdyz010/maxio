@@ -124,35 +124,47 @@ defmodule Maxio.Storage.EpochStore do
     do: {:error, {:invalid_mutation_request, request}}
 
   @doc """
-  per-endpoint 终结原语：token 精确匹配且 phase ∈ published/committed（幂等）→ epoch →
-  committed + 丢弃 backup 目录。request = `%{target, token, mutation_id}`；successor →
-  `{:ok, :superseded}`。
+  proof-aware per-endpoint 终结原语（设计 D4/D5）：在**同一个 EpochStore 串行闭包**内复用
+  与 `verify_mutation/3` 完全相同的 proof 核心，证明通过后才写 committed epoch 并丢弃
+  backup。request 与 proof request 同形，含 `final_rel`/`expected_fingerprint`/`layout`。
+
+  语义：`published`/`committed` 均重新取证；同 token `claimed` 是 finalize-only repair，
+  只有 actual final 与 request fingerprint 精确一致时才写带 fingerprint 的 committed 并清
+  backup，否则保持 cleanup debt；只有 clean absent 与 exact-target 严格更旧 token 返回有界
+  orphan（target 漂移、corrupt、IO 故障与同 token claimed 都不是 orphan）；proof 失败绝不
+  触碰 epoch/backup；epoch 写入或 backup 丢弃失败降级为 proof-passed 的 cleanup debt。
   """
   @spec finalize_mutation(String.t(), map(), keyword()) ::
-          {:ok, :finalized} | {:ok, :superseded} | {:error, term()}
+          PublishedProof.endpoint_finalize_result()
   def finalize_mutation(drive_root, request, opts \\ [])
 
-  def finalize_mutation(
-        drive_root,
-        %{target: target, token: token, mutation_id: mutation_id},
-        opts
-      ) do
-    with {:ok, rel} <- ObjectEpoch.relative_path(target),
-         {:ok, token} <- validate_token(token),
-         {:ok, mutation_id} <- validate_owned_mutation_id(token, mutation_id) do
-      backup_dir = Path.join(drive_root, MutationBackup.relative_dir(mutation_id))
+  def finalize_mutation(drive_root, request, opts)
+      when is_binary(drive_root) and is_map(request) do
+    with {:ok, drive_root} <- normalize_drive_root(drive_root),
+         {:ok, normalized} <- validate_verify_request(request) do
+      backup_dir = Path.join(drive_root, MutationBackup.relative_dir(normalized.mutation_id))
 
       serialize(
         drive_root,
-        rel,
-        fn -> do_finalize(epoch_path(drive_root, rel), token, backup_dir, opts) end,
+        normalized.epoch_rel,
+        fn ->
+          do_finalize_mutation(
+            epoch_path(drive_root, normalized.epoch_rel),
+            drive_root,
+            normalized,
+            backup_dir,
+            opts
+          )
+        end,
         opts
       )
+    else
+      {:error, code} -> invalid_finalize_request(request, code)
     end
   end
 
   def finalize_mutation(_drive_root, request, _opts),
-    do: {:error, {:invalid_mutation_request, request}}
+    do: invalid_finalize_request(request, :invalid_request)
 
   @doc """
   在 target 的 epoch 串行段内验证已发布 final 的 exact epoch/raw-sidecar fingerprint 与
@@ -425,40 +437,137 @@ defmodule Maxio.Storage.EpochStore do
     end)
   end
 
-  defp do_finalize(epoch_path, token, backup_dir, opts) do
+  # ── proof-aware finalize（设计 D4 步骤 1–8 与 D5 的端点侧落点）──
+
+  defp do_finalize_mutation(epoch_path, drive_root, request, backup_dir, opts) do
     case do_read(epoch_path) do
+      # clean absent 是唯一可由「读干净但没有 epoch」得出的 orphan。
       {:ok, :absent} ->
-        {:error, :epoch_missing}
+        finalize_orphan(:epoch_absent, request)
 
       {:ok, %ObjectEpoch{} = current} ->
-        case ObjectEpoch.compare_tokens(current.token, token) do
-          {:ok, :gt} -> {:ok, :superseded}
-          {:ok, :lt} -> {:error, {:epoch_mismatch, current.token}}
-          {:ok, :eq} -> finalize_owned(current, epoch_path, backup_dir, opts)
-          {:error, reason} -> {:error, reason}
-        end
+        finalize_current_epoch(current, epoch_path, drive_root, request, backup_dir, opts)
+
+      {:error, {:corrupt, _reason}} ->
+        finalize_failure(:corrupt, :epoch_corrupt, false, request)
 
       {:error, reason} ->
-        {:error, reason}
+        finalize_failure(io_class(reason), :epoch_unavailable, false, request)
     end
   end
 
-  # 幂等重放：epoch 已 committed，但上次可能在 discard backup 前崩溃——收敛清理后返回。
-  defp finalize_owned(%ObjectEpoch{phase: "committed"}, _epoch_path, backup_dir, _opts) do
-    with :ok <- discard_dir(backup_dir), do: {:ok, :finalized}
+  defp finalize_current_epoch(current, epoch_path, drive_root, request, backup_dir, opts) do
+    # target 漂移即结构损坏，绝不能凭更大 token 伪装 successor，也绝不是 orphan。
+    if current.target == request.target do
+      case ObjectEpoch.compare_tokens(current.token, request.token) do
+        {:ok, :gt} ->
+          PublishedProof.endpoint_finalize_superseded(endpoint_identity(request.layout))
+
+        # exact target 且 epoch token 严格更旧：该端点从未参与本次 mutation。
+        {:ok, :lt} ->
+          finalize_orphan(:older_token, request)
+
+        {:ok, :eq} ->
+          finalize_owned_endpoint(current, epoch_path, drive_root, request, backup_dir, opts)
+
+        {:error, _reason} ->
+          finalize_failure(:corrupt, :invalid_epoch_token, false, request)
+      end
+    else
+      finalize_failure(:corrupt, :epoch_target_mismatch, false, request)
+    end
   end
 
-  defp finalize_owned(%ObjectEpoch{phase: "published"} = current, epoch_path, backup_dir, opts) do
+  # 同 token claimed 是 finalize-only repair：claimed epoch 没有 fingerprint，只能拿 actual
+  # final 与 request fingerprint 比对；不匹配一律保持 cleanup debt，等 heal 后重试。
+  defp finalize_owned_endpoint(
+         %ObjectEpoch{phase: "claimed"} = current,
+         epoch_path,
+         drive_root,
+         request,
+         backup_dir,
+         opts
+       ) do
+    case claimed_repair_proof(current, drive_root, request, opts) do
+      {:ok, _phase} ->
+        commit_endpoint(
+          %ObjectEpoch{current | fingerprint: request.expected_fingerprint},
+          epoch_path,
+          backup_dir,
+          request,
+          opts
+        )
+
+      # claimed 未通过 endpoint proof 不是 proof-passed 的清理债务：它必须作为真实的
+      # endpoint proof error 进入公共聚合（same-token 已确认，故 owned=true），由健康
+      # quorum 决定全局是 proof failure 还是 cleanup_pending。epoch/backup 均不动。
+      {:proof_error, class, code} ->
+        finalize_failure(class, code, true, request)
+    end
+  end
+
+  defp finalize_owned_endpoint(current, epoch_path, drive_root, request, backup_dir, opts) do
+    case owned_epoch_proof(current, drive_root, request, opts) do
+      # proof 成功才允许写 committed / 丢 backup。
+      {:ok, _phase} ->
+        commit_endpoint(current, epoch_path, backup_dir, request, opts)
+
+      # proof 失败绝不触碰 epoch 或 backup。
+      {:proof_error, class, code} ->
+        finalize_failure(class, code, true, request)
+    end
+  end
+
+  defp commit_endpoint(%ObjectEpoch{phase: "committed"}, _epoch_path, backup_dir, request, _opts) do
+    case discard_dir(backup_dir) do
+      :ok -> finalize_finalized(request)
+      {:error, _reason} -> finalize_cleanup_pending(request)
+    end
+  end
+
+  defp commit_endpoint(%ObjectEpoch{} = current, epoch_path, backup_dir, request, opts) do
     committed = %ObjectEpoch{current | phase: "committed", updated_at: DateTime.utc_now()}
 
+    # epoch 写入或 backup 丢弃失败是 proof-passed 的清理债务，不是 proof failure。
     with {:ok, :applied} <- write_epoch(epoch_path, committed, opts),
          :ok <- discard_dir(backup_dir) do
-      {:ok, :finalized}
+      finalize_finalized(request)
+    else
+      _error -> finalize_cleanup_pending(request)
     end
   end
 
-  defp finalize_owned(%ObjectEpoch{phase: phase}, _epoch_path, _backup_dir, _opts),
-    do: {:error, {:unexpected_epoch_phase, phase}}
+  defp finalize_finalized(request) do
+    PublishedProof.endpoint_finalized(endpoint_identity(request.layout), %{
+      layout: layout_label(request.layout),
+      owned: true
+    })
+  end
+
+  defp finalize_cleanup_pending(request) do
+    PublishedProof.endpoint_cleanup_pending(endpoint_identity(request.layout), %{
+      layout: layout_label(request.layout),
+      owned: true
+    })
+  end
+
+  defp finalize_orphan(reason, request),
+    do: PublishedProof.endpoint_orphan(endpoint_identity(request.layout), reason)
+
+  defp finalize_failure(class, code, owned?, request) do
+    PublishedProof.endpoint_finalize_failed(class, endpoint_identity(request.layout), %{
+      code: code,
+      layout: layout_label(request.layout),
+      owned: owned?
+    })
+  end
+
+  defp invalid_finalize_request(request, code) do
+    PublishedProof.endpoint_finalize_failed(:corrupt, request_endpoint_identity(request), %{
+      code: code,
+      owned: false
+    })
+  end
 
   # Task 2 的 proof-aware finalize 必须在同一 EpochStore 串行闭包内复用这一函数；
   # standalone?/claimed-repair 的差异只允许在进入本 proof 核心前显式裁决，不能复制盘上校验。
@@ -503,18 +612,44 @@ defmodule Maxio.Storage.EpochStore do
   end
 
   defp verify_owned_epoch(%ObjectEpoch{} = current, drive_root, request, opts) do
+    case owned_epoch_proof(current, drive_root, request, opts) do
+      {:ok, phase} ->
+        PublishedProof.verified(endpoint_identity(request.layout), %{
+          layout: layout_label(request.layout),
+          owned: true,
+          phase: phase
+        })
+
+      {:proof_error, class, code} ->
+        proof_failure(class, code, true, request)
+    end
+  end
+
+  # 唯一的 owned-epoch proof 核心：standalone proof 与 proof-aware finalize 共用，
+  # 两者只在如何把结果包成 proof / finalize summary 上有差别。
+  defp owned_epoch_proof(%ObjectEpoch{} = current, drive_root, request, opts) do
     cond do
       current.phase not in @proof_phases ->
-        proof_failure(:corrupt, :unexpected_phase, true, request)
+        {:proof_error, :corrupt, :unexpected_phase}
 
       current.value_type != "object" ->
-        proof_failure(:corrupt, :invalid_value_type, true, request)
+        {:proof_error, :corrupt, :invalid_value_type}
 
       not ObjectEpoch.fingerprint_matches?(request.expected_fingerprint, current.fingerprint) ->
-        proof_failure(:mismatch, :epoch_fingerprint_mismatch, true, request)
+        {:proof_error, :mismatch, :epoch_fingerprint_mismatch}
 
       true ->
         verify_final(current, drive_root, request, opts)
+    end
+  end
+
+  # claimed epoch 不带 fingerprint，故跳过 epoch 级比较，只用 actual final 与 request
+  # fingerprint 判定是否已被 heal 到精确目标值。
+  defp claimed_repair_proof(%ObjectEpoch{} = current, drive_root, request, opts) do
+    if current.value_type != "object" do
+      {:proof_error, :corrupt, :invalid_value_type}
+    else
+      verify_final(current, drive_root, request, opts)
     end
   end
 
@@ -539,14 +674,7 @@ defmodule Maxio.Storage.EpochStore do
          :ok <- match_actual_fingerprint(request.expected_fingerprint, actual),
          {:ok, expected_part_size} <- expected_part_size(core.meta, core.size, request.layout),
          :ok <- verify_regular_part(paths.part, expected_part_size, opts) do
-      PublishedProof.verified(endpoint_identity(request.layout), %{
-        layout: layout_label(request.layout),
-        owned: true,
-        phase: current.phase
-      })
-    else
-      {:proof_error, class, code} ->
-        proof_failure(class, code, true, request)
+      {:ok, current.phase}
     end
   end
 

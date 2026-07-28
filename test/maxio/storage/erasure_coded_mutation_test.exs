@@ -2,9 +2,12 @@ defmodule Maxio.Storage.ErasureCodedMutationTest do
   # 纯 tmp drives，无 DataCase/Repo：MutationContext 直接以 struct 构造（不经 journal），
   # 对应实现计划 B3 的 EC 后端验收断言。6 盘（4+2）→ write_quorum=4、
   # epoch_quorum=max(4, ⌊6/2⌋+1)=4：容忍 2 盘故障，3 盘故障必须拒绝。
-  use ExUnit.Case, async: true
+  #
+  # async: false —— Task 2 G3 的「重复 drive 预检零端点 I/O」用节点级全局
+  # `Maxio.Cluster.DriveIO` 累计计数器取证，必须独占运行才不被并发测试污染。
+  use ExUnit.Case, async: false
 
-  alias Maxio.Cluster.{Paths, ShardServer}
+  alias Maxio.Cluster.{DriveIO, Paths, ShardServer}
   alias Maxio.Storage.{EpochStore, ErasureCoded, MutationBackup, MutationContext, ObjectEpoch}
   alias Maxio.Storage.ObjectCommit.Control
 
@@ -297,7 +300,7 @@ defmodule Maxio.Storage.ErasureCodedMutationTest do
           result
         end)
 
-      assert {:ok, %{epoch_fingerprint: _fingerprint}} = put_result
+      assert {:ok, %{epoch_fingerprint: fingerprint}} = put_result
 
       # put 成功收口：Control.finalize → finalize_if_current → epoch=committed、backup 消失
       assert {:ok, %ObjectEpoch{phase: "committed"}} = ErasureCoded.current_epoch(ctx.target, o)
@@ -305,8 +308,12 @@ defmodule Maxio.Storage.ErasureCodedMutationTest do
       assert body(drives, "k") == "new-bytes"
       assert Enum.all?(drives, &temp_empty?/1)
 
-      # 重复 finalize 幂等
-      assert {:ok, :finalized} = ErasureCoded.finalize_if_current(ctx, o)
+      # 重复 finalize 幂等（proof-aware：committed 重放必须先复验才收敛）
+      proof_ctx = %MutationContext{ctx | published_fingerprint: fingerprint}
+
+      assert {:ok, {:finalized, %{"status" => "finalized", "verified" => 6, "finalized" => 6}}} =
+               ErasureCoded.finalize_if_current(proof_ctx, o)
+
       assert {:ok, %ObjectEpoch{phase: "committed"}} = ErasureCoded.current_epoch(ctx.target, o)
 
       # committed 后 restore 被 quorum 级防线拒绝（metadata_committed 禁回滚落点）
@@ -651,7 +658,22 @@ defmodule Maxio.Storage.ErasureCodedMutationTest do
 
       ctx = build_ctx("k", 1, @id_a, nil, "null")
       assert {:error, :epoch_missing} = ErasureCoded.restore_if_current(ctx, o)
-      assert {:error, :epoch_missing} = ErasureCoded.finalize_if_current(ctx, o)
+
+      # proof-aware finalize：该 ctx 没有 published fingerprint —— 非法 request 在读取
+      # epoch 之前就 fail closed 成 non-owned corrupt（因此不是 orphan）；owned corrupt
+      # 才参与全局 integrity 选择，故外层落 fallback unavailable。绝不删任何字节。
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "mode" => "finalize",
+                 "verified" => 0,
+                 "finalized" => 0,
+                 "orphaned" => 0,
+                 "debt" => 6,
+                 "degraded" => details
+               }}} = ErasureCoded.finalize_if_current(ctx, o)
+
+      assert Enum.all?(details, &(&1["class"] == "corrupt" and &1["owned"] == false))
       assert_finals(old, "k")
     end
   end
@@ -729,6 +751,468 @@ defmodule Maxio.Storage.ErasureCodedMutationTest do
       # 旧 final 逐字节不动、对象仍可读（错误发生在任何破坏性 rename 之前）
       assert_finals(old, "k")
       assert body(drives, "k") == "old-bytes"
+    end
+  end
+
+  describe "Task 2 backend proof aggregation（RED）" do
+    # 6 盘 4+2 → epoch_quorum = 4。
+    defp ec_published_ctx!(drives, key) do
+      {ctx, {:ok, %{epoch_fingerprint: fingerprint}}} =
+        drive_mutation_put(drives, key, ["new-bytes"], 1, @id_a, fn _ctx, result -> result end)
+
+      %MutationContext{ctx | published_fingerprint: fingerprint}
+    end
+
+    defp ec_break_meta!(drive, key) do
+      meta = Path.join(final_dir(drive, key), "meta.json")
+      File.write!(meta, File.read!(meta) <> "\n")
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: EC verify_published reaches exact quorum over immutable drive ordinals",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+      proof_ctx = ec_published_ctx!(drives, "k")
+
+      assert function_exported?(ErasureCoded, :verify_published, 2)
+
+      assert {:ok,
+              {:verified,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "verified",
+                 "required" => 4,
+                 "verified" => 6,
+                 "observed_owned" => 6,
+                 "unavailable" => 0,
+                 "debt" => 0,
+                 "degraded" => [],
+                 "omitted" => 0
+               } = summary}} = ErasureCoded.verify_published(proof_ctx, o)
+
+      refute Enum.any?(~w(path root drive node), &Map.has_key?(summary, &1))
+      refute Enum.any?(drives, &(inspect(summary) =~ &1))
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: EC minority failure degrades while below-quorum failure is global",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+
+      degraded_ctx = ec_published_ctx!(drives, "k-degraded")
+      ec_break_meta!(Enum.at(drives, 5), "k-degraded")
+
+      assert {:ok,
+              {:degraded,
+               %{
+                 "scope" => "aggregate",
+                 "status" => "degraded",
+                 "required" => 4,
+                 "verified" => 5,
+                 "debt" => 1,
+                 "degraded" => [detail]
+               }}} = ErasureCoded.verify_published(degraded_ctx, o)
+
+      # 少数派证据只暴露冻结 ordinal，不含 node/drive/路径。
+      assert detail["endpoint"] == "ordinal:5"
+      assert detail["class"] == "mismatch"
+      refute Enum.any?(~w(path drive node), &Map.has_key?(detail, &1))
+
+      failed_ctx = ec_published_ctx!(drives, "k-below")
+      Enum.each([3, 4, 5], &ec_break_meta!(Enum.at(drives, &1), "k-below"))
+
+      assert {:error,
+              {:published_proof_failed, :mismatch,
+               %{"scope" => "aggregate", "status" => "failed", "verified" => 3, "required" => 4}}} =
+               ErasureCoded.verify_published(failed_ctx, o)
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: EC successor outranks minority degradation", %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+      proof_ctx = ec_published_ctx!(drives, "k")
+
+      ec_break_meta!(Enum.at(drives, 4), "k")
+      claim_on_drives!([Enum.at(drives, 5)], proof_ctx.target, token(2, @id_b))
+
+      assert {:ok,
+              {:superseded,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "superseded",
+                 "verified" => 0,
+                 "observed_owned" => 0,
+                 "unavailable" => 0
+               }}} = ErasureCoded.verify_published(proof_ctx, o)
+    end
+
+    @tag :task2_red_backend
+    test "task2 red: EC finalize distinguishes finalized, cleanup debt and orphan hints",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+
+      terminal_ctx = ec_published_ctx!(drives, "k-terminal")
+
+      assert {:ok,
+              {:finalized,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "finalize",
+                 "status" => "finalized",
+                 "required" => 4,
+                 "verified" => 6,
+                 "finalized" => 6,
+                 "debt" => 0,
+                 "orphaned" => 0
+               }}} = ErasureCoded.finalize_if_current(terminal_ctx, o)
+
+      # 少数派仍未证明/清理 → proof quorum 已过但保留 durable cleanup debt。
+      debt_ctx = ec_published_ctx!(drives, "k-debt")
+      ec_break_meta!(Enum.at(drives, 5), "k-debt")
+
+      assert {:ok,
+              {:cleanup_pending,
+               %{"scope" => "aggregate", "status" => "cleanup_pending", "verified" => 5}} =
+                {_outcome, cleanup}} = ErasureCoded.finalize_if_current(debt_ctx, o)
+
+      assert cleanup["debt"] >= 1
+
+      # 该端点的 backup/manifest 残留绝不被删除。
+      assert File.exists?(Path.join(final_dir(Enum.at(drives, 5), "k-debt"), "meta.json"))
+
+      # epoch absent 的端点只产生有界 orphan hint，不投票、不计 debt、不授权删除。
+      orphan_ctx = ec_published_ctx!(drives, "k-orphan")
+      orphan_drive = Enum.at(drives, 5)
+      File.rm_rf!(epoch_path(orphan_drive, orphan_ctx.target))
+
+      assert {:ok,
+              {:finalized,
+               %{
+                 "status" => "finalized",
+                 "verified" => 5,
+                 "finalized" => 5,
+                 "debt" => 0,
+                 "orphaned" => 1,
+                 "orphan_hints" => [hint],
+                 "orphan_omitted" => 0
+               }}} = ErasureCoded.finalize_if_current(orphan_ctx, o)
+
+      assert hint["status"] == "orphan"
+      assert hint["orphan_reason"] == "epoch_absent"
+      assert hint["endpoint"] == "ordinal:5"
+      assert File.exists?(Path.join(final_dir(orphan_drive, "k-orphan"), "part.0"))
+    end
+
+    @tag :task2_red_backend
+    test "task2 control: EC publish writes a quorum of epochs and per-drive backups", %{
+      drives: drives
+    } do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+      {:ok, _} = ErasureCoded.put(@bucket, "k", "null", ["old-bytes"], o)
+
+      {ctx, put_result} =
+        drive_mutation_put(drives, "k", ["new-bytes"], 1, @id_a, fn _ctx, result ->
+          assert {:ok, %{epoch_fingerprint: fingerprint}} = result
+          assert is_map(fingerprint)
+          result
+        end)
+
+      assert {:ok, %{epoch_fingerprint: _fingerprint}} = put_result
+
+      committed =
+        Enum.count(drives, fn drive ->
+          match?(%ObjectEpoch{phase: "committed"}, drive_epoch(drive, ctx.target))
+        end)
+
+      assert committed >= 4
+    end
+  end
+
+  describe "Task 2 G3 EC 聚合接线（RED）" do
+    # 冻结 drive 向量的重复项：置换 d5 为 d4，长度仍为 K+M（Config 校验通过），但两个
+    # ordinal 指向同一物理 drive。缺少 preflight 时两个 ordinal 都会各自 verified，
+    # 冒充 6/4 quorum；正确实现必须在任何端点 IO 之前折叠为 canonical placement drift。
+    defp duplicate_drive_opts(drives) do
+      opts(List.replace_at(drives, 5, Enum.at(drives, 4)))
+    end
+
+    # 把某盘的同 token epoch 强制回退为 claimed（finalize-only repair 的入口条件）。
+    defp force_claimed_epoch!(drive, ctx) do
+      {:ok, claimed} =
+        ObjectEpoch.new(ctx.target, ctx.token, %{
+          operation: "put",
+          phase: "claimed",
+          value_type: "object",
+          updated_at: DateTime.utc_now()
+        })
+
+      assert {:ok, :applied} =
+               EpochStore.cas(drive, claimed, {:exact, ctx.token, ["published", "committed"]})
+    end
+
+    defp heal_final_from!(source_drive, target_drive, key) do
+      source = final_dir(source_drive, key)
+      target = final_dir(target_drive, key)
+      File.mkdir_p!(target)
+
+      Enum.each(["meta.json", "part.0"], fn name ->
+        File.write!(Path.join(target, name), File.read!(Path.join(source, name)))
+      end)
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: EC 重复 drive term 在任何端点 IO 之前折叠为 canonical placement drift",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+      proof_ctx = ec_published_ctx!(drives, "k")
+      dup = duplicate_drive_opts(drives)
+
+      # 直接零 I/O 取证：`ShardServer.verify_mutation/finalize_mutation` 分别经
+      # `DriveIO.track(:read | :write, ...)`，故 read_ops/write_ops 是端点原语是否被调用的
+      # 直接证据（proof 只读、committed finalize 幂等，epoch 前后快照不是有效 oracle）。
+      on_exit(&DriveIO.reset/0)
+
+      # 正向校准：先证明健康路径确实各留下 6 次可计数的端点操作，
+      # 否则「重复预检 0 次」可能只是计数器本身没在工作。
+      DriveIO.reset()
+      assert {:ok, {:verified, %{"verified" => 6}}} = ErasureCoded.verify_published(proof_ctx, o)
+      assert DriveIO.snapshot().read_ops == 6
+
+      DriveIO.reset()
+
+      assert {:ok, {:finalized, %{"finalized" => 6}}} =
+               ErasureCoded.finalize_if_current(proof_ctx, o)
+
+      assert DriveIO.snapshot().write_ops == 6
+
+      DriveIO.reset()
+
+      assert {:error,
+              {:published_proof_failed, :placement_drift,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "failed",
+                 "class" => "placement_drift",
+                 "verified" => 0,
+                 "observed_owned" => 0,
+                 "unavailable" => 0,
+                 "degraded" => [witness]
+               }}} = ErasureCoded.verify_published(proof_ctx, dup)
+
+      proof_io = DriveIO.snapshot()
+      assert proof_io.read_ops == 0
+      assert proof_io.write_ops == 0
+      assert proof_io.completed_ops == 0
+
+      # 有界脱敏 witness：shard 域身份（绝不用 FS 专属的 "local"）、非 owned、
+      # 且不含任何 drive/node/路径。
+      assert witness["endpoint"] == "ordinal:0"
+      assert witness["owned"] == false
+      assert witness["class"] == "placement_drift"
+      assert witness["scope"] == "endpoint"
+      refute Enum.any?(drives, &(inspect(witness) =~ &1))
+
+      DriveIO.reset()
+
+      assert {:error,
+              {:published_proof_failed, :placement_drift,
+               %{"finalized" => 0, "degraded" => [finalize_witness]}}} =
+               ErasureCoded.finalize_if_current(proof_ctx, dup)
+
+      finalize_io = DriveIO.snapshot()
+      assert finalize_io.read_ops == 0
+      assert finalize_io.write_ops == 0
+      assert finalize_io.completed_ops == 0
+      assert finalize_witness["endpoint"] == "ordinal:0"
+      assert finalize_witness["owned"] == false
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: EC 少数派 unavailable 按冻结 ordinal 归位且不泄漏路径/原始原因",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+      proof_ctx = ec_published_ctx!(drives, "k")
+
+      # 确定性的真实 unavailable（不是 mismatch）：把该盘的 epoch 文件替换成目录，
+      # epoch 读取返回 :eisdir/:eacces 等瞬时 IO 失败 → D6 分类为 :unavailable。
+      down_drive = Enum.at(drives, 5)
+      epoch_file = epoch_path(down_drive, proof_ctx.target)
+      File.rm_rf!(epoch_file)
+      File.mkdir_p!(epoch_file)
+
+      assert {:ok,
+              {:degraded,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "proof",
+                 "status" => "degraded",
+                 "required" => 4,
+                 "verified" => 5,
+                 "unavailable" => 1,
+                 "debt" => 1,
+                 "degraded" => [detail]
+               }}} = ErasureCoded.verify_published(proof_ctx, o)
+
+      assert detail["endpoint"] == "ordinal:5"
+      assert detail["class"] == "unavailable"
+      assert detail["owned"] == false
+      assert detail["code"] == "epoch_unavailable"
+      refute Enum.any?(~w(path drive node), &Map.has_key?(detail, &1))
+      refute inspect(detail) =~ down_drive
+      refute inspect(detail) =~ "eisdir"
+      refute inspect(detail) =~ "eacces"
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: EC 恰好 quorum 的少数派 mismatch 按冻结 ordinal 归位",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+      proof_ctx = ec_published_ctx!(drives, "k")
+
+      # 恰好 4/6 verified（epoch_quorum=4）：仍是 degraded success，两条有界证据。
+      Enum.each([4, 5], &ec_break_meta!(Enum.at(drives, &1), "k"))
+
+      assert {:ok,
+              {:degraded,
+               %{
+                 "status" => "degraded",
+                 "required" => 4,
+                 "verified" => 4,
+                 "observed_owned" => 6,
+                 "debt" => 2,
+                 "degraded" => details
+               }}} = ErasureCoded.verify_published(proof_ctx, o)
+
+      assert Enum.map(details, & &1["endpoint"]) |> Enum.sort() == ["ordinal:4", "ordinal:5"]
+      assert Enum.all?(details, &(&1["class"] == "mismatch"))
+      refute Enum.any?(drives, &(inspect(details) =~ &1))
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: EC finalize —— 同 token claimed 债务、healthy quorum 不足与精确 heal 收敛",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+
+      debt_ctx = ec_published_ctx!(drives, "k-claimed")
+      claimed_drive = Enum.at(drives, 5)
+      ec_break_meta!(claimed_drive, "k-claimed")
+      force_claimed_epoch!(claimed_drive, debt_ctx)
+
+      # proof quorum 已过（5 verified >= 4），但 same-token claimed 未通过端点 proof：
+      # 它是 owned 的真实 proof error，只能作为 durable cleanup 债务保留。
+      assert {:ok,
+              {:cleanup_pending,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "finalize",
+                 "status" => "cleanup_pending",
+                 "required" => 4,
+                 "verified" => 5,
+                 "finalized" => 5,
+                 "orphaned" => 0,
+                 "degraded" => [debt_detail]
+               }}} = ErasureCoded.finalize_if_current(debt_ctx, o)
+
+      assert debt_detail["endpoint"] == "ordinal:5"
+      assert debt_detail["owned"] == true
+      assert debt_detail["status"] == "failed"
+      # 未通过 proof 的 claimed 端点：epoch 与 final 字节一律不动。
+      assert %ObjectEpoch{phase: "claimed", fingerprint: nil} =
+               drive_epoch(claimed_drive, debt_ctx.target)
+
+      assert File.exists?(Path.join(final_dir(claimed_drive, "k-claimed"), "part.0"))
+
+      # heal 写回精确 final 后重试：claimed repair 收敛为带 fingerprint 的 committed。
+      heal_final_from!(Enum.at(drives, 0), claimed_drive, "k-claimed")
+
+      assert {:ok,
+              {:finalized,
+               %{"status" => "finalized", "verified" => 6, "finalized" => 6, "debt" => 0}}} =
+               ErasureCoded.finalize_if_current(debt_ctx, o)
+
+      assert %ObjectEpoch{phase: "committed", fingerprint: fingerprint} =
+               drive_epoch(claimed_drive, debt_ctx.target)
+
+      assert fingerprint == debt_ctx.published_fingerprint
+
+      # healthy proof 不足 quorum：整体是 proof failure，绝不降级成「只是清理失败」，
+      # 且失败调用绝不破坏任何端点字节。
+      failed_ctx = ec_published_ctx!(drives, "k-below")
+      Enum.each([3, 4, 5], &ec_break_meta!(Enum.at(drives, &1), "k-below"))
+
+      assert {:error,
+              {:published_proof_failed, :mismatch,
+               %{"scope" => "aggregate", "mode" => "finalize", "verified" => 3}}} =
+               ErasureCoded.finalize_if_current(failed_ctx, o)
+
+      Enum.each(drives, fn drive ->
+        assert File.exists?(Path.join(final_dir(drive, "k-below"), "part.0"))
+      end)
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: EC orphan-only 不投票，finalized quorum 在合法 orphan 证据下仍是终态",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+
+      orphan_only_ctx = ec_published_ctx!(drives, "k-orphan-only")
+      Enum.each(drives, &File.rm_rf!(epoch_path(&1, orphan_only_ctx.target)))
+
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "scope" => "aggregate",
+                 "mode" => "finalize",
+                 "status" => "failed",
+                 "verified" => 0,
+                 "finalized" => 0,
+                 "orphaned" => 6
+               }}} = ErasureCoded.finalize_if_current(orphan_only_ctx, o)
+
+      # 非破坏性：orphan 从不授权删除 manifest-only 残留。
+      Enum.each(drives, fn drive ->
+        assert File.exists?(Path.join(final_dir(drive, "k-orphan-only"), "part.0"))
+      end)
+    end
+
+    @tag :task2_red_backend
+    test "task2 g3: EC Control finalize 闭包捕获带 published fingerprint 的 proof 上下文",
+         %{drives: drives} do
+      o = opts(drives)
+      :ok = ErasureCoded.put_bucket(@bucket, o)
+      {:ok, _} = ErasureCoded.put(@bucket, "k", "null", ["old-bytes"], o)
+
+      {ctx, put_result} =
+        drive_mutation_put(drives, "k", ["new-bytes"], 1, @id_a, fn _ctx, result -> result end)
+
+      assert {:ok, %{epoch_fingerprint: fingerprint}} = put_result
+
+      # publish 阶段注册的 ctx 本身没有 fingerprint；只有 finalize 闭包捕获了
+      # proof_ctx（携 published fingerprint）时，Control.finalize 才可能取证通过并收口。
+      assert ctx.published_fingerprint == nil
+
+      Enum.each(drives, fn drive ->
+        assert %ObjectEpoch{phase: "committed", fingerprint: ^fingerprint} =
+                 drive_epoch(drive, ctx.target)
+
+        refute File.exists?(backup_dir(drive, @id_a))
+      end)
+
+      # restore 闭包捕获的是原始 ctx：committed 之后仍由既有 quorum 防线拒绝回滚。
+      assert {:error, :epoch_committed} = ErasureCoded.restore_if_current(ctx, o)
     end
   end
 end
