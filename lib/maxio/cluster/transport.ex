@@ -50,6 +50,8 @@ defmodule Maxio.Cluster.Transport do
   @callback cas_epoch(node(), String.t(), map()) :: {:ok, :applied} | {:error, term()}
   @callback restore_mutation(node(), String.t(), map()) ::
               {:ok, :restored} | {:ok, :superseded} | {:error, term()}
+  @callback verify_mutation(node(), String.t(), map()) ::
+              Maxio.Storage.PublishedProof.proof_result()
   @callback finalize_mutation(node(), String.t(), map()) ::
               {:ok, :finalized} | {:ok, :superseded} | {:error, term()}
   # durable backup manifest 写原语（协议 §3.2）：Distributed 的协议化 publish 必须把每端点
@@ -197,6 +199,16 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def restore_mutation(node, drive_root, request) do
     call(node, :restore_mutation, [drive_root, request], fn -> {:error, :unavailable} end)
+  end
+
+  @impl true
+  def verify_mutation(node, drive_root, request) do
+    call(node, :verify_mutation, [drive_root, request], fn ->
+      Maxio.Storage.PublishedProof.failed(:unavailable, node, %{
+        code: :rpc_unavailable,
+        owned: false
+      })
+    end)
   end
 
   @impl true

@@ -584,6 +584,16 @@ defmodule Maxio.Cluster.ShardServer do
   end
 
   @doc """
+  已发布值 endpoint proof：在 EpochStore 串行段内校验 exact epoch/raw sidecar fingerprint
+  与 FS/shard 物理形状。响应是有界纯数据，不回传对象、sidecar 或本机路径。
+  """
+  @spec verify_mutation(String.t(), map(), keyword()) ::
+          Maxio.Storage.PublishedProof.proof_result()
+  def verify_mutation(drive_root, request, opts \\ []) do
+    DriveIO.track(:read, fn -> EpochStore.verify_mutation(drive_root, request, opts) end)
+  end
+
+  @doc """
   per-endpoint 终结原语：token 精确匹配且 phase ∈ published/committed（幂等）→ epoch →
   committed + 丢弃 backup 目录。request = `%{target, token, mutation_id}`；successor →
   `{:ok, :superseded}`。

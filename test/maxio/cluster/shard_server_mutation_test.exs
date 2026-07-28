@@ -125,6 +125,27 @@ defmodule Maxio.Cluster.ShardServerMutationTest do
     assert read["format"] == "maxio/object-epoch/1"
   end
 
+  test "verify_mutation：ShardServer 暴露有界 endpoint proof", %{dir: dir} do
+    key = "verify-endpoint"
+    t = target(key)
+    rel = final_rel(key)
+    raw_meta = Jason.encode!(%{"format" => "maxio/2", "etag" => "etag-proof", "size" => 5})
+    fingerprint = ObjectEpoch.fingerprint("etag-proof", 5, raw_meta)
+    _claimed = claim!(dir, t, 1, @id_a)
+    tok = publish!(dir, t, 1, @id_a, fingerprint)
+    write_final!(dir, rel, %{"part.0" => "proof", "meta.json" => raw_meta})
+
+    assert {:ok, {:verified, %{"verified" => 1, "degraded" => []}}} =
+             ShardServer.verify_mutation(dir, %{
+               target: t,
+               token: tok,
+               mutation_id: @id_a,
+               final_rel: rel,
+               expected_fingerprint: fingerprint,
+               layout: %{kind: "fs"}
+             })
+  end
+
   test "cas_epoch 拒绝坏 payload（decode 全量重验）", %{dir: dir} do
     assert {:error, {:invalid_epoch_payload, _}} =
              ShardServer.cas_epoch(dir, %{

@@ -20,13 +20,23 @@ defmodule Maxio.Storage.EpochStore do
   """
 
   alias Maxio.Cluster.ShardServer
-  alias Maxio.Storage.{MutationBackup, ObjectEpoch}
+  alias Maxio.Storage.{MutationBackup, ObjectEpoch, PublishedProof}
 
   @call_timeout 30_000
   # 两步 rename 的暂存名固定：串行段内独占无并发冲突，crash 残留由 read 自愈回位。
   @stale_suffix ".stale"
   @tmp_suffix ".tmp"
   @restore_phases ~w(claimed published)
+  @proof_phases ~w(published committed)
+  @sidecar_limit 16 * 1024 * 1024
+  @verify_request_keys [
+    :expected_fingerprint,
+    :final_rel,
+    :layout,
+    :mutation_id,
+    :target,
+    :token
+  ]
 
   @typedoc """
   CAS 前置条件：
@@ -141,6 +151,40 @@ defmodule Maxio.Storage.EpochStore do
 
   def finalize_mutation(_drive_root, request, _opts),
     do: {:error, {:invalid_mutation_request, request}}
+
+  @doc """
+  在 target 的 epoch 串行段内验证已发布 final 的 exact epoch/raw-sidecar fingerprint 与
+  物理 part 形状。standalone proof 只接受 published/committed；successor 在任何 final
+  探测前短路为 `:superseded`。响应由 `PublishedProof` 限界，绝不包含绝对路径或 sidecar。
+  """
+  @spec verify_mutation(String.t(), map(), keyword()) :: PublishedProof.proof_result()
+  def verify_mutation(drive_root, request, opts \\ [])
+
+  def verify_mutation(drive_root, request, opts)
+      when is_binary(drive_root) and is_map(request) do
+    case validate_verify_request(request) do
+      {:ok, normalized} ->
+        serialize(
+          drive_root,
+          normalized.epoch_rel,
+          fn ->
+            do_verify_mutation(
+              epoch_path(drive_root, normalized.epoch_rel),
+              drive_root,
+              normalized,
+              opts
+            )
+          end,
+          opts
+        )
+
+      {:error, code} ->
+        PublishedProof.failed(:corrupt, "local", %{code: code, owned: false})
+    end
+  end
+
+  def verify_mutation(_drive_root, _request, _opts),
+    do: PublishedProof.failed(:corrupt, "local", %{code: :invalid_request, owned: false})
 
   @doc "epoch → 纯数据 payload map（erpc 传输/ShardServer 响应用；与磁盘 JSON 同形）。"
   @spec payload(ObjectEpoch.t()) :: {:ok, map()} | {:error, term()}
@@ -406,6 +450,269 @@ defmodule Maxio.Storage.EpochStore do
 
   defp finalize_owned(%ObjectEpoch{phase: phase}, _epoch_path, _backup_dir, _opts),
     do: {:error, {:unexpected_epoch_phase, phase}}
+
+  # Task 2 的 proof-aware finalize 必须在同一 EpochStore 串行闭包内复用这一函数；
+  # standalone?/claimed-repair 的差异只允许在进入本 proof 核心前显式裁决，不能复制盘上校验。
+  defp do_verify_mutation(epoch_path, drive_root, request, opts) do
+    case do_read(epoch_path) do
+      {:ok, :absent} ->
+        proof_failure(:corrupt, :epoch_missing, false, request)
+
+      {:ok, %ObjectEpoch{} = current} ->
+        verify_current_epoch(current, drive_root, request, opts)
+
+      {:error, {:corrupt, _reason}} ->
+        proof_failure(:corrupt, :epoch_corrupt, false, request)
+
+      {:error, reason} ->
+        proof_failure(io_class(reason), :epoch_unavailable, false, request)
+    end
+  end
+
+  defp verify_current_epoch(current, drive_root, request, opts) do
+    case ObjectEpoch.compare_tokens(current.token, request.token) do
+      {:ok, :gt} ->
+        PublishedProof.superseded(endpoint_identity(request.layout))
+
+      {:ok, :lt} ->
+        proof_failure(:corrupt, :old_epoch, false, request)
+
+      {:ok, :eq} ->
+        verify_owned_epoch(current, drive_root, request, opts)
+
+      {:error, _reason} ->
+        proof_failure(:corrupt, :invalid_epoch_token, false, request)
+    end
+  end
+
+  defp verify_owned_epoch(%ObjectEpoch{} = current, drive_root, request, opts) do
+    cond do
+      current.phase not in @proof_phases ->
+        proof_failure(:corrupt, :unexpected_phase, true, request)
+
+      current.value_type != "object" ->
+        proof_failure(:corrupt, :invalid_value_type, true, request)
+
+      not ObjectEpoch.fingerprint_matches?(request.expected_fingerprint, current.fingerprint) ->
+        proof_failure(:mismatch, :epoch_fingerprint_mismatch, true, request)
+
+      true ->
+        verify_final(current, drive_root, request, opts)
+    end
+  end
+
+  defp verify_final(current, drive_root, request, opts) do
+    final_dir = Path.join(drive_root, request.final_rel)
+    meta_path = Path.join(final_dir, "meta.json")
+
+    with {:ok, raw_meta} <- read_bounded_regular(meta_path, opts),
+         {:ok, core} <- decode_durable_core(raw_meta),
+         actual <-
+           ObjectEpoch.fingerprint(
+             core.etag,
+             core.size,
+             raw_meta
+           ),
+         :ok <- match_actual_fingerprint(request.expected_fingerprint, actual),
+         {:ok, expected_part_size} <- expected_part_size(core.meta, core.size, request.layout),
+         :ok <-
+           verify_regular_part(Path.join(final_dir, "part.0"), expected_part_size, opts) do
+      PublishedProof.verified(endpoint_identity(request.layout), %{
+        layout: layout_label(request.layout),
+        owned: true,
+        phase: current.phase
+      })
+    else
+      {:proof_error, class, code} ->
+        proof_failure(class, code, true, request)
+    end
+  end
+
+  defp read_bounded_regular(path, opts) do
+    case lstat(path, opts) do
+      {:ok, %File.Stat{type: :regular, size: size}} when size <= @sidecar_limit ->
+        read_bounded(path)
+
+      {:ok, %File.Stat{type: :regular}} ->
+        {:proof_error, :corrupt, :sidecar_too_large}
+
+      {:ok, %File.Stat{}} ->
+        {:proof_error, :corrupt, :sidecar_not_regular}
+
+      {:error, :enoent} ->
+        {:proof_error, :corrupt, :sidecar_missing}
+
+      {:error, reason} ->
+        {:proof_error, io_class(reason), :sidecar_unavailable}
+    end
+  end
+
+  # limit+1 的单次有界读取避免 TOCTOU 增长把 sidecar 全量拉入内存。
+  defp read_bounded(path) do
+    case File.open(path, [:read, :binary]) do
+      {:ok, io} ->
+        result =
+          case IO.binread(io, @sidecar_limit + 1) do
+            bytes when is_binary(bytes) and byte_size(bytes) <= @sidecar_limit ->
+              {:ok, bytes}
+
+            bytes when is_binary(bytes) ->
+              {:proof_error, :corrupt, :sidecar_too_large}
+
+            :eof ->
+              {:ok, ""}
+
+            {:error, reason} ->
+              {:proof_error, io_class(reason), :sidecar_unavailable}
+          end
+
+        _ = File.close(io)
+        result
+
+      {:error, :enoent} ->
+        {:proof_error, :corrupt, :sidecar_missing}
+
+      {:error, reason} ->
+        {:proof_error, io_class(reason), :sidecar_unavailable}
+    end
+  end
+
+  defp decode_durable_core(raw_meta) do
+    case Jason.decode(raw_meta) do
+      {:ok, %{} = meta} ->
+        etag = Map.get(meta, "etag")
+        size = Map.get(meta, "size")
+
+        if is_binary(etag) and etag != "" and is_integer(size) and size >= 0 do
+          {:ok, %{etag: etag, size: size, meta: meta}}
+        else
+          {:proof_error, :corrupt, :invalid_sidecar_core}
+        end
+
+      {:ok, _non_map} ->
+        {:proof_error, :corrupt, :invalid_sidecar_shape}
+
+      {:error, _reason} ->
+        {:proof_error, :corrupt, :invalid_sidecar_json}
+    end
+  end
+
+  defp match_actual_fingerprint(expected, actual) do
+    if ObjectEpoch.fingerprint_matches?(expected, actual),
+      do: :ok,
+      else: {:proof_error, :mismatch, :final_fingerprint_mismatch}
+  end
+
+  defp expected_part_size(_meta, core_size, %{kind: "fs"}), do: {:ok, core_size}
+
+  defp expected_part_size(meta, _core_size, %{kind: "shard", index: index}) do
+    with shards when is_list(shards) <- Map.get(meta, "shards"),
+         :ok <- validate_shard_metadata(shards),
+         %{"drive" => ^index} = entry <- Enum.at(shards, index) do
+      {:ok, Map.fetch!(entry, "shard_file_size")}
+    else
+      _invalid -> {:proof_error, :corrupt, :invalid_shard_metadata}
+    end
+  end
+
+  defp validate_shard_metadata(shards) do
+    valid? =
+      shards
+      |> Enum.with_index()
+      |> Enum.all?(fn
+        {%{"drive" => drive, "shard_file_size" => size}, index}
+        when is_integer(drive) and drive == index and is_integer(size) and size >= 0 ->
+          true
+
+        _invalid ->
+          false
+      end)
+
+    if shards != [] and valid? do
+      :ok
+    else
+      {:error, :invalid_shard_metadata}
+    end
+  end
+
+  defp verify_regular_part(path, expected_size, opts) do
+    case lstat(path, opts) do
+      {:ok, %File.Stat{type: :regular, size: ^expected_size}} ->
+        :ok
+
+      {:ok, %File.Stat{type: :regular}} ->
+        {:proof_error, :mismatch, :part_size_mismatch}
+
+      {:ok, %File.Stat{}} ->
+        {:proof_error, :corrupt, :part_not_regular}
+
+      {:error, :enoent} ->
+        {:proof_error, :corrupt, :part_missing}
+
+      {:error, reason} ->
+        {:proof_error, io_class(reason), :part_unavailable}
+    end
+  end
+
+  defp proof_failure(class, code, owned?, request) do
+    PublishedProof.failed(class, endpoint_identity(request.layout), %{
+      code: code,
+      layout: layout_label(request.layout),
+      owned: owned?
+    })
+  end
+
+  defp layout_label(%{kind: "fs"}), do: "fs"
+  defp layout_label(%{kind: "shard", index: index}), do: "shard:#{index}"
+  defp endpoint_identity(%{kind: "fs"}), do: "local"
+  defp endpoint_identity(%{kind: "shard", index: index}), do: index
+
+  defp validate_verify_request(request) do
+    with true <- Map.keys(request) |> Enum.sort() == @verify_request_keys,
+         %{"kind" => "object_version"} <- request.target,
+         {:ok, epoch_rel} <- ObjectEpoch.relative_path(request.target),
+         {:ok, token} <- validate_token(request.token),
+         {:ok, mutation_id} <-
+           validate_owned_mutation_id(token, request.mutation_id),
+         {:ok, final_rel} <- validate_final_rel(request.final_rel),
+         true <-
+           ObjectEpoch.fingerprint_matches?(
+             request.expected_fingerprint,
+             request.expected_fingerprint
+           ),
+         {:ok, layout} <- validate_layout(request.layout) do
+      {:ok,
+       %{
+         epoch_rel: epoch_rel,
+         expected_fingerprint: request.expected_fingerprint,
+         final_rel: final_rel,
+         layout: layout,
+         mutation_id: mutation_id,
+         target: request.target,
+         token: token
+       }}
+    else
+      _invalid -> {:error, :invalid_request}
+    end
+  end
+
+  defp validate_layout(%{kind: "fs"} = layout) when map_size(layout) == 1, do: {:ok, layout}
+
+  defp validate_layout(%{kind: "shard", index: index} = layout)
+       when map_size(layout) == 2 and is_integer(index) and index >= 0,
+       do: {:ok, layout}
+
+  defp validate_layout(_layout), do: {:error, :invalid_layout}
+
+  defp io_class(reason) when reason in [:eacces, :eio], do: :unavailable
+  defp io_class(_reason), do: :unavailable
+
+  defp lstat(path, opts) do
+    case Keyword.get(opts, :lstat) do
+      fun when is_function(fun, 1) -> fun.(path)
+      _other -> File.lstat(path)
+    end
+  end
 
   defp discard_dir(dir) do
     case File.rm_rf(dir) do

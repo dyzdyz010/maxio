@@ -1,6 +1,8 @@
 defmodule Maxio.Cluster.TransportInProcessTest do
   use ExUnit.Case, async: false
+  alias Maxio.Cluster.Paths
   alias Maxio.Cluster.Transport.InProcess
+  alias Maxio.Storage.{EpochStore, ObjectEpoch}
 
   setup do
     InProcess.setup!()
@@ -32,6 +34,49 @@ defmodule Maxio.Cluster.TransportInProcessTest do
     :ok = InProcess.put_sidecar(:maxio@n2, dir, %{"size" => 1})
     InProcess.set_down(:maxio@n2)
     assert {:error, :unavailable} = InProcess.get_sidecar(:maxio@n2, dir)
+  end
+
+  test "verify_mutation 透传有界 proof 并遵循 drive outage", %{base: base} do
+    node = :maxio@n2
+    drive = Path.join(base, "proof-drive")
+    {:ok, target} = ObjectEpoch.object_target("inprocess-proof", "key", "null")
+    {:ok, final_rel} = Paths.object_rel("inprocess-proof", "key", "null")
+    {:ok, token} = ObjectEpoch.token(1, "00000000-0000-0000-0000-00000000000a")
+    raw_meta = Jason.encode!(%{"format" => "maxio/2", "etag" => "etag", "size" => 4})
+    fingerprint = ObjectEpoch.fingerprint("etag", 4, raw_meta)
+
+    {:ok, epoch} =
+      ObjectEpoch.new(target, token, %{
+        operation: "put",
+        phase: "published",
+        value_type: "object",
+        fingerprint: fingerprint,
+        updated_at: DateTime.utc_now()
+      })
+
+    final_dir = Path.join(drive, final_rel)
+    File.mkdir_p!(final_dir)
+    File.write!(Path.join(final_dir, "part.0"), "data")
+    File.write!(Path.join(final_dir, "meta.json"), raw_meta)
+    assert {:ok, :applied} = EpochStore.cas(drive, epoch, {:claim, token})
+
+    request = %{
+      target: target,
+      token: token,
+      mutation_id: token["mutation_id"],
+      final_rel: final_rel,
+      expected_fingerprint: fingerprint,
+      layout: %{kind: "fs"}
+    }
+
+    assert {:ok, {:verified, %{"verified" => 1}}} =
+             InProcess.verify_mutation(node, drive, request)
+
+    InProcess.set_drive_down(node, drive)
+
+    assert {:error,
+            {:published_proof_failed, :unavailable, %{"status" => "failed", "unavailable" => 1}}} =
+             InProcess.verify_mutation(node, drive, request)
   end
 
   test "move_shard moves directories and reports unavailable drives", %{base: base} do
