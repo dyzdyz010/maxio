@@ -13,6 +13,10 @@ defmodule Maxio.Storage.PublishedProof do
   @orphan_reasons [:epoch_absent, :older_token]
 
   @max_endpoints 32
+  # 一个 journal wrapper 中 published proof 与 last failure 的 detail 合计上限；初次持久化
+  # 成功 proof 只用 31 条，为后续 merge 的强制 witness 预留一条。
+  @max_wrapper_details 32
+  @max_published_details @max_wrapper_details - 1
   @max_encoded_bytes 60 * 1024
   @max_label_bytes 128
   @identity ~r/\A(?:local|ordinal:(?:0|[1-9][0-9]*))\z/
@@ -90,11 +94,11 @@ defmodule Maxio.Storage.PublishedProof do
 
   def failed(class, identity, attrs)
       when class in @endpoint_failure_classes and is_map(attrs) do
-    attrs = Map.put_new(attrs, :owned, false)
-
-    case build_endpoint(identity, :proof, "failed", class, attrs, %{}) do
-      {:ok, summary} -> {:error, {:published_proof_failed, class, summary}}
-      {:error, _reason} -> invalid_endpoint_result(:proof)
+    with {:ok, attrs} <- endpoint_failure_attrs(class, attrs),
+         {:ok, summary} <- build_endpoint(identity, :proof, "failed", class, attrs, %{}) do
+      {:error, {:published_proof_failed, class, summary}}
+    else
+      _invalid -> invalid_endpoint_result(:proof)
     end
   end
 
@@ -190,11 +194,12 @@ defmodule Maxio.Storage.PublishedProof do
   def endpoint_finalize_failed(class, identity, attrs)
       when class in @endpoint_failure_classes and is_map(attrs) do
     extras = %{"proof_passed" => false, "finalized" => false}
-    attrs = Map.put_new(attrs, :owned, false)
 
-    case build_endpoint(identity, :finalize, "failed", class, attrs, extras) do
-      {:ok, summary} -> {:error, {:published_proof_failed, class, summary}}
-      {:error, _reason} -> invalid_endpoint_result(:finalize)
+    with {:ok, attrs} <- endpoint_failure_attrs(class, attrs),
+         {:ok, summary} <- build_endpoint(identity, :finalize, "failed", class, attrs, extras) do
+      {:error, {:published_proof_failed, class, summary}}
+    else
+      _invalid -> invalid_endpoint_result(:finalize)
     end
   end
 
@@ -241,6 +246,9 @@ defmodule Maxio.Storage.PublishedProof do
   @spec journal_evidence(String.t(), map() | nil, map() | nil) ::
           {:ok, map()} | {:error, :invalid_proof_evidence}
   def journal_evidence(target_phase, proof_summary, failure_summary) do
+    proof_summary = trim_published_proof(proof_summary)
+    failure_summary = trim_last_failure(failure_summary, wrapper_budget(proof_summary))
+
     evidence = %{
       "published_proof" => proof_summary,
       "last_failure" => failure_summary
@@ -653,6 +661,16 @@ defmodule Maxio.Storage.PublishedProof do
     end
   end
 
+  # placement drift 永远是结构性裁决，绝不是 owned-token 事实：owned drift 既不能由 public
+  # constructor 产生，也不能作为 canonical aggregate 的 witness 被保留。
+  defp endpoint_failure_attrs(class, attrs) do
+    attrs = Map.put_new(attrs, :owned, false)
+
+    if class == :placement_drift and Map.get(attrs, :owned) != false,
+      do: :error,
+      else: {:ok, attrs}
+  end
+
   defp validate_attrs(attrs) do
     if Enum.all?(Map.keys(attrs), &(&1 in @attrs)) and
          Map.has_key?(attrs, :owned) and is_boolean(attrs.owned) do
@@ -732,7 +750,8 @@ defmodule Maxio.Storage.PublishedProof do
        when class in @endpoint_failure_classes and mode in [:proof, :finalize] do
     endpoint_shape?(summary, endpoint_keys(mode), mode) and
       summary["status"] == "failed" and summary["class"] == Atom.to_string(class) and
-      valid_finalize_failure_flags?(summary, mode)
+      valid_finalize_failure_flags?(summary, mode) and
+      (class != :placement_drift or summary["owned"] == false)
   end
 
   defp valid_failed_endpoint?(_summary, _class, _mode), do: false
@@ -803,6 +822,42 @@ defmodule Maxio.Storage.PublishedProof do
   end
 
   defp valid_identity?(value), do: match?({:ok, _identity}, normalize_identity(value))
+
+  # 冻结的 wrapper 预算分配：published proof 先裁到 31 条（裁剪幂等，故 merge 时逐字节不变），
+  # 剩余名额按 last failure 的 degraded、再 orphan_hints 的既有确定顺序填充。decisive/debt
+  # witness 已由 classifier 置于 degraded 首位，因此始终随首名额保留。
+  defp trim_published_proof(summary),
+    do: trim_details(summary, "degraded", "omitted", @max_published_details)
+
+  defp wrapper_budget(%{"degraded" => degraded}) when is_list(degraded),
+    do: max(@max_wrapper_details - length(degraded), 0)
+
+  defp wrapper_budget(_summary), do: @max_wrapper_details
+
+  defp trim_last_failure(%{"degraded" => degraded} = summary, budget) when is_list(degraded) do
+    summary = trim_details(summary, "degraded", "omitted", budget)
+    remaining = max(budget - length(summary["degraded"]), 0)
+    trim_details(summary, "orphan_hints", "orphan_omitted", remaining)
+  end
+
+  defp trim_last_failure(summary, _budget), do: summary
+
+  defp trim_details(summary, list_key, omitted_key, limit) when is_map(summary) do
+    details = Map.get(summary, list_key)
+    omitted = Map.get(summary, omitted_key)
+
+    if is_list(details) and is_integer(omitted) and length(details) > limit do
+      kept = Enum.take(details, limit)
+
+      summary
+      |> Map.put(list_key, kept)
+      |> Map.put(omitted_key, omitted + length(details) - length(kept))
+    else
+      summary
+    end
+  end
+
+  defp trim_details(summary, _list_key, _omitted_key, _limit), do: summary
 
   defp valid_journal_combination?(target_phase, proof_summary, failure_summary)
        when is_binary(target_phase) do
@@ -916,6 +971,7 @@ defmodule Maxio.Storage.PublishedProof do
     degraded = summary["degraded"]
 
     non_negative_integer?(finalized) and finalized <= summary["verified"] and
+      summary["verified"] - finalized <= summary["debt"] and
       non_negative_integer?(orphaned) and is_list(orphan_hints) and
       non_negative_integer?(orphan_omitted) and
       Enum.all?(orphan_hints, &valid_orphan_endpoint?/1) and
@@ -959,7 +1015,7 @@ defmodule Maxio.Storage.PublishedProof do
 
       "failed" ->
         verified < required and class in Enum.map(@endpoint_failure_classes, &Atom.to_string/1) and
-          valid_failure_relation?(summary)
+          valid_failure_relation?(summary) and canonical_drift_summary?(summary, :proof)
 
       "superseded" ->
         is_nil(class) and canonical_superseded_summary?(summary, :proof)
@@ -981,16 +1037,19 @@ defmodule Maxio.Storage.PublishedProof do
       verified >= required and finalized >= required and debt == 0 and unavailable == 0
 
     case summary["status"] do
+      # 零债务终态里，proof-passed endpoint 不可能凭空消失。
       "finalized" ->
-        terminal? and is_nil(class)
+        terminal? and is_nil(class) and verified == finalized and
+          verified == summary["observed_owned"]
 
+      # cleanup pending 必须真的欠着可指认的清理债务，不能只靠 status/计数改写伪造。
       "cleanup_pending" ->
-        verified >= required and not terminal? and is_nil(class) and
+        verified >= required and debt > 0 and summary["degraded"] != [] and is_nil(class) and
           no_priority_short_circuit_detail?(summary)
 
       "failed" ->
         verified < required and class in Enum.map(@endpoint_failure_classes, &Atom.to_string/1) and
-          valid_failure_relation?(summary)
+          valid_failure_relation?(summary) and canonical_drift_summary?(summary, :finalize)
 
       "superseded" ->
         is_nil(class) and canonical_superseded_summary?(summary, :finalize)
@@ -998,6 +1057,26 @@ defmodule Maxio.Storage.PublishedProof do
       _other ->
         false
     end
+  end
+
+  # placement drift 的聚合计数被结构预检刻意归零；durable 校验必须重新推导这一事实，
+  # 而不是只相信 outer class。
+  defp canonical_drift_summary?(%{"class" => "placement_drift"} = summary, mode) do
+    summary["verified"] == 0 and summary["observed_owned"] == 0 and
+      summary["unavailable"] == 0 and canonical_drift_finalize_zero?(summary, mode) and
+      Enum.any?(summary["degraded"], fn detail ->
+        detail["status"] == "failed" and detail["class"] == "placement_drift" and
+          detail["owned"] == false
+      end)
+  end
+
+  defp canonical_drift_summary?(_summary, _mode), do: true
+
+  defp canonical_drift_finalize_zero?(_summary, :proof), do: true
+
+  defp canonical_drift_finalize_zero?(summary, :finalize) do
+    summary["finalized"] == 0 and summary["orphaned"] == 0 and
+      summary["orphan_hints"] == [] and summary["orphan_omitted"] == 0
   end
 
   defp no_priority_short_circuit_detail?(summary) do

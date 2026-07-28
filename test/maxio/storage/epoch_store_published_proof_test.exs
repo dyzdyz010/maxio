@@ -1026,6 +1026,253 @@ defmodule Maxio.Storage.EpochStorePublishedProofTest do
              PublishedProof.journal_evidence("rollback_pending", nil, forged_outer)
   end
 
+  test "PublishedProof enforces canonical placement drift and non-owned drift witnesses" do
+    verified = PublishedProof.verified("ordinal:0", %{owned: true})
+    finalized = PublishedProof.endpoint_finalized("ordinal:0", %{phase: "committed"})
+    {:ok, {:verified, published}} = PublishedProof.classify(1, [{"ordinal:0", verified}])
+
+    {:error, {:published_proof_failed, :placement_drift, proof_drift}} =
+      PublishedProof.classify(1, [{"ordinal:0", verified}, {"ordinal:0", verified}])
+
+    {:error, {:published_proof_failed, :placement_drift, finalize_drift}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", finalized},
+        {"ordinal:0", finalized}
+      ])
+
+    # 冻结 canonical zero counts：只改语义计数的 drift forgery 一律不可持久化。
+    for forged <- [
+          %{proof_drift | "required" => 2, "verified" => 1, "observed_owned" => 1},
+          %{proof_drift | "required" => 2, "observed_owned" => 1},
+          %{proof_drift | "required" => 2, "unavailable" => 1}
+        ] do
+      assert {:error, :invalid_proof_evidence} =
+               PublishedProof.journal_evidence("rollback_pending", nil, forged)
+    end
+
+    for forged <- [
+          %{finalize_drift | "required" => 2, "verified" => 1, "finalized" => 1},
+          %{finalize_drift | "required" => 2, "observed_owned" => 1},
+          %{finalize_drift | "required" => 2, "orphaned" => 1, "orphan_omitted" => 1}
+        ] do
+      assert {:error, :invalid_proof_evidence} =
+               PublishedProof.journal_evidence("finalize_pending", published, forged)
+    end
+
+    # public endpoint constructor 必须拒绝 owned=true 的 placement drift。
+    for result <- [
+          PublishedProof.failed(:placement_drift, "ordinal:1", %{owned: true}),
+          PublishedProof.endpoint_finalize_failed(:placement_drift, "ordinal:1", %{owned: true})
+        ] do
+      assert {:error,
+              {:published_proof_failed, :placement_drift,
+               %{"endpoint" => "local", "owned" => false, "code" => "invalid_evidence"}}} = result
+    end
+
+    # 不可信的 owned drift observation 必须被重建为非 owned canonical witness，
+    # 而不是原样保留后让 classifier 自己的结果无法持久化。
+    forged_owned_drift =
+      {:error,
+       {:published_proof_failed, :placement_drift,
+        %{
+          "scope" => "endpoint",
+          "mode" => "proof",
+          "endpoint" => "ordinal:1",
+          "status" => "failed",
+          "class" => "placement_drift",
+          "owned" => true
+        }}}
+
+    {:error, {:published_proof_failed, :placement_drift, rebuilt}} =
+      PublishedProof.classify(2, [{"ordinal:1", forged_owned_drift}])
+
+    assert [rebuilt_witness] = rebuilt["degraded"]
+    assert rebuilt_witness["owned"] == false
+    assert rebuilt_witness["class"] == "placement_drift"
+    assert {:ok, _evidence} = PublishedProof.journal_evidence("rollback_pending", nil, rebuilt)
+
+    # constructor → classifier → phase-aware journal evidence 必须闭合。
+    drift_endpoint =
+      PublishedProof.failed(:placement_drift, "ordinal:1", %{
+        owned: false,
+        code: :placement_drift
+      })
+
+    {:error, {:published_proof_failed, :placement_drift, canonical}} =
+      PublishedProof.classify(2, [{"ordinal:1", drift_endpoint}])
+
+    assert %{"verified" => 0, "observed_owned" => 0, "unavailable" => 0} = canonical
+
+    assert {:ok, %{"last_failure" => ^canonical}} =
+             PublishedProof.journal_evidence("rollback_pending", nil, canonical)
+
+    finalize_drift_endpoint =
+      PublishedProof.endpoint_finalize_failed(:placement_drift, "ordinal:1", %{owned: false})
+
+    {:error, {:published_proof_failed, :placement_drift, canonical_finalize}} =
+      PublishedProof.classify_finalize(2, [{"ordinal:1", finalize_drift_endpoint}])
+
+    assert %{"finalized" => 0, "orphaned" => 0, "orphan_hints" => []} = canonical_finalize
+
+    assert {:ok, %{"last_failure" => ^canonical_finalize}} =
+             PublishedProof.journal_evidence("finalize_pending", published, canonical_finalize)
+  end
+
+  test "PublishedProof enforces finalize count conservation" do
+    verified = PublishedProof.verified("local", %{owned: true})
+    {:ok, {:verified, published}} = PublishedProof.classify(1, [{"local", verified}])
+
+    finalized_a = PublishedProof.endpoint_finalized("ordinal:0", %{phase: "committed"})
+    finalized_b = PublishedProof.endpoint_finalized("ordinal:1", %{phase: "committed"})
+    cleanup = PublishedProof.endpoint_cleanup_pending("ordinal:2", %{phase: "committed"})
+    mismatch = PublishedProof.endpoint_finalize_failed(:mismatch, "ordinal:2", %{owned: true})
+
+    {:ok, {:finalized, terminal}} =
+      PublishedProof.classify_finalize(1, [{"ordinal:0", finalized_a}])
+
+    {:ok, {:cleanup_pending, pending}} =
+      PublishedProof.classify_finalize(1, [
+        {"ordinal:0", finalized_a},
+        {"ordinal:2", cleanup}
+      ])
+
+    {:error, {:published_proof_failed, :mismatch, failed}} =
+      PublishedProof.classify_finalize(3, [
+        {"ordinal:0", finalized_a},
+        {"ordinal:1", finalized_b},
+        {"ordinal:2", mismatch}
+      ])
+
+    # terminal 且零债务时，proof-passed endpoint 不可能凭空消失。
+    assert %{"debt" => 0, "verified" => 1, "finalized" => 1, "observed_owned" => 1} = terminal
+
+    # classifier 产出的 cleanup_pending / failed 仍必须可持久化。
+    assert {:ok, %{"last_failure" => ^pending}} =
+             PublishedProof.journal_evidence("finalize_pending", published, pending)
+
+    assert {:ok, %{"last_failure" => ^failed}} =
+             PublishedProof.journal_evidence("finalize_pending", published, failed)
+
+    # 零债务、零 witness 的 cleanup_pending 是不可达状态。
+    forged_zero_debt =
+      terminal
+      |> Map.put("status", "cleanup_pending")
+      |> Map.put("finalized", 0)
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, forged_zero_debt)
+
+    # verified - finalized 必须完全落在 debt 里。
+    forged_pending_gap = %{pending | "verified" => 5, "observed_owned" => 5}
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, forged_pending_gap)
+
+    forged_failed_gap = %{failed | "finalized" => 0}
+
+    assert {:error, :invalid_proof_evidence} =
+             PublishedProof.journal_evidence("finalize_pending", published, forged_failed_gap)
+
+    # 只改 status/计数不能把 terminal finalize 结果洗成 durable evidence。
+    for phase <- ["finalize_pending", "quarantined"] do
+      assert {:error, :invalid_proof_evidence} =
+               PublishedProof.journal_evidence(phase, published, terminal)
+    end
+  end
+
+  test "PublishedProof budgets retained endpoint details across the journal wrapper" do
+    proof_ok = for index <- 0..3, do: {"ordinal:#{index}", PublishedProof.verified(index, %{})}
+
+    proof_failures =
+      for index <- 4..43 do
+        {"ordinal:#{index}", PublishedProof.failed(:unavailable, index, %{owned: false})}
+      end
+
+    {:ok, {:degraded, published}} = PublishedProof.classify(4, proof_ok ++ proof_failures)
+    assert length(published["degraded"]) == 32
+    assert published["omitted"] == 8
+    assert published["debt"] == 40
+
+    finalize_ok =
+      for index <- 0..3, do: {"ordinal:#{index}", PublishedProof.endpoint_finalized(index, %{})}
+
+    finalize_pending =
+      for index <- 4..23 do
+        {"ordinal:#{index}", PublishedProof.endpoint_cleanup_pending(index, %{})}
+      end
+
+    finalize_orphans =
+      for index <- 24..43 do
+        {"ordinal:#{index}", PublishedProof.endpoint_orphan(index, :epoch_absent)}
+      end
+
+    {:ok, {:cleanup_pending, last_failure}} =
+      PublishedProof.classify_finalize(4, finalize_ok ++ finalize_pending ++ finalize_orphans)
+
+    assert length(last_failure["degraded"]) == 20
+    assert length(last_failure["orphan_hints"]) == 12
+    assert last_failure["orphan_omitted"] == 8
+
+    # 初次持久化成功 proof：最多 31 条，为未来强制 witness 预留一条。
+    {:ok, first} = PublishedProof.journal_evidence("finalize_pending", published, nil)
+    assert length(first["published_proof"]["degraded"]) == 31
+    assert first["published_proof"]["omitted"] == 9
+    assert first["published_proof"]["debt"] == 40
+
+    {:ok, merged} = PublishedProof.merge_failure("finalize_pending", first, last_failure)
+
+    # published proof 在 merge 中逐字节不变。
+    assert merged["published_proof"] == first["published_proof"]
+
+    assert Jason.encode!(merged["published_proof"]) ==
+             Jason.encode!(first["published_proof"])
+
+    merged_failure = merged["last_failure"]
+
+    total_details =
+      length(merged["published_proof"]["degraded"]) +
+        length(merged_failure["degraded"]) + length(merged_failure["orphan_hints"])
+
+    assert total_details == 32
+
+    # 强制 debt witness 必须留下；debt/orphaned 总数不变，omitted 精确增加。
+    assert length(merged_failure["degraded"]) == 1
+    assert merged_failure["omitted"] == 19
+    assert merged_failure["debt"] == 20
+    assert merged_failure["orphan_hints"] == []
+    assert merged_failure["orphan_omitted"] == 20
+    assert merged_failure["orphaned"] == 20
+    assert byte_size(Jason.encode!(merged)) <= 60 * 1024
+
+    # failed last failure 保留的那一条必须是决定性 owned witness。
+    owned_corrupt = PublishedProof.failed(:corrupt, "ordinal:44", %{owned: true})
+
+    {:error, {:published_proof_failed, :corrupt, corrupt_failure}} =
+      PublishedProof.classify(50, proof_failures ++ [{"ordinal:44", owned_corrupt}])
+
+    {:ok, corrupt_evidence} =
+      PublishedProof.journal_evidence("rollback_pending", published, corrupt_failure)
+
+    assert [corrupt_witness] = corrupt_evidence["last_failure"]["degraded"]
+    assert corrupt_witness["class"] == "corrupt"
+    assert corrupt_witness["owned"] == true
+    assert corrupt_evidence["last_failure"]["debt"] == corrupt_failure["debt"]
+
+    assert corrupt_evidence["last_failure"]["omitted"] ==
+             corrupt_failure["debt"] - 1
+
+    # pre-published 的 nil-proof failure 可以独占全部 32 条预算。
+    {:error, {:published_proof_failed, :unavailable, nil_proof_failure}} =
+      PublishedProof.classify(50, proof_failures)
+
+    {:ok, nil_proof_evidence} =
+      PublishedProof.journal_evidence("rollback_pending", nil, nil_proof_failure)
+
+    assert length(nil_proof_evidence["last_failure"]["degraded"]) == 32
+    assert nil_proof_evidence["last_failure"]["omitted"] == 8
+    assert byte_size(Jason.encode!(nil_proof_evidence)) <= 60 * 1024
+  end
+
   test "PublishedProof bounds decimal ordinal identities" do
     huge_ordinal = Integer.pow(2, 1024)
 
