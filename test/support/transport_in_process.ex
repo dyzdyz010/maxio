@@ -269,11 +269,7 @@ defmodule Maxio.Cluster.Transport.InProcess do
   @impl true
   def verify_mutation(node, drive_root, request) do
     if down?(node, drive_root) or op_down?(:verify_mutation, node, drive_root),
-      do:
-        Maxio.Storage.PublishedProof.failed(:unavailable, node, %{
-          code: :rpc_unavailable,
-          owned: false
-        }),
+      do: Maxio.Cluster.Transport.mutation_proof_unavailable(request),
       else: ShardServer.verify_mutation(drive_root, request)
   end
 

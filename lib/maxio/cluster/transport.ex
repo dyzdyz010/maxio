@@ -51,7 +51,7 @@ defmodule Maxio.Cluster.Transport do
   @callback restore_mutation(node(), String.t(), map()) ::
               {:ok, :restored} | {:ok, :superseded} | {:error, term()}
   @callback verify_mutation(node(), String.t(), map()) ::
-              Maxio.Storage.PublishedProof.proof_result()
+              Maxio.Storage.PublishedProof.endpoint_proof_result()
   @callback finalize_mutation(node(), String.t(), map()) ::
               {:ok, :finalized} | {:ok, :superseded} | {:error, term()}
   # durable backup manifest 写原语（协议 §3.2）：Distributed 的协议化 publish 必须把每端点
@@ -72,6 +72,33 @@ defmodule Maxio.Cluster.Transport do
   def impl(opts \\ []) do
     Keyword.get(opts, :transport) ||
       Application.get_env(:maxio, :shard_transport, Maxio.Cluster.Transport.Erpc)
+  end
+
+  @doc false
+  @spec mutation_proof_unavailable(map()) :: Maxio.Storage.PublishedProof.endpoint_proof_result()
+  def mutation_proof_unavailable(%{layout: %{kind: "fs"} = layout})
+      when map_size(layout) == 1 do
+    Maxio.Storage.PublishedProof.failed(:unavailable, "local", %{
+      code: :rpc_unavailable,
+      layout: "fs",
+      owned: false
+    })
+  end
+
+  def mutation_proof_unavailable(%{layout: %{kind: "shard", index: index} = layout})
+      when map_size(layout) == 2 and is_integer(index) and index >= 0 do
+    Maxio.Storage.PublishedProof.failed(:unavailable, index, %{
+      code: :rpc_unavailable,
+      layout: "shard:#{index}",
+      owned: false
+    })
+  end
+
+  def mutation_proof_unavailable(_request) do
+    Maxio.Storage.PublishedProof.failed(:placement_drift, "local", %{
+      code: :invalid_endpoint_layout,
+      owned: false
+    })
   end
 end
 
@@ -204,10 +231,7 @@ defmodule Maxio.Cluster.Transport.Erpc do
   @impl true
   def verify_mutation(node, drive_root, request) do
     call(node, :verify_mutation, [drive_root, request], fn ->
-      Maxio.Storage.PublishedProof.failed(:unavailable, node, %{
-        code: :rpc_unavailable,
-        owned: false
-      })
+      Maxio.Cluster.Transport.mutation_proof_unavailable(request)
     end)
   end
 
@@ -260,19 +284,18 @@ defmodule Maxio.Cluster.Transport.Erpc do
 
   # 本地直接调；远端 :erpc。任何宕机/超时/异常 -> on_fail 兜底（铁律 3：结构化降级，绝不上抛）。
   defp call(node, fun, args, on_fail) do
-    if node == Node.self() do
-      apply(ShardServer, fun, args)
-    else
-      try do
+    try do
+      if node == Node.self() do
+        apply(ShardServer, fun, args)
+      else
         :erpc.call(node, ShardServer, fun, args, @timeout)
-      catch
-        # 节点 down（{:erpc, :noconnection}）/超时（{:erpc, :timeout}）/远端异常均经
-        # :erlang.error 抛出（class :error），远端进程退出经 class :exit；显式 throw 经 :throw。
-        # 三类统一兜底为 on_fail（铁律 3：结构化降级，绝不上抛炸后端）。
-        :error, _reason -> on_fail.()
-        :exit, _reason -> on_fail.()
-        :throw, _reason -> on_fail.()
       end
+    catch
+      # 本地 direct apply 与远端 :erpc 的 error/exit/throw 都必须归一为调用方提供的
+      # bounded fallback，不能让本地节点成为异常上抛的特殊路径。
+      :error, _reason -> on_fail.()
+      :exit, _reason -> on_fail.()
+      :throw, _reason -> on_fail.()
     end
   end
 end

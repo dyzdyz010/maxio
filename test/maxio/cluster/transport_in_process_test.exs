@@ -1,6 +1,7 @@
 defmodule Maxio.Cluster.TransportInProcessTest do
   use ExUnit.Case, async: false
   alias Maxio.Cluster.Paths
+  alias Maxio.Cluster.Transport.Erpc
   alias Maxio.Cluster.Transport.InProcess
   alias Maxio.Storage.{EpochStore, ObjectEpoch}
 
@@ -36,47 +37,69 @@ defmodule Maxio.Cluster.TransportInProcessTest do
     assert {:error, :unavailable} = InProcess.get_sidecar(:maxio@n2, dir)
   end
 
-  test "verify_mutation 透传有界 proof 并遵循 drive outage", %{base: base} do
+  test "verify_mutation freezes the same endpoint identity across success and outage", %{
+    base: base
+  } do
     node = :maxio@n2
-    drive = Path.join(base, "proof-drive")
-    {:ok, target} = ObjectEpoch.object_target("inprocess-proof", "key", "null")
-    {:ok, final_rel} = Paths.object_rel("inprocess-proof", "key", "null")
-    {:ok, token} = ObjectEpoch.token(1, "00000000-0000-0000-0000-00000000000a")
-    raw_meta = Jason.encode!(%{"format" => "maxio/2", "etag" => "etag", "size" => 4})
-    fingerprint = ObjectEpoch.fingerprint("etag", 4, raw_meta)
 
-    {:ok, epoch} =
-      ObjectEpoch.new(target, token, %{
-        operation: "put",
-        phase: "published",
-        value_type: "object",
-        fingerprint: fingerprint,
-        updated_at: DateTime.utc_now()
-      })
+    for {name, layout, endpoint} <- [
+          {"fs", %{kind: "fs"}, "local"},
+          {"shard", %{kind: "shard", index: 1}, "ordinal:1"}
+        ] do
+      drive = Path.join(base, "proof-drive-#{name}")
+      request = published_proof_request!(drive, "key-#{name}", layout)
 
-    final_dir = Path.join(drive, final_rel)
-    File.mkdir_p!(final_dir)
-    File.write!(Path.join(final_dir, "part.0"), "data")
-    File.write!(Path.join(final_dir, "meta.json"), raw_meta)
-    assert {:ok, :applied} = EpochStore.cas(drive, epoch, {:claim, token})
+      assert {:ok,
+              {:verified,
+               %{
+                 "scope" => "endpoint",
+                 "mode" => "proof",
+                 "status" => "verified",
+                 "endpoint" => ^endpoint,
+                 "owned" => true
+               }}} = InProcess.verify_mutation(node, drive, request)
 
-    request = %{
-      target: target,
-      token: token,
-      mutation_id: token["mutation_id"],
-      final_rel: final_rel,
-      expected_fingerprint: fingerprint,
-      layout: %{kind: "fs"}
-    }
+      InProcess.set_drive_down(node, drive)
 
-    assert {:ok, {:verified, %{"verified" => 1}}} =
-             InProcess.verify_mutation(node, drive, request)
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "scope" => "endpoint",
+                 "mode" => "proof",
+                 "status" => "failed",
+                 "endpoint" => ^endpoint,
+                 "owned" => false
+               }}} = InProcess.verify_mutation(node, drive, request)
 
-    InProcess.set_drive_down(node, drive)
+      InProcess.set_drive_up(node, drive)
+    end
+  end
 
-    assert {:error,
-            {:published_proof_failed, :unavailable, %{"status" => "failed", "unavailable" => 1}}} =
-             InProcess.verify_mutation(node, drive, request)
+  test "erpc outage evidence uses layout identity instead of node or drive path" do
+    unreachable = :maxio_proof_unreachable@localhost
+
+    for {layout, endpoint} <- [
+          {%{kind: "fs"}, "local"},
+          {%{kind: "shard", index: 7}, "ordinal:7"}
+        ] do
+      assert {:error,
+              {:published_proof_failed, :unavailable,
+               %{
+                 "scope" => "endpoint",
+                 "mode" => "proof",
+                 "status" => "failed",
+                 "endpoint" => ^endpoint,
+                 "owned" => false
+               } = summary}} =
+               Erpc.verify_mutation(unreachable, "private-drive-path", %{layout: layout})
+
+      refute Map.has_key?(summary, "node")
+      refute Map.has_key?(summary, "path")
+    end
+  end
+
+  test "erpc normalizes exceptions from local direct apply" do
+    assert nil == Erpc.get_shard(Node.self(), nil, 0, 1)
   end
 
   test "move_shard moves directories and reports unavailable drives", %{base: base} do
@@ -201,5 +224,57 @@ defmodule Maxio.Cluster.TransportInProcessTest do
 
     assert {:error, :unavailable} =
              InProcess.quarantine_layout_roots(node, drive, ["bucket-a"], "q-1", %{})
+  end
+
+  defp published_proof_request!(drive, key, layout) do
+    {:ok, target} = ObjectEpoch.object_target("inprocess-proof", key, "null")
+    {:ok, final_rel} = Paths.object_rel("inprocess-proof", key, "null")
+    {:ok, token} = ObjectEpoch.token(1, "00000000-0000-0000-0000-00000000000a")
+
+    sidecar =
+      %{
+        "format" => "maxio/2",
+        "etag" => "etag",
+        "size" => 4,
+        "sha256" => String.duplicate("a", 64),
+        "versions" => [%{"version_id" => "null", "type" => "object"}]
+      }
+      |> maybe_put_shards(layout)
+
+    raw_meta = Jason.encode!(sidecar)
+    fingerprint = ObjectEpoch.fingerprint("etag", 4, raw_meta)
+
+    {:ok, epoch} =
+      ObjectEpoch.new(target, token, %{
+        operation: "put",
+        phase: "published",
+        value_type: "object",
+        fingerprint: fingerprint,
+        updated_at: DateTime.utc_now()
+      })
+
+    final_dir = Path.join(drive, final_rel)
+    File.mkdir_p!(final_dir)
+    File.write!(Path.join(final_dir, "part.0"), "data")
+    File.write!(Path.join(final_dir, "meta.json"), raw_meta)
+    assert {:ok, :applied} = EpochStore.cas(drive, epoch, {:claim, token})
+
+    %{
+      target: target,
+      token: token,
+      mutation_id: token["mutation_id"],
+      final_rel: final_rel,
+      expected_fingerprint: fingerprint,
+      layout: layout
+    }
+  end
+
+  defp maybe_put_shards(sidecar, %{kind: "fs"}), do: sidecar
+
+  defp maybe_put_shards(sidecar, %{kind: "shard"}) do
+    Map.put(sidecar, "shards", [
+      %{"drive" => 0, "shard_file_size" => 4, "block_hashes" => []},
+      %{"drive" => 1, "shard_file_size" => 4, "block_hashes" => []}
+    ])
   end
 end

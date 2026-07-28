@@ -19,7 +19,9 @@ defmodule Maxio.Storage.EpochStore do
   `{:corrupt, reason}`（后端映射 quarantine 证据）。
   """
 
-  alias Maxio.Cluster.ShardServer
+  alias Maxio.Cluster.{Paths, ShardServer}
+  alias Maxio.Native.PathSafety
+  alias Maxio.Sidecar
   alias Maxio.Storage.{MutationBackup, ObjectEpoch, PublishedProof}
 
   @call_timeout 30_000
@@ -157,34 +159,41 @@ defmodule Maxio.Storage.EpochStore do
   物理 part 形状。standalone proof 只接受 published/committed；successor 在任何 final
   探测前短路为 `:superseded`。响应由 `PublishedProof` 限界，绝不包含绝对路径或 sidecar。
   """
-  @spec verify_mutation(String.t(), map(), keyword()) :: PublishedProof.proof_result()
+  @spec verify_mutation(String.t(), map(), keyword()) :: PublishedProof.endpoint_proof_result()
   def verify_mutation(drive_root, request, opts \\ [])
 
   def verify_mutation(drive_root, request, opts)
       when is_binary(drive_root) and is_map(request) do
-    case validate_verify_request(request) do
-      {:ok, normalized} ->
-        serialize(
-          drive_root,
-          normalized.epoch_rel,
-          fn ->
-            do_verify_mutation(
-              epoch_path(drive_root, normalized.epoch_rel),
-              drive_root,
-              normalized,
-              opts
-            )
-          end,
-          opts
-        )
-
+    with {:ok, drive_root} <- normalize_drive_root(drive_root),
+         {:ok, normalized} <- validate_verify_request(request) do
+      serialize(
+        drive_root,
+        normalized.epoch_rel,
+        fn ->
+          do_verify_mutation(
+            epoch_path(drive_root, normalized.epoch_rel),
+            drive_root,
+            normalized,
+            opts
+          )
+        end,
+        opts
+      )
+    else
       {:error, code} ->
-        PublishedProof.failed(:corrupt, "local", %{code: code, owned: false})
+        PublishedProof.failed(:corrupt, request_endpoint_identity(request), %{
+          code: code,
+          owned: false
+        })
     end
   end
 
-  def verify_mutation(_drive_root, _request, _opts),
-    do: PublishedProof.failed(:corrupt, "local", %{code: :invalid_request, owned: false})
+  def verify_mutation(_drive_root, request, _opts),
+    do:
+      PublishedProof.failed(:corrupt, request_endpoint_identity(request), %{
+        code: :invalid_request,
+        owned: false
+      })
 
   @doc "epoch → 纯数据 payload map（erpc 传输/ShardServer 响应用；与磁盘 JSON 同形）。"
   @spec payload(ObjectEpoch.t()) :: {:ok, map()} | {:error, term()}
@@ -470,6 +479,14 @@ defmodule Maxio.Storage.EpochStore do
   end
 
   defp verify_current_epoch(current, drive_root, request, opts) do
+    if current.target == request.target do
+      compare_verified_epoch_token(current, drive_root, request, opts)
+    else
+      proof_failure(:corrupt, :epoch_target_mismatch, false, request)
+    end
+  end
+
+  defp compare_verified_epoch_token(current, drive_root, request, opts) do
     case ObjectEpoch.compare_tokens(current.token, request.token) do
       {:ok, :gt} ->
         PublishedProof.superseded(endpoint_identity(request.layout))
@@ -502,11 +519,17 @@ defmodule Maxio.Storage.EpochStore do
   end
 
   defp verify_final(current, drive_root, request, opts) do
-    final_dir = Path.join(drive_root, request.final_rel)
-    meta_path = Path.join(final_dir, "meta.json")
-
-    with {:ok, raw_meta} <- read_bounded_regular(meta_path, opts),
-         {:ok, core} <- decode_durable_core(raw_meta),
+    with {:ok, paths} <- canonical_proof_paths(drive_root, request.final_rel),
+         {:ok, ancestor_snapshot} <- snapshot_directories(paths.ancestors, opts),
+         {:ok, raw_meta} <-
+           read_bounded_regular(
+             paths.meta,
+             paths.ancestors,
+             ancestor_snapshot,
+             opts
+           ),
+         {:ok, core} <-
+           decode_durable_core(raw_meta, request.target["version_id"]),
          actual <-
            ObjectEpoch.fingerprint(
              core.etag,
@@ -515,8 +538,7 @@ defmodule Maxio.Storage.EpochStore do
            ),
          :ok <- match_actual_fingerprint(request.expected_fingerprint, actual),
          {:ok, expected_part_size} <- expected_part_size(core.meta, core.size, request.layout),
-         :ok <-
-           verify_regular_part(Path.join(final_dir, "part.0"), expected_part_size, opts) do
+         :ok <- verify_regular_part(paths.part, expected_part_size, opts) do
       PublishedProof.verified(endpoint_identity(request.layout), %{
         layout: layout_label(request.layout),
         owned: true,
@@ -528,72 +550,183 @@ defmodule Maxio.Storage.EpochStore do
     end
   end
 
-  defp read_bounded_regular(path, opts) do
-    case lstat(path, opts) do
-      {:ok, %File.Stat{type: :regular, size: size}} when size <= @sidecar_limit ->
-        read_bounded(path)
+  defp canonical_proof_paths(drive_root, final_rel) do
+    root = Path.expand(drive_root)
+    final_dir = Path.expand(Path.join(root, final_rel))
+    relative = Path.relative_to(final_dir, root)
 
-      {:ok, %File.Stat{type: :regular}} ->
-        {:proof_error, :corrupt, :sidecar_too_large}
+    contained? =
+      Path.type(relative) == :relative and relative != "." and
+        Enum.all?(Path.split(relative), &(&1 not in ["", ".", ".."]))
 
-      {:ok, %File.Stat{}} ->
-        {:proof_error, :corrupt, :sidecar_not_regular}
+    if contained? do
+      {:ok,
+       %{
+         meta: Path.join(final_dir, "meta.json"),
+         part: Path.join(final_dir, "part.0"),
+         ancestors:
+           (absolute_prefixes(root) ++ absolute_prefixes(final_dir))
+           |> Enum.uniq()
+       }}
+    else
+      {:proof_error, :corrupt, :invalid_final_path}
+    end
+  end
 
-      {:error, :enoent} ->
-        {:proof_error, :corrupt, :sidecar_missing}
+  defp absolute_prefixes(path) do
+    case Path.split(path) do
+      [] ->
+        []
 
-      {:error, reason} ->
-        {:proof_error, io_class(reason), :sidecar_unavailable}
+      [volume | segments] ->
+        [
+          volume
+          | Enum.scan(segments, volume, fn segment, parent -> Path.join(parent, segment) end)
+        ]
+    end
+  end
+
+  defp snapshot_directories(paths, opts) do
+    paths
+    |> Enum.reduce_while({:ok, []}, fn path, {:ok, snapshots} ->
+      case snapshot_component(path, :directory, :ancestor, opts) do
+        {:ok, stat} -> {:cont, {:ok, [ancestor_identity(stat) | snapshots]}}
+        {:proof_error, _class, _code} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, snapshots} -> {:ok, Enum.reverse(snapshots)}
+      {:proof_error, _class, _code} = error -> error
+    end
+  end
+
+  defp read_bounded_regular(path, ancestor_paths, ancestor_snapshot, opts) do
+    with {:ok, pre_path} <- snapshot_component(path, :regular, :sidecar, opts),
+         :ok <- validate_sidecar_size(pre_path.size),
+         {:ok, io} <- open_raw(path, opts) do
+      try do
+        read_opened_sidecar(
+          io,
+          path,
+          pre_path,
+          ancestor_paths,
+          ancestor_snapshot,
+          opts
+        )
+      after
+        _ = close_raw(io, opts)
+      end
     end
   end
 
   # limit+1 的单次有界读取避免 TOCTOU 增长把 sidecar 全量拉入内存。
-  defp read_bounded(path) do
-    case File.open(path, [:read, :binary]) do
-      {:ok, io} ->
-        result =
-          case IO.binread(io, @sidecar_limit + 1) do
-            bytes when is_binary(bytes) and byte_size(bytes) <= @sidecar_limit ->
-              {:ok, bytes}
+  defp validate_sidecar_size(size) when is_integer(size) and size <= @sidecar_limit, do: :ok
+  defp validate_sidecar_size(_size), do: {:proof_error, :corrupt, :sidecar_too_large}
 
-            bytes when is_binary(bytes) ->
-              {:proof_error, :corrupt, :sidecar_too_large}
-
-            :eof ->
-              {:ok, ""}
-
-            {:error, reason} ->
-              {:proof_error, io_class(reason), :sidecar_unavailable}
-          end
-
-        _ = File.close(io)
-        result
-
-      {:error, :enoent} ->
-        {:proof_error, :corrupt, :sidecar_missing}
-
-      {:error, reason} ->
-        {:proof_error, io_class(reason), :sidecar_unavailable}
+  defp read_opened_sidecar(
+         io,
+         path,
+         pre_path,
+         ancestor_paths,
+         ancestor_snapshot,
+         opts
+       ) do
+    with {:ok, pre_handle} <- handle_stat(io, opts),
+         :ok <- ensure_regular_handle(pre_handle),
+         :ok <- ensure_same_file(pre_path, pre_handle),
+         {:ok, bytes} <- bounded_read(io, pre_path.size, opts),
+         {:ok, post_handle} <- handle_stat(io, opts),
+         :ok <- ensure_regular_handle(post_handle),
+         {:ok, post_path} <- snapshot_component(path, :regular, :sidecar, opts),
+         :ok <- ensure_same_file(pre_path, post_path),
+         :ok <- ensure_same_file(pre_handle, post_handle),
+         :ok <- ensure_same_file(post_path, post_handle),
+         {:ok, post_ancestors} <- snapshot_directories(ancestor_paths, opts),
+         :ok <- ensure_same_ancestors(ancestor_snapshot, post_ancestors) do
+      {:ok, bytes}
     end
   end
 
-  defp decode_durable_core(raw_meta) do
-    case Jason.decode(raw_meta) do
-      {:ok, %{} = meta} ->
-        etag = Map.get(meta, "etag")
-        size = Map.get(meta, "size")
+  defp ensure_regular_handle(%File.Stat{type: :regular}), do: :ok
 
-        if is_binary(etag) and etag != "" and is_integer(size) and size >= 0 do
-          {:ok, %{etag: etag, size: size, meta: meta}}
-        else
-          {:proof_error, :corrupt, :invalid_sidecar_core}
-        end
+  defp ensure_regular_handle(%File.Stat{}),
+    do: {:proof_error, :corrupt, :sidecar_not_regular}
 
-      {:ok, _non_map} ->
-        {:proof_error, :corrupt, :invalid_sidecar_shape}
+  defp bounded_read(io, expected_size, opts) do
+    case read_raw(io, @sidecar_limit + 1, opts) do
+      bytes
+      when is_binary(bytes) and byte_size(bytes) <= @sidecar_limit and
+             byte_size(bytes) == expected_size ->
+        {:ok, bytes}
+
+      bytes when is_binary(bytes) and byte_size(bytes) > @sidecar_limit ->
+        {:proof_error, :corrupt, :sidecar_too_large}
+
+      bytes when is_binary(bytes) ->
+        {:proof_error, :corrupt, :sidecar_changed}
+
+      :eof when expected_size == 0 ->
+        {:ok, ""}
+
+      :eof ->
+        {:proof_error, :corrupt, :sidecar_changed}
+
+      {:error, reason} ->
+        proof_io_error(reason, :sidecar)
+
+      _other ->
+        {:proof_error, :unavailable, :sidecar_unavailable}
+    end
+  end
+
+  defp ensure_same_file(left, right) do
+    if stat_signature(left) == stat_signature(right),
+      do: :ok,
+      else: {:proof_error, :corrupt, :sidecar_changed}
+  end
+
+  defp ensure_same_ancestors(left, right) do
+    if left == right,
+      do: :ok,
+      else: {:proof_error, :corrupt, :ancestor_changed}
+  end
+
+  defp stat_signature(%File.Stat{} = stat) do
+    {
+      stat.type,
+      stat.size,
+      stat.mtime,
+      stat.ctime,
+      stat.mode,
+      stat.links,
+      stat.major_device,
+      stat.minor_device,
+      stat.inode
+    }
+  end
+
+  # Directory size/timestamps/link count/mode legitimately change when another object sharing an
+  # ancestor is created or removed. Ancestor rechecks therefore compare only stable identity;
+  # snapshot_component/4 independently repeats type and reparse checks before and after the read.
+  defp ancestor_identity(%File.Stat{} = stat) do
+    {
+      stat.type,
+      stat.major_device,
+      stat.minor_device,
+      stat.inode
+    }
+  end
+
+  defp decode_durable_core(raw_meta, version_id) do
+    case Sidecar.decode_durable_object(raw_meta, version_id) do
+      {:ok, %{core: %{etag: etag, size: size}, meta: meta}} ->
+        {:ok, %{etag: etag, size: size, meta: meta}}
+
+      {:error, :invalid_json} ->
+        {:proof_error, :corrupt, :invalid_sidecar_json}
 
       {:error, _reason} ->
-        {:proof_error, :corrupt, :invalid_sidecar_json}
+        {:proof_error, :corrupt, :invalid_sidecar_shape}
     end
   end
 
@@ -636,21 +769,10 @@ defmodule Maxio.Storage.EpochStore do
   end
 
   defp verify_regular_part(path, expected_size, opts) do
-    case lstat(path, opts) do
-      {:ok, %File.Stat{type: :regular, size: ^expected_size}} ->
-        :ok
-
-      {:ok, %File.Stat{type: :regular}} ->
-        {:proof_error, :mismatch, :part_size_mismatch}
-
-      {:ok, %File.Stat{}} ->
-        {:proof_error, :corrupt, :part_not_regular}
-
-      {:error, :enoent} ->
-        {:proof_error, :corrupt, :part_missing}
-
-      {:error, reason} ->
-        {:proof_error, io_class(reason), :part_unavailable}
+    with {:ok, stat} <- snapshot_component(path, :regular, :part, opts) do
+      if stat.size == expected_size,
+        do: :ok,
+        else: {:proof_error, :mismatch, :part_size_mismatch}
     end
   end
 
@@ -667,14 +789,27 @@ defmodule Maxio.Storage.EpochStore do
   defp endpoint_identity(%{kind: "fs"}), do: "local"
   defp endpoint_identity(%{kind: "shard", index: index}), do: index
 
+  defp request_endpoint_identity(%{layout: %{kind: "shard", index: index}})
+       when is_integer(index) and index >= 0,
+       do: index
+
+  defp request_endpoint_identity(_request), do: "local"
+
   defp validate_verify_request(request) do
     with true <- Map.keys(request) |> Enum.sort() == @verify_request_keys,
-         %{"kind" => "object_version"} <- request.target,
+         %{
+           "kind" => "object_version",
+           "bucket" => bucket,
+           "key" => key,
+           "version_id" => version_id
+         } <- request.target,
          {:ok, epoch_rel} <- ObjectEpoch.relative_path(request.target),
+         {:ok, canonical_final_rel} <- Paths.object_rel(bucket, key, version_id),
          {:ok, token} <- validate_token(request.token),
          {:ok, mutation_id} <-
            validate_owned_mutation_id(token, request.mutation_id),
          {:ok, final_rel} <- validate_final_rel(request.final_rel),
+         true <- final_rel == canonical_final_rel,
          true <-
            ObjectEpoch.fingerprint_matches?(
              request.expected_fingerprint,
@@ -696,6 +831,17 @@ defmodule Maxio.Storage.EpochStore do
     end
   end
 
+  defp normalize_drive_root(drive_root)
+       when is_binary(drive_root) and byte_size(drive_root) > 0 do
+    if Path.type(drive_root) == :absolute,
+      do: {:ok, Path.expand(drive_root)},
+      else: {:error, :invalid_drive_root}
+  rescue
+    _error -> {:error, :invalid_drive_root}
+  end
+
+  defp normalize_drive_root(_drive_root), do: {:error, :invalid_drive_root}
+
   defp validate_layout(%{kind: "fs"} = layout) when map_size(layout) == 1, do: {:ok, layout}
 
   defp validate_layout(%{kind: "shard", index: index} = layout)
@@ -704,7 +850,134 @@ defmodule Maxio.Storage.EpochStore do
 
   defp validate_layout(_layout), do: {:error, :invalid_layout}
 
-  defp io_class(reason) when reason in [:eacces, :eio], do: :unavailable
+  defp snapshot_component(path, expected_type, context, opts) do
+    with :ok <- ensure_not_reparse_point(path, context, opts) do
+      case lstat(path, opts) do
+        {:ok, %File.Stat{type: ^expected_type} = stat} ->
+          {:ok, stat}
+
+        {:ok, %File.Stat{}} ->
+          {:proof_error, :corrupt, shape_code(context)}
+
+        {:error, reason} ->
+          proof_io_error(reason, context)
+
+        _other ->
+          {:proof_error, :unavailable, unavailable_code(context)}
+      end
+    end
+  end
+
+  defp ensure_not_reparse_point(path, context, opts) do
+    result =
+      case Keyword.get(opts, :reparse_point) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _other -> PathSafety.reparse_point(path)
+      end
+
+    case result do
+      {:ok, false} -> :ok
+      {:ok, true} -> {:proof_error, :corrupt, reparse_code(context)}
+      {:error, reason} -> proof_io_error(reason, context)
+      _other -> {:proof_error, :unavailable, unavailable_code(context)}
+    end
+  end
+
+  defp open_raw(path, opts) do
+    result =
+      case Keyword.get(opts, :open_raw) do
+        fun when is_function(fun, 1) -> fun.(path)
+        _other -> File.open(path, [:read, :binary])
+      end
+
+    case result do
+      {:ok, io} -> {:ok, io}
+      {:error, reason} -> proof_io_error(reason, :sidecar)
+      _other -> {:proof_error, :unavailable, :sidecar_unavailable}
+    end
+  end
+
+  defp handle_stat(io, opts) do
+    result =
+      case Keyword.get(opts, :handle_stat) do
+        fun when is_function(fun, 1) -> fun.(io)
+        _other -> default_handle_stat(io)
+      end
+
+    case result do
+      {:ok, %File.Stat{} = stat} -> {:ok, stat}
+      {:error, reason} -> proof_io_error(reason, :sidecar)
+      _other -> {:proof_error, :unavailable, :sidecar_unavailable}
+    end
+  end
+
+  defp default_handle_stat(io) do
+    case :file.read_file_info(io, time: :universal) do
+      {:ok, file_info} -> {:ok, File.Stat.from_record(file_info)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_raw(io, count, opts) do
+    case Keyword.get(opts, :read_raw) do
+      fun when is_function(fun, 2) -> fun.(io, count)
+      _other -> IO.binread(io, count)
+    end
+  end
+
+  defp close_raw(io, opts) do
+    case Keyword.get(opts, :close_raw) do
+      fun when is_function(fun, 1) -> fun.(io)
+      _other -> File.close(io)
+    end
+  end
+
+  defp proof_io_error(reason, context) when reason in [:enoent] do
+    {:proof_error, :corrupt, missing_code(context)}
+  end
+
+  defp proof_io_error(reason, _context) when reason in [:enotdir, :eloop, :einval] do
+    {:proof_error, :corrupt, :unsafe_path}
+  end
+
+  defp proof_io_error(
+         reason,
+         context
+       )
+       when reason in [
+              :eacces,
+              :eperm,
+              :eio,
+              :enodev,
+              :estale,
+              :etimedout,
+              :ebusy,
+              :nif_not_loaded,
+              :native_unavailable
+            ] do
+    {:proof_error, :unavailable, unavailable_code(context)}
+  end
+
+  defp proof_io_error(_reason, context),
+    do: {:proof_error, :unavailable, unavailable_code(context)}
+
+  defp missing_code(:sidecar), do: :sidecar_missing
+  defp missing_code(:part), do: :part_missing
+  defp missing_code(:ancestor), do: :unsafe_path
+
+  defp shape_code(:sidecar), do: :sidecar_not_regular
+  defp shape_code(:part), do: :part_not_regular
+  defp shape_code(:ancestor), do: :unsafe_path
+
+  defp reparse_code(:sidecar), do: :sidecar_reparse_point
+  defp reparse_code(:part), do: :part_reparse_point
+  defp reparse_code(:ancestor), do: :ancestor_reparse_point
+
+  defp unavailable_code(:sidecar), do: :sidecar_unavailable
+  defp unavailable_code(:part), do: :part_unavailable
+  defp unavailable_code(:ancestor), do: :path_unavailable
+
+  defp io_class(reason) when reason in [:enoent, :enotdir, :eloop], do: :corrupt
   defp io_class(_reason), do: :unavailable
 
   defp lstat(path, opts) do
@@ -813,6 +1086,8 @@ defmodule Maxio.Storage.EpochStore do
 
     if invalid?, do: {:error, {:invalid_final_rel, final_rel}}, else: {:ok, final_rel}
   end
+
+  defp validate_final_rel(_final_rel), do: {:error, :invalid_final_rel}
 
   defp validate_expect_shape(next, {:claim, proposed}) do
     case ObjectEpoch.compare_tokens(next.token, proposed) do

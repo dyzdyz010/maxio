@@ -588,7 +588,7 @@ defmodule Maxio.Cluster.ShardServer do
   与 FS/shard 物理形状。响应是有界纯数据，不回传对象、sidecar 或本机路径。
   """
   @spec verify_mutation(String.t(), map(), keyword()) ::
-          Maxio.Storage.PublishedProof.proof_result()
+          Maxio.Storage.PublishedProof.endpoint_proof_result()
   def verify_mutation(drive_root, request, opts \\ []) do
     DriveIO.track(:read, fn -> EpochStore.verify_mutation(drive_root, request, opts) end)
   end

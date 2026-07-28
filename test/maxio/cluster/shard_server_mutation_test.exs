@@ -129,13 +129,29 @@ defmodule Maxio.Cluster.ShardServerMutationTest do
     key = "verify-endpoint"
     t = target(key)
     rel = final_rel(key)
-    raw_meta = Jason.encode!(%{"format" => "maxio/2", "etag" => "etag-proof", "size" => 5})
+
+    raw_meta =
+      Jason.encode!(%{
+        "format" => "maxio/2",
+        "etag" => "etag-proof",
+        "size" => 5,
+        "sha256" => String.duplicate("a", 64),
+        "versions" => [%{"version_id" => "null", "type" => "object"}]
+      })
+
     fingerprint = ObjectEpoch.fingerprint("etag-proof", 5, raw_meta)
     _claimed = claim!(dir, t, 1, @id_a)
     tok = publish!(dir, t, 1, @id_a, fingerprint)
     write_final!(dir, rel, %{"part.0" => "proof", "meta.json" => raw_meta})
 
-    assert {:ok, {:verified, %{"verified" => 1, "degraded" => []}}} =
+    assert {:ok,
+            {:verified,
+             %{
+               "scope" => "endpoint",
+               "endpoint" => "local",
+               "status" => "verified",
+               "owned" => true
+             }}} =
              ShardServer.verify_mutation(dir, %{
                target: t,
                token: tok,
