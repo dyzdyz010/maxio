@@ -180,6 +180,13 @@ aggregate proof failed/superseded or aggregate finalize failed/cleanup_pending/s
 endpoint summaries, cross-mode summaries, proof successes in last failure, finalize finalized,
 and `nil/nil`. Keep the wrapper at or below 60 KiB before Journal's 64 KiB gate.
 
+Both proof and finalize failed aggregates require `verified < required`; fenced is never a failed
+class, corrupt/mismatch retains an owned same-class endpoint witness, and placement drift uses
+canonical zero counts plus a retained drift witness. Both proof and finalize superseded aggregates
+have no outer class, retain a strict endpoint `superseded/fenced/owned=false` witness, and normalize
+all semantic vote counts to zero (including finalize `finalized/orphaned`). Durable evidence
+validation re-derives these relations from retained bounded details.
+
 ### Step 3: Implement standalone `EpochStore.verify_mutation/3`
 
 Validate the D4 request. In the existing serialized closure:

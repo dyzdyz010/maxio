@@ -144,6 +144,24 @@ class 与 aggregate 重入。任一结构漂移均生成规范化 `placement_dri
 successor 与 D5 的语义裁决。identity 只允许 `"local"` 或 `"ordinal:N"`；整数 ordinal
 必须先限制十进制表示，使最终 identity 总长不超过 128 bytes。
 
+所有可持久化 aggregate failure/superseded summary 还必须满足统一 witness 规则：
+
+```text
+proof/finalize failed:
+  verified < required
+  fenced 不得作为 failed class
+  corrupt/mismatch 必须保留 owned=true、同 class endpoint witness
+  placement_drift 必须使用上述 canonical zero counts，并保留 drift witness
+
+proof/finalize superseded:
+  aggregate 无 outer class
+  必须保留 status=superseded、class=fenced、owned=false 的 endpoint witness
+  verified/observed_owned/unavailable/debt 规范化为零
+  finalize 另将 finalized/orphaned 规范化为零
+```
+
+validator 必须从保留的有界 detail 重验这些关系；不能只相信 aggregate outer status/class。
+
 `finalize_if_current/2` 的新唯一返回契约是：
 
 ```elixir
