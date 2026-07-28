@@ -16,6 +16,10 @@
 - Implement with TDD: capture a genuine RED caused by the missing behavior, then the focused GREEN. Do not write implementation before RED.
 - Never buffer object bytes. This batch does not full-read payloads; it reads bounded raw sidecar bytes and file stats only.
 - `Commit` and `Recovery` know only the backend proof contract; layout/placement knowledge stays behind `Maxio.Storage.Backend`.
+- Scope is every existing ordinary-object PG-authority `ObjectMutation.Commit` caller:
+  PutObject, CopyObject, Console upload, ObjectWriter, inventory, access-log, replication, and
+  rebalance. Do not add multipart assemble/complete, delete, meta-only, tombstone, or any other
+  Phase2A caller.
 - A journal may become `published` only after the initial proof succeeds.
 - Exact comparison is `request/journal fingerprint == epoch fingerprint == ObjectEpoch.fingerprint(top-level core etag, top-level core size, raw final meta.json bytes)`.
 - Endpoint wire observations and backend aggregate summaries are separate domains. Every summary
@@ -43,6 +47,12 @@ finalize_if_current(ctx, opts) ::
   | {:error, {:published_proof_failed, proof_class, evidence}}
 ```
 
+- Every backend return crosses `PublishedProof.validate_callback_result(mode, result)` at the
+  Storage facade, with `mode in [:proof, :finalize]`.
+  Invalid/obsolete/wrong-mode aggregate values become exactly
+  `{:error, {:published_proof_contract_violation, mode}}`; raw terms are never persisted,
+  logged, or exposed.
+
 - A `finalized` journal requires all currently observable same-token participants clean, no unresolved endpoint, and finalized quorum. A same-token `claimed` endpoint is finalized only by exact-final claimed repair after metadata commit; absent/old-token manifest-only debris is never destructive authority and gets a finalize-only explicit orphan hint for later GC. Orphans do not vote, do not add debt, do not block a separately proven finalized quorum, and never authorize deletion.
 - Raw sidecars are `lstat`-checked; symlinks/non-regular files are rejected; reads are hard-limited to 16 MiB and never read object/shard contents.
 - `request.target`, decoded epoch target, and canonical `final_rel` are one identity. Check the
@@ -57,6 +67,18 @@ finalize_if_current(ctx, opts) ::
   Pre-published failures alone may use a nil published proof; published and later phases require
   a successful aggregate proof. Bounded endpoint details total at most 32, the wrapper is at most
   60 KiB, and the existing Journal 64 KiB JSON gate remains authoritative.
+- PG `metadata_committed` / `finalize_pending` canonical wrappers are validated before endpoint
+  I/O by exact non-mutating `PublishedProof.validate_durable_evidence/2`; rollback-path generic
+  non-PublishedProof evidence does not enter this validator. Operational
+  lock/lease/restore/generic errors preserve existing evidence through
+  `mark_operational_error/3` or `quarantine_preserving_evidence/3`; neither update set contains
+  fingerprint or evidence.
+- Recovery authority/phase routing is exact: PG metadata/finalize validates→verify→finalize;
+  sidecar published uses current-epoch adjudication→sidecar finalize; sidecar
+  finalize-pending resumes sidecar finalize directly with no PG wrapper/standalone verify;
+  sidecar metadata-committed fails closed before endpoint I/O.
+- Sidecar consumes the proof-aware finalize union through the independent generic scalar
+  adapter frozen in Task 3. It never synthesizes or merges a PG PublishedProof wrapper.
 - S3 XML uses stable public messages; never expose `inspect(reason)`, drive paths, backup paths, body, credentials, or SSE envelope.
 - No migration, Phase2A caller migration, delete/meta-only work, placement-durability work, participant bitmap, orphan GC implementation, or scrub/heal expansion.
 - No `Process.sleep/1` in tests. Use `start_supervised!/1` for processes.
@@ -289,10 +311,17 @@ Commit subject: `feat(storage): prove published endpoint state`
 - Modify: `lib/maxio/storage/erasure_coded.ex`
 - Modify: `lib/maxio/storage/distributed.ex`
 - Modify: `lib/maxio/storage/epoch_store.ex`
+- Modify: `lib/maxio/storage/published_proof.ex`
+- Modify: `lib/maxio/cluster/shard_server.ex`
+- Modify: `lib/maxio/cluster/transport.ex`
+- Modify: `test/support/transport_in_process.ex`
 - Modify: every path returned by `rg -l "@behaviour Maxio.Storage.Backend" lib test`
 - Modify: `test/maxio/storage/fs_mutation_test.exs`
 - Modify: `test/maxio/storage/erasure_coded_mutation_test.exs`
 - Modify: `test/maxio/storage/distributed_mutation_test.exs`
+- Modify: `test/maxio/storage/epoch_store_published_proof_test.exs`
+- Modify: `test/maxio/cluster/shard_server_mutation_test.exs`
+- Modify: `test/maxio/cluster/transport_in_process_test.exs`
 - Create a focused facade/quorum test only if existing mutation files cannot express a case cleanly
 
 ### Step 1: Write genuine failing backend/finalize tests
@@ -300,8 +329,15 @@ Commit subject: `feat(storage): prove published endpoint state`
 Cover:
 
 - `Storage.verify_published/2` delegates through the configured backend;
+- obsolete `{:ok, :finalized}` / `{:ok, :superseded}` values fail closed;
+- nil `published_fingerprint` and the obsolete three-field finalize request fail closed before
+  epoch/backup I/O;
 - FS verified proof and every proof error;
 - EC/Distributed all endpoints, exact quorum, below quorum, minority mismatch/unavailable, sidecar divergence, ordinal mismatch and topology drift;
+- out-of-order completion, task exit, timeout, malformed response, and pre-RPC failure remain
+  bound to the captured expected ordinal and become unavailable for that ordinal;
+- duplicate physical endpoint/identity and topology drift are rejected before endpoint RPC;
+- Distributed never falls back from the frozen journal placement to current routing;
 - deterministic global order: successor; verified quorum; recoverable unavailable quorum; global mismatch/corrupt; unavailable fallback;
 - successor appearing between global pre-adjudication and endpoint proof causes global superseded;
 - exact callback outcome tuples and bounded summaries;
@@ -313,18 +349,47 @@ Cover:
 - finalized quorum remains terminal in the presence of valid orphan hints, while orphan-only or
   arbitrary non-owned failure cannot satisfy quorum;
 - no absolute path/raw sidecar is returned.
+- callback trust-boundary validation accepts canonical aggregate results unchanged and rejects
+  obsolete tuple, wrong mode/scope, and forged status/class/counts without exposing the raw term.
 
 ### Step 2: Add the mandatory backend callback and facade
 
-Add `verify_published/2` to the mandatory `Maxio.Storage.Backend` behaviour and `Maxio.Storage` facade. Update all production and test behaviour implementers in this task. Test fakes delegate to FS unless a test explicitly injects proof behavior. `compile --warnings-as-errors` must remain clean.
+Add `verify_published/2` to the mandatory `Maxio.Storage.Backend` behaviour and
+`Maxio.Storage` facade. Record `rg -l "@behaviour Maxio.Storage.Backend" lib test` before and
+after editing; the command, not the historical count, is authoritative. Update every returned
+production/support/test-file implementation. Every path must be updated and loaded/compiled;
+runtime exercise is mandatory for custom proof overrides and the deterministic Task 3 backend,
+not for a pure delegating fake solely to satisfy inventory accounting.
+The historical Task 1 base has 13 paths; the Task 3 test-only backend increases the eventual
+coherent-batch inventory, but neither historical number replaces the command output.
+
+Expose exact non-mutating API in `PublishedProof`:
+
+```elixir
+@spec validate_callback_result(:proof | :finalize, term()) ::
+        :ok | {:error, :invalid_proof_result}
+```
+
+The Storage facade validates every backend aggregate return and translates rejection only to
+`{:error, {:published_proof_contract_violation, mode}}`. It never normalizes or returns a
+replacement value. Test fakes delegate to FS unless a test explicitly injects proof behavior.
+The cold compile must add no touched-file diagnostic; report the existing 35-file repository
+warning baseline exactly instead of calling its nonzero result clean.
 
 ### Step 3: Implement backend verification
 
-FS constructs an endpoint request with `layout: %{kind: "fs"}`.
+Upgrade the endpoint path in this order: EpochStore full finalize request/result union;
+ShardServer facade/spec; Transport plus InProcess/ERPC normalization; then backend aggregation.
+FS constructs `layout: %{kind: "fs"}`.
 
-EC enumerates immutable drive ordinals. Distributed enumerates the frozen placement endpoint order and calls Transport; it never falls back to current routing. Both apply the design’s global classification order and require `verified >= epoch_quorum`.
-
-Do not recompute payload/block hashes. Do not use an unvalidated ordinal lookup.
+EC validates topology, enumerates `cfg.drives` exactly once, and captures immutable ordinals.
+Distributed validates the hash-covered frozen placement, resolves/enumerates that endpoint order
+exactly once, and never consults current routing afterward. Every call carries captured
+`layout.index`; every result is rebound to its expected `"ordinal:N"` even after out-of-order
+completion, exit, timeout, malformed return, or pre-RPC failure. Duplicate identity/topology
+drift fails before RPC. Both use only the common classifier and require
+`verified >= epoch_quorum`. Do not recompute payload/block hashes or use an unvalidated ordinal
+lookup.
 
 ### Step 4: Make finalize proof-aware
 
@@ -352,7 +417,8 @@ Control adapts all three successful finalize outcomes to callback `:ok`; proof e
 ### Step 5: Internal focused checkpoint and commit
 
 ```powershell
-mix test test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/storage/fs_mutation_test.exs test/maxio/storage/erasure_coded_mutation_test.exs test/maxio/storage/distributed_mutation_test.exs
+mix test test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/cluster/shard_server_mutation_test.exs test/maxio/cluster/transport_in_process_test.exs
+mix test test/maxio/storage/fs_mutation_test.exs test/maxio/storage/erasure_coded_mutation_test.exs test/maxio/storage/distributed_mutation_test.exs
 mix compile --warnings-as-errors
 mix format --check-formatted
 git diff --check
@@ -362,7 +428,9 @@ Commit subject: `feat(storage): gate backend publish with final proof`
 
 This commit is not a release or independent-review boundary. Continue directly to Task 3
 in the same implementation lane. The old Commit/Recovery semantics are intentionally removed
-only when the coherent batch is complete; do not run or cite a full-suite verdict here.
+only when the coherent batch is complete; do not run or cite a full-suite or ordinary-object
+verdict here. Both storage-focused groups are independently executable. The compile command is
+baseline evidence, not a green gate, while the existing 35-file warning set remains.
 
 ## Task 3: Complete the coherent batch with proof ordering, Recovery and S3 semantics
 
@@ -372,14 +440,32 @@ only when the coherent batch is complete; do not run or cite a full-suite verdic
 - Modify: `lib/maxio/object_mutation/recovery.ex`
 - Modify: `lib/maxio/object_mutation.ex`
 - Modify: `lib/maxio/object_mutation/log.ex`
+- Modify: `lib/maxio/storage/published_proof.ex` only for the non-mutating durable validator
 - Modify: `lib/maxio/s3/handlers/object.ex`
+- Modify as required by the shared outcome adapter:
+  `lib/maxio/console/object_upload.ex`, `lib/maxio/s3/object_writer.ex`,
+  `lib/maxio/s3/inventory/report.ex`, `lib/maxio/s3/replication_delivery.ex`,
+  `lib/maxio/s3/plugs/access_log_delivery.ex`, `lib/maxio/cluster/rebalance/runner.ex`
 - Modify: `config/config.exs`
 - Modify: `lib/mix/tasks/maxio.object_mutations.status.ex`
+- Create: `test/support/storage_published_proof_script_backend.ex` or an equivalently named
+  test-only deterministic seam
 - Modify: `test/maxio/object_mutation_test.exs`
 - Modify: `test/maxio/object_mutation/commit_test.exs`
 - Modify: `test/maxio/object_mutation/recovery_test.exs`
+- Modify: `test/maxio/storage/epoch_store_published_proof_test.exs`
 - Modify: `test/maxio/s3/put_object_mutation_e2e_test.exs`
-- Modify: `test/mix/tasks/maxio_object_mutations_test.exs` if CLI rendering changes
+- Modify: `test/mix/tasks/maxio_object_mutations_test.exs`
+- Regression: `test/maxio/console/object_upload_mutation_test.exs`
+- Regression: `test/maxio/s3/copy_object_mutation_test.exs`
+- Regression: `test/maxio/s3/object_writer_mutation_test.exs`
+- Regression: `test/maxio/s3/inventory/report_mutation_test.exs`
+- Regression: `test/maxio/s3/access_log_mutation_test.exs`
+- Regression: `test/maxio/s3/replication_delivery_mutation_test.exs`
+- Regression: `test/maxio/cluster/rebalance_runner_mutation_test.exs`
+- Compile/contract coverage: `test/maxio/s3/in_flight_test.exs`,
+  `test/maxio/s3/slow_down_quorum_test.exs`,
+  `test/maxio_web/live/object_live_show_test.exs`
 
 ### Step 1: Write genuine failing orchestration tests
 
@@ -398,7 +484,25 @@ Cover:
 - post-metadata unavailable remains finalize-pending, returns retryable error and Recovery retries;
 - cleanup/degraded pending returns request success, preserves `finalize_pending`, and Recovery converges;
 - `accelerate_mark_committed/2` is not called on post-metadata proof error;
-- Recovery calls the same backend callback and merges `"last_failure"` without erasing `"published_proof"`.
+- Recovery calls the same backend callback and merges `"last_failure"` without erasing `"published_proof"`;
+- direct finalize and Control finalize receive the exact enriched fingerprint context, while
+  restore retains the original fingerprint-independent context;
+- a 32-detail raw successful proof is persisted only as the normalized 31-detail wrapper, and
+  later failure merge preserves that proof term and encoding;
+- rollback phase/fingerprint/evidence/last-error change atomically, including 65,536-byte
+  generic evidence acceptance, 65,537-byte rejection, and CAS-loss zero-write behavior;
+- operational lock/lease/restore/generic failures preserve the wrapper term and JSON bytes;
+- durable PG validation directly accepts canonical evidence unchanged and rejects
+  missing/extra keys, illegal phase, persisted 32-detail evidence, impossible hidden
+  counters/witnesses, and over-60-KiB evidence without mutation;
+- pre-metadata callback contract violation atomically rolls back with exact bounded generic PG
+  contract evidence and no forged summary; post-metadata proof/finalize violations preserve
+  the canonical wrapper and quarantine;
+- sidecar published current-epoch absent/unavailable/conflict/malformed branches quarantine
+  using exact scalar evidence with no path/node/raw/token sentinel leakage;
+- sidecar `published` and `finalize_pending` both cover finalized, cleanup-pending,
+  superseded, unavailable, integrity, and malformed/obsolete finalize outcomes;
+- all exact eight existing shared-Commit callers retain behavior coverage.
 
 ### Step 2: Refactor Commit ordering
 
@@ -407,10 +511,38 @@ After publish returns `epoch_fingerprint`:
 1. enrich temporary context;
 2. hit new failpoint `:object_mutation_after_publish_before_proof`;
 3. call `Storage.verify_published/2`;
-4. on verified/degraded success transition to `published` with fingerprint and `%{"published_proof" => summary, "last_failure" => nil}`;
+4. pass the raw classifier result through `PublishedProof.journal_evidence/3`, persist its
+   Stage-B-normalized wrapper with the fingerprint, and transition to `published`;
 5. reconstruct context from the fresh journal before metadata/finalize;
 6. on proof failure/superseded atomically transition to rollback pending with phase-valid evidence
    and a nil fingerprint, then return the structured error.
+
+Replace the old rollback API with exactly:
+
+```elixir
+request_rollback(journal, attrs, opts \\ [])
+```
+
+`attrs` is a map allowing only `published_fingerprint`, `recovery_evidence`, and `last_error`;
+reject unknown keys and invalid phase/evidence/size before SQL. Write phase, all supplied attrs,
+and bounded last error in the existing id/phase/attempt/lease CAS. `rollback_pending` replay
+requires every supplied attr to be term-equal; conflict writes nothing. `rolled_back` is
+terminally idempotent and never rewritten. Initial proof failure/superseded supplies all three
+fields, including `published_fingerprint: nil`. Generic Journal evidence tests at 65,536/65,537
+bytes remain separate from the 60 KiB PublishedProof cap.
+
+A facade contract violation has no canonical aggregate summary. Before metadata, proof-mode
+violation never calls PublishedProof merge: it requests rollback with nil fingerprint, exact
+last error `"published_proof_contract_violation:proof"`, and exactly
+`%{"authority_mode" => "pg", "stage" => "verify_published",
+"outcome" => "contract_violation", "mode" => "proof"}`. Then best-effort restore, write no
+metadata, retain backup on restore failure, and return 500. Never persist the raw callback.
+Accept this generic non-PublishedProof subshape only for PG authority observed in `claimed`,
+targeting `rollback_pending`, with exact four keys/values, nil fingerprint, and the exact last
+error. Validate those constraints plus the Journal JSON-safe/depth/65,536-byte gate before SQL;
+failure is zero-write. It may persist only through rollback-pending/rolled-back/quarantined and
+is illegal in published/metadata/finalize phases. Operational retries preserve it rather than
+overwriting evidence.
 
 Refactor finalize to return an explicit request outcome:
 
@@ -420,45 +552,137 @@ Refactor finalize to return an explicit request outcome:
 - global mismatch/corrupt/placement drift: quarantine and return error;
 - superseded after metadata: terminal evidence, no rollback, return retryable error.
 
-The rollback guard stays armed. Call `accelerate_mark_committed/2` only for finalized/cleanup-pending success, never for proof error.
+The request-level superseded term is exactly
+`{:published_proof_superseded, aggregate_summary}`. Never forge a failed/fenced aggregate.
+The rollback guard stays armed. Call `accelerate_mark_committed/2` only for
+finalized/cleanup-pending success, never for proof error.
 
 ### Step 3: Refactor Recovery
 
-Recovery first calls `Storage.verify_published/2`, then calls proof-aware finalize. It:
+Freeze this authority/phase matrix:
 
-- retries unavailable;
-- quarantines globally adjudicated mismatch/corrupt/placement drift;
-- treats healthy-quorum minority mismatch as cleanup debt;
-- terminally records superseded;
-- retries cleanup pending;
-- preserves initial proof evidence while updating `"last_failure"`.
+1. PG `metadata_committed` / `finalize_pending`: non-mutating durable wrapper validation,
+   `Storage.verify_published/2`, then proof-aware finalize.
+2. Sidecar `published`: existing `current_epoch` adjudication, transition pending, then sidecar
+   finalize.
+3. Sidecar `finalize_pending`: continue sidecar finalize directly; no PG wrapper or standalone
+   verify.
+4. Sidecar `metadata_committed`: impossible; fail closed before endpoint I/O.
 
-It contains no layout/shard proof logic.
+For sidecar `published`, replace raw existing `current_epoch` evidence with the exact
+pre-adapter subshape
+`%{"authority_mode" => "sidecar", "stage" => "current_epoch", "outcome" => outcome}`.
+Allowed outcome/last-error pairs are:
 
-All `mark_error`/quarantine paths use the phase-aware evidence helper; they never hand-build or
-overwrite `"published_proof"`. Structured proof logging adds only bounded class/count metadata
-to the formatter whitelist, never a raw evidence map.
+- `missing` / `"sidecar_current_epoch:missing"` for absent;
+- `unavailable` / `"sidecar_current_epoch:unavailable"` for read/RPC error;
+- `conflict` / `"sidecar_current_epoch:conflict"` for same/older illegal phase or target/token
+  conflict;
+- `contract_violation` / `"sidecar_current_epoch:contract_violation"` for malformed/obsolete
+  return or exception.
+
+All four quarantine and retain backup. Exact target/token in published/committed and
+exact-target greater token proceed to the finalize adapter without pre-adapter evidence. Before
+SQL, validate sidecar `published → quarantined`, exact keys/value/last-error, and Journal
+JSON/depth/64-KiB; write phase, last error, and evidence in one phase/attempt/lease CAS. Store no
+endpoint, node/drive/path, token generation/mutation-id, placement, or raw/inspected reason.
+Cover all four with path/node/raw sentinels in journal/log/CLI.
+
+Expose exactly:
+
+```elixir
+PublishedProof.validate_durable_evidence(target_phase, evidence) ::
+  :ok | {:error, :invalid_proof_evidence}
+```
+
+It validates the persisted wrapper, including 31/32/60-KiB and hidden-slot/witness gates,
+without trim/reorder/omitted repair or replacement map. Missing/malformed PG proof quarantines
+before any endpoint call.
+
+After metadata, proof/finalize callback contract violation uses
+`quarantine_preserving_evidence/3` with exact last error
+`"published_proof_contract_violation:proof"` or
+`"published_proof_contract_violation:finalize"`. It does not call aggregate merge or change
+valid fingerprint/evidence, retains backup, and Recovery follows the same rule.
+
+PG Recovery retries unavailable and cleanup pending; quarantines global
+mismatch/corrupt/placement drift; treats healthy-quorum minority mismatch as cleanup debt;
+terminally records successor; and preserves initial proof evidence while replacing only a
+canonical last failure. It contains no layout/shard proof logic.
+
+Whenever existing recovery evidence must remain unchanged—valid wrapper, malformed wrapper
+retained for forensics, or exact generic PG contract evidence—use exactly:
+
+```elixir
+mark_operational_error(journal, reason, opts \\ [])
+quarantine_preserving_evidence(journal, reason, opts \\ [])
+```
+
+The first update set is only attempts, next-attempt, bounded last-error, and updated-at. The
+second is only quarantine phase/timestamp/lease cleanup and bounded last-error. Neither includes
+fingerprint/evidence. Invalid-proof quarantine preserves even malformed evidence term and JSON
+bytes. Add sentinel tests for lock, lease, restore, generic exception, and invalid proof.
+
+Both legal sidecar states use one exact adapter:
+
+- finalized → bounded scalar evidence + terminal `finalized`;
+- cleanup-pending → remain pending, bounded scalar evidence, retry;
+- superseded → bounded scalar evidence + terminal `finalized`/superseded;
+- unavailable → remain pending, bounded scalar evidence, retry;
+- mismatch/corrupt/placement-drift → quarantine with backup retained;
+- callback contract violation or malformed/obsolete/wrong-mode tuple → quarantine with backup
+  retained and no raw tuple persistence.
+
+Sidecar evidence is generic and contains only
+`authority_mode="sidecar"`, `stage="finalize"`, outcome, optional class, and canonical
+mode/status/required/verified/finalized/debt/unavailable/omitted/orphaned scalars. It never calls
+PG PublishedProof merge/validator, and never stores detail, path, endpoint identity, raw tuple,
+or inspected reason.
+
+Structured proof logs expose only scalar `proof_mode`, `proof_class`, `proof_required`,
+`proof_verified`, `proof_finalized`, `proof_debt`, `proof_unavailable`, `proof_omitted`, and
+`proof_orphaned`; raw summary never enters `reason`.
 
 ### Step 4: Add safe HTTP mappings and deterministic e2e faults
 
 Map:
 
 - unavailable/fenced/superseded → default-message `SlowDownWrite` 503;
-- mismatch/corrupt/placement drift → default-message `InternalError` 500.
+- mismatch/corrupt/placement drift and Storage callback contract violation →
+  default-message `InternalError` 500.
 
 Never pass internal reason to `Error.new/2`.
 
 Use `:object_mutation_after_publish_before_proof` with `{:fun, fun}` to corrupt initial final deterministically. Reuse existing `:object_mutation_finalize` with `{:fun, fun}` for post-metadata drift. Do not rely on file-permission races or sleeps.
 
-At real Bandit level cover ordinary signed PUT and existing self-signed aws-chunked PUT. Assert status/XML, old/new bytes, PG/journal/epoch/backup outcomes and absence of path/reason leakage.
+Add one test-only backend/seam that delegates ordinary behavior to FS and deterministically emits
+initial unavailable, post-metadata unavailable, cleanup-pending-once then finalized, and
+superseded plus obsolete/malformed proof/finalize callback results and sidecar current-epoch
+unavailable/malformed sentinel returns. These tests are
+`async: false`; setup may temporarily switch only the global backend
+module and must restore the exact previous value in `on_exit`. Script state lives in a
+`start_supervised!` named Agent/GenServer, never Application env or `persistent_term`.
+Production code/config never references the module.
+
+At real Bandit level cover ordinary signed PUT and existing self-signed aws-chunked PUT for
+pre/post-metadata 500/503 and cleanup success followed by Recovery convergence. Assert
+status/XML, old/new bytes, PG/journal/epoch/backup outcomes and absence of path/reason leakage.
+
+Apply the shared gate and stable public adapters to exactly the eight existing callers. Run all
+eight regression paths; do not add a new Phase2A caller. CLI text/JSON renders fingerprint plus
+bounded mode/status/class/counts/omitted using only `local` / `ordinal:N`; it never prints
+node/drive, final/backup path, raw sidecar, or inspected internal reason.
 
 ### Step 5: Focused verification and commit
 
 ```powershell
 mix test test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/cluster/shard_server_mutation_test.exs test/maxio/cluster/transport_in_process_test.exs
 mix test test/maxio/storage/fs_mutation_test.exs test/maxio/storage/erasure_coded_mutation_test.exs test/maxio/storage/distributed_mutation_test.exs
-mix test test/maxio/object_mutation/commit_test.exs test/maxio/object_mutation/recovery_test.exs
+mix test test/maxio/object_mutation_test.exs test/maxio/object_mutation/commit_test.exs test/maxio/object_mutation/recovery_test.exs
 mix test test/maxio/s3/put_object_mutation_e2e_test.exs test/mix/tasks/maxio_object_mutations_test.exs
+mix test test/maxio/s3/in_flight_test.exs test/maxio/s3/slow_down_quorum_test.exs test/maxio_web/live/object_live_show_test.exs
+mix test test/maxio/console/object_upload_mutation_test.exs test/maxio/s3/copy_object_mutation_test.exs test/maxio/s3/object_writer_mutation_test.exs
+mix test test/maxio/s3/inventory/report_mutation_test.exs test/maxio/s3/access_log_mutation_test.exs test/maxio/s3/replication_delivery_mutation_test.exs test/maxio/cluster/rebalance_runner_mutation_test.exs
 mix compile --warnings-as-errors
 mix format --check-formatted
 git diff --check
