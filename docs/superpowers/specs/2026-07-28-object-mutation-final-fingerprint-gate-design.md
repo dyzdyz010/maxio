@@ -156,8 +156,9 @@ proof/finalize failed:
 proof/finalize superseded:
   aggregate 无 outer class
   必须保留 status=superseded、class=fenced、owned=false 的 endpoint witness
-  verified/observed_owned/unavailable/debt 规范化为零
+  verified/observed_owned/unavailable 规范化为零
   finalize 另将 finalized/orphaned 规范化为零
+  witness 保存在 degraded；debt == length(degraded) + omitted 且至少为 1
 ```
 
 validator 必须从保留的有界 detail 重验这些关系；不能只相信 aggregate outer status/class。
