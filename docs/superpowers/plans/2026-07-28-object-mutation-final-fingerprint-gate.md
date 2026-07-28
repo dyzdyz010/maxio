@@ -189,18 +189,27 @@ have no outer class, retain a strict endpoint `superseded/fenced/owned=false` wi
 is retained in `degraded`, so `debt == length(degraded) + omitted >= 1`. Durable evidence validation
 re-derives these relations from retained bounded details.
 
-Finalize conservation additionally requires `verified - finalized <= debt`.
-`cleanup_pending` requires proof quorum and `debt > 0`; terminal finalized with zero debt therefore
-has `verified == finalized == observed_owned`. Reject a status/count rewrite that loses an
-unfinalized endpoint or claims cleanup pending without debt.
+Finalize conservation is type-aware. Let `gap = verified - finalized` and let
+`visible_cleanup` count retained cleanup-pending details; require
+`visible_cleanup <= gap <= visible_cleanup + omitted` in addition to the generic debt relations.
+`cleanup_pending` requires proof quorum, `debt > 0`, and a retained debt witness; terminal
+finalized with zero debt therefore has `verified == finalized == observed_owned`. Reject a
+status/count rewrite that uses unrelated failure debt for an unfinalized endpoint, loses a visible
+cleanup endpoint, or claims cleanup pending without debt. Durable validation also replays global
+priority: any retained successor requires canonical superseded, and absent successor any retained
+placement drift requires canonical placement-drift failure.
 
-The 32-detail limit is wrapper-wide across published proof degraded details, last-failure degraded
+The evidence boundary validates the complete source proof/failure summaries before any trimming,
+reordering, or omitted-count adjustment; invalid counters, tail details, priority relations, or
+missing witnesses are rejected rather than normalized into validity. Only then does it allocate the
+wrapper-wide 32-detail budget across published proof degraded details, last-failure degraded
 details, and last-failure orphan hints. Initial successful proof persistence retains at most 31
 details and moves the rest to its omitted count, reserving one slot for a future mandatory failure
-witness. Merge preserves that published proof byte-for-byte, retains the first mandatory
-decisive/debt witness from last failure, fills remaining capacity from last-failure degraded then
-orphan details in deterministic order, and updates omitted counts without changing debt/orphan
-totals. A nil-proof pre-published failure may use all 32 slots.
+witness. Last-failure normalization explicitly selects its status/class-specific mandatory witness,
+then fills remaining capacity from degraded and orphan details in deterministic order. Revalidate
+the normalized durable form, exact omitted arithmetic, 31/32 limits, JSON safety, and 60 KiB gate.
+Merge first requires an already-durable 31-detail proof, preserves it term/encoding byte-for-byte,
+and normalizes only the new failure. A nil-proof pre-published failure may use all 32 slots.
 
 ### Step 3: Implement standalone `EpochStore.verify_mutation/3`
 

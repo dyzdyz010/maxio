@@ -137,7 +137,16 @@ length(degraded) + length(orphan_hints) <= 32
 否则 proof quorum 已过但仍有清理债务才是 `cleanup_pending`。`orphaned > 0` 不阻塞已有
 真实 finalized quorum；orphan-only 且未达 quorum 仍是全局 unavailable failure。
 
-finalize aggregate 还必须满足 `verified - finalized <= debt`。因此
+finalize aggregate 还必须把 proof-passed/unfinalized endpoint 与具体 detail 类型守恒。令
+`gap = verified - finalized`，`visible_cleanup` 为 retained `degraded` 中
+`status="cleanup_pending" && proof_passed=true && finalized=false` 的条数，必须满足：
+
+```text
+visible_cleanup <= gap <= visible_cleanup + omitted
+```
+
+因此 unrelated mismatch/corrupt/unavailable/drift/superseded debt 不能冒充 cleanup gap，
+retained cleanup detail 也不能从 aggregate 计数中消失。继续要求
 `cleanup_pending` 必须 `verified >= required && debt > 0`，并保留至少一条 cleanup/debt
 witness；`finalized` 在 `debt == 0` 时必然
 `verified == finalized == observed_owned`。不能只改 status/finalized 计数伪造无债务的
@@ -149,6 +158,11 @@ class 与 aggregate 重入。任一结构漂移均生成规范化 `placement_dri
 `finalized=0, orphaned=0`，只保留一条有界脱敏 witness。只有输入集结构合法后才进入
 successor 与 D5 的语义裁决。identity 只允许 `"local"` 或 `"ordinal:N"`；整数 ordinal
 必须先限制十进制表示，使最终 identity 总长不超过 128 bytes。
+
+durable aggregate validator 必须重放同一优先级：任一 retained endpoint successor 都要求
+canonical aggregate superseded；没有 successor 时，任一 retained placement drift 都要求
+canonical aggregate placement-drift failure。success/degraded/cleanup 或低优先级 failed
+outer shape 不能包住这两类强裁决 detail。
 
 所有可持久化 aggregate failure/superseded summary 还必须满足统一 witness 规则：
 
@@ -410,16 +424,31 @@ failed/cleanup_pending/superseded；endpoint summary、proof success 与 finaliz
 时最多保留 31 条 detail，并把其余精确计入 proof `"omitted"`，为未来 last failure 的强制
 witness 预留一条。若 published proof 少于 31 条，未用预算可供 last failure 使用。
 
-wrapper 分配规则固定为：
+evidence 入口固定为两阶段 trust boundary。Stage A 在任何裁剪、重排或 omitted 调整前，
+完整验证 source proof/failure 的 sum type、phase、非负计数、精确 debt/orphan 关系、
+上述 typed finalize conservation、identity 唯一/互斥、endpoint 脱敏形态、全局优先级与
+mandatory witness。非法 source 立即拒绝；禁止让 normalization 修复负 omitted、重复/
+非法 tail detail，或把 successor/placement drift 洗入匿名 omitted。
+
+Stage B 只对已通过 Stage A 的 source 执行 wrapper 分配：
 
 1. 已持久化的 published proof 不再裁剪或重排；
-2. last failure 先保留其状态/class 所需的第一条 canonical decisive/debt witness；
-3. 剩余预算按 `last_failure.degraded`、再 `last_failure.orphan_hints` 的既有确定顺序填充；
-4. 每次裁剪都保持 `debt`/`orphaned` 总数不变，并精确增加对应
+2. 初次持久化的 successful proof 按既有确定顺序裁至最多 31 条，并精确增加 omitted；
+3. last failure 按 status/class 显式选择 mandatory canonical decisive/debt witness 并置于
+   retained 首位，不能只相信输入 list 位置；
+4. cleanup gap 为正时优先选择 visible cleanup witness；没有该类 mandatory witness
+   要求的 unavailable 等状态不得凭空合成 witness；
+5. 剩余预算按 `last_failure.degraded`、再 `last_failure.orphan_hints` 的既有确定顺序填充；
+6. 每次裁剪都保持 `debt`/`orphaned` 总数不变，并精确增加对应
    `omitted`/`orphan_omitted`；
-5. pre-published 的 nil-proof failure 可独占全部 32 条预算。
+7. pre-published 的 nil-proof failure 可独占全部 32 条预算；
+8. normalization 后再次运行完整 durable semantic validator，并显式校验 proof retained
+   `<=31`、wrapper retained `<=32`、JSON-safe 与编码 `<=60 KiB`。
 
 若 mandatory witness 缺失，必须拒绝 evidence，不能仅靠 omitted 合成决定性事实。
+`merge_failure/3` 还必须先证明输入是已持久化的 31-detail durable wrapper；既有
+`published_proof` 不得再次裁剪/重排，只允许新 last failure 走 Stage A/Stage B，返回的
+proof term 与编码必须和输入完全一致。伪造的 32-detail “已持久化 proof”直接拒绝。
 PublishedProof wrapper 的编码结果必须不超过 60 KiB，并继续通过 Journal 既有
 JSON-safe/64 KiB gate。后续 `mark_error`/quarantine 必须用 phase-aware merge 更新
 `"last_failure"`，保留初始 `"published_proof"`，不得整图覆盖。
