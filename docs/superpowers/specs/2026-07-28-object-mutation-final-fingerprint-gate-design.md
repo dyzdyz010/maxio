@@ -46,6 +46,72 @@ Maxio.Storage.verify_published(ctx, opts)
 
 `class` 只允许 `:unavailable | :mismatch | :corrupt | :fenced | :placement_drift`。`proof_summary` 是有界、可 JSON 化、无对象内容/密钥/完整绝对路径的纯数据；至少含 string-key 的 `status`、`required`、`verified`、`observed_owned`、`unavailable` 与有界 `degraded` endpoint 摘要。
 
+endpoint wire observation 与 backend aggregate proof 是两个不可混用的域：
+
+- summary 必须带 `"scope" => "endpoint" | "aggregate"`；endpoint summary 另带稳定
+  `"endpoint"` identity。FS identity 固定为 `"local"`，shard identity 固定为冻结 placement
+  的全局 `"ordinal:N"`，不含 node/drive 路径。
+- `EpochStore` / `ShardServer` / `Transport.verify_mutation` 只返回 endpoint result；
+  `Storage.Backend.verify_published` 才返回 aggregate result。endpoint wire 不允许自报
+  `:degraded`，且 endpoint summary 根本不携带
+  `required/verified/observed_owned/unavailable/degraded/omitted` 聚合计数；每条有效 endpoint
+  observation 由本地 classifier 最多贡献一票。
+- 聚合入口接收 `{expected_identity, endpoint_result}`，expected identity 必须唯一且与响应
+  identity 精确相等。重复、错配、aggregate 重入或 outcome/status/class/count 不一致均在计票前
+  fail closed 为 `:placement_drift`，绝不静默去重或接受自报 quorum。
+- aggregate summary 明示 `"debt"`；它等于有界 `degraded` 条目数加 `"omitted"`。journal
+  只接受 aggregate 的 verified/degraded 成功 summary，endpoint summary 永远不能作为 durable
+  published evidence 或再次参与 quorum。
+
+低层与聚合返回联合逐项冻结为：
+
+```elixir
+@type endpoint_proof_result ::
+  {:ok, {:verified | :superseded, endpoint_summary}}
+  | {:error, {:published_proof_failed, class, endpoint_summary}}
+
+@type aggregate_proof_result ::
+  {:ok, {:verified | :degraded | :superseded, aggregate_summary}}
+  | {:error, {:published_proof_failed, class, aggregate_summary}}
+
+@type endpoint_finalize_result ::
+  {:ok, {:finalized | :cleanup_pending | :superseded, endpoint_finalize_summary}}
+  | {:error, {:published_proof_failed, class, endpoint_summary}}
+
+@type aggregate_finalize_result ::
+  {:ok, {:finalized | :cleanup_pending | :superseded, aggregate_finalize_summary}}
+  | {:error, {:published_proof_failed, class, aggregate_summary}}
+```
+
+endpoint proof summary 的合法语义只有三种：
+
+| tuple outcome | endpoint `status` | `owned` | `class` |
+| --- | --- | --- | --- |
+| `:verified` | `"verified"` | `true` | 不存在 |
+| `:superseded` | `"superseded"` | `false` | `"fenced"` |
+| error | `"failed"` | exact requested token 已确认时才为 `true` | 必须与 outer class 相同 |
+
+outcome/status、outer/detail class 或 identity 任一不一致即结构漂移。endpoint finalize summary
+额外带 boolean `proof_passed` 与 `finalized`：
+`:finalized` 必须 `status="finalized", owned=true, proof_passed=true, finalized=true`
+且 class 不存在；`:cleanup_pending` 必须
+`status="cleanup_pending", owned=true, proof_passed=true, finalized=false`
+且 class 不存在；`:superseded` 必须
+`status="superseded", owned=false, proof_passed=false, finalized=false`。
+未通过 endpoint proof 的 claimed/缺失/分叉不能伪装 cleanup-only debt，仍以
+endpoint proof error 进入 backend 聚合，由健康 quorum 决定全局是 proof failure 还是
+`cleanup_pending`。
+
+aggregate proof summary 由 classifier 唯一生成：`required > 0`，所有计数非负，
+`debt == length(degraded) + omitted`，`unavailable <= debt`，
+`verified <= observed_owned <= verified + debt`。`verified` 状态要求
+`verified >= required && debt == 0`；`degraded` 要求
+`verified >= required && debt > 0`；`failed` 要求 `verified < required` 且 tuple/summary
+class 一致。aggregate finalize summary 另带 `finalized`，且
+`0 <= finalized <= verified`；终态要求
+`verified >= required && finalized >= required && debt == 0 && unavailable == 0`；
+否则 proof quorum 已过但仍有清理债务才是 `cleanup_pending`。
+
 `finalize_if_current/2` 的新唯一返回契约是：
 
 ```elixir
@@ -121,12 +187,20 @@ A+ 明确不能发现“同长度 payload 被静默翻位但 sidecar 未变”�
 endpoint 内按固定顺序：
 
 1. 读取 epoch；absent/损坏结构化失败。
-2. 比较 token；successor 立即返回 `:superseded`，不读取/触碰 final 或 backup。
-3. standalone publish proof 要求 phase 为 `published` 或幂等重放的 `committed`，且 epoch fingerprint 与 request fingerprint 精确相等。finalize 另允许同 token `claimed` repair：claimed epoch 不计 initial proof quorum；metadata 已提交后的 finalize 只有在 actual final 精确匹配 request/journal fingerprint 时，才可把该 endpoint 直接收敛为带 fingerprint 的 `committed` 并清 backup。claimed final 缺失/不匹配时保持 cleanup debt，等待 heal 后重试。
-4. 从 `final_rel` 定位 final，先用 `lstat` 拒绝 symlink/非 regular，并执行 16 MiB hard limit；只读取至 limit+1，取得 exact raw `meta.json` 后再 decode。
-5. 从 top-level durable core 取 `etag`/`size`，以 raw sidecar 字节重建 actual fingerprint；禁止使用 `versions` 中 S3-visible 的 ETag/size。
-6. 三方比较：request/journal == epoch == actual final。
-7. 校验 `part.0` 是 regular file：
+2. 先比较 decoded epoch target 与 request canonical target。target 不同即结构损坏；即使其中
+   token 更大也不得伪装 successor，且不探测 final。
+3. target 相同后比较 token；successor 立即返回 `:superseded`，不读取/触碰 final 或 backup。
+4. standalone publish proof 要求 phase 为 `published` 或幂等重放的 `committed`，且 epoch fingerprint 与 request fingerprint 精确相等。finalize 另允许同 token `claimed` repair：claimed epoch 不计 initial proof quorum；metadata 已提交后的 finalize 只有在 actual final 精确匹配 request/journal fingerprint 时，才可把该 endpoint 直接收敛为带 fingerprint 的 `committed` 并清 backup。claimed final 缺失/不匹配时保持 cleanup debt，等待 heal 后重试。
+5. 从 `final_rel` 定位 final，先用 `lstat` 拒绝 symlink/非 regular，并执行 16 MiB hard limit；只读取至 limit+1，取得 exact raw `meta.json` 后再 decode。
+6. 通过 `Maxio.Sidecar` 的唯一 non-raising durable-object decoder 验证完整的普通对象
+   `maxio/2` envelope：format、top-level `etag`/`size`/`sha256`、非空 versions，以及与
+   target version_id **恰好一条**、且 type 为 object 的 entry；同 version_id 重复（包括
+   delete-marker/object 冲突）一律 corrupt，不能让 proof 的 existential lookup 与读侧
+   `find_version/2` 的首项语义分叉。随后只从 top-level durable core 取
+   `etag`/`size`，以 raw sidecar 字节重建 actual fingerprint；禁止使用 `versions` 中
+   S3-visible 的 ETag/size，也禁止要求二者与 core 相等（SSE/multipart 可合法不同）。
+7. 三方比较：request/journal == epoch == actual final。
+8. 校验 `part.0` 是 regular file：
    - FS：大小等于 top-level core stored size；
    - shard：按本 endpoint 的固定 ordinal 精确查找 `shards[i]`，大小等于 `shard_file_size`。
    - 零字节对象仍必须有零长度 `part.0`。
@@ -135,6 +209,29 @@ endpoint 内按固定顺序：
 `finalize_mutation` 在同一个 `EpochStore` 串行闭包内复用步骤 1–8。proof 成功后才写 committed epoch，再删除 backup。committed 幂等重放也必须先复验，不能直接删 backup。
 
 Transport 只新增有界 proof RPC，不回传对象/shard 内容。Distributed 只使用 `ctx.placement_snapshot` 的历史 set/topology；禁止回退当前 router。
+
+target 与路径身份另有硬约束：
+
+- request target、epoch 内 decoded target 与 canonical target bytes 必须精确相等；target
+  不同的 greater token 不能伪装 successor。`final_rel` 必须逐字等于
+  `Paths.object_rel(bucket, key, version_id)`，不能只做词法安全检查。
+- configured drive root 必须是非空绝对目录。root 到 final directory 的每个路径组件在 proof
+  前后都要检查；扫描范围从 volume/filesystem root 到 configured drive root 的每个前缀，再到
+  canonical final directory。Unix 使用 `lstat`；Windows 不能依赖 OTP `lstat` 识别 junction，
+  必须经 `Maxio.Native.PathSafety` 的 DirtyIo NIF 调用 Rust
+  `symlink_metadata`，并拒绝全部 `FILE_ATTRIBUTE_REPARSE_POINT (0x400)`。NIF 未加载或返回
+  不可判定时 fail closed 为 unavailable，绝不回退成“OTP 看起来是 directory 就安全”。
+- 现有 Rustler crate 改由中性的 `Maxio.Native` loader 注册；ErasureCoding 与 PathSafety
+  分别通过 wrapper 委托。静态 reparse detector 只用 Rust std，不新增 dependency，也不能
+  污染 `Maxio.Native.ErasureCoding` 的公开职责。
+- sidecar 采用 opened-handle 复验：pre-lstat → raw open → fstat/path-lstat identity 对照 →
+  limit+1 read → fstat/path-lstat/ancestor 二次对照。任一身份或大小漂移 fail closed；part 仍只做
+  stat/shape proof，不读取对象字节。
+- 标准 OTP 没有跨平台 `openat2/O_NOFOLLOW` 或 Windows reparse-point handle 能力。本批保证受控
+  数据盘、Maxio writer 经 EpochStore 串行下的静态 link/junction、常见换链与布局损坏检测；
+  native scan 与 opened-handle 复验之间仍不能消除 hostile concurrent junction swap/ABA。
+  不宣称抵御拥有本地写权限的恶意进程精心竞态。若未来威胁模型包含 hostile local writer，
+  必须新增原生文件能力层，不能在当前代码上夸大保证。
 
 ### D5 — quorum 与降级语义
 
@@ -160,11 +257,16 @@ epoch absent、旧 token 或从未参与的 endpoint 不构成 destructive 授�
 
 全局 proof 分类顺序固定，禁止因遍历/返回顺序不同而把同一证据随机映射成 500 或 503：
 
-1. quorum 预裁决或任一 endpoint proof 观察到 successor：全局 `:superseded`，立即短路/重新裁决，绝不能把 successor 当少数 degraded failure。
-2. `verified >= epoch_quorum`：proof 成功；有失败 endpoint 时是 degraded success。
-3. `verified + unavailable >= epoch_quorum`：当前证据仍可能在端点恢复后达到 quorum，分类 `:unavailable`。
-4. 否则若存在 owned-token 的 mismatch/corrupt：quorum 已不可能由未知端点补足，分类确定性 mismatch/corrupt。
-5. 其余不足 quorum：分类 `:unavailable`。
+1. 合法 endpoint 观察到 successor：全局 `:superseded`，立即短路/重新裁决，绝不能把
+   successor 当少数 degraded failure；successor 不算 same-token owned。
+2. expected identity 重复/错配、aggregate 重入或 frozen placement 结构漂移：
+   `:placement_drift`。
+3. `verified >= epoch_quorum`：proof 成功；有失败 endpoint 时是 degraded success。
+4. `verified + unavailable >= epoch_quorum`：当前证据仍可能在端点恢复后达到 quorum，分类
+   `:unavailable`。
+5. 否则若存在 owned-token `:corrupt`，分类 `:corrupt`；再考虑 owned-token
+   `:mismatch`。epoch absent/旧 token 的 non-owned corrupt 不参与确定性 integrity 选择。
+6. 其余不足 quorum：分类 `:unavailable`。
 
 因此下表中的 mismatch/corrupt 指“按上述全局顺序裁决后的整体 proof failure”，不是健康 quorum 之外的少数坏副本。
 
@@ -199,9 +301,9 @@ successor 的阶段语义固定：
 
 | endpoint 事实 | proof class |
 | --- | --- |
-| timeout、节点失联、`:eacces`、`:eio`、读取/`lstat` 暂时失败 | `:unavailable` |
+| timeout、节点失联、`:eacces`、`:eperm`、`:eio`、`:enodev`、`:estale`、`:etimedout`、`:ebusy` 等暂时失败 | `:unavailable` |
 | raw fingerprint、core etag/size、part/shard size 与 expected 不同 | `:mismatch` |
-| meta/part 缺失、JSON/shape 非法、symlink/非 regular、sidecar 超 16 MiB、invalid internal request、epoch absent/旧 token | `:corrupt` |
+| meta/part 缺失、JSON/shape 非法、symlink/junction/非 regular、`:enotdir`、`:eloop`、sidecar 超 16 MiB、invalid internal request、epoch absent/旧 token | `:corrupt` |
 | greater token / successor | `:fenced`，折叠为全局 superseded |
 | frozen placement 非法或 topology hash 漂移 | `:placement_drift` |
 
@@ -234,12 +336,22 @@ CLI 继续读取 journal 的 `published_fingerprint` / `recovery_evidence`，展
 ### Endpoint / backend
 
 - raw sidecar 任意字节变化，即使 decode 后 etag/size 相同，也必须 mismatch。
+- wrong/missing `maxio/2` format、缺 core SHA256、空 versions、无对应 object version，即使
+  request/epoch/final fingerprint 自洽也必须 corrupt；同 version_id 重复或
+  delete-marker/object 冲突同样拒绝；SSE/multipart 的 versions ETag/size 与 core 不同时仍可通过。
 - request/journal 与 epoch 不同，即使 final 匹配 epoch，也必须拒绝。
+- request target、decoded epoch target 与 canonical final_rel 三方身份绑定；跨 key/version
+  final_rel、target-mismatch greater token、祖先 symlink/junction 与确定性换链均 fail closed。
 - `meta.json` 缺失、损坏、symlink、非 regular、超过 16 MiB；`part.0` 缺失、非 regular、截短或加长。
+- sidecar 恰好 16 MiB 可有界读取；lstat 后增长到 limit+1 必须拒绝。successor 测试必须通过
+  file-op seam 证明 final descendant 零探测，而不是仅依赖 final 缺失。
 - FS 零字节对象必须存在空 part；SSE 使用 stored/core size；multipart-visible ETag 不得污染 core proof。
 - committed replay：正常+backup 存在、正常+backup 已无、异常+backup 存在、cleanup 首次失败后重试。
 - successor 在任何 final 读取前短路。
 - EC/Distributed：exact quorum、低于 quorum、少数 mismatch/unavailable、sidecar 分叉、ordinal 错配。
+- forged endpoint counts、outcome/status/class 不一致、aggregate 重入、重复/错配 ordinal identity
+  均不得获得票；verified + non-owned corrupt 低于 quorum 是 unavailable，owned corrupt 优先于
+  owned mismatch，non-owned corrupt 不触发 quarantine。
 - Distributed placement drift fail closed，且 RPC 返回有界摘要。
 
 ### Orchestration / HTTP
