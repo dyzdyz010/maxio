@@ -295,7 +295,30 @@ metadata 前 proof failure/superseded 必须在同一个 id/phase/attempt/lease 
 `last_error`。公开 API 固定为
 `request_rollback(journal, attrs, opts \\ [])`；`attrs` 仅允许
 `published_fingerprint`、`recovery_evidence`、`last_error`，旧 keyword-opts arity 不保留。
-`rollback_pending` 幂等重放要求所有 supplied attrs 与持久值 term-equal，冲突零写入；
+初始 proof failure/superseded 必须显式供应完整原子三元组，即使其中
+`published_fingerprint` 或 `recovery_evidence` 为 nil，也不得借“未供应”保留旧值。
+入口顺序固定为 authority/phase 与 evidence domain、durable JSON、supplied attrs 的严格
+`===` replay 比较，最后才可进入 CAS；existing-state 或 equality shortcut 不得绕过前述
+validation。错误 outcome 与 stable `last_error` 的逐字映射固定为：
+
+```elixir
+%{
+  unavailable: "published_proof_failed:proof:unavailable",
+  corrupt: "published_proof_failed:proof:corrupt",
+  mismatch: "published_proof_failed:proof:mismatch",
+  placement_drift: "published_proof_failed:proof:placement_drift",
+  superseded: "published_proof_superseded:proof"
+}
+```
+
+任一 outcome/code 错配、任意 code、wrong-phase evidence 或非 durable evidence 都返回
+`{:error, :invalid_rollback_evidence}`，并在 SQL 前零写入。`rollback_pending` 幂等重放要求
+所有 supplied attrs 与持久值严格 `===`；冲突零写入。真正进入 CAS 后若丢失竞争，必须
+fresh-read 判定：evidence 不同返回
+`{:error, {:rollback_evidence_conflict, :recovery_evidence}}`；evidence 相同而
+`last_error` 不同返回 `{:error, {:rollback_evidence_conflict, :last_error}}`，不得把 loser
+误判成幂等成功。每个 CAS loser 只允许一次 `object_mutations` UPDATE attempt，且不得改写
+winner 的完整 row 或 forensic JSON bytes。
 `rolled_back` 是不可重写的终态。generic Journal evidence 的 65,536/65,537-byte 门与
 PublishedProof 的 60 KiB 门分别测试，不能把二者混为一个上限。
 
@@ -484,6 +507,49 @@ successor 的阶段语义固定：
 Rust raw errno 必须按 `target_os` 分表，或只使用稳定 `ErrorKind` 加 OS-specific raw
 whitelist；未知/瞬态 errno 必须映射 unavailable，不能因不同 Unix 数值复用而误报 corrupt。
 
+#### Durable JSON 是 JSONB 严格回读契约
+
+“Jason 可编码”不足以证明数据可持久化：Jason 1.4.5 默认只解码至多 1,024 个十进制
+token bytes 的整数；PostgreSQL JSONB 会归一化某些 float，并拒绝 U+0000。所有新写入或
+replay-validation 的 journal JSON 值必须先经过唯一、中立、纯函数边界：
+
+```elixir
+Maxio.DurableJSON.validate(value,
+  max_depth: non_neg_integer(),
+  max_encoded_bytes: pos_integer()
+)
+# => {:ok, encoded_binary} | {:error, :invalid_durable_json}
+```
+
+该 helper 从 root depth 0 开始计数；只接受 string-key map、list、binary、boolean、nil 与
+integer。所有 key/value binary 必须是 valid UTF-8 且不含 U+0000；struct 与所有 float
+一律拒绝；每个 integer 的 `byte_size(Integer.to_string(integer)) <= 1_024`，负号计入
+token bytes。它还必须依次证明 caller-specific depth、`Jason.encode/1` 成功、exact encoded
+bytes 不超过 caller 上限、对这些 exact bytes 的 `Jason.decode/1` 成功，且 decoded term
+与输入严格 `===`。缺少、额外或类型错误的 options 与任何异常都统一返回
+`{:error, :invalid_durable_json}`，helper 不 raise；caller 保留既有 public error taxonomy。
+
+调用 profile 固定为：
+
+- `PublishedProof` 在完整 semantic validation 后调用
+  `max_depth: 6, max_encoded_bytes: 61_440`；
+- `Journal.changeset/2` 的每个 JSONB-backed field（含 `recovery_evidence`）以及
+  `Journal.json_evidence_valid?/1` 调用
+  `max_depth: 15, max_encoded_bytes: 65_536`。
+
+Journal 的 root-zero depth 15 与既有 root-one、`depth > 16` 拒绝语义等价，不得暗中扩缩。
+PublishedProof 的 list/map/key/string/phase/detail/witness 等限制仍属于 semantic layer，
+不能下沉成 helper 的可配置选项。不得提高 Jason 全局 integer limit，也不得把 formal
+PublishedProof ceiling 降到 32 KiB：已有 clean intended-canonical wrapper 被四重取证为
+37,883 encoded bytes、public durable validator `:ok`、Jason strict `===`，且经 PostgreSQL
+16.14 JSONB 实际 INSERT/SELECT 后 strict `===`。60 KiB 仍是 absolute defense，不宣称
+today's schema 能达到 exact positive endpoint。
+
+证据保全更新是刻意的例外：已从数据库装载的 malformed evidence 必须原样保留时，SQL
+update set 不包含该 column，因而不得为了“修复”它而重新经过 changeset/durable gate。
+但任何新值、supplied replay 值或 equality/idempotency 候选均必须先验证，再做严格
+`===` 比较。
+
 `recovery_evidence` 有两个互斥 domain，绝不互相伪装：
 
 1. canonical PublishedProof wrapper：只承载 aggregate proof/finalize 事实，经
@@ -491,7 +557,7 @@ whitelist；未知/瞬态 errno 必须映射 unavailable，不能因不同 Unix 
 2. generic non-PublishedProof evidence：包括 PG 的 pre-proof/rollback operational facts
    （含 exact contract-violation subshape），以及 legacy sidecar recovery 的
    `current_epoch` pre-adapter 与 finalize adapter 两个 exact bounded scalar subshape。它们经
-   Journal 既有 string-key/JSON-safe/depth/64-KiB gate 和各调用点的
+   Journal 的 shared durable-JSON/depth/64-KiB gate 和各调用点的
    authority/phase/keys/value validator，不调用 PublishedProof normalize/merge，也不消费
    31/32/60-KiB proof budget。
 
@@ -545,7 +611,8 @@ fingerprint 必须 nil，`last_error` 必须精确为
 ```
 
 `request_rollback` 在 SQL 前先执行上述 phase/authority/fingerprint/keys/value validator，
-再用 `Journal.changeset` 执行 JSON-safe/depth/65,536-byte gate；任一步失败均零写入。该
+再用 `Journal.changeset` 执行 shared durable-JSON/depth/65,536-byte gate；任一步失败均
+零写入。该
 evidence 可随 rollback 收敛保留在 `rollback_pending`、`rolled_back` 或 `quarantined`，
 restore/lease/generic error 只用 evidence-preserving operational update 改 attempts/backoff/
 last_error，不覆盖它。它在 `published`/metadata/finalize phase 永不合法，也不参与
@@ -576,14 +643,14 @@ Stage B 只对已通过 Stage A 的 source 执行 wrapper 分配：
    `omitted`/`orphan_omitted`；
 7. pre-published 的 nil-proof failure 可独占全部 32 条预算；
 8. normalization 后再次运行完整 durable semantic validator，并显式校验 proof retained
-   `<=31`、wrapper retained `<=32`、JSON-safe 与编码 `<=60 KiB`。
+   `<=31`、wrapper retained `<=32`、shared durable JSON 与编码 `<=60 KiB`。
 
 若 mandatory witness 缺失，必须拒绝 evidence，不能仅靠 omitted 合成决定性事实。
 `merge_failure/3` 还必须先证明输入是已持久化的 31-detail durable wrapper；既有
 `published_proof` 不得再次裁剪/重排，只允许新 last failure 走 Stage A/Stage B，返回的
 proof term 与编码必须和输入完全一致。伪造的 32-detail “已持久化 proof”直接拒绝。
 PublishedProof wrapper 的编码结果必须不超过 60 KiB，并继续通过 Journal 既有
-JSON-safe/64 KiB gate。canonical proof/finalize outcome 才能用 phase-aware merge 更新
+shared durable-JSON/64 KiB gate。canonical proof/finalize outcome 才能用 phase-aware merge 更新
 `"last_failure"`，并保留初始 `"published_proof"`。lock、lease、restore、generic exception
 等 operational error 不能伪装 aggregate proof failure。凡现有 evidence 必须原样保留
 （valid wrapper、invalid wrapper 取证、或上述 exact generic contract evidence），分别使用精确
@@ -592,7 +659,13 @@ JSON-safe/64 KiB gate。canonical proof/finalize outcome 才能用 phase-aware m
 `attempts`、`next_attempt_at`、bounded `last_error`、`updated_at`；后者仅含 quarantine
 phase/timestamp/lease cleanup 与 bounded `last_error`。二者都不得更新 fingerprint 或
 recovery evidence。invalid-proof quarantine 同样保留 malformed source evidence 的 term 与
-JSON 编码，供取证使用。
+JSON 编码，供取证使用。`reason` 必须是 binary；非 binary 统一返回
+`{:error, :invalid_operational_reason}`，在 SQL 前零写入且完整 row 严格不变。
+
+`quarantine_preserving_evidence/3` 的 CAS loser 不得走 generic terminal idempotency：
+同一 stale snapshot 的不同 reason 竞争只允许一次 `object_mutations` UPDATE attempt，
+fresh-read 后精确返回 `{:error, {:stale_journal, "quarantined", attempts}}`；winner 完整 row
+与 forensic JSON bytes 保持权威。
 
 ### D7 — Recovery 复用同一 callback
 
@@ -647,7 +720,7 @@ sidecar `published` 的 `current_epoch` 裁决先使用独立 pre-adapter 表：
 
 validator 只允许 observed `authority_mode="sidecar", phase="published"` 到
 `quarantined`，逐字校验三个 key、allowed outcome 与对应 stable last_error，再跑 Journal
-generic JSON/depth/64-KiB gate；phase、last_error 与 evidence 在同一个既有
+shared durable-JSON/depth/64-KiB gate；phase、last_error 与 evidence 在同一个既有
 phase/attempt/lease CAS 写入，任一步失败零写入。禁止存 endpoint、node/drive/path、token
 generation/mutation id、raw/inspected reason 或 placement payload。带上述 sentinel 的
 absent/unavailable/conflict/contract-violation 测试必须证明 journal、log、CLI 均不泄漏。
@@ -703,6 +776,24 @@ CLI 继续读取 journal 的 `published_fingerprint` / `recovery_evidence`，展
 - durable validator：canonical wrapper 返回 `:ok` 且调用前后 term/Jason bytes 完全相同；
   missing/extra key、非法 phase、已持久化 32-detail、非法 hidden counter/witness、超过 60 KiB
   全部拒绝，且不得 trim/reorder/repair。
+- shared DurableJSON 独立覆盖正数 1,024/1,025 digits、负号加 1,023/1,024 digits、所有
+  float、U+0000 key/value、缺失/额外/非法 options，以及 codec-roundtrippable string payload
+  的 exact 61,440/61,441 bytes；不得用 source regex 代替 public call。
+- PublishedProof 大正控使用 clean intended-canonical wrapper，断言 measured
+  `>32 KiB && <=60 KiB`、public validator `:ok`、Jason strict `===` 与真实 JSONB reload
+  strict `===`；已知含 over-permissive detail 的 42,587-byte transport fixture 不得成为 public
+  contract。huge-counter exact-61,440/61,441 wrapper 均是 rejection oracle，不是 size-positive。
+- helper capability、PublishedProof public rejection、Journal changeset NUL、ObjectMutation NUL
+  与 ObjectMutation 61,441 equality-bypass attack 必须是独立 test cases。ObjectMutation attack
+  用 real PG prepared row + tests-only rejecting repo，证明 validation 在 equality/CAS 前发生、
+  zero UPDATE、完整 row `===` 与 forensic bytes 不变；不得把 U+0000 提交给真实 JSONB。
+- rollback stable-code 的五个正控、每 outcome wrong-code 与 arbitrary-code 负控均断言 exact
+  result、pre-SQL zero UPDATE；另覆盖 generic wrong-phase 的 term-identical replay。两类
+  rollback CAS loser 与 quarantine CAS loser 都用 Repo telemetry 证明 exactly one UPDATE
+  attempt，并证明 winner 完整 row/bytes 权威；所有 pre-SQL rejection 用 telemetry 而非
+  “调用后值相同”证明零写入。
+- `mark_operational_error/3` 与 `quarantine_preserving_evidence/3` 分别覆盖 non-binary
+  reason 的 exact `{:error, :invalid_operational_reason}`、zero UPDATE 与完整 row 不变。
 - sidecar `published` 与合法 `finalize_pending` 均覆盖 finalized、cleanup-pending、
   superseded、unavailable、integrity failure 与 malformed/obsolete callback；所有非 finalized
   分支保留 backup。

@@ -66,13 +66,21 @@ finalize_if_current(ctx, opts) ::
   `%{"published_proof" => success_summary_or_nil, "last_failure" => failure_or_nil}`.
   Pre-published failures alone may use a nil published proof; published and later phases require
   a successful aggregate proof. Bounded endpoint details total at most 32, the wrapper is at most
-  60 KiB, and the existing Journal 64 KiB JSON gate remains authoritative.
+  60 KiB, and the shared Journal 64 KiB durable-JSON gate remains authoritative.
+- Every newly written or replay-validated JSONB value crosses the shared pure
+  `Maxio.DurableJSON.validate/2` boundary. The allowed term domain is string-key maps, lists,
+  valid UTF-8/NUL-free binaries, booleans, nil and integers whose decimal token is at most 1,024
+  bytes; floats and structs are rejected. Validation includes caller depth, encoded-size,
+  encode/decode and strict `===` round-trip checks. Profiles are exactly
+  PublishedProof `6/61_440` and Journal `15/65_536`, both with root depth zero. Do not change
+  Jason's global integer limit or lower the 60-KiB PublishedProof ceiling.
 - PG `metadata_committed` / `finalize_pending` canonical wrappers are validated before endpoint
   I/O by exact non-mutating `PublishedProof.validate_durable_evidence/2`; rollback-path generic
   non-PublishedProof evidence does not enter this validator. Operational
   lock/lease/restore/generic errors preserve existing evidence through
   `mark_operational_error/3` or `quarantine_preserving_evidence/3`; neither update set contains
-  fingerprint or evidence.
+  fingerprint or evidence, so already-loaded malformed forensic evidence is not revalidated or
+  rewritten.
 - Recovery authority/phase routing is exact: PG metadata/finalize validates→verify→finalize;
   sidecar published uses current-epoch adjudication→sidecar finalize; sidecar
   finalize-pending resumes sidecar finalize directly with no PG wrapper/standalone verify;
@@ -173,7 +181,8 @@ This single module owns:
   and constructors;
 - proof-class predicates;
 - global quorum classification helpers;
-- phase-aware JSON-safe evidence and merge helpers;
+- phase-aware semantic evidence and merge helpers, with shared DurableJSON enforcement added at
+  the Task 3 persistence boundary;
 - a maximum of 32 total degraded/orphan endpoint details plus separate omitted counts;
 - endpoint identities only as `"local"` / frozen `"ordinal:N"` labels, never node-only or
   absolute drive/backup paths;
@@ -439,8 +448,12 @@ baseline evidence, not a green gate, while the existing 35-file warning set rema
 - Modify: `lib/maxio/object_mutation/commit.ex`
 - Modify: `lib/maxio/object_mutation/recovery.ex`
 - Modify: `lib/maxio/object_mutation.ex`
+- Modify: `lib/maxio/object_mutation/journal.ex`
 - Modify: `lib/maxio/object_mutation/log.ex`
-- Modify: `lib/maxio/storage/published_proof.ex` only for the non-mutating durable validator
+- Create: `lib/maxio/durable_json.ex`
+- Modify: `lib/maxio/storage/published_proof.ex` to apply one shared post-semantic durable boundary
+  to `journal_evidence/3`, `merge_failure/3`, and `validate_durable_evidence/2` without changing
+  their existing semantic rules
 - Modify: `lib/maxio/s3/handlers/object.ex`
 - Modify as required by the shared outcome adapter:
   `lib/maxio/console/object_upload.ex`, `lib/maxio/s3/object_writer.ex`,
@@ -450,6 +463,8 @@ baseline evidence, not a green gate, while the existing 35-file warning set rema
 - Modify: `lib/mix/tasks/maxio.object_mutations.status.ex`
 - Create: `test/support/storage_published_proof_script_backend.ex` or an equivalently named
   test-only deterministic seam
+- Create: `test/support/rejecting_object_mutation_repo.ex` as a tests-only no-SQL capability seam
+- Create: `test/maxio/durable_json_test.exs`
 - Modify: `test/maxio/object_mutation_test.exs`
 - Modify: `test/maxio/object_mutation/commit_test.exs`
 - Modify: `test/maxio/object_mutation/recovery_test.exs`
@@ -489,12 +504,37 @@ Cover:
   restore retains the original fingerprint-independent context;
 - a 32-detail raw successful proof is persisted only as the normalized 31-detail wrapper, and
   later failure merge preserves that proof term and encoding;
-- rollback phase/fingerprint/evidence/last-error change atomically, including 65,536-byte
-  generic evidence acceptance, 65,537-byte rejection, and CAS-loss zero-write behavior;
+- rollback phase/fingerprint/evidence/last-error change atomically; initial proof
+  failure/superseded supplies the complete three-field tuple including explicit nils. Freeze the
+  five exact outcome/last-error pairs from design D2, wrong-code for every outcome, arbitrary
+  code, wrong-phase term-identical replay, and exact invalid-evidence/zero-UPDATE results;
+- retain both real rollback races from one stale snapshot: differing evidence loses with exact
+  `{:rollback_evidence_conflict, :recovery_evidence}`, while identical evidence plus different
+  last-error loses with exact `{:rollback_evidence_conflict, :last_error}`. Repo telemetry must
+  prove exactly one UPDATE attempt per loser and full-row/forensic-byte winner preservation;
+- generic Journal evidence accepts 65,536 encoded bytes and rejects 65,537. Shared DurableJSON
+  separately freezes positive/negative integer token edges (including the negative sign), all
+  floats, U+0000 map key/value, invalid options, and exact 61,440/61,441 codec-roundtrippable
+  string payloads through an `apply/3` capability seam during tests-only RED;
 - operational lock/lease/restore/generic failures preserve the wrapper term and JSON bytes;
 - durable PG validation directly accepts canonical evidence unchanged and rejects
   missing/extra keys, illegal phase, persisted 32-detail evidence, impossible hidden
-  counters/witnesses, and over-60-KiB evidence without mutation;
+  counters/witnesses, non-durable integers/NUL, and over-60-KiB evidence without mutation;
+- prove a clean intended-canonical PublishedProof wrapper measures `>32 KiB && <=60 KiB`, passes
+  public validation and Jason strict round-trip, and survives a real transaction-scoped JSONB
+  reload with strict `===`. The exact-61,440 huge-counter wrapper is a rejection oracle; do not
+  retain any obsolete positive “maximum” claim. A 42,587-byte fixture containing a known
+  over-permissive detail may only be a non-contractual helper/transport probe;
+- split helper capability, public PublishedProof, Journal NUL and ObjectMutation equality-bypass
+  REDs so one missing capability cannot mask another. The 61,441 ObjectMutation attack uses a
+  real prepared PG row plus `Maxio.Test.RejectingObjectMutationRepo`; its `update_all/2` and
+  `get/2` send a fixed message then raise a fixed sentinel without SQL. Fetch before/after through
+  real `Maxio.Repo`; assert no seam message, no object-mutation UPDATE, complete row `===` and
+  exact forensic bytes. Never submit U+0000 to real JSONB;
+- non-binary reason calls to both evidence-preserving operational APIs return exact
+  `{:error, :invalid_operational_reason}`, perform zero UPDATEs and preserve the complete row.
+  A quarantine different-reason CAS loser attempts exactly one UPDATE then returns exact
+  `{:error, {:stale_journal, "quarantined", attempts}}`, preserving the winner row/bytes;
 - pre-metadata callback contract violation atomically rolls back with exact bounded generic PG
   contract evidence and no forged summary; post-metadata proof/finalize violations preserve
   the canonical wrapper and quarantine;
@@ -504,7 +544,25 @@ Cover:
   superseded, unavailable, integrity, and malformed/obsolete finalize outcomes;
 - all exact eight existing shared-Commit callers retain behavior coverage.
 
-### Step 2: Refactor Commit ordering
+For the G1 review correction, this is a mandatory tests-only RED checkpoint: synchronously remove
+every obsolete exact-61,440 positive assertion from the original `task3_red_core` and review tags,
+invoke deliberately wrong-typed public calls through `apply/3` so focused compile remains clean,
+run both tag baselines, and stop. Three independent read-only lanes must approve the revised RED,
+failure signatures, durable oracle and production hash freeze before any Step 2 production edit.
+
+### Step 2: Implement the shared durable boundary and refactor Commit ordering
+
+Implement the exact non-raising `Maxio.DurableJSON.validate/2` API from design D6. Traverse from
+root depth zero with bounded caller limits; accept only string-key maps/lists/NUL-free valid
+UTF-8 binaries/booleans/nil/integers, reject structs/floats, and cap each integer's decimal token
+at 1,024 bytes including a negative sign. Encode once, enforce exact encoded bytes, decode those
+same bytes, and require strict `===`. Invalid, missing or extra options return the same
+`{:error, :invalid_durable_json}`. Do not raise Jason's global limit.
+
+Wire PublishedProof only after its semantic validator with profile `6/61_440`; wire every
+Journal JSONB field and `json_evidence_valid?/1` with profile `15/65_536`. Preserve caller error
+taxonomies. Evidence-preserving operational update sets intentionally omit the unchanged JSON
+column and do not revalidate already-loaded malformed forensic evidence.
 
 After publish returns `epoch_fingerprint`:
 
@@ -526,10 +584,30 @@ request_rollback(journal, attrs, opts \\ [])
 `attrs` is a map allowing only `published_fingerprint`, `recovery_evidence`, and `last_error`;
 reject unknown keys and invalid phase/evidence/size before SQL. Write phase, all supplied attrs,
 and bounded last error in the existing id/phase/attempt/lease CAS. `rollback_pending` replay
-requires every supplied attr to be term-equal; conflict writes nothing. `rolled_back` is
-terminally idempotent and never rewritten. Initial proof failure/superseded supplies all three
-fields, including `published_fingerprint: nil`. Generic Journal evidence tests at 65,536/65,537
-bytes remain separate from the 60 KiB PublishedProof cap.
+requires every supplied attr to be strictly `===`; conflict writes nothing. Validate
+authority/phase/domain, then shared durable JSON, then strict replay equality, then CAS—no
+existing-state shortcut may bypass validation. `rolled_back` is terminally idempotent and never
+rewritten. Initial proof failure/superseded supplies all three fields, including
+`published_fingerprint: nil` and an explicit evidence value.
+
+Freeze the stable outcome/error map exactly:
+
+```elixir
+%{
+  unavailable: "published_proof_failed:proof:unavailable",
+  corrupt: "published_proof_failed:proof:corrupt",
+  mismatch: "published_proof_failed:proof:mismatch",
+  placement_drift: "published_proof_failed:proof:placement_drift",
+  superseded: "published_proof_superseded:proof"
+}
+```
+
+Wrong/arbitrary code, wrong phase or invalid durable evidence returns exactly
+`{:error, :invalid_rollback_evidence}` before SQL. A CAS loser fresh-reads once: differing
+evidence returns `{:error, {:rollback_evidence_conflict, :recovery_evidence}}`; otherwise a
+last-error difference returns `{:error, {:rollback_evidence_conflict, :last_error}}`. It cannot
+be reported as replay success. Generic Journal evidence tests at 65,536/65,537 bytes remain
+separate from the 60 KiB PublishedProof cap.
 
 A facade contract violation has no canonical aggregate summary. Before metadata, proof-mode
 violation never calls PublishedProof merge: it requests rollback with nil fingerprint, exact
@@ -539,7 +617,8 @@ last error `"published_proof_contract_violation:proof"`, and exactly
 metadata, retain backup on restore failure, and return 500. Never persist the raw callback.
 Accept this generic non-PublishedProof subshape only for PG authority observed in `claimed`,
 targeting `rollback_pending`, with exact four keys/values, nil fingerprint, and the exact last
-error. Validate those constraints plus the Journal JSON-safe/depth/65,536-byte gate before SQL;
+error. Validate those constraints plus the Journal shared durable-JSON/depth/65,536-byte gate
+before SQL;
 failure is zero-write. It may persist only through rollback-pending/rolled-back/quarantined and
 is illegal in published/metadata/finalize phases. Operational retries preserve it rather than
 overwriting evidence.
@@ -584,7 +663,8 @@ Allowed outcome/last-error pairs are:
 All four quarantine and retain backup. Exact target/token in published/committed and
 exact-target greater token proceed to the finalize adapter without pre-adapter evidence. Before
 SQL, validate sidecar `published → quarantined`, exact keys/value/last-error, and Journal
-JSON/depth/64-KiB; write phase, last error, and evidence in one phase/attempt/lease CAS. Store no
+shared durable-JSON/depth/64-KiB gate; write phase, last error, and evidence in one existing
+phase/attempt/lease CAS. Store no
 endpoint, node/drive/path, token generation/mutation-id, placement, or raw/inspected reason.
 Cover all four with path/node/raw sentinels in journal/log/CLI.
 
@@ -621,7 +701,12 @@ quarantine_preserving_evidence(journal, reason, opts \\ [])
 The first update set is only attempts, next-attempt, bounded last-error, and updated-at. The
 second is only quarantine phase/timestamp/lease cleanup and bounded last-error. Neither includes
 fingerprint/evidence. Invalid-proof quarantine preserves even malformed evidence term and JSON
-bytes. Add sentinel tests for lock, lease, restore, generic exception, and invalid proof.
+bytes. Both APIs accept binary reasons only; any non-binary reason returns exact
+`{:error, :invalid_operational_reason}` before SQL. A quarantine CAS loser with a different
+reason performs one UPDATE attempt, then returns exact
+`{:error, {:stale_journal, "quarantined", attempts}}`; it never uses generic terminal
+idempotency. Add sentinel tests for lock, lease, restore, generic exception, invalid proof and
+the two operational API boundaries.
 
 Both legal sidecar states use one exact adapter:
 
@@ -678,7 +763,7 @@ node/drive, final/backup path, raw sidecar, or inspected internal reason.
 ```powershell
 mix test test/maxio/storage/epoch_store_published_proof_test.exs test/maxio/cluster/shard_server_mutation_test.exs test/maxio/cluster/transport_in_process_test.exs
 mix test test/maxio/storage/fs_mutation_test.exs test/maxio/storage/erasure_coded_mutation_test.exs test/maxio/storage/distributed_mutation_test.exs
-mix test test/maxio/object_mutation_test.exs test/maxio/object_mutation/commit_test.exs test/maxio/object_mutation/recovery_test.exs
+mix test test/maxio/durable_json_test.exs test/maxio/object_mutation_test.exs test/maxio/object_mutation/commit_test.exs test/maxio/object_mutation/recovery_test.exs
 mix test test/maxio/s3/put_object_mutation_e2e_test.exs test/mix/tasks/maxio_object_mutations_test.exs
 mix test test/maxio/s3/in_flight_test.exs test/maxio/s3/slow_down_quorum_test.exs test/maxio_web/live/object_live_show_test.exs
 mix test test/maxio/console/object_upload_mutation_test.exs test/maxio/s3/copy_object_mutation_test.exs test/maxio/s3/object_writer_mutation_test.exs
