@@ -861,8 +861,8 @@ defmodule Maxio.S3.Handlers.Multipart do
         @max_uploads_limit
       )
 
-    key_marker = Map.get(qp, "key-marker")
-    upload_id_marker = Map.get(qp, "upload-id-marker")
+    key_marker = ListQuery.cursor(qp, "key-marker")
+    upload_id_marker = ListQuery.cursor(qp, "upload-id-marker")
 
     res =
       Multipart.list_uploads(bucket, %{

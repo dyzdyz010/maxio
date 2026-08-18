@@ -132,7 +132,7 @@ defmodule Maxio.S3.Handlers.Bucket do
       charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
       prefix = Map.get(qp, "prefix", "")
       delimiter = ListQuery.delimiter(qp)
-      marker = Map.get(qp, "marker")
+      marker = ListQuery.cursor(qp, "marker")
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       encoding_type = Map.get(qp, "encoding-type")
       optional_attributes = optional_object_attributes!(conn)
@@ -184,8 +184,8 @@ defmodule Maxio.S3.Handlers.Bucket do
       prefix = Map.get(qp, "prefix", "")
       delimiter = ListQuery.delimiter(qp)
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
-      continuation = Map.get(qp, "continuation-token")
-      start_after = Map.get(qp, "start-after")
+      continuation = ListQuery.cursor(qp, "continuation-token")
+      start_after = ListQuery.cursor(qp, "start-after")
       encoding_type = Map.get(qp, "encoding-type")
       optional_attributes = optional_object_attributes!(conn)
 
@@ -246,8 +246,8 @@ defmodule Maxio.S3.Handlers.Bucket do
       prefix = Map.get(qp, "prefix", "")
       delimiter = ListQuery.delimiter(qp)
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
-      key_marker = Map.get(qp, "key-marker")
-      version_id_marker = Map.get(qp, "version-id-marker")
+      key_marker = ListQuery.cursor(qp, "key-marker")
+      version_id_marker = ListQuery.cursor(qp, "version-id-marker")
       encoding_type = Map.get(qp, "encoding-type")
       optional_attributes = optional_object_attributes!(conn)
 
@@ -358,6 +358,8 @@ defmodule Maxio.S3.Handlers.Bucket do
   defp restore_status_requested?(optional_attributes),
     do: MapSet.member?(optional_attributes, "RestoreStatus")
 
+  # `delimiter != ""` 是纵深防御：delimiter 已由 `Maxio.S3.ListQuery.delimiter/1` 在查询层归一，
+  # 到这里只可能是 `nil` 或非空串，`""` 不会再出现。保留守卫，勿据此以为 `""` 仍会到达。
   defp next_marker(%{is_truncated: true, next_continuation_token: token}, delimiter)
        when is_binary(delimiter) and delimiter != "",
        do: token
@@ -366,6 +368,8 @@ defmodule Maxio.S3.Handlers.Bucket do
 
   defp list_v1_marker_cursor(nil, _delimiter), do: nil
 
+  # 同上：`delimiter != ""` 为纵深防御，`""` 已在 `Maxio.S3.ListQuery` 归一为 `nil`；
+  # marker 亦已经 `ListQuery.cursor/2` 归一，故 `""` 不会走到下面的 `String.ends_with?/2`。
   defp list_v1_marker_cursor(marker, delimiter)
        when is_binary(marker) and is_binary(delimiter) and delimiter != "" do
     if String.ends_with?(marker, delimiter) do

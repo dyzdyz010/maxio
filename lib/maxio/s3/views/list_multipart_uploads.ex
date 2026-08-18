@@ -52,6 +52,9 @@ defmodule Maxio.S3.Views.ListMultipartUploads do
   end
 
   defp maybe_delimiter(children, nil), do: children
+
+  # `""` 已在查询层被 `Maxio.S3.ListQuery.delimiter/1` 归一为 `nil`，正常路径到不了这条子句；
+  # 保留作纵深防御（本 view 也可被未经该层的调用方直接调用），勿据此以为 `""` 仍会到达。
   defp maybe_delimiter(children, ""), do: children
   defp maybe_delimiter(children, d), do: children ++ [element("Delimiter", [], characters(d))]
 end

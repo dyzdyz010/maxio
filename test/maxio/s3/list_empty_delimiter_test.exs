@@ -221,6 +221,57 @@ defmodule Maxio.S3.ListEmptyDelimiterTest do
     assert slash.resp_body =~ "AccessDenied"
   end
 
+  test "s3:delimiter 条件键：StringEqualsIfExists 区分「缺席」与「存在但为空」（归一化变异敏感）" do
+    bucket = "led-authz-ifexists"
+    seed_tree(bucket)
+
+    # 为什么用 StringEqualsIfExists 而不是 Null：`Null` 对「缺席」与「存在但为空」本来就同判
+    # （evaluator 把空的 context 值当缺席），所以 Null 那条测试**锁不住**归一化本身——把
+    # authz.ex 的 ListQuery.delimiter(qp) 改回 Map.get(qp, "delimiter")，它照样通过。
+    #
+    # StringEqualsIfExists 是能区分两者的算子（Maxio.Policy.Condition）：
+    #   * 条件键**缺席** → missing_key_holds?(_, if_exists?: true, ...) → true → Allow 生效；
+    #   * 条件键**存在但为空** → eval("StringEquals", "/", "") → req_vals=[""] 不匹配 "/" → false
+    #     → Allow 不生效 → 隐式拒绝 403。
+    # 故 `?delimiter=`（空串）在归一化前被拒、归一化后放行——这条断言**只有**在
+    # 条件键读归一化值时才成立，改回原样即失败。
+    policy =
+      Jason.encode!(%{
+        "Version" => "2012-10-17",
+        "Statement" => [
+          %{
+            "Effect" => "Allow",
+            "Action" => ["s3:ListBucket"],
+            "Resource" => "arn:aws:s3:::#{bucket}",
+            "Condition" => %{"StringEqualsIfExists" => %{"s3:delimiter" => "/"}}
+          }
+        ]
+      })
+
+    :ok = Store.put_principal_policy(@alice_arn, "list-empty-delimiter-#{bucket}", policy)
+
+    # 空串 delimiter 必须被判为「条件键缺席」→ IfExists 放行
+    empty = alice(:get, "/#{bucket}", query: %{"list-type" => "2", "delimiter" => ""}) |> call()
+
+    assert empty.status == 200
+    assert empty.resp_body =~ "<Key>dir/a.txt</Key>"
+
+    # 完全不带 delimiter：同样缺席 → 放行（空串与缺席同判的另一半）
+    absent = alice(:get, "/#{bucket}", query: %{"list-type" => "2"}) |> call()
+    assert absent.status == 200
+
+    # delimiter=/ 存在且相等 → 放行（回归：非空值行为不变）
+    slash = alice(:get, "/#{bucket}", query: %{"list-type" => "2", "delimiter" => "/"}) |> call()
+    assert slash.status == 200
+    assert slash.resp_body =~ "<CommonPrefixes>"
+
+    # delimiter=| 存在但不等 → IfExists 不豁免 → 拒绝（证明该算子在本项目里确实会因值不符而拒，
+    # 即上面 empty 的 200 不是"这条 policy 恒放行"的假阳性）
+    other = alice(:get, "/#{bucket}", query: %{"list-type" => "2", "delimiter" => "|"}) |> call()
+    assert other.status == 403
+    assert other.resp_body =~ "AccessDenied"
+  end
+
   defp alice(method, path, opts) do
     SigV4Request.signed_conn(
       method,

@@ -32,7 +32,64 @@ defmodule Maxio.S3.ListQuery do
 
   非二进制值（如 `?delimiter[]=x` 被解析成 list、或嵌套 map）同样归一为 `nil`：契约只接受
   `String.t() | nil`，其余按「未指定」处理，绝不把不可预期的形态漏给下游 `:binary.match/2`。
+
+  ## 游标参数（`cursor/2`）
+
+  分页游标同属这类边界歧义，但表现出的缺陷与 delimiter 不同类：空串游标不会崩，会**参数遮蔽**。
+  `Maxio.Objects.list_objects_v2/2` 里
+
+      cursor = Map.get(opts, :continuation_token) || Map.get(opts, :start_after)
+
+  依赖「未指定 = falsy」，而 Elixir 中 `""` 是 truthy——`?list-type=2&continuation-token=&start-after=dir/`
+  会让**空**的 continuation-token 吞掉**非空**的 start-after，静默返回全量而非 `dir/` 之后的一页。
+  内部契约里游标同样只有「有（非空串）」与「无（nil）」两种状态，故与 delimiter 同层、同理归一。
+
+  六个游标参数逐个核过，`""` 一律归一为 `nil`：
+
+  | 参数 | API | `""` 归一前的实际行为 | 归一后 |
+  |---|---|---|---|
+  | `continuation-token` | V2 | **遮蔽 `start-after`**（真 bug） | 等价未指定 |
+  | `start-after` | V2 | `key > ""`——S3 key 恒非空故等价 | 同（显式化） |
+  | `marker` | V1 | 经 `list_v1_marker_cursor/2` → `key > ""`，等价 | 同（显式化） |
+  | `key-marker` | Versions / MPU | `key > ""`，等价 | 同（显式化） |
+  | `version-id-marker` | Versions | 与非空 key-marker 并用时 `version_id < ""` 恒假，等价 | 同（显式化） |
+  | `upload-id-marker` | MPU | 查不到 marker upload，回落纯 key 游标，等价 | 同（显式化） |
+
+  即只有 `continuation-token` 是行为修复，其余五个是把「碰巧等价」变成「按契约显式」——纵深防御，
+  也让六个参数在同一处读同一套规则，不必逐个复推等价性证明。响应 XML 逐字节不变：四个 view 的
+  marker 元素一律 `data.x || ""`、`maybe/3` 把 `""` 视为 falsy，`nil` 与 `""` 渲染相同。
+
+  **非空游标的分页语义逐字不变**——本模块只动 `""`。
+
+  ## 空 `continuation-token` 的 S3 语义（VERIFY-AT-IMPL：已核验，结论与既有假设相反）
+
+  * **AWS 官方 API Reference 无明文**：ListObjectsV2 的 `continuation-token` 条目只说
+    「`ContinuationToken` indicates to Amazon S3 that the list is being continued on this bucket
+    with a token」，无 Length Constraints、无空串说明；Errors 节只列 `NoSuchBucket`。
+  * **但真实 AWS 与当前 MinIO 都是拒绝，不是忽略**：minio/minio#5931 报告 AWS S3 对空
+    ContinuationToken 返回「The continuation token provided is incorrect」，MinIO 当时忽略；
+    PR #5940 起 MinIO 已改为对齐 AWS，`cmd/api-resources.go` `getListObjectsV2Args` 首段即
+
+        // The continuation-token cannot be empty.
+        if val, ok := values["continuation-token"]; ok {
+            if len(val[0]) == 0 { errCode = ErrIncorrectContinuationToken; return ... } }
+
+    `ErrIncorrectContinuationToken` = `InvalidArgument` / 400 /
+    "The continuation token provided is incorrect"（`cmd/api-errors.go`）。
+  * 本次**仍取宽松的「忽略」语义**：它无条件优于现状（遮蔽 = 静默返回错误结果），且不新增拒绝路径；
+    但「是否改判 400 InvalidArgument」是一个新错误面的设计决策，须由架构侧定夺，故留作
+    **VERIFY-AT-IMPL**，不在本次实现里自行落地。
+  * 其余五个游标参数无此争议：MinIO 用 Go `url.Values.Get/1`，`""` 与缺席在 Go 里本就无从区分，
+    下游一律按「无 marker」处理——空串等价未指定即 MinIO 语义本身。
+
+  分析/清单/指标三类配置列举（`?analytics`/`?inventory`/`?metrics`）自带不透明 token 语义，
+  已在各自模块显式处理 `""`（`Analytics.list_configs/2` 的 `"" -> 0` + `blank_to_nil/1`），
+  不经本模块。
   """
+
+  # 允许经 `cursor/2` 归一的 query 参数白名单——逐个核过空串语义（见上表）。
+  # 未列举的参数名视为编程错误而非静默放行：新增列举路径须先把参数补进这张表并核语义。
+  @cursor_params ~w(continuation-token start-after marker key-marker version-id-marker upload-id-marker)
 
   @doc """
   从 query 参数 map 取归一化后的 delimiter：`nil`（未指定/空串/非法形态）或非空字符串。
@@ -49,4 +106,23 @@ defmodule Maxio.S3.ListQuery do
   def normalize_delimiter(""), do: nil
   def normalize_delimiter(value) when is_binary(value), do: value
   def normalize_delimiter(_other), do: nil
+
+  @doc """
+  从 query 参数 map 取归一化后的分页游标：`nil`（未指定/空串/非法形态）或非空字符串。
+
+  `name` 必须是 `#{inspect(@cursor_params)}` 之一——白名单即「空串语义已逐个核过」的证据。
+  """
+  @spec cursor(map(), String.t()) :: String.t() | nil
+  def cursor(query_params, name) when is_map(query_params) and name in @cursor_params do
+    query_params |> Map.get(name) |> normalize_cursor()
+  end
+
+  @doc """
+  归一化单个游标值：空串与非二进制值 → `nil`（等价于未指定）。非空字符串原样透传，
+  故**非空游标的分页语义逐字不变**。
+  """
+  @spec normalize_cursor(term()) :: String.t() | nil
+  def normalize_cursor(""), do: nil
+  def normalize_cursor(value) when is_binary(value), do: value
+  def normalize_cursor(_other), do: nil
 end
