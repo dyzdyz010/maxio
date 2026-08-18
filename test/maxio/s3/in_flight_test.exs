@@ -132,6 +132,8 @@ end
 defmodule Maxio.S3.InFlightTest do
   use Maxio.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Maxio.{Buckets, Objects}
   alias Maxio.S3.{Endpoint, InFlight}
   alias Maxio.Test.SigV4Request
@@ -233,6 +235,50 @@ defmodule Maxio.S3.InFlightTest do
     Enum.each(tasks, &Task.await/1)
 
     assert InFlight.count() == 0
+  end
+
+  test "a killed handler process releases its counted slot" do
+    parent = self()
+
+    handler =
+      spawn(fn ->
+        InFlight.track(fn ->
+          send(parent, {:inside_track, self()})
+
+          receive do
+            :never_released -> :ok
+          end
+        end)
+      end)
+
+    ref = Process.monitor(handler)
+    assert_receive {:inside_track, ^handler}
+    assert InFlight.count() == 1
+
+    # An S3 handler killed by an exit signal never runs the `after` block of
+    # `track/1`; without owner-side settlement the counter would stay above zero
+    # for the lifetime of the node and pause background maintenance forever.
+    Process.exit(handler, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^handler, :killed}
+
+    _ = :sys.get_state(InFlight)
+
+    assert InFlight.count() == 0
+  end
+
+  test "the counter owner reports unexpected messages instead of dropping them" do
+    # Adding a `:DOWN` clause replaces the `use GenServer` default `handle_info/2`,
+    # which logs unknown messages. Losing that would make anything mis-routed to
+    # this process invisible.
+    log =
+      capture_log(fn ->
+        send(InFlight, :maxio_in_flight_unexpected_probe)
+        _ = :sys.get_state(InFlight)
+      end)
+
+    assert log =~ "s3 in-flight counter owner received an unexpected message"
+    assert log =~ "maxio_in_flight_unexpected_probe"
+    assert Process.alive?(Process.whereis(InFlight))
   end
 
   test "S3 dispatch counts a live handler until it returns" do

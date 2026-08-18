@@ -9,6 +9,12 @@ defmodule Mix.Tasks.Maxio.Drive.Io do
   The counters are application-level ShardServer observations: active operation
   counts, completed operation count, bytes, latency, and byte throughput since
   the last reset. This is not OS/device queue-depth or hardware telemetry.
+
+  `active_gauge_register_failures` / `active_gauge_owner_absent` report how many
+  tracked operations were counted *without* owner-side settlement (see
+  `Maxio.ActiveGauge`): while either is climbing, the active gauges above can
+  over-report, because a killed caller's units have nothing to return them.
+  Both are cumulative and are not cleared by `--reset`.
   """
   use Mix.Task
 
@@ -56,7 +62,9 @@ defmodule Mix.Tasks.Maxio.Drive.Io do
         "read_throughput_bytes_per_sec=#{snapshot.read_throughput_bytes_per_sec} " <>
         "write_throughput_bytes_per_sec=#{snapshot.write_throughput_bytes_per_sec} " <>
         "avg_latency_us=#{snapshot.avg_latency_us} max_latency_us=#{snapshot.max_latency_us} " <>
-        "total_latency_us=#{snapshot.total_latency_us}"
+        "total_latency_us=#{snapshot.total_latency_us} " <>
+        "active_gauge_register_failures=#{snapshot.active_gauge_register_failures} " <>
+        "active_gauge_owner_absent=#{snapshot.active_gauge_owner_absent}"
     )
   end
 end

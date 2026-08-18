@@ -8,9 +8,20 @@ defmodule Maxio.Cluster.DriveIO do
   and throughput are application-level observations, not OS/device queue-depth
   or hardware telemetry. `max_latency_us` is a best-effort high-water mark under
   concurrent completions.
+
+  The active (in-flight) gauges are claimed through `Maxio.ActiveGauge`, so a
+  storage caller that is killed by an exit signal — an `async_stream` timeout, a
+  brutal supervisor shutdown, `Process.exit(pid, :kill)` — still returns its
+  units when this process observes its `:DOWN`. `try/after` alone never runs for
+  those deaths, which would pin `active_ops` above zero for the lifetime of the
+  node and silently throttle every consumer of the pressure signal.
   """
 
   use GenServer
+
+  require Logger
+
+  alias Maxio.ActiveGauge
 
   @table :maxio_cluster_drive_io
 
@@ -56,7 +67,9 @@ defmodule Maxio.Cluster.DriveIO do
           throughput_bytes_per_sec: non_neg_integer(),
           read_throughput_bytes_per_sec: non_neg_integer(),
           write_throughput_bytes_per_sec: non_neg_integer(),
-          errors: non_neg_integer()
+          errors: non_neg_integer(),
+          active_gauge_register_failures: non_neg_integer(),
+          active_gauge_owner_absent: non_neg_integer()
         }
 
   @started_at_key :started_at_ms
@@ -67,7 +80,7 @@ defmodule Maxio.Cluster.DriveIO do
   @impl true
   def init(_opts) do
     create_table()
-    {:ok, %{}}
+    {:ok, ActiveGauge.owner_state()}
   end
 
   @impl true
@@ -76,13 +89,46 @@ defmodule Maxio.Cluster.DriveIO do
     {:reply, :ok, state}
   end
 
+  def handle_call({:maxio_active_gauge_register, pid}, _from, state) do
+    {:reply, :ok, ActiveGauge.monitor(state, pid)}
+  end
+
+  # Resetting through the owner serialises the reset against every `:DOWN` that
+  # has ALREADY reached this mailbox. It does not order the reset against a
+  # `:DOWN` still in flight: BEAM only guarantees message order between one
+  # sender/receiver pair, and the `:DOWN` comes from the dying process, not from
+  # the caller of `reset/0`. That is harmless here — `reset/0` only clears the
+  # cumulative counters, and a late settlement decrements an active gauge, which
+  # `Maxio.ActiveGauge` clamps at 0.
+  def handle_call(:reset, _from, state) do
+    {:reply, reset_cumulative_counters(), state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    {:noreply, ActiveGauge.handle_down(state, ref, @table, @active_counter_keys)}
+  end
+
+  # Defining `handle_info/2` above replaces the `use GenServer` default clause,
+  # which logs unexpected messages. Keep that visibility rather than silently
+  # dropping them (AGENTS.md §3: never fail silently).
+  def handle_info(message, state) do
+    Logger.warning("drive io telemetry owner received an unexpected message",
+      action: :drive_io_unexpected_message,
+      reason: inspect(message)
+    )
+
+    {:noreply, state}
+  end
+
   @doc "Track one storage IO operation and preserve the wrapped function result."
   @spec track(op(), (-> result), keyword()) :: result when result: term()
   def track(op, fun, opts \\ []) when is_function(fun, 0) do
     normalized_op = normalize_op(op)
     keys = counter_keys(op)
     started_at_us = System.monotonic_time(:microsecond)
-    _ = safe_each(keys.start, &increment(&1, 1))
+    _ = safe_call(fn -> claim_active(keys.active) end)
+    _ = safe_each(keys.cumulative, &increment(&1, 1))
 
     try do
       result = fun.()
@@ -99,7 +145,7 @@ defmodule Maxio.Cluster.DriveIO do
     after
       elapsed_us = max(System.monotonic_time(:microsecond) - started_at_us, 0)
       _ = safe_call(fn -> record_latency(normalized_op, elapsed_us) end)
-      _ = safe_each(keys.stop, &decrement(&1, 1))
+      _ = safe_call(fn -> release_active(keys.active) end)
     end
   end
 
@@ -111,53 +157,91 @@ defmodule Maxio.Cluster.DriveIO do
   @spec active_count() :: non_neg_integer()
   def active_count, do: active_ops()
 
-  @doc "Return all node-local IO counters."
+  @doc """
+  Return all node-local IO counters.
+
+  Includes the `Maxio.ActiveGauge` degradation counters
+  (`:active_gauge_register_failures`, `:active_gauge_owner_absent`): every
+  increment there is one tracked operation whose active gauge was accounted
+  without owner-side settlement and can therefore leak upward if that process is
+  killed. They are part of the snapshot so `mix maxio.drive.io` — the CLI exit
+  for this telemetry — shows the degradation next to the counters it distorts.
+  """
   @spec snapshot() :: snapshot()
   def snapshot do
     case safe_call(fn -> Map.new(@counter_keys, &{&1, counter(&1)}) end) do
-      {:ok, snapshot} -> add_derived_snapshot_fields(snapshot)
-      {:error, _reason} -> zero_snapshot()
+      {:ok, snapshot} ->
+        snapshot
+        |> Map.merge(gauge_degradation())
+        |> add_derived_snapshot_fields()
+
+      {:error, _reason} ->
+        zero_snapshot()
     end
   end
 
-  @doc false
+  defp gauge_degradation do
+    case safe_call(fn -> ActiveGauge.degradation_snapshot(@table) end) do
+      {:ok, degradation} -> degradation
+      {:error, _reason} -> zero_gauge_degradation()
+    end
+  end
+
+  defp zero_gauge_degradation, do: Map.new(ActiveGauge.degradation_keys(), &{&1, 0})
+
+  @doc """
+  Clear cumulative counters, preserving the active gauges of in-flight operations.
+
+  Runs inside the owner process when it is alive, so any dead-caller settlement
+  already queued in the owner's mailbox is applied first. A `:DOWN` still in
+  flight is *not* ordered against this call (see `handle_call(:reset, ...)`);
+  that only ever settles an active gauge downward, which is clamped at 0.
+  """
   @spec reset() :: :ok
   def reset do
-    _ =
-      safe_call(fn ->
-        ensure_table()
-        Enum.each(@cumulative_counter_keys, &:ets.insert(@table, {&1, 0}))
-        :ets.insert(@table, {@started_at_key, System.monotonic_time(:millisecond)})
-      end)
+    case Process.whereis(__MODULE__) do
+      nil ->
+        _ = safe_call(&reset_cumulative_counters/0)
+        :ok
 
+      pid when pid == self() ->
+        _ = safe_call(&reset_cumulative_counters/0)
+        :ok
+
+      pid ->
+        case safe_call(fn -> GenServer.call(pid, :reset) end) do
+          {:ok, _reply} ->
+            :ok
+
+          # Owner unavailable (restarting): fall back to the direct ETS reset so
+          # telemetry maintenance never blocks on a supervisor restart.
+          {:error, _reason} ->
+            _ = safe_call(&reset_cumulative_counters/0)
+            :ok
+        end
+    end
+  end
+
+  defp reset_cumulative_counters do
+    ensure_table()
+    Enum.each(@cumulative_counter_keys, &:ets.insert(@table, {&1, 0}))
+    :ets.insert(@table, {@started_at_key, System.monotonic_time(:millisecond)})
     :ok
   end
 
   defp counter_keys(op) do
     case normalize_op(op) do
       :read ->
-        %{
-          start: [:active_ops, :active_read_ops, :read_ops],
-          stop: [:active_ops, :active_read_ops]
-        }
+        %{active: [:active_ops, :active_read_ops], cumulative: [:read_ops]}
 
       :write ->
-        %{
-          start: [:active_ops, :active_write_ops, :write_ops],
-          stop: [:active_ops, :active_write_ops]
-        }
+        %{active: [:active_ops, :active_write_ops], cumulative: [:write_ops]}
 
       :delete ->
-        %{
-          start: [:active_ops, :active_write_ops, :delete_ops],
-          stop: [:active_ops, :active_write_ops]
-        }
+        %{active: [:active_ops, :active_write_ops], cumulative: [:delete_ops]}
 
       :metadata ->
-        %{
-          start: [:active_ops, :active_metadata_ops, :metadata_ops],
-          stop: [:active_ops, :active_metadata_ops]
-        }
+        %{active: [:active_ops, :active_metadata_ops], cumulative: [:metadata_ops]}
     end
   end
 
@@ -232,15 +316,14 @@ defmodule Maxio.Cluster.DriveIO do
     :ok
   end
 
-  defp decrement(key, n) do
+  defp claim_active(keys) do
     ensure_table()
-    value = :ets.update_counter(@table, key, {2, -n}, {key, 0})
+    ActiveGauge.claim(@table, __MODULE__, keys)
+  end
 
-    if value < 0 do
-      :ets.insert(@table, {key, 0})
-    end
-
-    :ok
+  defp release_active(keys) do
+    ensure_table()
+    ActiveGauge.release(@table, keys)
   end
 
   defp ensure_table do
@@ -349,6 +432,7 @@ defmodule Maxio.Cluster.DriveIO do
   defp zero_snapshot do
     @counter_keys
     |> Map.new(&{&1, 0})
+    |> Map.merge(zero_gauge_degradation())
     |> Map.put(:avg_latency_us, 0)
     |> Map.put(:sample_age_ms, 0)
     |> Map.put(:throughput_bytes_per_sec, 0)
