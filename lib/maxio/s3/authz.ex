@@ -20,7 +20,7 @@ defmodule Maxio.S3.Authz do
   import Plug.Conn
   alias Maxio.{Buckets, ObjectMeta, Objects, Tags}
   alias Maxio.Policy.{ACL, ActionMap, Arn, Evaluator, RequestContext, Store}
-  alias Maxio.S3.{CopySource, Error, Log, OwnershipControls, PublicAccessBlock}
+  alias Maxio.S3.{CopySource, Error, ListQuery, Log, OwnershipControls, PublicAccessBlock}
 
   @max_keys_limit 1000
   @root_bucket_policy_recovery_actions ~w(
@@ -843,14 +843,16 @@ defmodule Maxio.S3.Authz do
   defp maybe_put_header(map, conn, condition_key, header_name),
     do: maybe_put(map, condition_key, conn |> get_req_header(header_name) |> List.first())
 
-  # ListObjects* 的 s3:prefix / s3:delimiter / s3:max-keys（来自 query；max-keys 与 handler 同源归一化）。
+  # ListObjects* 的 s3:prefix / s3:delimiter / s3:max-keys（来自 query；max-keys / delimiter 与
+  # handler 同源归一化——`?delimiter=` 空串等价于未指定，条件键须与 handler 一致地视为**缺席**，
+  # 否则同一个请求在授权层与列举层对 delimiter 的判读会分叉，见 Maxio.S3.ListQuery）。
   defp put_list_conditions(conds, conn, action)
        when action in [:list_objects, :list_objects_v2, :list_object_versions] do
     qp = conn.query_params || %{}
 
     conds
     |> maybe_put("s3:prefix", Map.get(qp, "prefix"))
-    |> maybe_put("s3:delimiter", Map.get(qp, "delimiter"))
+    |> maybe_put("s3:delimiter", ListQuery.delimiter(qp))
     |> Map.put("s3:max-keys", normalize_max_keys(Map.get(qp, "max-keys")))
   end
 

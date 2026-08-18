@@ -3,7 +3,17 @@ defmodule Maxio.S3.Handlers.Bucket do
   import Plug.Conn
   alias Maxio.{BucketConfigs, Buckets, Storage}
   alias Maxio.Policy.ACL
-  alias Maxio.S3.{Error, ExpectedBucketOwner, Log, ObjectLock, OwnershipControls, RequestPayer}
+
+  alias Maxio.S3.{
+    Error,
+    ExpectedBucketOwner,
+    ListQuery,
+    Log,
+    ObjectLock,
+    OwnershipControls,
+    RequestPayer
+  }
+
   alias Maxio.S3.Views.{ListBucket, ListBucketV1, LocationConstraint, ListVersions}
 
   @max_keys_limit 1000
@@ -121,7 +131,7 @@ defmodule Maxio.S3.Handlers.Bucket do
       :ok = ExpectedBucketOwner.verify!(conn, bucket)
       charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
       prefix = Map.get(qp, "prefix", "")
-      delimiter = Map.get(qp, "delimiter")
+      delimiter = ListQuery.delimiter(qp)
       marker = Map.get(qp, "marker")
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       encoding_type = Map.get(qp, "encoding-type")
@@ -172,7 +182,7 @@ defmodule Maxio.S3.Handlers.Bucket do
       :ok = ExpectedBucketOwner.verify!(conn, bucket)
       charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
       prefix = Map.get(qp, "prefix", "")
-      delimiter = Map.get(qp, "delimiter")
+      delimiter = ListQuery.delimiter(qp)
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       continuation = Map.get(qp, "continuation-token")
       start_after = Map.get(qp, "start-after")
@@ -234,7 +244,7 @@ defmodule Maxio.S3.Handlers.Bucket do
       :ok = ExpectedBucketOwner.verify!(conn, bucket)
       charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
       prefix = Map.get(qp, "prefix", "")
-      delimiter = Map.get(qp, "delimiter")
+      delimiter = ListQuery.delimiter(qp)
       max_keys = parse_int(Map.get(qp, "max-keys"), @max_keys_limit, @max_keys_limit)
       key_marker = Map.get(qp, "key-marker")
       version_id_marker = Map.get(qp, "version-id-marker")

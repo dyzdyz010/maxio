@@ -18,6 +18,7 @@ defmodule Maxio.S3.Handlers.Multipart do
     CopySource,
     Error,
     ExpectedBucketOwner,
+    ListQuery,
     Log,
     NotificationDelivery,
     NotificationRetainedLedger,
@@ -849,7 +850,7 @@ defmodule Maxio.S3.Handlers.Multipart do
     charge = RequestPayer.require!(conn, bucket, resource: "/" <> bucket)
 
     prefix = Map.get(qp, "prefix", "")
-    delimiter = Map.get(qp, "delimiter")
+    delimiter = ListQuery.delimiter(qp)
 
     max_uploads =
       parse_limited_query_int!(
