@@ -481,6 +481,8 @@ defmodule Maxio.Ops.ReleaseReadinessBundle do
     |> Enum.map(&sanitize_external_value/1)
   end
 
+  defp sanitize_external_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
+
   defp sanitize_external_value(%{} = value) do
     Map.new(value, fn
       {key, _item} when key in ["path", :path] ->
@@ -499,7 +501,6 @@ defmodule Maxio.Ops.ReleaseReadinessBundle do
   end
 
   defp sanitize_external_value(value) when is_binary(value), do: redact_local_paths(value)
-  defp sanitize_external_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
   defp sanitize_external_value(value) when is_atom(value), do: Atom.to_string(value)
   defp sanitize_external_value(value), do: value
 
@@ -1134,12 +1135,13 @@ defmodule Maxio.Ops.ReleaseReadinessBundle do
   defp item_reason(%{reason: reason}), do: to_string(reason)
   defp item_reason(item), do: inspect(item)
 
+  defp sanitize_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
+
   defp sanitize_value(%{} = value) do
     Map.new(value, fn {key, item} -> {to_string(key), sanitize_value(item)} end)
   end
 
   defp sanitize_value(values) when is_list(values), do: Enum.map(values, &sanitize_value/1)
-  defp sanitize_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
   defp sanitize_value(value) when is_atom(value), do: Atom.to_string(value)
   defp sanitize_value(value), do: value
 

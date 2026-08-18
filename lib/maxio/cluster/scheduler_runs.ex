@@ -2865,9 +2865,9 @@ defmodule Maxio.Cluster.SchedulerRuns do
   defp now, do: DateTime.utc_now()
 
   defp evidence_value_to_view(%DateTime{} = value), do: DateTime.to_iso8601(value)
+  defp evidence_value_to_view(value) when is_boolean(value) or is_nil(value), do: value
   defp evidence_value_to_view(value) when is_atom(value), do: Atom.to_string(value)
   defp evidence_value_to_view(value) when is_binary(value), do: value
-  defp evidence_value_to_view(value) when is_boolean(value) or is_nil(value), do: value
   defp evidence_value_to_view(value) when is_number(value), do: value
 
   defp evidence_value_to_view(values) when is_list(values),

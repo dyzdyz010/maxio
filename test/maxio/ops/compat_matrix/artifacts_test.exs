@@ -104,6 +104,25 @@ defmodule Maxio.Ops.CompatMatrix.ArtifactsTest do
     assert Enum.all?(artifact.blockers, &(&1["reason"] == "malformed_section"))
   end
 
+  test "missing provenance fields stay nil instead of becoming the string \"nil\"" do
+    dir = tmp_dir()
+
+    artifact =
+      ready_artifact()
+      |> Map.drop(["generated_at", "run_id", "git_sha", "node", "mix_env"])
+
+    write_json(dir, "s3_compat_matrix_missing_fields.json", artifact)
+
+    [artifact] = Artifacts.list_recent(dir: dir)
+
+    assert artifact.status == "ok"
+    assert artifact.generated_at == nil
+    assert artifact.run_id == nil
+    assert artifact.git_sha == nil
+    assert artifact.node == nil
+    assert artifact.mix_env == nil
+  end
+
   defp ready_artifact do
     %{
       "schema_version" => 1,

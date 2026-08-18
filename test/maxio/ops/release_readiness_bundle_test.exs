@@ -254,6 +254,71 @@ defmodule Maxio.Ops.ReleaseReadinessBundleTest do
     refute encoded =~ "Python311"
   end
 
+  test "artifact timestamps carried as DateTime structs are serialized, not crashed on" do
+    {:ok, result} =
+      ReleaseReadinessBundle.run(
+        [],
+        base_opts(
+          stress_artifacts_fun: fn _opts ->
+            [%{stress_artifact() | generated_at: ~U[2026-07-05 05:29:00Z]}]
+          end,
+          compat_artifacts_fun: fn _opts -> [] end,
+          gate_artifacts_fun: fn _opts -> [ops_gate_artifact()] end,
+          rehearsal_bundles_fun: fn _opts -> [rehearsal_artifact()] end,
+          external_probe_fun: fn -> external_probe("ok") end,
+          git_status_fun: fn -> {:ok, ""} end,
+          status_files_fun: fn -> "mix precommit -> 3386 tests, 0 failures, 5 excluded" end
+        )
+      )
+
+    checks = Map.new(result.artifact["checks"], &{&1["id"], &1})
+    stress = checks["stress_campaign"]
+
+    assert stress["status"] == "blocked"
+
+    assert Enum.any?(
+             stress["blockers"],
+             &(&1["reason"] == "invalid_generated_at" and
+                 &1["generated_at"] == "2026-07-05T05:29:00Z")
+           )
+  end
+
+  test "external client evidence with DateTime fields is serialized, not reported as a probe failure" do
+    {:ok, result} =
+      ReleaseReadinessBundle.run(
+        [],
+        base_opts(
+          stress_artifacts_fun: fn _opts -> [stress_artifact()] end,
+          compat_artifacts_fun: fn _opts -> [] end,
+          gate_artifacts_fun: fn _opts -> [ops_gate_artifact()] end,
+          rehearsal_bundles_fun: fn _opts -> [rehearsal_artifact()] end,
+          external_probe_fun: fn ->
+            external_probe_with_datetime(~U[2026-07-05 05:45:00Z])
+          end,
+          git_status_fun: fn -> {:ok, ""} end,
+          status_files_fun: fn -> "mix precommit -> 3386 tests, 0 failures, 5 excluded" end
+        )
+      )
+
+    checks = Map.new(result.artifact["checks"], &{&1["id"], &1})
+    external = checks["external_clients"]
+
+    assert external["status"] == "attention"
+    refute Enum.any?(external["blockers"], &(&1["reason"] == "external_probe_failed"))
+
+    assert Enum.any?(
+             external["warnings"],
+             &(&1["observed_at"] == "2026-07-05T05:45:00Z")
+           )
+
+    [client] = external["detail"]["clients"]
+
+    assert Enum.any?(
+             client["warnings"],
+             &(&1["observed_at"] == "2026-07-05T05:45:00Z")
+           )
+  end
+
   test "json output emits the release readiness artifact" do
     {:ok, result} =
       ReleaseReadinessBundle.run(
@@ -364,6 +429,33 @@ defmodule Maxio.Ops.ReleaseReadinessBundleTest do
         "warnings" => warnings,
         "external_clients" => [
           %{"id" => "aws_cli", "status" => status, "warnings" => warnings, "blockers" => []}
+        ]
+      }
+    }
+  end
+
+  defp external_probe_with_datetime(observed_at) do
+    warning = %{
+      "entry" => "aws_cli",
+      "kind" => "external_client",
+      "reason" => "external_client_not_configured",
+      "observed_at" => observed_at
+    }
+
+    %{
+      artifact: %{
+        "gate_status" => "attention",
+        "blockers" => [],
+        "warnings" => [warning],
+        "external_clients" => [
+          %{
+            "id" => "aws_cli",
+            "label" => "aws-cli",
+            "mode" => "external_availability",
+            "status" => "attention",
+            "warnings" => [warning],
+            "blockers" => []
+          }
         ]
       }
     }

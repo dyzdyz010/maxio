@@ -384,7 +384,7 @@ defmodule MaxioWeb.RoleLive.Index do
           if policy do
             stream_delete(socket, :managed_policies, policy)
           else
-            stream(:managed_policies, managed_policies,
+            stream(socket, :managed_policies, managed_policies,
               reset: true,
               dom_id: &managed_policy_dom_id/1
             )

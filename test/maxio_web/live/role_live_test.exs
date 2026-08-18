@@ -85,6 +85,30 @@ defmodule MaxioWeb.RoleLiveTest do
     assert :error = Maxio.IAM.get_managed_policy(policy_arn)
   end
 
+  test "deleting a managed policy that no longer exists refreshes the list without crashing", %{
+    conn: conn
+  } do
+    policy_name = unique_name("console-ghost-policy")
+    ghost_arn = Maxio.IAM.managed_policy_arn(policy_name, "/console/")
+
+    kept_name = unique_name("console-kept-policy")
+
+    {:ok, kept} =
+      Maxio.IAM.create_managed_policy(
+        name: kept_name,
+        path: "/console/",
+        policy: @managed_policy
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/roles")
+
+    html = render_click(view, "delete_managed_policy", %{"policy-arn" => ghost_arn})
+
+    assert html =~ "Deleted managed policy"
+    assert has_element?(view, "#managed-policy-#{dom_suffix(kept.policy_arn)}")
+    assert :error = Maxio.IAM.get_managed_policy(ghost_arn)
+  end
+
   test "selected role can attach and detach managed policies", %{conn: conn} do
     role_name = unique_name("console-attach-role")
     role_suffix = dom_suffix(role_name)

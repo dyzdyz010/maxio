@@ -252,6 +252,54 @@ defmodule Maxio.Cluster.SchedulerEvidenceTest do
     assert scheduler.rollup_coverage.windows == 1
   end
 
+  test "evidence view keeps booleans and nil as JSON booleans and null" do
+    assert SchedulerRuns.evidence_to_view(%{
+             flag: true,
+             other_flag: false,
+             missing: nil,
+             name: :rebalance,
+             nested: %{ok?: true, reason: nil}
+           }) == %{
+             flag: true,
+             other_flag: false,
+             missing: nil,
+             name: "rebalance",
+             nested: %{ok?: true, reason: nil}
+           }
+  end
+
+  test "evidence report view keeps gate booleans as booleans" do
+    {:ok, _ok} =
+      SchedulerRuns.record(
+        :rebalance,
+        :scheduled,
+        @t0,
+        DateTime.add(@t0, 1, :second),
+        {:ok, %{status: :ok}},
+        node: :node_a
+      )
+
+    {:ok, report} =
+      SchedulerRuns.evidence_report(
+        scheduler: :rebalance,
+        from: @t0,
+        until: DateTime.add(@t0, 60, :second),
+        window_ms: 60_000,
+        expected_interval_ms: 60_000,
+        stale_after_ms: 120_000,
+        expected_nodes: ["node_a"],
+        min_effective_nodes: 1,
+        require_lock_loser?: false
+      )
+
+    view = SchedulerRuns.evidence_to_view(report)
+
+    assert view.require_lock_loser? === false
+    assert [scheduler] = view.schedulers
+    assert scheduler.min_effective_nodes_met? === true
+    assert scheduler.lock_loser_evidence_met? === true
+  end
+
   defp scheduler_run_ids(scheduler) do
     [scheduler: scheduler, limit: 20]
     |> SchedulerRuns.list_runs()

@@ -305,6 +305,8 @@ defmodule Maxio.Ops.RebalanceWorkflowConsole do
     |> Enum.join(", ")
   end
 
+  defp value(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+
   defp value(%{} = map) do
     map
     |> Enum.take(8)
@@ -313,7 +315,6 @@ defmodule Maxio.Ops.RebalanceWorkflowConsole do
     |> empty_to_dash()
   end
 
-  defp value(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
   defp value(value) when is_binary(value), do: display_text(value)
 
   defp value(value) when is_integer(value) or is_float(value) or is_boolean(value),

@@ -501,9 +501,9 @@ defmodule Maxio.Ops.CompatMatrix.Artifacts do
   defp status_value(value) when is_atom(value), do: value |> Atom.to_string() |> status_value()
   defp status_value(_value), do: "unknown"
 
+  defp string_value(nil), do: nil
   defp string_value(value) when is_binary(value), do: String.trim(value)
   defp string_value(value) when is_atom(value), do: Atom.to_string(value)
-  defp string_value(nil), do: nil
   defp string_value(value), do: to_string(value)
 
   defp summary_value(nil), do: "-"
