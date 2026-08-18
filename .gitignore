@@ -51,3 +51,6 @@ npm-debug.log
 # Codex 隔离工作树与 Superpowers SDD 临时产物（均可由源码/计划重建）。
 /.worktrees/
 /.superpowers/
+
+# Test-run artifacts (release-readiness bundles etc).
+/artifacts/
