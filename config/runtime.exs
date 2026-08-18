@@ -268,6 +268,28 @@ if s3_port = System.get_env("MAXIO_S3_PORT") do
   config :maxio, Maxio.S3.Endpoint, port: String.to_integer(s3_port)
 end
 
+# S3 监听地址运行时覆盖。dev 默认绑 127.0.0.1（见 config/dev.exs），容器里的真实客户端
+# （mc / aws-cli 经 host.docker.internal）连不上——而 CLAUDE.md 要求 S3 行为用真实客户端做
+# 端到端活体取证。用 MAXIO_S3_IP=0.0.0.0 临时放开即可取证，默认值不变（绝不把 dev 默认
+# 暴露到 0.0.0.0）。绑定 socket 在 Application.start 期建立，本项属"需重启"配置。
+if s3_ip = System.get_env("MAXIO_S3_IP") do
+  parsed_s3_ip =
+    case :inet.parse_address(String.to_charlist(s3_ip)) do
+      {:ok, address} ->
+        address
+
+      {:error, _reason} ->
+        # 绝不静默回落默认地址：静默回落会让运维以为已经放开监听，实际仍绑在 loopback。
+        raise """
+        environment variable MAXIO_S3_IP must be a literal IP address, got: #{inspect(s3_ip)}.
+        Use 0.0.0.0 (all IPv4 interfaces), :: (all IPv6 interfaces) or a concrete address such as
+        127.0.0.1. Host names are not resolved here—bind addresses must be unambiguous.
+        """
+    end
+
+  config :maxio, Maxio.S3.Endpoint, ip: parsed_s3_ip
+end
+
 if account_id = System.get_env("MAXIO_ACCOUNT_ID") do
   config :maxio, :sts, account_id: account_id
 end

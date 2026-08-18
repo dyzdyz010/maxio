@@ -33,12 +33,14 @@ defmodule Maxio.S3.Prometheus do
     end
   end
 
+  @doc """
+  metrics 面的路径判定。规则本体住在 `Maxio.S3.ReservedNamespace` 的认领规则表——
+  三个保留面（health / admin / metrics）共用一张表，启动期影子化审计的扫描面也由它派生；
+  本模块若自持一份副本，审计就会漏报 metrics 路径下的 key（铁律 3）。
+  """
   @spec metrics_path?(String.t()) :: boolean()
   def metrics_path?(path) when is_binary(path) do
-    path == "/minio/v2/metrics" or
-      String.starts_with?(path, "/minio/v2/metrics/") or
-      path == "/minio/metrics/v3" or
-      String.starts_with?(path, "/minio/metrics/v3/")
+    Maxio.S3.ReservedNamespace.metrics_path?(path)
   end
 
   @spec render(family()) :: iodata()

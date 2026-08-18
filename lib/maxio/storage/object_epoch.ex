@@ -361,7 +361,11 @@ defmodule Maxio.Storage.ObjectEpoch do
 
   defp normalize_datetime(_value), do: {:error, :invalid_updated_at}
 
-  defp validate_bucket(bucket), do: Buckets.validate_name(bucket)
+  # epoch target 只需要桶名"可被解释"（能安全进路径段与 fencing token），走**语法**校验；
+  # 绝不走建桶准入 `Buckets.validate_creatable_name/1`——保留名单会增长，而 epoch 校验在
+  # 每次 PutObject/CopyObject 的 journal changeset 上跑，用注册期规则卡它等于把存量桶
+  # （如保留 `minio` 之前就建好的同名桶）静默降级成只读、写入报 500（铁律 3）。
+  defp validate_bucket(bucket), do: Buckets.validate_addressable_name(bucket)
 
   defp validate_locator(value, field) when is_binary(value) do
     if String.trim(value) == "", do: {:error, {:invalid_locator, field}}, else: :ok

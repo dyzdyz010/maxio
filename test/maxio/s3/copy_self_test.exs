@@ -23,7 +23,7 @@ defmodule Maxio.S3.CopySelfTest do
 
   defp call(conn), do: Endpoint.call(conn, Endpoint.init([]))
 
-  # 桶名须 3..63 字符（S3 规则 + Maxio.Buckets.validate_name/1）；用合法桶名 "cself"。
+  # 桶名须 3..63 字符（S3 规则 + Maxio.Buckets.validate_creatable_name/1）；用合法桶名 "cself"。
   test "CopyObject REPLACE 自拷贝 不丢字节（src==dest, metadata-directive=REPLACE）" do
     SigV4Request.signed_conn(:put, "/cself") |> call()
     body = "Welcome to Amazon S3. Self-copy must not truncate."

@@ -14,6 +14,8 @@ defmodule Maxio.RuntimeConfigTest do
     MAXIO_ACCESS_KEY_SECRET_KEYRING_FILE
     DATABASE_URL
     SECRET_KEY_BASE
+    MAXIO_S3_IP
+    MAXIO_S3_PORT
   )
 
   setup do
@@ -134,6 +136,49 @@ defmodule Maxio.RuntimeConfigTest do
     after
       File.rm(path)
     end
+  end
+
+  test "MAXIO_S3_IP unset leaves the compile-time S3 bind address untouched" do
+    endpoint = s3_endpoint_config(read_dev_runtime!())
+
+    refute Keyword.has_key?(endpoint, :ip)
+  end
+
+  test "MAXIO_S3_IP overrides the S3 bind address at runtime" do
+    System.put_env("MAXIO_S3_IP", "0.0.0.0")
+
+    assert read_dev_runtime!() |> s3_endpoint_config() |> Keyword.fetch!(:ip) == {0, 0, 0, 0}
+  end
+
+  test "MAXIO_S3_IP accepts IPv6 literals" do
+    System.put_env("MAXIO_S3_IP", "::")
+
+    assert read_dev_runtime!() |> s3_endpoint_config() |> Keyword.fetch!(:ip) ==
+             {0, 0, 0, 0, 0, 0, 0, 0}
+  end
+
+  test "MAXIO_S3_IP keeps the port override alongside the bind address" do
+    System.put_env("MAXIO_S3_IP", "0.0.0.0")
+    System.put_env("MAXIO_S3_PORT", "9910")
+
+    endpoint = s3_endpoint_config(read_dev_runtime!())
+
+    assert Keyword.fetch!(endpoint, :ip) == {0, 0, 0, 0}
+    assert Keyword.fetch!(endpoint, :port) == 9910
+  end
+
+  test "MAXIO_S3_IP rejects values that are not IP addresses instead of silently defaulting" do
+    System.put_env("MAXIO_S3_IP", "localhost")
+
+    assert_raise RuntimeError, ~r/MAXIO_S3_IP/, &read_dev_runtime!/0
+  end
+
+  defp s3_endpoint_config(config) do
+    config |> Keyword.get(:maxio, []) |> Keyword.get(Maxio.S3.Endpoint, [])
+  end
+
+  defp read_dev_runtime! do
+    Config.Reader.read!(Path.expand("../../config/runtime.exs", __DIR__), env: :dev)
   end
 
   defp read_prod_runtime! do

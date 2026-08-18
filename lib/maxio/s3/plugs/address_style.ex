@@ -5,6 +5,11 @@ defmodule Maxio.S3.Plugs.AddressStyle do
   下游 handler 只看 {bucket, key}，不关心寻址方式（铁律 1）。
   domain 来自 config :maxio, :s3, :domain。
 
+  另外 assign `:s3_address_style`（`:path | :virtual_host | :website`）——**寻址方式本身**
+  也是数据契约的一部分：MinIO 保留面（`/minio/health/*`、`/minio/admin/*`、metrics）只在
+  path-style 下才等于"服务器根命名空间"，vhost 下它是某个真实桶里 `minio/...` 的对象 key。
+  认领方（`Maxio.S3.ReservedNamespace.claimed?/2`）据此判定，绝不各自再解析一遍 Host。
+
   host 的权威来源是 `conn.host`（由 HTTP 适配器从 Host 头/authority 解析），
   与 SigV4 plug 一致：直接读 conn.host 而非 req_headers 的 host（新版 Plug 不再
   把 host 放进 req_headers，且禁止用 put_req_header 写 host）。跨适配器稳健（铁律 5）。
@@ -25,20 +30,20 @@ defmodule Maxio.S3.Plugs.AddressStyle do
     host = conn.host
     domain = domain()
 
-    {bucket, key, endpoint_kind} =
+    {bucket, key, endpoint_kind, address_style} =
       case website_host_bucket(host) do
         nil ->
           case virtual_host_bucket(host, domain) do
             nil ->
               {bucket, key} = RawPath.path_style(conn)
-              {bucket, key, :rest}
+              {bucket, key, :rest, :path}
 
             vbucket ->
-              {vbucket, RawPath.vhost_key(conn), :rest}
+              {vbucket, RawPath.vhost_key(conn), :rest, :virtual_host}
           end
 
         vbucket ->
-          {vbucket, RawPath.vhost_key(conn), :website}
+          {vbucket, RawPath.vhost_key(conn), :website, :website}
       end
 
     level = level_of(bucket, key)
@@ -48,6 +53,7 @@ defmodule Maxio.S3.Plugs.AddressStyle do
     |> assign(:s3_key, key)
     |> assign(:s3_level, level)
     |> assign(:s3_endpoint_kind, endpoint_kind)
+    |> assign(:s3_address_style, address_style)
   end
 
   # virtual-host：host == "<bucket>.<domain>" 时返回 bucket，否则 nil。

@@ -60,6 +60,7 @@ defmodule Maxio.Application do
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
         maybe_bootstrap_root()
+        audit_reserved_bucket()
         log_deferred_features()
         {:ok, pid}
 
@@ -164,6 +165,36 @@ defmodule Maxio.Application do
         "SSE-KMS uses local provider/wrapping key (no rotation/external KMS); " <>
         "MFA Delete requires configured verifier; SSE-C and SSE-KMS object/copy/multipart paths supported; DSSE-KMS returns 501"
     )
+  end
+
+  # 启动期报告被保留路径影子化的对象 key（设计 D8）：只报告，不删除，不阻止启动。
+  # DB 尚未可达时降级为一条结构化 error——审计本身绝不能成为启动失败的新原因，但
+  # "审计没跑成"必须留下**可归因**的痕迹：走项目统一的结构化日志（`Maxio.S3.Log`，
+  # 进 Logger metadata 可按 reason 检索），并把 stacktrace 一并留下（只记 message 的话，
+  # 一句 "** (DBConnection.ConnectionError) ..." 根本定位不到是谁在什么位置炸的）。
+  defp audit_reserved_bucket do
+    Maxio.S3.ReservedBucketAudit.audit()
+  rescue
+    e ->
+      report_reserved_bucket_audit_failure(Exception.format(:error, e, __STACKTRACE__))
+  catch
+    # `rescue` 只接 raise。启动期 DB 尚未就绪时最常见的失败形态恰恰是 **exit**——
+    # Ecto 连接池 checkout 超时 / Repo 进程未起，`Repo.all` 会 `exit({:noproc, ...})` 或
+    # `exit({:timeout, ...})`，那会原样穿过 rescue 中断 `Application.start/2`。
+    # 本函数的全部承诺就是"审计绝不成为启动失败的新原因"，故 exit 与 throw 一并兜住。
+    kind, reason ->
+      report_reserved_bucket_audit_failure(Exception.format(kind, reason, __STACKTRACE__))
+  end
+
+  defp report_reserved_bucket_audit_failure(formatted) do
+    Maxio.S3.Log.error(
+      "reserved path audit did not run; shadowed object keys are NOT reported this boot",
+      reason: formatted,
+      code: "ReservedPathAuditFailed",
+      action: "startup_audit"
+    )
+
+    :ok
   end
 
   # 仅 EctoStore 下在 Repo 起来后幂等引导 root（MemoryStore 自带惰性引导，无需此步）。

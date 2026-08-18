@@ -514,16 +514,21 @@ Maxio.S3.Plugs.Dispatch               # Dispatcher.resolve/3 判定表 → Authz
 ```
 Plug.RequestId
 Maxio.S3.Plugs.RequestLimits
+Maxio.S3.Plugs.AddressStyle       # ← 上移：保留面的认领判定需要寻址结果（见 D8 回写 1）
 Maxio.S3.Plugs.MinioHealth        # ← 新增①：/minio/health/*，无鉴权，早于 SigV4
-Maxio.S3.Plugs.PrometheusMetrics
-Maxio.S3.Plugs.AddressStyle
-... （原有中段不变）
+Maxio.S3.Plugs.PrometheusMetrics  # ← 同样移到 AddressStyle 之后（同一劫持缺陷）
+... （原有中段不变：RequestMetrics / AccessLogDelivery / WebsiteEndpoint / Cors / PostObject）
 Maxio.S3.Plugs.SigV4
 Maxio.Admin.Plug                  # ← 新增②：/minio/admin/v3/*，需要 assigns.principal
 Maxio.IAM.QueryPlug
 Maxio.STS.QueryPlug
 Maxio.S3.Plugs.Dispatch
 ```
+
+> 实现批次修正：health / metrics 原设计挂在 `AddressStyle` **之前**，实测会在 virtual-host 寻址下
+> 劫持任意桶的 `minio/...` key（D8 回写 1）。二者移到 `AddressStyle` 之后、`RequestMetrics` 之前——
+> 既拿到寻址结果，又保持"探针与 metrics 面对数据面统计不可见"的既有语义不变；仍早于 SigV4，
+> 探针依旧免鉴权（`AddressStyle` 不鉴权也不 halt）。
 
 **为什么 health 与 admin 必须拆成两个 plug、且分列 SigV4 两侧**：
 
@@ -544,6 +549,54 @@ Maxio.S3.Plugs.Dispatch
 3. `MinioHealth` / `Admin.Plug` 的路径匹配必须**精确**（`/minio/health/...`、`/minio/admin/...` 前缀 + 完整段匹配），不能用 `String.starts_with?("/minio")` 粗匹配 —— 否则 `/minioxyz` 这个合法桶也会被误吞。对齐 `Prometheus.metrics_path?/1` 已有的谨慎写法（它显式区分 `/minio/v2/metrics` 与 `/minio/v2/metricsfoobar`）。
 
 > **VERIFY-AT-IMPL V-A1**：真实 MinIO 是否把 `minio` 整体保留为桶名（`isMinioReservedBucket`），还是只保留 `/minio` 路径前缀。需核对 `minio/cmd/utils.go`。maxio 的取舍应对齐真实行为。
+
+**D8 实现批次回写（2026-08-18）**——落地时补齐的三条，均有活体取证，后续批次直接以此为准：
+
+1. **认领必须同时约束寻址方式**。原文只说"路径匹配必须精确"，不够：virtual-host 寻址下
+   `Host: <bucket>.<domain>` + `GET /minio/health/live` 指的是**桶 `<bucket>` 里 key 为
+   `minio/health/live` 的对象**。只看 `conn.request_path` 认领会把**任意桶**的这批 key 劫持成
+   200 空 body / admin JSON / metrics 文本——比报错更危险，备份与同步工具会把 200 空 body 当成
+   一个合法的空对象。故三个保留面（health / admin / metrics）**统一挂在 `AddressStyle` 之后**，
+   经 `ReservedNamespace.claimed?/2` 要求 `assigns.s3_address_style == :path`。
+   health / metrics 仍在 SigV4 之前（探针不带凭据），admin 仍在 SigV4 之后（需要 principal）。
+   回归用例：`test/maxio/s3/reserved_namespace_addressing_test.exs`。
+2. **"禁止新建"与"合法已存在"是两个概念，必须各有名字**。保留名单只能用于 CreateBucket
+   准入（`Maxio.Buckets.validate_creatable_name/1`）；写路径 / journal changeset /
+   `ObjectEpoch` target 一律只做**桶名语法**校验（`validate_addressable_name/1`）。
+   两者混用会让"新增一个保留名"把**存量同名桶**静默降级成只读（每次 PutObject 在 journal
+   changeset 上失败 → 500 InternalError），这正是保留 `minio` 之后实测到的症状。
+3. **只报告是不够的，必须给出运维出路**。path-style 部署下被影子化的 key 既读不到也删不掉
+   （DELETE 同样被认领），于是 DeleteBucket 永远 `BucketNotEmpty`。因此除启动期审计外还提供
+   `mix maxio.reserved_bucket.purge`（默认 dry-run，`--confirm-delete` 才删），审计文案直接
+   指向它。**未采用**"plug 在 DELETE 时放行"的方案：它只能救 health 的两条精确路径、救不了
+   admin 的整个前缀，且会让探针行为随数据状态漂移，而 GET 仍被认领——运维能删却读不到自己
+   要删的东西。审计的扫描面由认领规则表派生（`ReservedNamespace.shadowed_targets/0`），
+   总数走精确聚合、逐 key 列举有上限但明说截断量，绝不静默截断。
+4. **保留面只在 path-style 下可达，是对 MinIO 的已知偏离，运维后果必须写明**。
+   MinIO 把 health / admin / metrics 注册在**顶层 mux、不看 Host**（`cmd/routers.go`：
+   `healthcheck-router` / `adminRouter` / `metricsRouter` 都注册在 bucket 路由之前且不做
+   Host 匹配），所以 `mc admin info https://minio.example.com` 也能命中。maxio 的
+   `ReservedNamespace.claimed?/2` 额外要求 `assigns.s3_address_style == :path`（第 1 条的
+   数据完整性取舍），于是当 `config :maxio, :s3, :domain` 配了真实域名时：
+
+   | 场景 | MinIO | maxio |
+   |---|---|---|
+   | `GET https://s3.example.com/minio/health/live`（path-style） | 200 | 200 |
+   | `GET https://minio.example.com/minio/health/live`（vhost，桶名 `minio`） | 200 | 落 S3 面 → `NoSuchBucket`/对象 404 |
+   | `mc admin info https://<bucket>.example.com` | admin JSON | S3 XML 错误，madmin 显示 "bucket does not exist" |
+   | `GET https://<bucket>.example.com/minio/v2/metrics` | metrics 文本 | 落 S3 面 |
+
+   **运维要求**：k8s/LB 探针、`mc admin`、Prometheus scrape target **一律用 path-style
+   endpoint**（Host 里不带桶名）。**不得**把 `:domain` 配成会让运维 Host 被解析成桶名的形式。
+
+   **诊断**：一条被认领的路径仅因寻址方式被跳过时，`claimed?/2` 打结构化 warning
+   （`reason: "reserved_surface_skipped_non_path_addressing"`，带 surface / bucket /
+   address_style / resource），运维可据此把 `NoSuchBucket` 直接归因到寻址方式，
+   而不是去排查"admin 面是不是没上线"。**不接受**"沉默地返回 NoSuchBucket"（铁律 3）。
+
+   为什么不对齐 MinIO：对齐就必须在 vhost 下也认领 `/minio/...`，那会让**任意桶**里
+   `minio/health/live` 这类真实对象被劫持成 200 空 body / admin JSON / metrics 文本
+   ——静默数据劫持的危害远大于"运维必须用 path-style endpoint"的不便。
 
 ### D9 —— 鉴权：**完全复用现有 SigV4 + Policy 评估器**，零新鉴权代码
 
@@ -665,19 +718,25 @@ mainAliasSet
 
 ### 9.2 第一批端点表
 
-| # | 路径 | 方法 | 鉴权 | 授权 action | 响应 | 必要性 |
-|---|---|---|---|---|---|---|
-| 1 | `/minio/health/live` | GET, HEAD | **无** | —— | 200，**空 body** | 运维基线；k8s liveness |
-| 2 | `/minio/health/ready` | GET, HEAD | **无** | —— | 200 / 5xx，空 body | k8s readiness；须真实反映 Repo + 存储后端可达性 |
-| 3 | `/minio/health/cluster` | GET, HEAD | **无** | —— | 200 / 503 / 412，空 body + `X-Minio-Write-Quorum` 等头 | madmin `Healthy()` 用；**可选**，见下 |
-| 4 | `/minio/health/cluster/read` | GET, HEAD | **无** | —— | 同上 + `X-Minio-Read-Quorum` | **可选** |
-| 5 | `/minio/admin/v3/info` | GET | SigV4 | `admin:ServerInfo` | 200 明文 JSON `InfoMessage` | **本批核心** |
-| 6 | `/minio/admin/v4/*` | any | —— | —— | **426 Upgrade Required** | 让未来 v4 madmin 自动回落 v3 |
-| 7 | `/minio/admin/v3/*`（未实现路径） | any | SigV4 | —— | **501 JSON** `NotImplemented` | 绝不 404 假装路径不存在 |
+| # | 状态 | 路径 | 方法 | 鉴权 | 授权 action | 响应 | 必要性 |
+|---|---|---|---|---|---|---|---|
+| 1 | ✅ 已实现 | `/minio/health/live` | GET, HEAD | **无** | —— | 200，**空 body** | 运维基线；k8s liveness |
+| 2 | ✅ 已实现（语义已改，见下） | `/minio/health/ready` | GET, HEAD | **无** | —— | 200，空 body | k8s readiness |
+| 3 | ❌ 本批不做（见下） | `/minio/health/cluster` | GET, HEAD | **无** | —— | —— | madmin `Healthy()` 用 |
+| 4 | ❌ 本批不做（见下） | `/minio/health/cluster/read` | GET, HEAD | **无** | —— | —— | —— |
+| 5 | ❌ 本批不做 | `/minio/admin/v3/info` | GET | SigV4 | `admin:ServerInfo` | 200 明文 JSON `InfoMessage` | 落到 #7 的 501 |
+| 6 | ⚠️ 落 501 而非 426（见下） | `/minio/admin/v4/*` | any | SigV4 | —— | **501 JSON** `NotImplemented` | —— |
+| 7 | ✅ 已实现 | `/minio/admin/*`（全部路径） | any | SigV4 | —— | **501 JSON** `NotImplemented`；匿名 403 JSON | 绝不 404 假装路径不存在 |
 
-**关于 #3/#4（cluster health）**：语义上它们要回答"写/读 quorum 是否满足"。maxio 在 FS 后端下没有 quorum 概念；在 EC/分布式后端下有（`Erasure.Config` 的 `read_quorum` / `write_quorum` + `DriveHealth.probe_topology/1`）。**裁决**：第一批实现，但 FS 后端下必须诚实 —— 返回 200 且**不发** `X-Minio-Write-Quorum` 头（而不是编一个假 quorum 数字）。若这导致 madmin `Healthy()` 行为异常，记为 V-A5 调整。
+> 上表的"状态"列与下面三条裁定是**实现批次回写**（2026-08-18，骨架批次）。设计与实现出现分歧时，
+> 以本节为准，下一批不要再从原始设计文字重新论证一遍。
 
-**关于 #7（501 而非 404）**：`mc admin` 的其他子命令打到未实现端点时，运维必须看到"这个功能没实现"而不是"路径不存在"。404 会让人误以为是版本/路径问题去反复排查。这是铁律 3 在管控面的直接应用。
+**#2 `ready` 的语义改为与 `live` 一致（不探 Repo / 存储后端）**。原文要求"须真实反映 Repo + 存储后端可达性"，实现刻意不这么做，理由：readiness 决定的是**LB 是否把流量摘掉**。把它绑到 Postgres 可达性上，等于让 DB 的一次抖动**同时**摘除所有节点——把一个局部/共享依赖的故障放大成整集群不可用，而且此时节点其实还能服务任何不碰元数据的请求。MinIO 自己的 readiness 也只探**外部**依赖（KMS、etcd），刻意避开存储检查（`cmd/healthcheck-handler.go`）；maxio 当前两者皆无外部形态（KMS 是本地 provider，Repo 是进程内依赖），故 ready 与 live 同语义。
+> **重新开探的触发条件**（写死在 `Maxio.S3.Plugs.MinioHealth` 的 V-H1）：接入**外部** KMS 或外部一致性存储后，`ready` 必须开始探它们并在不可达时返回 5xx，届时须核实 MinIO 的确切状态码与 `X-Minio-Server-Status` 头语义。"Repo 可达性"本身不在触发条件里。
+
+**#3/#4 cluster health 本批不实现**（原文写的是"第一批实现，FS 后端下返回 200 且不发 quorum 头"）。改判理由：这两条端点的**唯一语义**就是回答"写/读 quorum 是否满足"。FS 后端下 maxio 没有 quorum 概念，一个"永远 200"的答复不是"诚实的降级"，而是**用一个恒真的假答案冒充集群健康判定**——运维会据此认为集群写入安全，而它根本没做过判定（铁律 3）。不认领这两条路径的代价是明确的、可见的（madmin `Healthy()` 拿到 S3 的 404/403），比一个静默的假 200 好。EC/分布式后端接入时（`Erasure.Config` 的 `read_quorum` / `write_quorum` + `DriveHealth.probe_topology/1` 已具备）再一并实现，届时 FS 后端应显式返回"不适用"而非 200。
+
+**#6 `/minio/admin/v4/*` 落 501 而非 426**。原文希望用 426 让未来 v4 madmin 自动回落 v3。实测依据：当前 mc 的 madmin **硬编码打 v3**，没有任何客户端会发 v4 请求，因此 426 分支**无法活体验证**——按 AGENTS §4 与铁律 5，不实现无法取证的分支（写了也只是一段没人走过的代码，且它宣称了一种我们没验证过的协商行为）。v4 统一落 #7 的 501 JSON，语义诚实（"这个端点 maxio 没实现"）。等到出现真发 v4 的客户端、能抓到它对 426 的实际反应时再实现，记为 **V-A9**。
 
 ### 9.3 明确**不在**第一批
 

@@ -93,6 +93,9 @@ config :phoenix_live_view,
 # 绑定 9000 报 :eacces。dev 用 9900 规避；prod 默认仍 9000（见 config.exs），可经 MAXIO_S3_PORT 覆盖。
 config :maxio, :s3, data_dir: Path.expand("../priv/s3_data/dev", __DIR__)
 
+# 监听地址 dev 默认仍是 loopback（不把开发实例暴露到局域网）；需要让容器内的真实客户端
+# （mc / aws-cli 经 host.docker.internal，Windows Docker Desktop 不支持 --network host）
+# 直连时，用 MAXIO_S3_IP=0.0.0.0 运行时覆盖（见 config/runtime.exs），不改本行默认值。
 config :maxio, Maxio.S3.Endpoint, port: 9900, ip: {127, 0, 0, 1}
 
 # ── M7 多节点：dev 用 gossip 策略（UDP 多播，单机多 iex --sname 自发现）。──

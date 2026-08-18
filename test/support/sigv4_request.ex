@@ -26,12 +26,16 @@ defmodule Maxio.Test.SigV4Request do
   @host "localhost"
 
   @doc """
-  自签并构造 conn。opts：:query (map)、:headers ([{name,value}])、:body (binary)。
+  自签并构造 conn。opts：:query (map)、:headers ([{name,value}])、:body (binary)、
+  :region（credential scope 的 region 段，默认 us-east-1；传 "" 复现 madmin 的空 region）、
+  :host（默认 localhost 走 path-style；传 "<bucket>.localhost" 走 virtual-host 寻址，
+  host 同时进 canonical headers，签名与服务端 conn.host 逐字一致）。
   自动加 host/x-amz-date/x-amz-content-sha256，签名后加 Authorization。
   """
   def signed_conn(method, path, opts \\ []) do
     query = Keyword.get(opts, :query, %{})
     body = Keyword.get(opts, :body, "")
+    host = Keyword.get(opts, :host, @host)
 
     extra_headers =
       opts
@@ -42,11 +46,14 @@ defmodule Maxio.Test.SigV4Request do
     secret = Keyword.get(opts, :secret, @secret)
     session_token = Keyword.get(opts, :session_token)
     service = Keyword.get(opts, :service, @service)
+    # :region 允许传空串——madmin（mc admin *）的 credential scope region 段恒为空
+    # （".../20260818//s3/aws4_request"，madmin api.go 的 location 全程不赋值）。
+    region = Keyword.get(opts, :region, @region)
 
     now = DateTime.utc_now()
     amz_date = Calendar.strftime(now, "%Y%m%dT%H%M%SZ")
     scope_date = Calendar.strftime(now, "%Y%m%d")
-    scope = "#{scope_date}/#{@region}/#{service}/aws4_request"
+    scope = "#{scope_date}/#{region}/#{service}/aws4_request"
 
     payload_hash =
       Keyword.get(opts, :content_sha256_override) || Signer.hex_sha256(body)
@@ -54,7 +61,7 @@ defmodule Maxio.Test.SigV4Request do
     base_headers =
       maybe_add_session_token(
         [
-          {"host", @host},
+          {"host", host},
           {"x-amz-content-sha256", payload_hash},
           {"x-amz-date", amz_date}
         ] ++ Enum.map(extra_headers, fn {k, v} -> {String.downcase(k), v} end),
@@ -76,7 +83,7 @@ defmodule Maxio.Test.SigV4Request do
 
     canonical = Canonical.canonical_request(canonical_req)
     sts = Signer.string_to_sign(amz_date, scope, canonical, "AWS4-HMAC-SHA256")
-    key = Signer.derive_signing_key(secret, scope_date, @region, service)
+    key = Signer.derive_signing_key(secret, scope_date, region, service)
     signature = Signer.signature(key, sts)
     signed_headers = Canonical.signed_headers(base_headers)
     signed_headers = maybe_transform_signed_headers(signed_headers, opts)
@@ -90,7 +97,7 @@ defmodule Maxio.Test.SigV4Request do
 
     conn =
       conn(method, full_path, body)
-      |> Map.put(:host, @host)
+      |> Map.put(:host, host)
       |> put_private(:maxio_now, now)
 
     # host 不经 put_req_header（Plug.Test 禁止），已由 conn.host 承载并参与签名。
@@ -390,11 +397,13 @@ defmodule Maxio.Test.SigV4Request do
 
   @doc """
   构造一个匿名（无凭据）请求 conn——无 Authorization 头、无 X-Amz-Signature 查询参数。
-  用于测试 public bucket policy / ACL 放行匿名访问。opts: :query、:headers、:body。
+  用于测试 public bucket policy / ACL 放行匿名访问，以及不带凭据的健康探针。
+  opts: :query、:headers、:body、:host（默认 localhost）。
   """
   def anon_conn(method, path, opts \\ []) do
     query = Keyword.get(opts, :query, %{})
     body = Keyword.get(opts, :body, "")
+    host = Keyword.get(opts, :host, @host)
 
     extra_headers =
       opts
@@ -406,7 +415,7 @@ defmodule Maxio.Test.SigV4Request do
 
     conn =
       conn(method, full_path, body)
-      |> Map.put(:host, @host)
+      |> Map.put(:host, host)
       |> put_private(:maxio_now, DateTime.utc_now())
 
     Enum.reduce(extra_headers, conn, fn {k, v}, acc ->

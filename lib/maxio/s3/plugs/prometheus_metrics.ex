@@ -1,11 +1,16 @@
 defmodule Maxio.S3.Plugs.PrometheusMetrics do
   @moduledoc """
   Intercepts MinIO-style Prometheus metrics paths before S3 bucket dispatch.
+
+  认领判定经 `Maxio.S3.ReservedNamespace.claimed?/2`：除路径匹配外还要求请求确实指向
+  **服务器根命名空间**（path-style）。vhost 下 `Host: <bucket>.<domain>` + `GET /minio/v2/metrics`
+  说的是桶 `<bucket>` 里 key 为 `minio/v2/metrics` 的对象——只看 `request_path` 就认领会把
+  任意桶的这批 key 静默劫持成 metrics 文本（铁律 3）。故本 plug 挂在 `AddressStyle` 之后。
   """
 
   import Plug.Conn
 
-  alias Maxio.S3.{Log, Prometheus, PrometheusAuthz, PrometheusToken}
+  alias Maxio.S3.{Log, Prometheus, PrometheusAuthz, PrometheusToken, ReservedNamespace}
 
   @behaviour Plug
 
@@ -16,7 +21,7 @@ defmodule Maxio.S3.Plugs.PrometheusMetrics do
   def call(conn, _opts) do
     path = conn.request_path || ""
 
-    if Prometheus.metrics_path?(path) do
+    if ReservedNamespace.claimed?(conn, :metrics) do
       dispatch(conn, path)
     else
       conn

@@ -126,12 +126,56 @@ defmodule Maxio.S3.ObjectLock do
     }
   end
 
-  @spec locked?(map(), keyword()) :: boolean()
-  def locked?(object, opts \\ []) when is_map(object) do
+  @typedoc """
+  版本为何**不可删除**——判定与解释的**同一个**事实来源。
+
+    * `:reason` —— `:legal_hold`（legal hold ON）或 `:retention`（保留期未过且模式仍生效）；
+    * `:mode` / `:retain_until` —— 该版本上的 Object Lock 元数据原文（可能为 nil）；
+    * `:bypassable?` —— 是否可经 `bypass_governance?: true` 放行。只有 GOVERNANCE 保留期
+      为真（对齐 S3 `x-amz-bypass-governance-retention`）；COMPLIANCE 与 legal hold 恒 false。
+  """
+  @type lock_status ::
+          :unlocked
+          | %{
+              reason: :legal_hold | :retention,
+              mode: String.t() | nil,
+              retain_until: DateTime.t() | nil,
+              bypassable?: boolean()
+            }
+
+  @doc """
+  版本的锁状态。`locked?/2` 是本函数的布尔投影——**绝不允许**任何调用方再写第二套锁判定：
+  拒绝删除（handler / purge 的执行边界）与向运维解释"为什么留着"（审计 / CLI 文案）
+  必须来自同一次判定，否则两者会漂移，而漂移的那一侧一定是静默失败（铁律 3）。
+  """
+  @spec lock_status(map(), keyword()) :: lock_status()
+  def lock_status(object, opts \\ []) when is_map(object) do
     bypass_governance? = Keyword.get(opts, :bypass_governance?, false)
     now = Keyword.get(opts, :now, DateTime.utc_now())
+    mode = object_value(object, :object_lock_mode)
+    retain_until = object_value(object, :object_lock_retain_until)
 
-    legal_hold_on?(object) or retention_active?(object, now, bypass_governance?)
+    cond do
+      legal_hold_on?(object) ->
+        %{reason: :legal_hold, mode: mode, retain_until: retain_until, bypassable?: false}
+
+      retention_active?(object, now, bypass_governance?) ->
+        %{
+          reason: :retention,
+          mode: mode,
+          retain_until: retain_until,
+          # GOVERNANCE 才可绕过；能走到这里说明本次调用没带 bypass（带了就已经放行）。
+          bypassable?: mode == "GOVERNANCE"
+        }
+
+      true ->
+        :unlocked
+    end
+  end
+
+  @spec locked?(map(), keyword()) :: boolean()
+  def locked?(object, opts \\ []) when is_map(object) do
+    lock_status(object, opts) != :unlocked
   end
 
   @spec validate_client_config(map()) :: {:ok, map()} | {:error, :malformed_xml}

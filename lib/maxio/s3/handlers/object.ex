@@ -2,6 +2,24 @@ defmodule Maxio.S3.Handlers.Object do
   @moduledoc """
   Object 级 handler：put（流式）/ get（含 Range）/ head / delete。
   对象字节走 Maxio.Storage（FS 流式），元数据走 Maxio.Objects。
+
+  ## 版本永久删除的**唯一提交路径**（含非 HTTP 调用方）
+
+  `delete_version!/4` 是 `commit_version_delete/5` 这条已被审查过的提交链的**不依赖 conn**
+  的公开入口：对象锁 → `reject_locked_version_delete!`（Object Lock 拒绝）→
+  `ObjectMeta.authoritative_source(:write)` 分流（`:sidecar` 盘上 quorum 删除权威 /
+  `:pg` PG 删行权威）→ 字节清理。HTTP `DELETE ?versionId`、`DeleteObjects` 与
+  **非 HTTP 的运维通路**（`Maxio.S3.ReservedBucketAudit.purge/1` 及其 CLI）共用同一份实现。
+
+  为什么这个入口必须存在：任何绕过它、直接 `Objects.delete_version/3` 的第二条删除通路，
+  都会同时丢掉两件事——(1) Object Lock 强制（COMPLIANCE/legal hold 的版本被静默销毁）、
+  (2) 写权威分流（`:sidecar` 权威下删 PG 行只是索引维护，B5-2 扫描器会从存活的 sidecar
+  把行重新 upsert，"已清除"的版本复活）。这两件事都属铁律 1「统一数据契约」与铁律 3
+  「绝不静默失败」，故删除语义只允许有**一份**（复审 C-1 / I-1）。
+
+  本入口不带 conn，因而**不发 bucket notification / 不做 replication 投递**（那两者的
+  事件属性来自 HTTP 请求上下文）。这是刻意取舍并在此点名：运维通路的删除仍会打
+  `action: :delete_object` 结构化日志，调用方（如 purge）另有自己的 CLI/审计留痕。
   """
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Storage}
@@ -1043,6 +1061,41 @@ defmodule Maxio.S3.Handlers.Object do
             raise Error.new(:request_timeout, resource: "/#{bucket}/#{key}")
         end
     end
+  end
+
+  @doc """
+  版本永久删除的**不依赖 conn 的公开提交入口**（见 moduledoc）。HTTP 路径与非 HTTP 的运维
+  通路共用 `commit_version_delete/5` 这条唯一链路，绝不各写一份删除语义。
+
+  opts：
+
+    * `:now` —— 判定保留期用的当前时刻（默认 `DateTime.utc_now/0`）；
+    * `:bypass_governance?` —— 是否绕过 **GOVERNANCE** 保留期（对齐 S3
+      `x-amz-bypass-governance-retention`）。COMPLIANCE 与 legal hold **永不可绕过**——
+      该语义由 `Maxio.S3.ObjectLock.lock_status/2` 单点保证，本入口只是把标志透传。
+      HTTP 路径还要求调用方具备 `s3:BypassGovernanceRetention` 授权；非 HTTP 调用方
+      （CLI）以"能执行本地 mix 任务 = 已是运维主体"为等价授权边界，须在各自文档写明。
+
+  返回 delete target（`%{deleted?:, was_delete_marker:, size:, etag:, version_id:}`）。
+  版本不存在时幂等成功（对齐 AWS）。失败一律 **raise `Maxio.S3.Error`**（绝不静默）：
+
+    * `AccessDenied` —— 且仅当被 Object Lock 拒绝（`reject_locked_version_delete!` 是本链路
+      唯一的 `:access_denied` 来源），调用方可据此把该版本记为"保留未清除"；
+    * `SlowDown` / `RequestTimeout` / `InternalError` —— quorum / 对象锁 / 后端故障。
+  """
+  @spec delete_version!(String.t(), String.t(), String.t(), keyword()) :: map()
+  def delete_version!(bucket, key, version_id, opts \\ [])
+      when is_binary(bucket) and is_binary(key) and is_binary(version_id) and is_list(opts) do
+    commit_version_delete(bucket, key, version_id, version_delete_lock_opts(opts), nil)
+  end
+
+  # 只透传 Object Lock 判定真正需要的两个键，且形状显式收敛——绝不把调用方的任意 opts
+  # 原样灌进锁判定（多传一个未来新增的键就可能悄悄改变判定语义）。
+  defp version_delete_lock_opts(opts) do
+    [
+      now: Keyword.get(opts, :now) || DateTime.utc_now(),
+      bypass_governance?: Keyword.get(opts, :bypass_governance?, false) == true
+    ]
   end
 
   @spec delete_objects(Plug.Conn.t()) :: Plug.Conn.t()
