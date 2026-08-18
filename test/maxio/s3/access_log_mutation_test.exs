@@ -265,6 +265,13 @@ defmodule Maxio.S3.AccessLogMutationTest do
   # 在 publish 之后、metadata 事务之前扰动目标 journal（attempts+1）：事务 hook 内基于
   # 请求手中旧 journal 行的 CAS 必然 stale_journal → 整个 metadata 事务回滚
   # （object_writer_mutation_test 同源注入手段）。
+  #
+  # 必须用**保留取证的** operational CAS probe `mark_operational_error/3`（design D6 §3.3）：
+  # 它只更新 attempts / next_attempt_at / bounded last_error / updated_at，逐字保留 PG
+  # published 行上已持久化的 `published_fingerprint` 与 canonical successful PublishedProof
+  # wrapper，随后 `request_rollback/3` 的 published-origin 证据校验才有合法 durable evidence。
+  # legacy `mark_error/4` 会**替换** recovery_evidence 并被 `{:error, :invalid_rollback_evidence}`
+  # 合法拒绝。reason 必须是稳定 binary（非 binary 一律 {:error, :invalid_operational_reason}）。
   defp arm_stale_metadata_perturbation(bucket, key) do
     Failpoint.arm(
       :object_mutation_before_metadata_commit,
@@ -276,12 +283,13 @@ defmodule Maxio.S3.AccessLogMutationTest do
                where: j.bucket_name == ^bucket and j.object_key == ^key and j.phase == "published"
            )
 
-         {:ok, _} = ObjectMutation.mark_error(journal, :c4_perturb, %{"stage" => "test"})
+         {:ok, _} = ObjectMutation.mark_operational_error(journal, "c4_perturb")
        end}
     )
   end
 
   # plug 集成版：仅命中目标桶 published 阶段 journal 时扰动（源对象 put 的 journal 放行）。
+  # 同上：保留取证的 operational CAS probe，canonical PublishedProof wrapper 逐字保留。
   defp arm_target_bucket_perturbation(bucket) do
     Failpoint.arm(
       :object_mutation_before_metadata_commit,
@@ -292,7 +300,7 @@ defmodule Maxio.S3.AccessLogMutationTest do
                   where: j.bucket_name == ^bucket and j.phase == "published"
               ) do
            nil -> :ok
-           journal -> {:ok, _} = ObjectMutation.mark_error(journal, :c4_perturb, %{})
+           journal -> {:ok, _} = ObjectMutation.mark_operational_error(journal, "c4_perturb")
          end
        end}
     )

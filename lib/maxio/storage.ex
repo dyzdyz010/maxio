@@ -156,7 +156,7 @@ defmodule Maxio.Storage do
           Maxio.Storage.PublishedProof.aggregate_finalize_result()
           | {:error, {:published_proof_contract_violation, :finalize}}
   def finalize_if_current(ctx, opts \\ []) do
-    guard_callback_result(:finalize, backend().finalize_if_current(ctx, opts))
+    invoke_callback(:finalize, fn -> backend().finalize_if_current(ctx, opts) end)
   end
 
   @doc """
@@ -172,7 +172,22 @@ defmodule Maxio.Storage do
           Maxio.Storage.PublishedProof.aggregate_proof_result()
           | {:error, {:published_proof_contract_violation, :proof}}
   def verify_published(ctx, opts \\ []) do
-    guard_callback_result(:proof, backend().verify_published(ctx, opts))
+    invoke_callback(:proof, fn -> backend().verify_published(ctx, opts) end)
+  end
+
+  # 插件 callback 的**唯一**异常边界（design D1 / G2 §5.1）。它只包住 proof/finalize 两个
+  # backend 调用：正常返回照旧交给既有的 `guard_callback_result/2`；raise、可捕获 exit 与
+  # throw 一律折叠为该 mode 的固定 contract violation。
+  #
+  # 异常本身、reason、stacktrace 与 raw callback term 绝不被记录或返回——调用方按 integrity
+  # fail closed 处理。`restore_if_current/2` 与其余 Storage 函数完全不受影响。
+  defp invoke_callback(mode, callback) do
+    guard_callback_result(mode, callback.())
+  rescue
+    _error -> {:error, {:published_proof_contract_violation, mode}}
+  catch
+    :exit, _reason -> {:error, {:published_proof_contract_violation, mode}}
+    _kind, _value -> {:error, {:published_proof_contract_violation, mode}}
   end
 
   defp guard_callback_result(mode, result) do

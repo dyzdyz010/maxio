@@ -12,12 +12,16 @@ defmodule Maxio.Storage.PublishedProof do
   @integrity_classes [:placement_drift, :corrupt, :mismatch]
   @orphan_reasons [:epoch_absent, :older_token]
 
+  alias Maxio.DurableJSON
+
   @max_endpoints 32
   # 一个 journal wrapper 中 published proof 与 last failure 的 detail 合计上限；初次持久化
   # 成功 proof 只用 31 条，为后续 merge 的强制 witness 预留一条。
   @max_wrapper_details 32
   @max_published_details @max_wrapper_details - 1
   @max_encoded_bytes 60 * 1024
+  # design D6 冻结的 PublishedProof 调用 profile；60 KiB absolute defense 保持不变。
+  @durable_profile [max_depth: 6, max_encoded_bytes: @max_encoded_bytes]
   @max_label_bytes 128
   @identity ~r/\A(?:local|ordinal:(?:0|[1-9][0-9]*))\z/
   @safe_text ~r/\A[a-zA-Z0-9@_.:-]+\z/
@@ -281,6 +285,33 @@ defmodule Maxio.Storage.PublishedProof do
   end
 
   def merge_failure(_target_phase, _evidence, _failure),
+    do: {:error, :invalid_proof_evidence}
+
+  @doc """
+  Recovery / rollback CAS 的**非变异** durable wrapper trust boundary：只判定**原样持久化
+  的 term** 是否是该 phase 合法的 canonical wrapper，返回标量结果，绝不裁剪、重排、修
+  omitted，也绝不返回 replacement map。
+
+  与 `merge_failure/3` 复用同一条严格 persisted-wrapper 判定：phase-aware sum type、
+  31 条 proof / 32 条 wrapper 预算、hidden-slot/witness/守恒、JSON-safe 与 60 KiB 编码门。
+  `prepared`、`claimed`、未知 phase 与一切非 binary phase 一律拒绝；generic operational
+  evidence 属另一个 domain，永远不是 canonical wrapper。
+  """
+  @spec validate_durable_evidence(String.t(), term()) ::
+          :ok | {:error, :invalid_proof_evidence}
+  def validate_durable_evidence(target_phase, evidence)
+
+  def validate_durable_evidence(
+        target_phase,
+        %{"published_proof" => proof_summary, "last_failure" => last_failure} = evidence
+      )
+      when is_binary(target_phase) and map_size(evidence) == 2 do
+    if persisted_wrapper?(target_phase, evidence, proof_summary, last_failure),
+      do: :ok,
+      else: {:error, :invalid_proof_evidence}
+  end
+
+  def validate_durable_evidence(_target_phase, _evidence),
     do: {:error, :invalid_proof_evidence}
 
   @doc """
@@ -973,8 +1004,8 @@ defmodule Maxio.Storage.PublishedProof do
 
   defp persisted_published_proof?(nil), do: true
 
-  defp persisted_published_proof?(%{"degraded" => degraded}) when is_list(degraded),
-    do: length(degraded) <= @max_published_details
+  defp persisted_published_proof?(%{"degraded" => degraded}),
+    do: bounded_detail_list?(degraded, @max_published_details)
 
   defp persisted_published_proof?(_summary), do: false
 
@@ -1108,8 +1139,8 @@ defmodule Maxio.Storage.PublishedProof do
       positive_integer?(summary["required"]) and
       non_negative_integer?(verified) and non_negative_integer?(owned) and
       non_negative_integer?(unavailable) and non_negative_integer?(omitted) and
-      non_negative_integer?(debt) and is_list(degraded) and
-      length(degraded) <= @max_endpoints and
+      non_negative_integer?(debt) and
+      bounded_detail_list?(degraded, @max_endpoints) and
       Enum.all?(degraded, &valid_degraded_endpoint?(&1, mode)) and
       unique_detail_identities?(degraded) and
       retained_priority_valid?(summary) and
@@ -1159,7 +1190,8 @@ defmodule Maxio.Storage.PublishedProof do
 
     non_negative_integer?(finalized) and finalized <= summary["verified"] and
       summary["verified"] - finalized <= summary["debt"] and
-      non_negative_integer?(orphaned) and is_list(orphan_hints) and
+      non_negative_integer?(orphaned) and
+      bounded_detail_list?(orphan_hints, @max_endpoints) and
       non_negative_integer?(orphan_omitted) and
       Enum.all?(orphan_hints, &valid_orphan_endpoint?/1) and
       orphaned == length(orphan_hints) + orphan_omitted and
@@ -1398,10 +1430,17 @@ defmodule Maxio.Storage.PublishedProof do
     MapSet.disjoint?(left_ids, right_ids)
   end
 
+  # 唯一的 post-semantic durable 门。它位于**完整语义校验之后**，同时覆盖
+  # `journal_evidence/3`、`merge_failure/3` 的 old-wrapper 判定与新 wrapper 发出，以及
+  # `validate_durable_evidence/2` 经 `persisted_wrapper?/4` 的只读判定：因此持久化入口
+  # 本身就无法发出一个解不回来的 wrapper，而不只是公共 validator 事后拒绝。
+  #
+  # `json_safe?/2` 是 PublishedProof 自己的 semantic layer（list/map/key/string 长度上限），
+  # 予以保留；共享 helper 只补上 JSONB 严格回读 domain（float、struct、非法 UTF-8、U+0000
+  # 与 1,024-byte 整数 token 上限），并返回**原始 evidence term**，绝不返回 decode 替代值。
   defp validate_evidence(evidence) do
     with true <- json_safe?(evidence, 0),
-         {:ok, bytes} <- Jason.encode(evidence),
-         true <- byte_size(bytes) <= @max_encoded_bytes do
+         {:ok, _encoded} <- DurableJSON.validate(evidence, @durable_profile) do
       {:ok, evidence}
     else
       _invalid -> {:error, :invalid_proof_evidence}
@@ -1429,6 +1468,23 @@ defmodule Maxio.Storage.PublishedProof do
   end
 
   defp json_safe?(_value, _depth), do: false
+
+  # 有界 proper-list 结构谓词。`is_list/1` 只证明「是 list」，**不证明是 proper list**：
+  # improper list 同样满足 `is_list/1`，随后的 `length/1` / `Enum` 会抛
+  # `ArgumentError: :erlang.length([%{} | 7])`。持久化 wrapper 是外部输入，因此所有
+  # list-bearing 字段必须先用本谓词证明结构合法，之后的 `length/1` / `Enum` 才是安全的。
+  #
+  # 它只做判定：接受真正的 `[]` 终止符，遇到 improper tail 直接返回 false，一旦超过语义
+  # 上限立即停止遍历，绝不 raise，也绝不规范化或重建持久化 term。
+  defp bounded_detail_list?(value, limit), do: bounded_detail_list?(value, limit, 0)
+
+  defp bounded_detail_list?([], _limit, _count), do: true
+  defp bounded_detail_list?([_head | _tail], limit, count) when count >= limit, do: false
+
+  defp bounded_detail_list?([_head | tail], limit, count),
+    do: bounded_detail_list?(tail, limit, count + 1)
+
+  defp bounded_detail_list?(_improper, _limit, _count), do: false
 
   defp positive_integer?(value), do: is_integer(value) and value > 0
   defp non_negative_integer?(value), do: is_integer(value) and value >= 0

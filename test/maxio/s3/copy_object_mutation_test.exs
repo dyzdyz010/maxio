@@ -312,10 +312,12 @@ defmodule Maxio.S3.CopyObjectMutationTest do
 
     # 扰动 copy journal（attempts+1）→ 恢复执行：metadata CAS 必然 stale → 失败路径
     # attempt_restore → restore_if_current 遇 successor token → :superseded（绝不触碰 B）。
+    #
+    # 保留取证的 operational CAS probe：只增加 attempts 等运维字段，逐字保留 published
+    # fingerprint 与 canonical wrapper，下面的 rolled_back + restore=superseded 证据断言
+    # 才成立（legacy `mark_error/4` 会替换 recovery_evidence 并使 rollback 被合法拒绝）。
     {:ok, _} =
-      ObjectMutation.mark_error(ObjectMutation.get(copy_journal.id), :c3_perturb, %{
-        "stage" => "test"
-      })
+      ObjectMutation.mark_operational_error(ObjectMutation.get(copy_journal.id), "c3_perturb")
 
     send(copy_pid, :resume)
 
@@ -512,6 +514,13 @@ defmodule Maxio.S3.CopyObjectMutationTest do
   # 在 publish 之后、metadata 事务之前扰动目标 journal（attempts+1）：事务 hook 内基于
   # 请求手中旧 journal 行的 CAS 必然 stale_journal → 整个 metadata 事务回滚
   # （put_object_mutation_e2e_test / C2 同源注入手段）。
+  #
+  # 必须用**保留取证**的 operational CAS probe `mark_operational_error/3`（design D6
+  # §3.3）：SQL update set 只含 attempts / next_attempt_at / bounded last_error /
+  # updated_at，逐字保留 published 行上的 `published_fingerprint` 与 canonical successful
+  # wrapper，于是随后的 `request_rollback/3` 仍有合法 durable evidence，可同步 restore 旧
+  # 对象。legacy `mark_error/4` 会替换 recovery_evidence 并被 published-origin 校验合法
+  # 拒绝——那是夹具违约，不是状态机回归。reason 必须是稳定 binary。
   defp arm_stale_metadata_perturbation(bucket, key) do
     Failpoint.arm(
       :object_mutation_before_metadata_commit,
@@ -523,7 +532,7 @@ defmodule Maxio.S3.CopyObjectMutationTest do
                where: j.bucket_name == ^bucket and j.object_key == ^key and j.phase == "published"
            )
 
-         {:ok, _} = ObjectMutation.mark_error(journal, :c3_perturb, %{"stage" => "test"})
+         {:ok, _} = ObjectMutation.mark_operational_error(journal, "c3_perturb")
        end}
     )
   end

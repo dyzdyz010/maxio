@@ -342,6 +342,13 @@ defmodule Maxio.S3.Inventory.ReportMutationTest do
   # 在 publish 之后、metadata 事务之前扰动目标 journal（attempts+1）：事务 hook 内基于
   # 请求手中旧 journal 行的 CAS 必然 stale_journal → 整个 metadata 事务回滚
   # （put_object_mutation_e2e_test 同源注入手段）。仅命中指定 key，其余对象照常提交。
+  #
+  # 必须用**保留取证的** operational CAS probe `mark_operational_error/3`（design D6 §3.3）：
+  # 它只更新 attempts / next_attempt_at / bounded last_error / updated_at，逐字保留 PG
+  # published 行上已持久化的 `published_fingerprint` 与 canonical successful PublishedProof
+  # wrapper，随后 `request_rollback/3` 的 published-origin 证据校验才有合法 durable evidence。
+  # legacy `mark_error/4` 会**替换** recovery_evidence 并被 `{:error, :invalid_rollback_evidence}`
+  # 合法拒绝。reason 必须是稳定 binary（非 binary 一律 {:error, :invalid_operational_reason}）。
   defp arm_stale_metadata_perturbation(bucket, key) do
     Failpoint.arm(
       :object_mutation_before_metadata_commit,
@@ -356,7 +363,7 @@ defmodule Maxio.S3.Inventory.ReportMutationTest do
              :ok
 
            journal ->
-             {:ok, _} = ObjectMutation.mark_error(journal, :c2_perturb, %{"stage" => "test"})
+             {:ok, _} = ObjectMutation.mark_operational_error(journal, "c2_perturb")
          end
        end}
     )

@@ -2361,4 +2361,582 @@ defmodule Maxio.Storage.EpochStorePublishedProofTest do
     Path.type(relative) == :relative and relative != "." and
       not String.starts_with?(relative, "..")
   end
+
+  # --- Task 3 R1：非变异 durable validator + exact 60 KiB 尺寸门 ---
+  #
+  # 正式 design D6/D7 与 plan Task 3 Step 1/Step 3 要求
+  # `PublishedProof.validate_durable_evidence(target_phase, evidence)` 是**只读**
+  # trust boundary，返回值只能是标量 `:ok | {:error, :invalid_proof_evidence}`：不裁剪、
+  # 不重排、不修 omitted，也绝不返回 replacement map。
+  #
+  # 【G1-FIX-R2 修订】原先把 exact-61,440 huge-counter wrapper 当作 size-positive 的断言
+  # 已被批准的 durable-JSON adjudication 推翻：只改十进制位宽推到 61,440 / 61,441 byte 的
+  # wrapper，其计数器十进制 token 远超 1,024 bytes，Jason 根本解不回来，因此**两者都不是
+  # durable evidence**，都必须被公共 durable 边界拒绝。61,440/61,441 的**尺寸谓词**改由中性
+  # 共享 helper 用 codec-roundtrippable 字符串 payload 在 `test/maxio/durable_json_test.exs`
+  # 中隔离；PublishedProof 的 exact call-site profile 由独立 G1-FIX-G code review 判定，
+  # 不靠脆弱的 source-regex RED。Journal 的 65,536/65,537 generic 门是另一个域，其 fixture
+  # 保留在 `test/maxio/object_mutation_test.exs`。
+
+  defp task3_durable_validator!() do
+    assert Code.ensure_loaded?(PublishedProof)
+
+    assert function_exported?(PublishedProof, :validate_durable_evidence, 2),
+           "T3-R1: Maxio.Storage.PublishedProof.validate_durable_evidence/2 尚未实现" <>
+             "（正式 design D7 / plan Task 3 Step 1）"
+  end
+
+  defp task3_validate_durable(target_phase, evidence) do
+    task3_durable_validator!()
+    PublishedProof.validate_durable_evidence(target_phase, evidence)
+  end
+
+  defp task3_success_wrapper!() do
+    {:ok, wrapper} =
+      PublishedProof.journal_evidence("finalize_pending", maxed_published_proof!(), nil)
+
+    wrapper
+  end
+
+  defp task3_nil_proof_wrapper!() do
+    {:error, {:published_proof_failed, :unavailable, failure}} =
+      PublishedProof.classify(1, [
+        {"local", PublishedProof.failed(:unavailable, "local", %{owned: true})}
+      ])
+
+    {:ok, wrapper} = PublishedProof.journal_evidence("rollback_pending", nil, failure)
+    wrapper
+  end
+
+  defp task3_cleanup_wrapper!() do
+    {:ok, wrapper} =
+      PublishedProof.journal_evidence("finalize_pending", published_proof!(), cleanup_failure!())
+
+    wrapper
+  end
+
+  # canonical verified aggregate proof：degraded 为空、debt/omitted/unavailable 全零，
+  # observed_owned 必须恰等于 verified，required ≤ verified。计数器位宽是唯一自由维度。
+  defp canonical_verified_proof(required, verified) do
+    %{
+      "scope" => "aggregate",
+      "mode" => "proof",
+      "status" => "verified",
+      "required" => required,
+      "verified" => verified,
+      "observed_owned" => verified,
+      "unavailable" => 0,
+      "degraded" => [],
+      "omitted" => 0,
+      "debt" => 0
+    }
+  end
+
+  # 按 `byte_size(Jason.encode!/1)` 精确校准到 total：固定开销实测得出，剩余字节由
+  # required（1~2 位）与 verified/observed_owned（同一位宽计两次）的十进制位宽承担。
+  defp canonical_wrapper_of_bytes!(total) do
+    probe = %{"published_proof" => canonical_verified_proof(1, 1), "last_failure" => nil}
+    overhead = byte_size(Jason.encode!(probe)) - 3
+    remaining = total - overhead
+
+    {required_digits, verified_digits} =
+      if rem(remaining, 2) == 1,
+        do: {1, div(remaining - 1, 2)},
+        else: {2, div(remaining - 2, 2)}
+
+    assert verified_digits >= required_digits
+
+    required = Integer.pow(10, required_digits - 1)
+    verified = Integer.pow(10, verified_digits - 1)
+
+    wrapper = %{
+      "published_proof" => canonical_verified_proof(required, verified),
+      "last_failure" => nil
+    }
+
+    assert byte_size(Jason.encode!(wrapper)) == total
+    wrapper
+  end
+
+  @tag :task3_red_core
+  test "task3 red: durable validator accepts the exact persisted wrapper as a scalar with no replacement" do
+    wrapper = task3_success_wrapper!()
+    rebuilt = task3_success_wrapper!()
+
+    # 成功 proof 初次持久化只保留 31 条 detail：合法 durable 形态。
+    assert length(wrapper["published_proof"]["degraded"]) == 31
+    assert is_nil(wrapper["last_failure"])
+
+    # 返回值必须是标量 `:ok`，绝不是 `{:ok, replacement}`。
+    assert task3_validate_durable("finalize_pending", wrapper) == :ok
+
+    # 被接受的持久化 fixture 的 term 与编码字节必须与独立重建结果完全一致。
+    assert wrapper == rebuilt
+    assert Jason.encode!(wrapper) == Jason.encode!(rebuilt)
+
+    # nil-proof failure wrapper 是 rollback domain 的合法 durable 形态。
+    assert task3_validate_durable("rollback_pending", task3_nil_proof_wrapper!()) == :ok
+
+    # 已 merge 的 wrapper（成功 proof + finalize last failure）同样必须原样通过。
+    {:ok, merged} = PublishedProof.merge_failure("finalize_pending", wrapper, cleanup_failure!())
+    assert task3_validate_durable("finalize_pending", merged) == :ok
+  end
+
+  @tag :task3_red_core
+  test "task3 red: durable validator rejects malformed wrappers with the exact scalar error" do
+    wrapper = task3_success_wrapper!()
+    proof = wrapper["published_proof"]
+
+    rejected = [
+      # 缺 key / 多 key：canonical wrapper 精确两个 key。
+      %{"published_proof" => proof},
+      %{"last_failure" => nil},
+      Map.put(wrapper, "extra", "x"),
+      # nil/nil 从来不是合法 proof evidence。
+      %{"published_proof" => nil, "last_failure" => nil},
+      # 伪造的 32 条"已持久化" proof 必须拒绝，而不是被静默裁成 31 条。
+      %{"published_proof" => maxed_published_proof!(), "last_failure" => nil},
+      # endpoint 残片永远不是 aggregate durable 形态。
+      %{
+        "published_proof" => proof,
+        "last_failure" => %{"scope" => "endpoint", "mode" => "finalize", "status" => "failed"}
+      },
+      # generic operational evidence 属另一个 domain，绝不能冒充 canonical wrapper。
+      %{
+        "authority_mode" => "pg",
+        "stage" => "verify_published",
+        "outcome" => "contract_violation",
+        "mode" => "proof"
+      },
+      # 非 map / 非 wrapper。
+      nil,
+      "published"
+    ]
+
+    for evidence <- rejected do
+      assert task3_validate_durable("finalize_pending", evidence) ==
+               {:error, :invalid_proof_evidence}
+    end
+  end
+
+  @tag :task3_red_core
+  test "task3 red: durable validator phase domain is exactly the canonical wrapper phases" do
+    success = task3_success_wrapper!()
+    nil_proof = task3_nil_proof_wrapper!()
+
+    # PG 成功 proof 必须存在的 phase。
+    for phase <- ~w(published metadata_committed finalize_pending finalized) do
+      assert task3_validate_durable(phase, success) == :ok
+    end
+
+    # rollback/quarantine domain 同时接受成功 wrapper 与 nil-proof failure wrapper。
+    for phase <- ~w(rollback_pending rolled_back quarantined) do
+      assert task3_validate_durable(phase, success) == :ok
+      assert task3_validate_durable(phase, nil_proof) == :ok
+    end
+
+    # proof 之前的 phase、未知 phase 与一切非 binary phase 一律拒绝。
+    for phase <- ["prepared", "claimed", "", "PUBLISHED", "unknown"] do
+      assert task3_validate_durable(phase, success) == {:error, :invalid_proof_evidence}
+    end
+
+    for phase <- [:finalize_pending, nil, 1, ["published"]] do
+      assert task3_validate_durable(phase, success) == {:error, :invalid_proof_evidence}
+    end
+
+    # nil-proof failure 在要求成功 proof 的 PG phase 上非法。
+    for phase <- ~w(published metadata_committed finalize_pending finalized) do
+      assert task3_validate_durable(phase, nil_proof) == {:error, :invalid_proof_evidence}
+    end
+  end
+
+  @tag :task3_red_core
+  test "task3 red: durable validator rejects both huge-counter wrappers as non-durable" do
+    at_ceiling = canonical_wrapper_of_bytes!(61_440)
+    over_ceiling = canonical_wrapper_of_bytes!(61_441)
+
+    assert byte_size(Jason.encode!(at_ceiling)) == 61_440
+    assert byte_size(Jason.encode!(over_ceiling)) == 61_441
+
+    # 两个 fixture 只在 required 计数器的十进制位宽上不同，语义上都是 canonical verified。
+    assert at_ceiling["published_proof"]["status"] == "verified"
+    assert over_ceiling["published_proof"]["status"] == "verified"
+    assert at_ceiling["published_proof"]["degraded"] == []
+    assert over_ceiling["published_proof"]["degraded"] == []
+
+    assert at_ceiling["published_proof"]["verified"] ==
+             at_ceiling["published_proof"]["observed_owned"]
+
+    assert over_ceiling["published_proof"]["verified"] ==
+             over_ceiling["published_proof"]["observed_owned"]
+
+    # 二者的计数器十进制 token 都远超 1,024 bytes，因此 Jason 无法把自己的编码结果解回来：
+    # 它们从来就不是可持久化的 durable evidence，**都不是 size-positive**。
+    for wrapper <- [at_ceiling, over_ceiling] do
+      counter = wrapper["published_proof"]["verified"]
+      assert byte_size(Integer.to_string(counter)) > 1_024
+      assert match?({:error, _reason}, Jason.decode(Jason.encode!(wrapper)))
+    end
+
+    # 因此在全部七个 canonical phase 上都必须被公共 durable 边界拒绝。
+    for phase <-
+          ~w(published metadata_committed finalize_pending finalized
+             rollback_pending rolled_back quarantined) do
+      assert task3_validate_durable(phase, at_ceiling) == {:error, :invalid_proof_evidence},
+             "exact-61,440 huge-counter wrapper 不是 durable evidence：#{phase}"
+
+      assert task3_validate_durable(phase, over_ceiling) == {:error, :invalid_proof_evidence}
+    end
+  end
+
+  @tag :task3_red_core
+  test "task3 red: durable validator rejects missing witnesses, impossible slots and phase mismatches" do
+    cleanup_wrapper = task3_cleanup_wrapper!()
+    success = task3_success_wrapper!()
+
+    # 起点必须是被接受的 canonical 控制，随后只改动一个具名谓词。
+    assert task3_validate_durable("finalize_pending", cleanup_wrapper) == :ok
+
+    # 1) 缺失强制 decisive/debt witness：cleanup pending 的可见 cleanup detail 被挪进
+    #    匿名 omitted，debt 仍守恒，但决定性事实消失。
+    failure = cleanup_wrapper["last_failure"]
+
+    witnessless =
+      Map.put(cleanup_wrapper, "last_failure", %{
+        failure
+        | "degraded" => [],
+          "omitted" => failure["omitted"] + length(failure["degraded"])
+      })
+
+    assert task3_validate_durable("finalize_pending", witnessless) ==
+             {:error, :invalid_proof_evidence}
+
+    # 2) 不可实现的 hidden slot 分配。基线必须是 omitted=0 的最小 proof，否则多出的一个
+    #    owned failure 仍可由既有隐藏名额承载，谓词就没有被真正隔离。
+    {:ok, minimal} = PublishedProof.journal_evidence("finalize_pending", published_proof!(), nil)
+    minimal_proof = minimal["published_proof"]
+
+    assert minimal_proof["omitted"] == 0
+    assert minimal_proof["degraded"] == []
+    assert minimal_proof["observed_owned"] == minimal_proof["verified"]
+    assert task3_validate_durable("finalize_pending", minimal) == :ok
+
+    # observed_owned 超过 verified + 可见 owned failure + omitted，隐藏名额无法承载。
+    impossible_slots =
+      Map.put(minimal, "published_proof", %{
+        minimal_proof
+        | "observed_owned" => minimal_proof["verified"] + minimal_proof["omitted"] + 1
+      })
+
+    assert task3_validate_durable("finalize_pending", impossible_slots) ==
+             {:error, :invalid_proof_evidence}
+
+    # 同一条不变量在 31-detail 的成功 wrapper 上同样成立：越过其可见上界一位即非法。
+    proof = success["published_proof"]
+    visible_owned = Enum.count(proof["degraded"], &(&1["owned"] == true))
+
+    assert task3_validate_durable(
+             "finalize_pending",
+             Map.put(success, "published_proof", %{
+               proof
+               | "observed_owned" => proof["verified"] + visible_owned + proof["omitted"] + 1
+             })
+           ) == {:error, :invalid_proof_evidence}
+
+    # 3) phase 专属 finalize last_failure：精确接受 metadata/finalize 之后的四个 phase。
+    for phase <- ~w(metadata_committed finalize_pending finalized quarantined) do
+      assert task3_validate_durable(phase, cleanup_wrapper) == :ok
+    end
+
+    # 并在 published 与整个 rollback domain 上拒绝。
+    for phase <- ~w(published rollback_pending rolled_back) do
+      assert task3_validate_durable(phase, cleanup_wrapper) == {:error, :invalid_proof_evidence}
+    end
+
+    # 4) 非法 nil-proof / finalize 组合：nil proof 只能承载 proof-mode failure/superseded。
+    nil_proof_finalize = %{"published_proof" => nil, "last_failure" => failure}
+
+    for phase <- ~w(rollback_pending rolled_back quarantined finalize_pending) do
+      assert task3_validate_durable(phase, nil_proof_finalize) ==
+               {:error, :invalid_proof_evidence}
+    end
+  end
+
+  @tag :task3_red_core
+  test "task3 control: canonical wrapper budget and merge byte stability hold under the frozen contract" do
+    wrapper = task3_success_wrapper!()
+    {:ok, merged} = PublishedProof.merge_failure("finalize_pending", wrapper, cleanup_failure!())
+
+    # 初次持久化成功 proof 最多 31 条，为后续 merge 的强制 witness 预留一条。
+    assert length(wrapper["published_proof"]["degraded"]) == 31
+
+    retained =
+      length(merged["published_proof"]["degraded"]) +
+        length(merged["last_failure"]["degraded"]) +
+        length(Map.get(merged["last_failure"], "orphan_hints", []))
+
+    assert retained <= 32
+
+    # merge 保持初始 published proof 逐字节不变，并留在 60 KiB 之内。
+    assert merged["published_proof"] == wrapper["published_proof"]
+
+    assert Jason.encode!(merged["published_proof"]) ==
+             Jason.encode!(wrapper["published_proof"])
+
+    assert byte_size(Jason.encode!(merged)) <= 61_440
+
+    # nil-proof failure 与 cleanup wrapper 亦是合法 fixture，证明 RED 失败来自缺失能力。
+    assert %{"published_proof" => nil, "last_failure" => %{"mode" => "proof"}} =
+             task3_nil_proof_wrapper!()
+
+    assert %{"last_failure" => %{"mode" => "finalize", "status" => "cleanup_pending"}} =
+             task3_cleanup_wrapper!()
+  end
+
+  @tag :task3_red_core
+  test "task3 red: journal_evidence never persists a huge-counter wrapper at either byte width" do
+    at_ceiling = canonical_wrapper_of_bytes!(61_440)
+    over_ceiling = canonical_wrapper_of_bytes!(61_441)
+
+    assert byte_size(Jason.encode!(at_ceiling)) == 61_440
+    assert byte_size(Jason.encode!(over_ceiling)) == 61_441
+
+    # 持久化入口与 durable validator 共用同一条 durable-JSON 边界：两个 huge-counter
+    # wrapper 的编码字节都无法被解回，因此都不得被发出为 durable evidence。
+    for wrapper <- [at_ceiling, over_ceiling] do
+      assert PublishedProof.journal_evidence(
+               "finalize_pending",
+               wrapper["published_proof"],
+               nil
+             ) == {:error, :invalid_proof_evidence}
+    end
+  end
+
+  # --- Task 3 / G1-FIX-R2：公共 PublishedProof durability（与共享 helper 能力独立）---
+  #
+  # 这些用例只行使**既有公共 PublishedProof 边界**，不触碰 `Maxio.DurableJSON`：缺失共享
+  # helper 绝不能掩盖公共 PublishedProof 是否真的被行使（adjudication「独立 failure
+  # signature」）。真实 transaction-scoped JSONB 往返控制需要 Repo，落在
+  # `test/maxio/object_mutation_test.exs`。
+
+  # adjudication §「clean intended-canonical wrapper」的确定性配方：所有出现的 `n` 都恰好是
+  # 1,024-byte 正整数 token，32 条 retained detail 全部来自公共 endpoint constructor，
+  # 且不含任何已知 over-permissive detail 字段。
+  defp g1r2_huge_token_integer, do: Integer.pow(10, 1_023)
+
+  defp g1r2_safe_label, do: String.duplicate("a", 128)
+
+  defp g1r2_detail_identity(index) do
+    "ordinal:" <>
+      String.duplicate("9", 118) <> String.pad_leading(Integer.to_string(index), 2, "0")
+  end
+
+  defp g1r2_clean_degraded_proof do
+    n = g1r2_huge_token_integer()
+
+    %{
+      "scope" => "aggregate",
+      "mode" => "proof",
+      "status" => "degraded",
+      "required" => n,
+      "verified" => n,
+      "observed_owned" => n,
+      "unavailable" => n,
+      "degraded" => [],
+      "omitted" => n,
+      "debt" => n
+    }
+  end
+
+  defp g1r2_clean_finalize_failure do
+    n = g1r2_huge_token_integer()
+    label = g1r2_safe_label()
+
+    details =
+      for index <- 1..32 do
+        identity = g1r2_detail_identity(index)
+        assert byte_size(identity) == 128
+
+        {:error, {:published_proof_failed, :unavailable, summary}} =
+          PublishedProof.endpoint_finalize_failed(:unavailable, identity, %{
+            owned: false,
+            code: label,
+            layout: label,
+            phase: label
+          })
+
+        refute Map.has_key?(summary, "orphan_reason")
+        assert summary["owned"] == false
+        summary
+      end
+
+    %{
+      "scope" => "aggregate",
+      "mode" => "finalize",
+      "status" => "failed",
+      "class" => "unavailable",
+      "required" => n + 1,
+      "verified" => n,
+      "finalized" => n,
+      "observed_owned" => n,
+      "unavailable" => n,
+      "omitted" => n,
+      "debt" => n + 32,
+      "orphaned" => n,
+      "orphan_omitted" => n,
+      "orphan_hints" => [],
+      "degraded" => details
+    }
+  end
+
+  # 只经公共 `journal_evidence/3` 发出，绝不手工拼装 wrapper map。
+  defp g1r2_clean_large_wrapper! do
+    {:ok, wrapper} =
+      PublishedProof.journal_evidence(
+        "finalize_pending",
+        g1r2_clean_degraded_proof(),
+        g1r2_clean_finalize_failure()
+      )
+
+    wrapper
+  end
+
+  @tag :task3_g1_review_red
+  test "g1r2 control: a clean intended-canonical wrapper is above 32 KiB, within 60 KiB and Jason-strict" do
+    wrapper = g1r2_clean_large_wrapper!()
+    encoded = Jason.encode!(wrapper)
+
+    # 实测编码尺寸严格大于 32 KiB 且不超过 60 KiB：因此把 formal ceiling 降到 32 KiB
+    # 会让这个已被证明干净的 canonical wrapper 变成不必要的回归。
+    assert byte_size(encoded) > 32 * 1024
+    assert byte_size(encoded) <= 60 * 1024
+
+    # 公共 durable validator 原样接受，且严格 codec 往返。
+    assert PublishedProof.validate_durable_evidence("finalize_pending", wrapper) == :ok
+    assert Jason.decode!(encoded) === wrapper
+
+    # 该 fixture 的每一个整数 token 都在 1,024-byte 边界内，detail 全部来自公共 constructor。
+    assert length(wrapper["last_failure"]["degraded"]) == 32
+    assert wrapper["published_proof"]["degraded"] == []
+    assert wrapper["last_failure"]["orphan_hints"] == []
+
+    # 这不是一个穷尽的公共最大值声明：只是一个被四重取证的干净正控。
+    assert byte_size(Integer.to_string(wrapper["published_proof"]["verified"])) == 1_024
+  end
+
+  @tag :task3_g1_review_red
+  test "g1r2 red: neither huge-counter wrapper is a public PublishedProof size-positive" do
+    at_ceiling = canonical_wrapper_of_bytes!(61_440)
+    over_ceiling = canonical_wrapper_of_bytes!(61_441)
+
+    assert byte_size(Jason.encode!(at_ceiling)) == 61_440
+    assert byte_size(Jason.encode!(over_ceiling)) == 61_441
+
+    # 独立于共享 helper 的公共边界断言：两者都必须被 `validate_durable_evidence/2` 拒绝。
+    for wrapper <- [at_ceiling, over_ceiling] do
+      assert PublishedProof.validate_durable_evidence("finalize_pending", wrapper) ==
+               {:error, :invalid_proof_evidence}
+
+      assert PublishedProof.validate_durable_evidence("rollback_pending", wrapper) ==
+               {:error, :invalid_proof_evidence}
+    end
+  end
+
+  # --- Task 3 / G1-FIX-G-R1：公共 durable validator 必须对任意 term 总函数化 ---
+  #
+  # 独立审查 I1-A：`degraded` 是外部持久化 term，`is_list/1` 只证明它是 list，**不证明它是
+  # proper list**——improper list 同样满足 `is_list/1`，随后的 `length/1` 会抛
+  # `ArgumentError: :erlang.length([%{} | 7])`。该异常穿过 persisted-wrapper 校验路径，
+  # 一路逃逸到 `ObjectMutation.request_rollback/3`，违反「畸形外部证据必须精确
+  # fail closed」的公共契约。
+  #
+  # 下面用**公共 constructor 产出的合法 canonical wrapper**做基线，只把目标 list 字段替换成
+  # improper list，因此拒绝不可能来自任何无关的先前原因。
+
+  defp improper_list_from(list), do: [hd(list) | 7]
+
+  @tag :task3_g1_green_review_correction
+  test "g1 correction: an improper published_proof.degraded is rejected without raising" do
+    wrapper = task3_success_wrapper!()
+    proof = wrapper["published_proof"]
+
+    # 基线本身必须是被接受的 canonical wrapper。
+    assert PublishedProof.validate_durable_evidence("finalize_pending", wrapper) == :ok
+    assert length(proof["degraded"]) == 31
+
+    malformed =
+      Map.put(wrapper, "published_proof", %{
+        proof
+        | "degraded" => improper_list_from(proof["degraded"])
+      })
+
+    refute Enum.empty?(proof["degraded"])
+
+    assert PublishedProof.validate_durable_evidence("finalize_pending", malformed) ==
+             {:error, :invalid_proof_evidence}
+  end
+
+  @tag :task3_g1_green_review_correction
+  test "g1 correction: improper lists in every persisted-external list field fail closed" do
+    cleanup = task3_cleanup_wrapper!()
+    failure = cleanup["last_failure"]
+
+    assert PublishedProof.validate_durable_evidence("finalize_pending", cleanup) == :ok
+    refute Enum.empty?(failure["degraded"])
+
+    # 每一个可从持久化 wrapper 抵达的 list 字段都必须结构性总函数化，而不只是首个被复现的
+    # `published_proof.degraded`。
+    variants = [
+      {"last_failure.degraded",
+       Map.put(cleanup, "last_failure", %{
+         failure
+         | "degraded" => improper_list_from(failure["degraded"])
+       })},
+      {"last_failure.orphan_hints",
+       Map.put(cleanup, "last_failure", %{failure | "orphan_hints" => [%{} | 7]})},
+      {"published_proof.degraded",
+       Map.put(cleanup, "published_proof", %{
+         cleanup["published_proof"]
+         | "degraded" => [%{} | 7]
+       })}
+    ]
+
+    for {label, malformed} <- variants do
+      assert PublishedProof.validate_durable_evidence("finalize_pending", malformed) ==
+               {:error, :invalid_proof_evidence},
+             "improper list 必须精确 fail closed 而不是抛异常：#{label}"
+    end
+  end
+
+  @tag :task3_g1_green_review_correction
+  test "g1 correction: the public durable validator is total for arbitrary hostile terms" do
+    wrapper = task3_success_wrapper!()
+    proof = wrapper["published_proof"]
+
+    hostile = [
+      Map.put(wrapper, "published_proof", %{proof | "degraded" => [%{} | %{}]}),
+      Map.put(wrapper, "published_proof", %{proof | "degraded" => {:not, :a, :list}}),
+      Map.put(wrapper, "published_proof", %{proof | "degraded" => "degraded"}),
+      Map.put(wrapper, "published_proof", %{proof | "debt" => [1 | 2]})
+    ]
+
+    for {malformed, index} <- Enum.with_index(hostile) do
+      assert PublishedProof.validate_durable_evidence("finalize_pending", malformed) ==
+               {:error, :invalid_proof_evidence},
+             "hostile term #{index} 必须精确 fail closed"
+    end
+  end
+
+  @tag :task3_g1_review_red
+  test "g1r2 control: an ordinary canonical wrapper is still accepted unchanged" do
+    {:ok, {:verified, proof}} =
+      PublishedProof.classify(1, [{"local", PublishedProof.verified("local", %{})}])
+
+    {:ok, wrapper} = PublishedProof.journal_evidence("published", proof, nil)
+    encoded = Jason.encode!(wrapper)
+
+    assert PublishedProof.validate_durable_evidence("published", wrapper) == :ok
+    assert Jason.encode!(wrapper) == encoded
+    assert Jason.decode!(encoded) === wrapper
+  end
 end

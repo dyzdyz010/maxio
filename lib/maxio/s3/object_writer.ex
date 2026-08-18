@@ -11,7 +11,7 @@ defmodule Maxio.S3.ObjectWriter do
   alias Maxio.Cluster.Placement
   alias Maxio.ObjectMutation.Commit, as: ObjectMutationCommit
   alias Maxio.Policy.ACL
-  alias Maxio.S3.{Error, Log, SSE}
+  alias Maxio.S3.{Error, Log, ObjectMutationError, SSE}
   alias Maxio.Storage.ObjectCommit.Control
 
   @type write_opts :: [
@@ -105,9 +105,9 @@ defmodule Maxio.S3.ObjectWriter do
       {:ok, {:error, :key_too_long}} ->
         raise Error.new(:key_too_long, resource: "/#{bucket}/#{key}")
 
-      {:ok, {:error, reason}} when reason in [:write_quorum, :rename_busy] ->
-        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
-
+      # G4a-2W：write_quorum / rename_busy 不再在此提前分流——每一个剩余的 storage /
+      # mutation 错误都必须经由 raise_storage_write_error/3 这个唯一的适配器边界，
+      # 否则它们会绕过共享分类政策。legacy quorum 分类原样保留在该 helper 内。
       {:ok, {:error, reason}} ->
         raise_storage_write_error(reason, bucket, key)
 
@@ -385,16 +385,42 @@ defmodule Maxio.S3.ObjectWriter do
     end
   end
 
+  # ObjectWriter 自身的对象 mutation 外部边界（G4a-2W 修正案 §2.1）：
+  #
+  #   * resource 只构造一次，所有 `Error.new/2` 复用它；
+  #   * 恰好一次调用共享纯适配器 `ObjectMutationError.to_error/2`——类别决策只能来自
+  #     它，本 helper 绝不匹配稳定信封、绝不 inspect opaque summary、绝不直连
+  #     Commit / Recovery / storage 层；
+  #   * `{:ok, error}` 即适配器投影结果，原样 raise；
+  #   * 只有 `:unrelated`（与 G4 语义无关）才落回既有 legacy 分类：quorum/rename busy →
+  #     SlowDownWrite，placement 不可用 → SlowDownWrite，placement 内部错误 → InternalError；
+  #   * 最终未知项走目录默认 `InternalError`——**不带 message**，由 catalog 提供默认文案，
+  #     绝不把 raw reason `inspect` 进公共 message。
   defp raise_storage_write_error(reason, bucket, key) do
+    resource = "/#{bucket}/#{key}"
+
+    case ObjectMutationError.to_error(reason, resource) do
+      {:ok, error} ->
+        raise error
+
+      :unrelated ->
+        raise legacy_write_error(reason, resource)
+    end
+  end
+
+  defp legacy_write_error(reason, resource) do
     cond do
+      reason in [:write_quorum, :rename_busy] ->
+        Error.new(:slow_down_write, resource: resource)
+
       placement_unavailable?(reason) ->
-        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+        Error.new(:slow_down_write, resource: resource)
 
       placement_internal_error?(reason) ->
-        raise Error.new(:internal_error, resource: "/#{bucket}/#{key}")
+        Error.new(:internal_error, resource: resource)
 
       true ->
-        raise Error.new(:internal_error, message: inspect(reason), resource: "/#{bucket}/#{key}")
+        Error.new(:internal_error, resource: resource)
     end
   end
 

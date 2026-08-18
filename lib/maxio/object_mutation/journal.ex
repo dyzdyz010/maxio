@@ -4,6 +4,7 @@ defmodule Maxio.ObjectMutation.Journal do
   use Ecto.Schema
   import Ecto.Changeset
 
+  alias Maxio.DurableJSON
   alias Maxio.Storage.ObjectEpoch
 
   @type t :: %__MODULE__{}
@@ -14,8 +15,11 @@ defmodule Maxio.ObjectMutation.Journal do
   @epoch_keys ~w(fingerprint format operation phase previous_token target token updated_at value_type)
   @fingerprint_phases ~w(published metadata_committed finalize_pending finalized)
   @sha256 ~r/^[0-9a-f]{64}$/
-  @max_json_depth 16
-  @max_json_bytes 65_536
+
+  # design D6 冻结的 Journal 调用 profile。root-zero 深度 15 与既有 root-one、
+  # `depth > 16` 拒绝语义完全等价（leaf 在 m 层嵌套下旧为 depth m+1、新为 depth m），
+  # 不得暗中扩缩可接受的嵌套。
+  @durable_profile [max_depth: 15, max_encoded_bytes: 65_536]
 
   @primary_key {:id, :binary_id, autogenerate: true}
   schema "object_mutations" do
@@ -51,6 +55,23 @@ defmodule Maxio.ObjectMutation.Journal do
 
   @spec phases() :: [String.t()]
   def phases, do: @phases
+
+  @doc """
+  journal JSON 列的既有 string-key / JSON-safe / depth / 65,536-byte 门，可在 changeset
+  之外独立复用。
+
+  `request_rollback/3` 需要它：当调用方提交的 evidence 与已观察值逐字相同时，changeset
+  不会把该列计为 change，`validate_change/3` 因而不会运行——但尺寸/JSON 门必须照常判定
+  已观察到的取证 term。
+  """
+  @spec json_evidence_valid?(term()) :: boolean()
+  def json_evidence_valid?(value), do: json_object(value) == :ok
+
+  @doc false
+  # schema 权威的 exact fingerprint 形态谓词，供 `request_rollback/3` 的信任边界复用：
+  # 绝不在 ObjectMutation 里复制第二套 etag/size/sidecar_sha256 schema。
+  @spec fingerprint_valid?(term()) :: boolean()
+  def fingerprint_valid?(value), do: valid_fingerprint?(value)
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(journal, attrs) do
@@ -215,39 +236,18 @@ defmodule Maxio.ObjectMutation.Journal do
 
   defp valid_fingerprint?(_fingerprint), do: false
 
+  # Journal 的 JSONB 列 root 必须是 map：中立 helper 允许 scalar/list root，schema 不允许。
+  # 除此之外，durable domain 的唯一事实来源是共享的 `Maxio.DurableJSON`——本模块不再保留
+  # 第二套 traversal，避免两处规则悄悄分叉。
   defp json_object(value) when is_map(value) do
-    with true <- json_safe?(value, 1),
-         {:ok, encoded} <- Jason.encode(value),
-         true <- byte_size(encoded) <= @max_json_bytes do
-      :ok
-    else
-      false -> {:error, "must use string keys and JSON-safe values within depth/size limits"}
-      {:error, _reason} -> {:error, "must contain valid JSON values"}
+    case DurableJSON.validate(value, @durable_profile) do
+      {:ok, _encoded} ->
+        :ok
+
+      {:error, :invalid_durable_json} ->
+        {:error, "must use string keys and JSON-safe values within depth/size limits"}
     end
   end
 
   defp json_object(_value), do: {:error, "must be a JSON object"}
-
-  defp json_safe?(_value, depth) when depth > @max_json_depth, do: false
-
-  defp json_safe?(value, _depth)
-       when is_binary(value) or is_boolean(value) or is_nil(value),
-       do: true
-
-  defp json_safe?(value, _depth) when is_integer(value), do: true
-
-  defp json_safe?(value, _depth) when is_float(value),
-    do: match?({:ok, _}, Jason.encode(value))
-
-  defp json_safe?(value, depth) when is_list(value),
-    do: Enum.all?(value, &json_safe?(&1, depth + 1))
-
-  defp json_safe?(value, depth) when is_map(value) do
-    not is_struct(value) and
-      Enum.all?(value, fn {key, nested} ->
-        is_binary(key) and json_safe?(nested, depth + 1)
-      end)
-  end
-
-  defp json_safe?(_value, _depth), do: false
 end
