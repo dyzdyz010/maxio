@@ -17,7 +17,7 @@ defmodule Maxio.Storage.ErasureCoded do
   require Logger
 
   alias Maxio.Storage.Erasure.{Codec, Config, Meta}
-  alias Maxio.Cluster.ShardServer
+  alias Maxio.Cluster.{ShardServer, Transport}
   alias Maxio.Sidecar
 
   alias Maxio.Storage.{
@@ -26,7 +26,8 @@ defmodule Maxio.Storage.ErasureCoded do
     MutationContext,
     NotificationLedger,
     ObjectCommit,
-    ObjectEpoch
+    ObjectEpoch,
+    PublishedProof
   }
 
   alias Maxio.Storage.ObjectCommit.Control
@@ -118,6 +119,9 @@ defmodule Maxio.Storage.ErasureCoded do
 
   @impl true
   def finalize_if_current(ctx, opts \\ []), do: do_finalize_if_current(ctx, opts)
+
+  @impl true
+  def verify_published(ctx, opts \\ []), do: do_verify_published(ctx, opts)
 
   # part 在盘 d 下的目录。
   defp part_dirs(bucket, upload_id, part_number, cfg) do
@@ -1169,8 +1173,11 @@ defmodule Maxio.Storage.ErasureCoded do
          {:ok, plans} <- plan_mutation_backups(commit_pairs, tmps, ctx),
          {:ok, fingerprint} <- staged_mutation_fingerprint(tmps, committed),
          {:ok, published_payload} <- published_epoch_payload(ctx, fingerprint) do
+      # 设计 D2：proof_ctx 在 Control.register 之前派生。restore 闭包捕获原始 ctx；
+      # finalize 闭包捕获带 published fingerprint 的 proof_ctx。
+      proof_ctx = %MutationContext{ctx | published_fingerprint: fingerprint}
       rollback = fn -> mutation_control_result(do_restore_if_current(ctx, opts)) end
-      finalize = fn -> mutation_control_result(do_finalize_if_current(ctx, opts)) end
+      finalize = fn -> mutation_control_result(do_finalize_if_current(proof_ctx, opts)) end
 
       case Control.register(control, identity, rollback, finalize) do
         :ok ->
@@ -1514,25 +1521,121 @@ defmodule Maxio.Storage.ErasureCoded do
     end
   end
 
+  # ── proof-aware backend 聚合（设计 D1/D4/D5，Task 2 G3）──
+  #
+  # 与旧的「全局 epoch 预裁决 + 三字段 finalize 请求」彻底替换：proof 与 finalize 都只走
+  # 逐盘的完整 proof request，每个结果按**枚举时捕获的 ordinal**（而非完成顺序、drive
+  # 路径或响应自报 identity）归位，再由 Task 1 的公共 classifier 唯一裁决 successor /
+  # quorum / integrity / unavailable / orphan / cleanup。EC 不做任何 quorum 复算。
+
+  defp do_verify_published(%MutationContext{} = ctx, opts) do
+    cfg = Config.load!(opts)
+
+    case ec_participants(cfg) do
+      {:ok, participants} ->
+        PublishedProof.classify(
+          cfg.epoch_quorum,
+          ec_observations(participants, ctx, opts, :proof)
+        )
+
+      {:error, code} ->
+        placement_drift_aggregate(cfg.epoch_quorum, :proof, code)
+    end
+  end
+
   defp do_finalize_if_current(%MutationContext{} = ctx, opts) do
     cfg = Config.load!(opts)
 
-    case adjudicate_mutation_epoch(ctx, :finalize, cfg, opts) do
-      :superseded ->
-        {:ok, :superseded}
+    case ec_participants(cfg) do
+      {:ok, participants} ->
+        PublishedProof.classify_finalize(
+          cfg.epoch_quorum,
+          ec_observations(participants, ctx, opts, :finalize)
+        )
 
-      :proceed ->
-        request = %{target: ctx.target, token: ctx.token, mutation_id: ctx.mutation_id}
-
-        cfg.drives
-        |> Enum.map(fn drive ->
-          {drive, ShardServer.finalize_mutation(drive, request, epoch_opts(opts))}
-        end)
-        |> conclude_mutation_quorum(:finalized, cfg.epoch_quorum)
-
-      {:error, reason} ->
-        {:error, reason}
+      {:error, code} ->
+        placement_drift_aggregate(cfg.epoch_quorum, :finalize, code)
     end
+  end
+
+  # 冻结参与者向量：`cfg.drives` **只枚举一次**（单次 reduction 同时建向量与 seen 集），
+  # ordinal 即 drive 在配置中的下标，identity 固定为全局 `"ordinal:N"`（绝不含 drive
+  # 路径）。空集/数量/精确重复项全部从**该捕获向量**判定，绝不二次枚举 `cfg.drives`；
+  # 重复 drive 会让两个 ordinal 指向同一物理盘、冒充 quorum，属结构性 placement 漂移。
+  # 端点 IO 只消费这一个向量。
+  defp ec_participants(%Config{} = cfg) do
+    {reversed, _seen, count, duplicate?} =
+      Enum.reduce(cfg.drives, {[], MapSet.new(), 0, false}, fn drive,
+                                                               {acc, seen, ordinal, duplicate?} ->
+        participant = %{ordinal: ordinal, identity: "ordinal:#{ordinal}", drive: drive}
+
+        {[participant | acc], MapSet.put(seen, drive), ordinal + 1,
+         duplicate? or MapSet.member?(seen, drive)}
+      end)
+
+    cond do
+      count == 0 -> {:error, :empty_placement}
+      duplicate? -> {:error, :duplicate_endpoint}
+      count < cfg.epoch_quorum -> {:error, :insufficient_participants}
+      true -> {:ok, Enum.reverse(reversed)}
+    end
+  end
+
+  defp ec_observations(participants, %MutationContext{} = ctx, opts, mode) do
+    Enum.map(participants, fn participant ->
+      request = shard_proof_request(ctx, participant.ordinal)
+      {participant.identity, ec_endpoint_call(participant, request, opts, mode)}
+    end)
+  end
+
+  # 复用 Transport 的惰性 outer-envelope 边界：call-time raise/exit/throw 与完全畸形的
+  # 外层返回都归一化为**该捕获 ordinal** 的 canonical unavailable；具备 endpoint 信封的
+  # 值（含伪造 identity/scope/mode/counts）原样透传给公共 classifier 判 placement drift。
+  defp ec_endpoint_call(participant, request, opts, :proof) do
+    Transport.call_mutation_proof(request, fn ->
+      ShardServer.verify_mutation(participant.drive, request, epoch_opts(opts))
+    end)
+  end
+
+  defp ec_endpoint_call(participant, request, opts, :finalize) do
+    Transport.call_mutation_finalize(request, fn ->
+      ShardServer.finalize_mutation(participant.drive, request, epoch_opts(opts))
+    end)
+  end
+
+  # 设计 D4 的完整 endpoint request：精确 target/token/mutation_id/final_rel/expected
+  # fingerprint + 捕获的 `layout.index`（端点据此固定自己的 shard ordinal 与响应 identity）。
+  defp shard_proof_request(%MutationContext{} = ctx, ordinal) do
+    %{
+      target: ctx.target,
+      token: ctx.token,
+      mutation_id: ctx.mutation_id,
+      final_rel: ctx.final_rel,
+      expected_fingerprint: ctx.published_fingerprint,
+      layout: %{kind: "shard", index: ordinal}
+    }
+  end
+
+  # preflight 漂移的唯一出口：canonical、脱敏、零端点 IO 的 aggregate placement drift。
+  # witness 由公共构造器生成（非 owned、无 node/drive/路径），再经公共 classifier 规范化。
+  # 身份用 shard 域的稳定 `"ordinal:0"`；`"local"` 是 FS 专属身份，分片后端不得借用。
+  @drift_identity "ordinal:0"
+
+  defp placement_drift_aggregate(required, :proof, code) do
+    witness =
+      PublishedProof.failed(:placement_drift, @drift_identity, %{code: code, owned: false})
+
+    PublishedProof.classify(required, [{@drift_identity, witness}])
+  end
+
+  defp placement_drift_aggregate(required, :finalize, code) do
+    witness =
+      PublishedProof.endpoint_finalize_failed(:placement_drift, @drift_identity, %{
+        code: code,
+        owned: false
+      })
+
+    PublishedProof.classify_finalize(required, [{@drift_identity, witness}])
   end
 
   # quorum 读全局裁决：裁决 token > ctx.token（successor 可见）→ :superseded；全 absent →

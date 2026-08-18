@@ -147,10 +147,53 @@ defmodule Maxio.Storage do
   def restore_if_current(ctx, opts \\ []), do: backend().restore_if_current(ctx, opts)
 
   @doc """
-  仅当 ctx.token 仍为当前 epoch 时终结（epoch → committed + 丢弃 backup）；幂等。
+  proof-aware 终结：仅当 ctx.token 仍为当前 epoch 时重新取证并终结；幂等。与
+  `verify_published/2` 共用同一个非变异 callback trust boundary，非法/obsolete/跨 mode
+  返回折叠为 `{:error, {:published_proof_contract_violation, :finalize}}`。
   见 `Maxio.Storage.Backend.finalize_if_current/2`。
   """
   @spec finalize_if_current(Maxio.Storage.MutationContext.t(), keyword()) ::
-          {:ok, :finalized | :superseded} | {:error, term()}
-  def finalize_if_current(ctx, opts \\ []), do: backend().finalize_if_current(ctx, opts)
+          Maxio.Storage.PublishedProof.aggregate_finalize_result()
+          | {:error, {:published_proof_contract_violation, :finalize}}
+  def finalize_if_current(ctx, opts \\ []) do
+    invoke_callback(:finalize, fn -> backend().finalize_if_current(ctx, opts) end)
+  end
+
+  @doc """
+  取得已发布 final 的 backend aggregate proof（设计 D1）。本函数是插件 trust boundary：
+  backend 返回先经非变异的
+  `Maxio.Storage.PublishedProof.validate_callback_result/2` 复核，合法值原样透传，
+  非法/obsolete/wrong-mode 值一律折叠为
+  `{:error, {:published_proof_contract_violation, :proof}}`。raw callback term 绝不
+  被持久化、记录或对外暴露；调用方按 integrity fail closed 处理，不得当作可重试的
+  unavailable，也不得删除 backup。
+  """
+  @spec verify_published(Maxio.Storage.MutationContext.t(), keyword()) ::
+          Maxio.Storage.PublishedProof.aggregate_proof_result()
+          | {:error, {:published_proof_contract_violation, :proof}}
+  def verify_published(ctx, opts \\ []) do
+    invoke_callback(:proof, fn -> backend().verify_published(ctx, opts) end)
+  end
+
+  # 插件 callback 的**唯一**异常边界（design D1 / G2 §5.1）。它只包住 proof/finalize 两个
+  # backend 调用：正常返回照旧交给既有的 `guard_callback_result/2`；raise、可捕获 exit 与
+  # throw 一律折叠为该 mode 的固定 contract violation。
+  #
+  # 异常本身、reason、stacktrace 与 raw callback term 绝不被记录或返回——调用方按 integrity
+  # fail closed 处理。`restore_if_current/2` 与其余 Storage 函数完全不受影响。
+  defp invoke_callback(mode, callback) do
+    guard_callback_result(mode, callback.())
+  rescue
+    _error -> {:error, {:published_proof_contract_violation, mode}}
+  catch
+    :exit, _reason -> {:error, {:published_proof_contract_violation, mode}}
+    _kind, _value -> {:error, {:published_proof_contract_violation, mode}}
+  end
+
+  defp guard_callback_result(mode, result) do
+    case Maxio.Storage.PublishedProof.validate_callback_result(mode, result) do
+      :ok -> result
+      {:error, :invalid_proof_result} -> {:error, {:published_proof_contract_violation, mode}}
+    end
+  end
 end

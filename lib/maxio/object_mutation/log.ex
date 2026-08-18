@@ -5,7 +5,9 @@ defmodule Maxio.ObjectMutation.Log do
 
   固定字段白名单：action / request_id / mutation_id / mutation_generation /
   mutation_operation / mutation_phase / authority_mode / backend / bucket / key /
-  version_id / placement_set_id / outcome / reason。`request_id` 依赖 S3 管线已注入的
+  version_id / placement_set_id / outcome / reason，以及 G2 的九个有界 proof 标量
+  proof_mode / proof_class / proof_required / proof_verified / proof_finalized /
+  proof_debt / proof_unavailable / proof_omitted / proof_orphaned。`request_id` 依赖 S3 管线已注入的
   进程 Logger metadata（Commit 在请求进程内执行，自动串联）；本模块只放行白名单键——
   **绝不记录对象 body、密钥或 SSE envelope**（字段硬性白名单保证）。
 
@@ -31,7 +33,19 @@ defmodule Maxio.ObjectMutation.Log do
     :version_id,
     :placement_set_id,
     :outcome,
-    :reason
+    :reason,
+    # G2 §3.4：proof/finalize 的**有界标量**取证字段。只放行这九个数值/枚举键；
+    # raw summary、endpoint、node、drive、path、backup path、sidecar、token、placement
+    # payload 与 inspected reason 一律不在白名单内，因此永远进不了日志。
+    :proof_mode,
+    :proof_class,
+    :proof_required,
+    :proof_verified,
+    :proof_finalized,
+    :proof_debt,
+    :proof_unavailable,
+    :proof_omitted,
+    :proof_orphaned
   ]
 
   @doc "把关键字参数中协议固定字段提取为 Logger metadata（白名单外的键一律丢弃）。"

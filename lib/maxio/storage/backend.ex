@@ -299,7 +299,25 @@ defmodule Maxio.Storage.Backend do
   @callback restore_if_current(Maxio.Storage.MutationContext.t(), opts :: keyword()) ::
               {:ok, :restored | :superseded} | {:error, term()}
 
-  @doc "仅当 ctx.token 仍为当前 epoch 时终结（epoch → committed + 丢弃 backup）；幂等。"
+  @doc """
+  在 PG metadata 提交前，对**已发布 final 的实际字节形状**取得 backend 级 aggregate proof
+  （设计 D1）：每个 endpoint 复核 exact epoch / raw sidecar fingerprint 与物理 part 形状，
+  再由 Task 1 的公共 classifier 唯一裁决 quorum 与 successor。
+
+  返回必须是 `Maxio.Storage.PublishedProof` 的精确 aggregate proof sum type；
+  endpoint summary、obsolete tuple 或伪造计数都不是合法返回值，会被
+  `Maxio.Storage` facade 的非变异 trust boundary 拒绝。summary 有界、可 JSON 化，
+  只用 `"local"` / `"ordinal:N"` identity，绝不含 node/drive/绝对路径或 raw sidecar。
+  """
+  @callback verify_published(Maxio.Storage.MutationContext.t(), opts :: keyword()) ::
+              Maxio.Storage.PublishedProof.aggregate_proof_result()
+
+  @doc """
+  proof-aware 终结：仅当 ctx.token 仍为当前 epoch 时，在端点侧复用同一 proof 核心重新取证，
+  证明通过后才写 committed epoch 并丢弃 backup；幂等。返回 `PublishedProof` 的精确
+  aggregate finalize sum type —— `cleanup_pending` 表示 proof quorum 已过但仍有 durable
+  清理债务，不是 proof failure。
+  """
   @callback finalize_if_current(Maxio.Storage.MutationContext.t(), opts :: keyword()) ::
-              {:ok, :finalized | :superseded} | {:error, term()}
+              Maxio.Storage.PublishedProof.aggregate_finalize_result()
 end

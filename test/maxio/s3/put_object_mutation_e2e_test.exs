@@ -242,6 +242,12 @@ defmodule Maxio.S3.PutObjectMutationE2ETest do
 
     # 在 publish 之后、metadata 事务之前扰动 journal（attempts+1）→ 事务内
     # metadata_committed CAS 必然 stale_journal → Repo.rollback → 结构化 503。
+    #
+    # 必须用**保留取证**的 operational CAS probe `mark_operational_error/3`（design D6
+    # §3.3）：只动 attempts / next_attempt_at / bounded last_error / updated_at，逐字保留
+    # published 行上的 `published_fingerprint` 与 canonical successful wrapper，于是随后的
+    # rollback 仍持有合法 durable evidence。legacy `mark_error/4` 会替换 recovery_evidence
+    # 并被 published-origin 校验合法拒绝。reason 必须是稳定 binary。
     Failpoint.arm(
       :object_mutation_before_metadata_commit,
       {:fun,
@@ -252,7 +258,7 @@ defmodule Maxio.S3.PutObjectMutationE2ETest do
                where: j.bucket_name == ^bucket and j.object_key == ^key and j.phase == "published"
            )
 
-         {:ok, _} = ObjectMutation.mark_error(journal, :e2e_perturb, %{"stage" => "e2e"})
+         {:ok, _} = ObjectMutation.mark_operational_error(journal, "e2e_perturb")
        end}
     )
 

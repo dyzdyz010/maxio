@@ -24,6 +24,7 @@ defmodule Maxio.Test.StoragePruneFailFS do
   defdelegate current_epoch(target, opts), to: FS
   defdelegate restore_if_current(ctx, opts), to: FS
   defdelegate finalize_if_current(ctx, opts), to: FS
+  defdelegate verify_published(ctx, opts), to: FS
 
   def delete_notification_ledgers(bucket, key, ids, opts) do
     case Application.get_env(:maxio, :notification_ledger_delete_mode) do

@@ -49,6 +49,20 @@ defmodule Maxio.S3.ErrorTest do
     assert sdw.code == "SlowDownWrite"
     assert sdw.http_status == 503
 
+    # G4a：默认 message 逐字对齐 MinIO cmd/api-errors.go 的 ErrSlowDownWrite。
+    # HTTP 503 表达瞬时服务状态，调用方应使用有界指数退避；具体重试行为由 SDK
+    # 版本与配置决定，需针对目标客户端验证，G4 不改动任何客户端重试配置。
+    assert sdw.message == "Resource requested is unwritable, please reduce your request rate"
+
+    sdw_with_resource = Error.new(:slow_down_write, resource: "/mybucket/objects/report.bin")
+    assert sdw_with_resource.code == "SlowDownWrite"
+    assert sdw_with_resource.http_status == 503
+
+    assert sdw_with_resource.message ==
+             "Resource requested is unwritable, please reduce your request rate"
+
+    assert sdw_with_resource.resource == "/mybucket/objects/report.bin"
+
     sdr = Error.new(:slow_down_read)
     assert sdr.code == "SlowDownRead"
     assert sdr.http_status == 503

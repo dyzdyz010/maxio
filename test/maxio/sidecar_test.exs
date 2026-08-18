@@ -72,6 +72,124 @@ defmodule Maxio.SidecarTest do
     end
   end
 
+  describe "decode_durable_object/2" do
+    test "returns only the top-level durable core and the exact target object entry" do
+      raw =
+        durable_raw(%{
+          "etag" => "stored-ciphertext-etag",
+          "size" => 19,
+          "versions" => [
+            %{"version_id" => "older", "type" => "delete_marker"},
+            %{
+              "version_id" => "v1",
+              "type" => "object",
+              "etag" => "multipart-visible-etag-2",
+              "size" => 11
+            }
+          ]
+        })
+
+      assert {:ok,
+              %{
+                core: %{
+                  etag: "stored-ciphertext-etag",
+                  size: 19,
+                  sha256: sha256
+                },
+                version: %{
+                  "version_id" => "v1",
+                  "type" => "object",
+                  "etag" => "multipart-visible-etag-2",
+                  "size" => 11
+                }
+              }} = Sidecar.decode_durable_object(raw, "v1")
+
+      assert sha256 == String.duplicate("a", 64)
+    end
+
+    test "is non-raising and rejects malformed JSON or a non-map envelope" do
+      assert {:error, :invalid_json} = Sidecar.decode_durable_object("{", "v1")
+      assert {:error, :invalid_envelope} = Sidecar.decode_durable_object("[]", "v1")
+      assert {:error, :invalid_request} = Sidecar.decode_durable_object(nil, "v1")
+      assert {:error, :invalid_request} = Sidecar.decode_durable_object("{}", "")
+    end
+
+    test "requires maxio/2 and the complete top-level durable core" do
+      assert {:error, :invalid_format} =
+               %{"format" => "maxio/1"}
+               |> durable_raw()
+               |> Sidecar.decode_durable_object("v1")
+
+      assert {:error, :invalid_format} =
+               %{"format" => nil}
+               |> durable_raw()
+               |> Sidecar.decode_durable_object("v1")
+
+      for {override, expected} <- [
+            {%{"etag" => ""}, :invalid_etag},
+            {%{"etag" => 1}, :invalid_etag},
+            {%{"size" => -1}, :invalid_size},
+            {%{"size" => "1"}, :invalid_size},
+            {%{"sha256" => nil}, :invalid_sha256},
+            {%{"sha256" => String.duplicate("g", 64)}, :invalid_sha256},
+            {%{"sha256" => String.duplicate("a", 63)}, :invalid_sha256}
+          ] do
+        assert {:error, ^expected} =
+                 override
+                 |> durable_raw()
+                 |> Sidecar.decode_durable_object("v1")
+      end
+    end
+
+    test "requires a non-empty versions list with exactly one target object" do
+      assert {:error, :invalid_versions} =
+               %{"versions" => []}
+               |> durable_raw()
+               |> Sidecar.decode_durable_object("v1")
+
+      assert {:error, :invalid_versions} =
+               %{"versions" => %{}}
+               |> durable_raw()
+               |> Sidecar.decode_durable_object("v1")
+
+      assert {:error, :missing_object_version} =
+               %{"versions" => [%{"version_id" => "other", "type" => "object"}]}
+               |> durable_raw()
+               |> Sidecar.decode_durable_object("v1")
+
+      assert {:error, :invalid_object_version} =
+               %{"versions" => [%{"version_id" => "v1", "type" => "delete_marker"}]}
+               |> durable_raw()
+               |> Sidecar.decode_durable_object("v1")
+    end
+
+    test "rejects duplicate object/delete-marker identity even when durable core is valid" do
+      raw =
+        durable_raw(%{
+          "versions" => [
+            %{"version_id" => "v1", "type" => "object", "etag" => "visible", "size" => 7},
+            %{"version_id" => "v1", "type" => "delete_marker"}
+          ]
+        })
+
+      assert {:error, :duplicate_version_identity} =
+               Sidecar.decode_durable_object(raw, "v1")
+    end
+
+    test "rejects duplicate object identities instead of accepting the first match" do
+      raw =
+        durable_raw(%{
+          "versions" => [
+            %{"version_id" => "v1", "type" => "object"},
+            %{"version_id" => "v1", "type" => "object"}
+          ]
+        })
+
+      assert {:error, :duplicate_version_identity} =
+               Sidecar.decode_durable_object(raw, "v1")
+    end
+  end
+
   describe "latest/find_version" do
     test "latest picks max-modtime; find_version by id" do
       v2 = Sidecar.migrate_v1(@v1, version_id: "v1", modtime: 5)
@@ -207,5 +325,17 @@ defmodule Maxio.SidecarTest do
       assert attrs.is_delete_marker == true
       assert attrs.version_id == "dm"
     end
+  end
+
+  defp durable_raw(overrides) do
+    %{
+      "format" => "maxio/2",
+      "etag" => "durable-etag",
+      "size" => 7,
+      "sha256" => String.duplicate("a", 64),
+      "versions" => [%{"version_id" => "v1", "type" => "object"}]
+    }
+    |> Map.merge(overrides)
+    |> Jason.encode!()
   end
 end

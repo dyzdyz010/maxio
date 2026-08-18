@@ -45,7 +45,8 @@ defmodule Maxio.Storage.FS do
     MutationContext,
     NotificationLedger,
     ObjectCommit,
-    ObjectEpoch
+    ObjectEpoch,
+    PublishedProof
   }
 
   alias Maxio.Storage.ObjectCommit.Control
@@ -140,6 +141,9 @@ defmodule Maxio.Storage.FS do
 
   @impl true
   def finalize_if_current(ctx, opts \\ []), do: do_finalize_if_current(ctx, opts)
+
+  @impl true
+  def verify_published(ctx, opts \\ []), do: do_verify_published(ctx, opts)
 
   @doc """
   ROUTE B B6-2 —— FS 的**合成单端点 topology**（单一事实来源；经
@@ -366,8 +370,12 @@ defmodule Maxio.Storage.FS do
     with :ok <- validate_mutation_final_dir(final_dir, drive_root, ctx),
          {:ok, plan} <- plan_mutation_backup(final_dir, drive_root, ctx),
          {:ok, fingerprint} <- staged_fingerprint(tmp, result) do
+      # 设计 D2：proof_ctx 必须在 Control.register 之前派生。restore 闭包捕获原始 ctx
+      # （回滚与 fingerprint 无关）；finalize 闭包捕获带 published fingerprint 的
+      # proof_ctx——proof-aware finalize 需要精确的 expected fingerprint 才能取证。
+      proof_ctx = %MutationContext{ctx | published_fingerprint: fingerprint}
       rollback = fn -> mutation_control_result(do_restore_if_current(ctx, opts)) end
-      finalize = fn -> mutation_control_result(do_finalize_if_current(ctx, opts)) end
+      finalize = fn -> mutation_control_result(do_finalize_if_current(proof_ctx, opts)) end
 
       case Control.register(control, identity, rollback, finalize) do
         :ok ->
@@ -550,11 +558,35 @@ defmodule Maxio.Storage.FS do
   end
 
   defp do_finalize_if_current(%MutationContext{} = ctx, opts) do
-    ShardServer.finalize_mutation(
-      data_dir(opts),
-      %{target: ctx.target, token: ctx.token, mutation_id: ctx.mutation_id},
-      epoch_opts(opts)
-    )
+    endpoint =
+      ShardServer.finalize_mutation(
+        data_dir(opts),
+        endpoint_proof_request(ctx),
+        epoch_opts(opts)
+      )
+
+    PublishedProof.classify_finalize(1, [{"local", endpoint}])
+  end
+
+  # FS 是 1/1 endpoint：构造 `layout: %{kind: "fs"}` 的完整 D4 proof request，交本地
+  # endpoint primitive 取证，再由 Task 1 公共 classifier 唯一裁决。nil published
+  # fingerprint 不做 caller precheck——它是非法 request，由 endpoint 结构化失败关闭。
+  defp do_verify_published(%MutationContext{} = ctx, opts) do
+    endpoint =
+      ShardServer.verify_mutation(data_dir(opts), endpoint_proof_request(ctx), epoch_opts(opts))
+
+    PublishedProof.classify(1, [{"local", endpoint}])
+  end
+
+  defp endpoint_proof_request(%MutationContext{} = ctx) do
+    %{
+      target: ctx.target,
+      token: ctx.token,
+      mutation_id: ctx.mutation_id,
+      final_rel: ctx.final_rel,
+      expected_fingerprint: ctx.published_fingerprint,
+      layout: %{kind: "fs"}
+    }
   end
 
   defp epoch_or_nil(:absent), do: nil

@@ -6,6 +6,7 @@ defmodule Maxio.S3.Handlers.Object do
   import Plug.Conn
   alias Maxio.{Buckets, Objects, Storage}
   alias Maxio.Cluster.Placement
+  alias Maxio.Failpoint
   alias Maxio.ObjectMutation.Commit, as: ObjectMutationCommit
   alias Maxio.Policy.ACL
 
@@ -30,6 +31,7 @@ defmodule Maxio.S3.Handlers.Object do
     StorageClass,
     SystemHeaders,
     ObjectLock,
+    ObjectMutationError,
     PostObjectForm,
     XML,
     NotificationRetainedLedger
@@ -534,7 +536,8 @@ defmodule Maxio.S3.Handlers.Object do
         raise Error.new(:key_too_long, resource: "/#{bucket}/#{key}")
 
       # 写 quorum 不足 / 原子 rename 争用 = 瞬时写限流，对齐 MinIO 的 SlowDownWrite(503)
-      # （cmd/api-errors.go: errErasureWriteQuorum -> ErrSlowDownWrite）。SDK 据此指数退避重试，
+      # （cmd/api-errors.go: errErasureWriteQuorum -> ErrSlowDownWrite）。503 表示瞬时条件，
+      # 调用方应做有界退避重试（具体 SDK 的自动重试行为取决于版本与配置），
       # 集群降级/争用得以自愈；绝不能映射成 500 InternalError（被客户端当硬失败）。
       # ObjectMutation（B5）同类瞬时条件：epoch quorum 读不足（:epoch_quorum_unavailable）。
       {:error, reason}
@@ -564,8 +567,11 @@ defmodule Maxio.S3.Handlers.Object do
                 resource: "/#{bucket}/#{key}"
               )
 
+      # G4a-2H：PutObject 最终 ObjectMutation 提交的通用兜底走 **G4 专用**外部边界——
+      # 共享 helper raise_storage_write_error/3 还服务 self-copy staging / delete marker /
+      # current delete，绝不能把 G4 分类政策扩散过去。
       {:error, reason} when reason != :locked ->
-        raise_storage_write_error(reason, bucket, key)
+        raise_object_mutation_write_error(reason, bucket, key)
 
       {:error, :locked} ->
         raise object_write_lock_error(conn.req_headers, bucket, key)
@@ -1828,8 +1834,8 @@ defmodule Maxio.S3.Handlers.Object do
   # ObjectMutation Phase 2A（C3）：copy seam 错误映射与 do_put 收口同源（B5/B7 先例）——
   # 瞬时条件（epoch quorum 读不足 / epoch fence 争用 / journal metadata CAS 争用）→ 503
   # SlowDownWrite（SDK 退避重试，重试以新 mutation 走完整协议序列，绝不 500/CaseClauseError
-  # 透出）；pre-B6-1 legacy 布局冲突 → 结构化 500；其余沿既有 raise_storage_write_error 兜底
-  # （:write_quorum/:rename_busy → 503 已在兜底内）。
+  # 透出）；pre-B6-1 legacy 布局冲突 → 结构化 500；其余走 G4 专用边界
+  # raise_object_mutation_write_error/3 兜底（:write_quorum/:rename_busy → 503 已在兜底内）。
   defp raise_copy_object_write_error(:epoch_quorum_unavailable, bucket, key),
     do: raise(Error.new(:slow_down_write, resource: "/#{bucket}/#{key}"))
 
@@ -1853,7 +1859,7 @@ defmodule Maxio.S3.Handlers.Object do
   end
 
   defp raise_copy_object_write_error(reason, bucket, key),
-    do: raise_storage_write_error(reason, bucket, key)
+    do: raise_object_mutation_write_error(reason, bucket, key)
 
   defp copy_checksum_changes_object?(_source_checksum, algorithm) when is_binary(algorithm),
     do: true
@@ -2242,20 +2248,56 @@ defmodule Maxio.S3.Handlers.Object do
 
   defp now(conn), do: conn.private[:maxio_now] || DateTime.utc_now()
 
-  defp raise_storage_write_error(reason, bucket, key)
-       when reason in [:write_quorum, :rename_busy],
-       do: raise(Error.new(:slow_down_write, resource: "/#{bucket}/#{key}"))
+  # G4a-2H 修正案 §2.1：Put/Copy **最终 ObjectMutation 提交**专用的对象写入外部边界。
+  #
+  #   * resource 只构造一次，适配器投影与 legacy 分类共用同一份；
+  #   * 恰好一次调用共享纯适配器 `ObjectMutationError.to_error/2`——G4 类别决策**只能**来自
+  #     它，本 helper 绝不匹配稳定信封 tag、绝不 inspect opaque reason、绝不直连
+  #     Commit / Recovery / Storage / PublishedProof / StorageDisposition / Journal；
+  #   * `{:ok, error}` 即适配器投影出的 canonical 外部信封，原样 raise；
+  #   * 只有 `:unrelated`（与 G4 语义无关）才落回既有 quorum/placement 分类——复用
+  #     `storage_write_error/3` 这**唯一一份**分类表，绝不复制第二份；
+  #   * 最终未知项走目录默认 `InternalError`（`:catalog_default` policy）——不带 message，
+  #     由 catalog 提供默认文案，绝不把 raw reason 放进公共 message。
+  #
+  # 遗留共享 helper `raise_storage_write_error/3` 仍服务 self-copy staging / delete marker /
+  # current delete 等非 G4 路径，绝不接适配器（否则 G4 分类政策会扩散到非 G4 操作）。
+  defp raise_object_mutation_write_error(reason, bucket, key) do
+    resource = "/#{bucket}/#{key}"
 
-  defp raise_storage_write_error(reason, bucket, key) do
+    case ObjectMutationError.to_error(reason, resource) do
+      {:ok, error} ->
+        raise error
+
+      :unrelated ->
+        raise storage_write_error(reason, resource, :catalog_default)
+    end
+  end
+
+  # 遗留共享 storage 写入边界（self-copy staging / delete marker / current delete）：
+  # 行为与接线前逐字节一致——未知项仍走 inspected fallback（`:inspect_reason` policy）。
+  defp raise_storage_write_error(reason, bucket, key),
+    do: raise(storage_write_error(reason, "/#{bucket}/#{key}", :inspect_reason))
+
+  # 唯一一份 quorum/placement 分类表；两个边界只在**未知项 policy** 上分叉：
+  #   * `:catalog_default` —— G4 专用边界：目录默认 InternalError（带 resource、无 message）；
+  #   * `:inspect_reason` —— 遗留共享 helper：保留既有 inspected fallback 行为。
+  defp storage_write_error(reason, resource, unknown_policy) do
     cond do
+      reason in [:write_quorum, :rename_busy] ->
+        Error.new(:slow_down_write, resource: resource)
+
       placement_unavailable?(reason) ->
-        raise Error.new(:slow_down_write, resource: "/#{bucket}/#{key}")
+        Error.new(:slow_down_write, resource: resource)
 
       placement_internal_error?(reason) ->
-        raise Error.new(:internal_error, resource: "/#{bucket}/#{key}")
+        Error.new(:internal_error, resource: resource)
+
+      unknown_policy == :catalog_default ->
+        Error.new(:internal_error, resource: resource)
 
       true ->
-        raise Error.new(:internal_error, message: inspect(reason))
+        Error.new(:internal_error, message: inspect(reason))
     end
   end
 
@@ -2472,15 +2514,47 @@ defmodule Maxio.S3.Handlers.Object do
           case Objects.delete_metadata(
                  bucket,
                  key,
+                 # C1 专用挂点：只位于 PG current-delete 的事务 hook 内、notification
+                 # enqueue 之前。绝不放进 `Objects.delete_metadata/3` 或共享
+                 # `notification_transaction_opts/1`，以免扩散到其它 caller / 操作。
                  notification_transaction_opts(fn target ->
+                   Failpoint.hit(:current_delete_metadata_before_notification_enqueue)
                    current_delete_notification(notification_fun, target)
                  end)
                ) do
-            {target, enqueued_notifications} -> {target, {:enqueued, enqueued_notifications}}
-            target when is_map(target) -> {target, :none}
-            {:error, reason} -> raise Error.new(:internal_error, message: inspect(reason))
+            # C1：`delete_metadata/3` 带 hook 的公开返回和是
+            # `map() | {map(), term()} | {:error, term()}`。**显式错误必须先于成功匹配**——
+            # 否则 `{:error, reason}` 会被任意二元组吞掉、被当成成功，随后仍删字节，造成
+            # 「PG 行保留 + 字节被删」的权威分叉。内部 reason 只进结构化日志，绝不进 XML。
+            {:error, reason} ->
+              Log.error("current object metadata delete transaction failed",
+                action: :delete_object,
+                bucket: bucket,
+                key: key,
+                reason: inspect(reason)
+              )
+
+              raise Error.new(:internal_error, resource: "/#{bucket}/#{key}")
+
+            # 成功二元组收窄到 **map target** 为证，不再接受任意 `{left, right}`。
+            {%{} = target, enqueued_notifications} ->
+              {target, {:enqueued, enqueued_notifications}}
+
+            %{} = target ->
+              {target, :none}
+
+            other ->
+              Log.error("invalid current object metadata delete result",
+                action: :delete_object,
+                bucket: bucket,
+                key: key,
+                result: inspect(other)
+              )
+
+              raise Error.new(:internal_error, resource: "/#{bucket}/#{key}")
           end
 
+        # 只有在 metadata 事务确认成功之后才允许删字节。
         _ = Storage.delete(bucket, key, "null", storage_opts)
         {target, notification_delivery}
     end

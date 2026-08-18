@@ -13,7 +13,7 @@ defmodule Maxio.Native.ErasureCoding do
   这里解包；{:error, _} 显式 raise ArgumentError，使调用方可安全假设拿到值（铁律 3：绝不静默）。
   blake3/1 永不失败，NIF 直接返回 binary。
   """
-  use Rustler, otp_app: :maxio, crate: :maxio_native
+  alias Maxio.Native
 
   @type shard :: binary()
 
@@ -27,7 +27,7 @@ defmodule Maxio.Native.ErasureCoding do
       when is_integer(data_shards) and data_shards > 0 and
              is_integer(parity_shards) and parity_shards > 0 and is_binary(data) do
     unwrap!(
-      native_rs_encode(data_shards, parity_shards, data),
+      Native.native_rs_encode(data_shards, parity_shards, data),
       {:encode, data_shards, parity_shards, byte_size(data)}
     )
   end
@@ -49,7 +49,7 @@ defmodule Maxio.Native.ErasureCoding do
       when is_integer(data_shards) and data_shards > 0 and
              is_integer(parity_shards) and parity_shards > 0 and is_list(shards) do
     unwrap!(
-      native_rs_reconstruct(data_shards, parity_shards, shards),
+      Native.native_rs_reconstruct(data_shards, parity_shards, shards),
       {:reconstruct, data_shards, parity_shards, length(shards)}
     )
   end
@@ -64,19 +64,13 @@ defmodule Maxio.Native.ErasureCoding do
 
   @doc "BLAKE3-256 摘要（32 字节）。用于 per-shard bitrot 校验和。"
   @spec blake3(binary()) :: binary()
-  def blake3(data) when is_binary(data), do: native_blake3(data)
+  def blake3(data) when is_binary(data), do: Native.native_blake3(data)
 
   # NIF 入口桩：未加载时 raise；加载后被替换为 Rust 实现。
   # 函数名与 src/lib.rs 中 #[rustler::nif] fn 名逐字一致（native_ 前缀）。
-  defp native_rs_encode(_k, _m, _data), do: err()
-  defp native_rs_reconstruct(_k, _m, _shards), do: err()
-  defp native_blake3(_data), do: err()
-
   defp unwrap!({:ok, value}, _ctx), do: value
 
   defp unwrap!({:error, reason}, ctx) do
     raise ArgumentError, "ErasureCoding #{inspect(ctx)} failed: #{inspect(reason)}"
   end
-
-  defp err, do: :erlang.nif_error(:nif_not_loaded)
 end

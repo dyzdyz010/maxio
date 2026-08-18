@@ -146,5 +146,109 @@ fn native_blake3<'a>(env: Env<'a>, data: Binary<'a>) -> Binary<'a> {
     to_bin(env, hash.as_bytes())
 }
 
+/// Stat one path component without following its final link.
+///
+/// Windows uses the reparse-point attribute so this covers symbolic links, junctions and other
+/// name-surrogate objects. Unix reports symbolic links. Errors are reduced to a fixed code
+/// whitelist so neither OS text nor the supplied path can escape into proof evidence.
+#[rustler::nif(schedule = "DirtyIo")]
+fn native_path_reparse_point(path: String) -> Result<bool, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(path_error_code)?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(metadata.file_type().is_symlink())
+    }
+}
+
+fn path_error_code(error: std::io::Error) -> String {
+    use std::io::ErrorKind;
+
+    let code = match error.kind() {
+        ErrorKind::NotFound => "enoent",
+        ErrorKind::PermissionDenied => "eacces",
+        ErrorKind::InvalidInput => "einval",
+        ErrorKind::TimedOut => "etimedout",
+        _ => raw_path_error_code(error.raw_os_error()),
+    };
+
+    code.to_string()
+}
+
+#[cfg(windows)]
+fn raw_path_error_code(raw: Option<i32>) -> &'static str {
+    match raw {
+        Some(2 | 3) => "enoent",
+        Some(5) => "eacces",
+        Some(123) => "einval",
+        Some(170) => "ebusy",
+        Some(267) => "enotdir",
+        Some(1460) => "etimedout",
+        _ => "eio",
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn raw_path_error_code(raw: Option<i32>) -> &'static str {
+    match raw {
+        Some(2) => "enoent",
+        Some(13) => "eacces",
+        Some(16) => "ebusy",
+        Some(20) => "enotdir",
+        Some(22) => "einval",
+        Some(40) => "eloop",
+        Some(110) => "etimedout",
+        Some(116) => "estale",
+        _ => "eio",
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn raw_path_error_code(raw: Option<i32>) -> &'static str {
+    match raw {
+        Some(2) => "enoent",
+        Some(13) => "eacces",
+        Some(16) => "ebusy",
+        Some(20) => "enotdir",
+        Some(22) => "einval",
+        Some(62) => "eloop",
+        Some(60) => "etimedout",
+        Some(70) => "estale",
+        _ => "eio",
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn raw_path_error_code(raw: Option<i32>) -> &'static str {
+    match raw {
+        Some(2) => "enoent",
+        Some(13) => "eacces",
+        Some(16) => "ebusy",
+        Some(20) => "enotdir",
+        Some(22) => "einval",
+        _ => "eio",
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn raw_path_error_code(_raw: Option<i32>) -> &'static str {
+    "eio"
+}
+
 // 单参自动发现形式（与 huanxi 的 rustler::init!("Elixir.Huanxi.Geo.H3"); 一致）。
-rustler::init!("Elixir.Maxio.Native.ErasureCoding");
+rustler::init!("Elixir.Maxio.Native");

@@ -267,10 +267,22 @@ defmodule Maxio.Cluster.Transport.InProcess do
   end
 
   @impl true
+  def verify_mutation(node, drive_root, request) do
+    # outage 判定与 ShardServer 调用全部在惰性边界内求值。
+    Maxio.Cluster.Transport.call_mutation_proof(request, fn ->
+      if down?(node, drive_root) or op_down?(:verify_mutation, node, drive_root),
+        do: Maxio.Cluster.Transport.mutation_proof_unavailable(request),
+        else: ShardServer.verify_mutation(drive_root, request)
+    end)
+  end
+
+  @impl true
   def finalize_mutation(node, drive_root, request) do
-    if down?(node, drive_root),
-      do: {:error, :unavailable},
-      else: ShardServer.finalize_mutation(drive_root, request)
+    Maxio.Cluster.Transport.call_mutation_finalize(request, fn ->
+      if down?(node, drive_root) or op_down?(:finalize_mutation, node, drive_root),
+        do: Maxio.Cluster.Transport.mutation_finalize_unavailable(request),
+        else: ShardServer.finalize_mutation(drive_root, request)
+    end)
   end
 
   @impl true

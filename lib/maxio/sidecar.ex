@@ -31,6 +31,7 @@ defmodule Maxio.Sidecar do
   alias Maxio.Storage.Erasure.Meta
 
   @format "maxio/2"
+  @sha256_pattern ~r/\A[0-9a-fA-F]{64}\z/
 
   @type version_entry :: %{optional(String.t()) => term()}
 
@@ -41,6 +42,44 @@ defmodule Maxio.Sidecar do
   @doc "把盘上 JSON 解码为 sidecar map（复用 Erasure.Meta 解码器）。"
   @spec decode!(binary()) :: map()
   def decode!(bin) when is_binary(bin), do: Meta.decode!(bin)
+
+  @doc """
+  Decodes and validates the durable ordinary-object envelope without raising.
+
+  The returned core always comes from the top-level durable fields. The selected version entry
+  is only used to prove that the requested object version exists exactly once; its S3-visible
+  ETag and size are intentionally allowed to differ from the durable core.
+  """
+  @spec decode_durable_object(binary(), String.t()) ::
+          {:ok,
+           %{
+             core: %{etag: String.t(), size: non_neg_integer(), sha256: String.t()},
+             meta: map(),
+             version: version_entry()
+           }}
+          | {:error,
+             :invalid_request
+             | :invalid_json
+             | :invalid_envelope
+             | :invalid_format
+             | :invalid_etag
+             | :invalid_size
+             | :invalid_sha256
+             | :invalid_versions
+             | :missing_object_version
+             | :duplicate_version_identity
+             | :invalid_object_version}
+  def decode_durable_object(raw, version_id)
+      when is_binary(raw) and is_binary(version_id) and byte_size(version_id) > 0 do
+    with {:ok, meta} <- decode_durable_json(raw),
+         :ok <- validate_durable_format(meta),
+         {:ok, core} <- durable_core(meta),
+         {:ok, version} <- durable_object_version(meta, version_id) do
+      {:ok, %{core: core, meta: meta, version: version}}
+    end
+  end
+
+  def decode_durable_object(_raw, _version_id), do: {:error, :invalid_request}
 
   @doc "当前 sidecar format（用于读侧分流 v1/v2）。"
   @spec format() :: String.t()
@@ -293,6 +332,71 @@ defmodule Maxio.Sidecar do
     case Enum.max_by(versions, &sort_key/1, fn -> nil end) do
       nil -> versions
       top -> Enum.map(versions, fn e -> Map.put(e, "is_latest", e == top) end)
+    end
+  end
+
+  defp decode_durable_json(raw) do
+    case Jason.decode(raw) do
+      {:ok, %{} = meta} -> {:ok, meta}
+      {:ok, _other} -> {:error, :invalid_envelope}
+      {:error, _reason} -> {:error, :invalid_json}
+    end
+  end
+
+  defp validate_durable_format(%{"format" => @format}), do: :ok
+  defp validate_durable_format(_meta), do: {:error, :invalid_format}
+
+  defp durable_core(meta) do
+    with {:ok, etag} <- durable_etag(meta),
+         {:ok, size} <- durable_size(meta),
+         {:ok, sha256} <- durable_sha256(meta) do
+      {:ok, %{etag: etag, size: size, sha256: sha256}}
+    end
+  end
+
+  defp durable_etag(%{"etag" => etag}) when is_binary(etag) and byte_size(etag) > 0,
+    do: {:ok, etag}
+
+  defp durable_etag(_meta), do: {:error, :invalid_etag}
+
+  defp durable_size(%{"size" => size}) when is_integer(size) and size >= 0, do: {:ok, size}
+  defp durable_size(_meta), do: {:error, :invalid_size}
+
+  defp durable_sha256(%{"sha256" => sha256}) when is_binary(sha256) do
+    if Regex.match?(@sha256_pattern, sha256),
+      do: {:ok, sha256},
+      else: {:error, :invalid_sha256}
+  end
+
+  defp durable_sha256(_meta), do: {:error, :invalid_sha256}
+
+  defp durable_object_version(%{"versions" => versions}, version_id)
+       when is_list(versions) and versions != [] do
+    with :ok <- validate_version_entries(versions) do
+      case Enum.filter(versions, &(&1["version_id"] == version_id)) do
+        [] -> {:error, :missing_object_version}
+        [%{"type" => "object"} = version] -> {:ok, version}
+        [_one] -> {:error, :invalid_object_version}
+        _duplicates -> {:error, :duplicate_version_identity}
+      end
+    end
+  end
+
+  defp durable_object_version(_meta, _version_id), do: {:error, :invalid_versions}
+
+  defp validate_version_entries(versions) do
+    if Enum.all?(versions, fn
+         %{"version_id" => version_id, "type" => type}
+         when is_binary(version_id) and byte_size(version_id) > 0 and
+                type in ["object", "delete_marker"] ->
+           true
+
+         _other ->
+           false
+       end) do
+      :ok
+    else
+      {:error, :invalid_versions}
     end
   end
 

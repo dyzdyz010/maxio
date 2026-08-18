@@ -143,10 +143,12 @@ defmodule Maxio.S3.Error do
     slow_down: {"SlowDown", 503, "Please reduce your request rate."},
     # MinIO 区分写/读 quorum 不足为可重试的 503（cmd/api-errors.go:
     # errErasureWriteQuorum -> ErrSlowDownWrite{Code:"SlowDownWrite",503}；
-    # errErasureReadQuorum -> ErrSlowDownRead{Code:"SlowDownRead",503}）。SDK 标准重试策略
-    # 把 503 SlowDown* 视为限流并指数退避，依赖此路径在集群降级/瞬时争用下自愈；
-    # 绝不能退化成 500 InternalError（被多数客户端当硬失败、跳过退避）。
-    slow_down_write: {"SlowDownWrite", 503, "Please reduce your write request rate."},
+    # errErasureReadQuorum -> ErrSlowDownRead{Code:"SlowDownRead",503}）。503 表达瞬时服务
+    # 状态，调用方应使用有界指数退避；具体重试行为随 SDK 版本与配置而异，须针对目标客户端
+    # 验证，maxio 不改动任何客户端重试配置。绝不能退化成 500 InternalError（多数客户端把
+    # 500 当硬失败）。默认 message 逐字对齐 MinIO cmd/api-errors.go 的 ErrSlowDownWrite。
+    slow_down_write:
+      {"SlowDownWrite", 503, "Resource requested is unwritable, please reduce your request rate"},
     # ROUTE B B4-3：翻读权威（:read=:sidecar）后，GET/HEAD 的 sidecar reconcile 不足 read_quorum
     # （端点宕机 / 副本分歧）→ 对象当前不可读、绝不返回猜测副本（铁律 3）。映射为 SlowDownRead(503)，
     # 与 PUT 写 quorum 的 :slow_down_write 对称，逐字对齐 MinIO toAPIErrorCode()：
