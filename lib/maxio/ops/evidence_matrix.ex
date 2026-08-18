@@ -363,6 +363,7 @@ defmodule Maxio.Ops.EvidenceMatrix do
   defp safe_string(value) when is_atom(value), do: Atom.to_string(value)
   defp safe_string(value) when is_integer(value), do: Integer.to_string(value)
   defp safe_string(value) when is_float(value), do: Float.to_string(value)
-  defp safe_string(value) when is_boolean(value), do: to_string(value)
+
+  # 布尔量由上面的 is_atom/1 子句吸收（Atom.to_string(true) == to_string(true)），无需单列。
   defp safe_string(value), do: inspect(value, limit: 20, printable_limit: 200)
 end

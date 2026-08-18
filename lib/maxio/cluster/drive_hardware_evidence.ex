@@ -924,7 +924,7 @@ defmodule Maxio.Cluster.DriveHardwareEvidence do
     do: Enum.map(reason, &sanitize_smart_error/1)
 
   defp sanitize_smart_error(reason) when is_binary(reason), do: "[redacted]"
-  defp sanitize_smart_error(nil), do: nil
+  # nil 由首个 is_atom/1 子句原样返回，无需单列。
   defp sanitize_smart_error(%{} = reason), do: redact_reason(reason)
   defp sanitize_smart_error(_reason), do: :redacted
 
@@ -989,7 +989,7 @@ defmodule Maxio.Cluster.DriveHardwareEvidence do
   defp redact_reason(reason) when is_atom(reason) or is_integer(reason) or is_boolean(reason),
     do: reason
 
-  defp redact_reason(nil), do: nil
+  # nil 由上面的 is_atom/1 子句原样返回，无需单列。
   defp redact_reason(reason) when is_binary(reason), do: "[redacted]"
 
   defp redact_reason(reason) when is_tuple(reason) do

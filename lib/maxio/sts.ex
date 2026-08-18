@@ -1262,8 +1262,8 @@ defmodule Maxio.STS do
          }}
       end
     else
-      {:error, :invalid_session_tags} -> {:error, :invalid_session_tags}
       {:error, :inherited_transitive_tag_conflict} = error -> error
+      # 其余（含 :invalid_session_tags）统一归一为 :invalid_session_tags 兜底。
       _error -> {:error, :invalid_session_tags}
     end
   end

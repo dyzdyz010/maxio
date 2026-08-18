@@ -764,7 +764,7 @@ defmodule Maxio.IAM.QueryPlug do
         user_arn: user.user_arn,
         path: path,
         permissions_boundary_policy_arn: permissions_boundary_policy_arn,
-        tag_count: map_size(user.tags || %{})
+        tag_count: map_size(user.tags)
       )
 
       conn
@@ -2207,7 +2207,7 @@ defmodule Maxio.IAM.QueryPlug do
         path: path,
         max_session_duration_seconds: role.max_session_duration_seconds,
         permissions_boundary_policy_arn: permissions_boundary_policy_arn,
-        tag_count: map_size(role.tags || %{})
+        tag_count: map_size(role.tags)
       )
 
       conn
@@ -2446,7 +2446,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :tag_role,
         principal_arn: conn.assigns.principal[:arn],
         role_arn: role.role_arn,
-        tag_count: map_size(role.tags || %{})
+        tag_count: map_size(role.tags)
       )
 
       empty_success(conn, "TagRole")
@@ -2470,7 +2470,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :untag_role,
         principal_arn: conn.assigns.principal[:arn],
         role_arn: role.role_arn,
-        tag_count: map_size(role.tags || %{})
+        tag_count: map_size(role.tags)
       )
 
       empty_success(conn, "UntagRole")
@@ -2505,7 +2505,7 @@ defmodule Maxio.IAM.QueryPlug do
         principal_arn: conn.assigns.principal[:arn],
         instance_profile_arn: instance_profile.instance_profile_arn,
         path: path,
-        tag_count: map_size(instance_profile.tags || %{})
+        tag_count: map_size(instance_profile.tags)
       )
 
       conn
@@ -2736,7 +2736,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :tag_instance_profile,
         principal_arn: conn.assigns.principal[:arn],
         instance_profile_arn: instance_profile.instance_profile_arn,
-        tag_count: map_size(instance_profile.tags || %{})
+        tag_count: map_size(instance_profile.tags)
       )
 
       empty_success(conn, "TagInstanceProfile")
@@ -2764,7 +2764,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :untag_instance_profile,
         principal_arn: conn.assigns.principal[:arn],
         instance_profile_arn: instance_profile.instance_profile_arn,
-        tag_count: map_size(instance_profile.tags || %{})
+        tag_count: map_size(instance_profile.tags)
       )
 
       empty_success(conn, "UntagInstanceProfile")
@@ -2805,7 +2805,7 @@ defmodule Maxio.IAM.QueryPlug do
         principal_arn: conn.assigns.principal[:arn],
         server_certificate_arn: server_certificate.server_certificate_arn,
         path: path,
-        tag_count: map_size(server_certificate.tags || %{})
+        tag_count: map_size(server_certificate.tags)
       )
 
       conn
@@ -2995,7 +2995,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :tag_server_certificate,
         principal_arn: conn.assigns.principal[:arn],
         server_certificate_arn: server_certificate.server_certificate_arn,
-        tag_count: map_size(server_certificate.tags || %{})
+        tag_count: map_size(server_certificate.tags)
       )
 
       empty_success(conn, "TagServerCertificate")
@@ -3024,7 +3024,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :untag_server_certificate,
         principal_arn: conn.assigns.principal[:arn],
         server_certificate_arn: server_certificate.server_certificate_arn,
-        tag_count: map_size(server_certificate.tags || %{})
+        tag_count: map_size(server_certificate.tags)
       )
 
       empty_success(conn, "UntagServerCertificate")
@@ -3395,7 +3395,7 @@ defmodule Maxio.IAM.QueryPlug do
          {:ok, max_items} <- max_items(conn),
          {:ok, marker_offset} <- marker_offset(conn),
          {:ok, user} <- IAM.get_user(user_name) do
-      tag_page = tag_page(user.tags || %{}, max_items, marker_offset)
+      tag_page = tag_page(user.tags, max_items, marker_offset)
 
       Log.info("iam list-user-tags returned",
         action: :list_user_tags,
@@ -3431,7 +3431,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :tag_user,
         principal_arn: conn.assigns.principal[:arn],
         user_arn: user.user_arn,
-        tag_count: map_size(user.tags || %{})
+        tag_count: map_size(user.tags)
       )
 
       empty_success(conn, "TagUser")
@@ -3455,7 +3455,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :untag_user,
         principal_arn: conn.assigns.principal[:arn],
         user_arn: user.user_arn,
-        tag_count: map_size(user.tags || %{})
+        tag_count: map_size(user.tags)
       )
 
       empty_success(conn, "UntagUser")
@@ -3881,7 +3881,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :tag_open_id_connect_provider,
         principal_arn: conn.assigns.principal[:arn],
         provider_arn: provider.provider_arn,
-        tag_count: map_size(provider.tags || %{})
+        tag_count: map_size(provider.tags)
       )
 
       empty_success(conn, "TagOpenIDConnectProvider")
@@ -3909,7 +3909,7 @@ defmodule Maxio.IAM.QueryPlug do
         action: :untag_open_id_connect_provider,
         principal_arn: conn.assigns.principal[:arn],
         provider_arn: provider.provider_arn,
-        tag_count: map_size(provider.tags || %{})
+        tag_count: map_size(provider.tags)
       )
 
       empty_success(conn, "UntagOpenIDConnectProvider")

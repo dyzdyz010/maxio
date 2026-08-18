@@ -628,8 +628,9 @@ defmodule Maxio.Ops.ClusterHealthConsole do
 
   defp text(nil), do: "-"
   defp text(""), do: "-"
+
+  # 布尔量由上面的 is_atom/1 子句吸收（Atom.to_string(true) == to_string(true)），无需单列。
   defp text(value) when is_atom(value), do: Atom.to_string(value)
-  defp text(value) when is_boolean(value), do: to_string(value)
   defp text(value) when is_number(value), do: to_string(value)
   defp text(%DateTime{} = value), do: DateTime.to_iso8601(value)
 

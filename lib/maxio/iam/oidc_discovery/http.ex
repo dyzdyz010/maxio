@@ -351,7 +351,7 @@ defmodule Maxio.IAM.OIDCDiscovery.HTTP do
           {:error, :oidc_discovery_response_too_large}
 
         true ->
-          <<chunk::binary-size(size), "\r\n", tail::binary>> = rest
+          <<chunk::binary-size(^size), "\r\n", tail::binary>> = rest
           decode_chunked_body(tail, acc <> chunk, limit)
       end
     else

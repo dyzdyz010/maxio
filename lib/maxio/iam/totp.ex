@@ -168,7 +168,7 @@ defmodule Maxio.IAM.TOTP do
   defp hotp(secret, counter, digits, algorithm) when counter >= 0 do
     hmac = :crypto.mac(:hmac, algorithm, secret, <<counter::unsigned-big-integer-size(64)>>)
     offset = :binary.last(hmac) &&& 0x0F
-    <<_prefix::binary-size(offset), truncated::binary-size(4), _rest::binary>> = hmac
+    <<_prefix::binary-size(^offset), truncated::binary-size(4), _rest::binary>> = hmac
     <<value::unsigned-big-integer-size(32)>> = truncated
 
     value

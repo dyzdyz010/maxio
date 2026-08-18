@@ -16,7 +16,9 @@ defmodule Maxio.S3.PrometheusAuthz do
 
   @spec authorize(Plug.Conn.t(), map()) :: :ok | {:error, atom()}
   def authorize(conn, principal) when is_map(principal) do
-    authenticated? = principal != :anonymous
+    # 本子句的 is_map/1 守卫已排除 :anonymous（匿名走下面的 implicit_deny 子句），
+    # 因此到这里的 principal 必然是已认证的 principal map。
+    authenticated? = true
     conn = assign(conn, :principal, principal)
     conditions = Authz.conditions_for(conn, authenticated?)
 

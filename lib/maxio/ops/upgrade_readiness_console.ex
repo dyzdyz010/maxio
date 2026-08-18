@@ -1059,9 +1059,8 @@ defmodule Maxio.Ops.UpgradeReadinessConsole do
     Map.get(map, key, Map.get(map, to_string(key), default))
   end
 
-  defp map_get(value, key, default) do
-    if is_struct(value) and Map.has_key?(value, key), do: Map.get(value, key), else: default
-  end
+  # 结构体也是 map，已被上面的 %{} 子句覆盖；本子句只会收到非 map 值。
+  defp map_get(_value, _key, default), do: default
 
   defp list(values) when is_list(values), do: values
   defp list(_values), do: []
@@ -1084,8 +1083,9 @@ defmodule Maxio.Ops.UpgradeReadinessConsole do
 
   defp text(nil), do: "-"
   defp text(""), do: "-"
+
+  # 布尔量由上面的 is_atom/1 子句吸收（Atom.to_string(true) == to_string(true)），无需单列。
   defp text(value) when is_atom(value), do: Atom.to_string(value)
-  defp text(value) when is_boolean(value), do: to_string(value)
   defp text(value) when is_number(value), do: to_string(value)
   defp text(%DateTime{} = value), do: DateTime.to_iso8601(value)
 
