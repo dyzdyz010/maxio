@@ -339,10 +339,47 @@ defmodule Maxio.S3.NotificationDelivery do
     end
   end
 
+  # `Task.start/1` 的 @spec 是 `{:ok, pid()}`，实现是 `{:ok, spawn(...)}`——它**不会**返回
+  # {:error, reason}；启动失败（进程表打满）走的是**异常**通道。实测取证（`+P 1024` 起 BEAM、
+  # 先把进程表占满再调用）：`Task.start/1` 抛 SystemLimitError。所以原来的 `{:error, reason}`
+  # 子句永远匹配不到，这条防线一直是空的。
+  #
+  # 此刻事件已经落进 outbox，按本模块 moduledoc 的契约：进 outbox 之后的投递失败只记账、
+  # 交给 `drain/1` 重投；只有进 outbox 之前的失败才升级成 S3 错误。因此必须把真实的异常通道
+  # 接住并打结构化日志——否则异常会穿透 `deliver_enqueued/1` 的 `:ok` 契约，把一个**已经提交**
+  # 的对象写请求炸成 500，同时丢掉这条投递失败的唯一留痕（AGENTS.md §3：绝不静默失败，
+  # 也绝不把 outbox 已可恢复的失败升级成请求级崩溃）。
+  #
+  # 生产路径**直调** `Task.start/1`（不经任何间接层）：只有直调才让类型检查器看得见它的
+  # 返回类型，从而在本函数里新增 `{:error, _}` 之类的死分支时由 `--warnings-as-errors`
+  # 当场拦下——这正是发现上面那条空防线的信号，不能被一个「可注入的函数值」遮蔽掉
+  # （把调用点换成 `fun.(...)` 后，同一条死分支编译器不再报任何告警）。
+  #
+  # 测试所需的失败注入因此被收窄成一个**只作用于失败通道**的 0 元 hook：它在
+  # `Task.start/1` 之前执行、不参与返回值，生产恒为 nil（零行为、零配置面）。
   defp deliver_enqueued_async(outbox_event_id, event) do
-    case Task.start(fn -> deliver_one(outbox_event_id) end) do
-      {:ok, _pid} -> :ok
-      {:error, reason} -> log_delivery_failed(event, reason)
+    inject_async_start_failure!()
+    {:ok, _pid} = Task.start(fn -> deliver_one(outbox_event_id) end)
+    :ok
+  rescue
+    err in Error ->
+      reraise err, __STACKTRACE__
+
+    error ->
+      log_delivery_failed(event, error)
+      :ok
+  end
+
+  # test-only 注入点（与 `:deliverer` / `:async?` 同一 Application env 键）：默认 nil，
+  # 生产路径只多一次 `Application.get_env` 读取；测试注入 0 元函数来复现
+  # `Task.start/1` 的异常通道（进程表打满 → SystemLimitError）。
+  defp inject_async_start_failure! do
+    :maxio
+    |> Application.get_env(:notification_delivery, [])
+    |> Keyword.get(:async_start_failure_fun)
+    |> case do
+      nil -> :ok
+      fun when is_function(fun, 0) -> fun.()
     end
   end
 

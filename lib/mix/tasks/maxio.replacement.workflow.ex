@@ -222,6 +222,9 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
 
   defp fail_if_needed!(_report, _opts), do: :ok
 
+  # Workflow.run/1 的失败全部来自 validate/1 的 cond，只有下面三种形状；主体成功路径恒返回
+  # {:ok, report}。原通用兜底子句与这三条完全重叠且不可达，删除后新增失败形状会以
+  # FunctionClauseError 当场炸出，不会被 inspect 成一句无信息量的文案掩盖过去。
   defp error_message(:advance_requires_heal),
     do: "--advance-steps and --verify-closure require --heal"
 
@@ -230,8 +233,6 @@ defmodule Mix.Tasks.Maxio.Replacement.Workflow do
 
   defp error_message({:invalid_advance_steps, value}),
     do: "--advance-steps must be a positive integer, got #{inspect(value)}"
-
-  defp error_message(reason), do: "replacement workflow failed: #{inspect(reason)}"
 
   defp json_ready(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
   defp json_ready(value) when is_boolean(value) or is_nil(value), do: value

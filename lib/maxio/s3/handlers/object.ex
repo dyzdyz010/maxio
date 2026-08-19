@@ -1727,7 +1727,21 @@ defmodule Maxio.S3.Handlers.Object do
             end
           end)
         after
-          if is_function(discard_copy_checksum, 0), do: discard_copy_checksum.()
+          # discard_copy_checksum 恒为 0 元函数：wrap_copy_checksum/3 的三条子句都收敛到
+          # wrap_copy_checksum_context/2 → Checksum.wrap_stream/2，两条子句都把 0 元 discard
+          # 作为第三元返回；prepare_copy_payload/6 的**五个** target_sse 分支
+          # （"AES256" / {:kms,…} / {:kms_dsse,…} / {:customer,…} / nil）原样透传。且本
+          # try/after 起点在上面的五元组解构之后——prepare_copy_payload 抛异常时根本进不到
+          # 这里，discard_copy_checksum 不可能未绑定。故 is_function/2 守卫恒真，直接调用即可。
+          #
+          # 与 object.ex:509 / multipart.ex 的五处同源 discard_checksum.() 调用点，等价的只是
+          # 「值必为 0 元函数」这一维——**风险剖面并不相同**：那五处全部位于 error 路径
+          # （Storage.put 的 {:error,_} 分支 / rescue / catch），而这里是覆盖**成功路径**的
+          # 无条件 after；此处若抛异常，会把一个已经提交成功的 CopyObject 变成 500。
+          #
+          # 去掉运行时守卫后，该不变量改由 `--warnings-as-errors` **静态**守住：把任一分支
+          # 返回的第三元变异成非函数值，编译器直接在下面这行报类型告警（运行期反例今天构造不出）。
+          discard_copy_checksum.()
         end
       after
         cleanup_copy_source(src_stream)
@@ -1880,9 +1894,11 @@ defmodule Maxio.S3.Handlers.Object do
     nil
   end
 
+  # 唯一调用点 copy/1 的 src_obj 来自 object_or_raise/3——查不到直接抛 S3 错误，拿到就一定是
+  # 对象结构体（map）。故 %{} 子句已覆盖 algorithm 非 binary 的全部输入，原「非 map → %{}」
+  # 兜底子句不可达；保留 %{} 形状断言，让契约被破坏时以 FunctionClauseError 显式炸出而非静默回 %{}。
   defp copy_source_checksum(_src_obj, algorithm) when is_binary(algorithm), do: %{}
   defp copy_source_checksum(%{} = src_obj, _algorithm), do: SSE.visible_checksum_metadata(src_obj)
-  defp copy_source_checksum(_src_obj, _algorithm), do: %{}
 
   # ObjectMutation Phase 2A（C3）：copy seam 错误映射与 do_put 收口同源（B5/B7 先例）——
   # 瞬时条件（epoch quorum 读不足 / epoch fence 争用 / journal metadata CAS 争用）→ 503

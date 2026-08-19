@@ -352,6 +352,13 @@ config :maxio, :rebalance_scheduler,
 # `{Maxio.S3.NotificationDelivery.AWS, opts}` for SigV4-signed SNS/SQS/Lambda/
 # EventBridge delivery. With no deliverer, events remain pending in the durable
 # outbox until an operator configures delivery and drains them.
+#
+# Besides `:deliverer` and `:async?`, this key also accepts
+# `:async_start_failure_fun` — a **test-only** injection point that must stay
+# unset in production. It is a 0-arity function invoked right before
+# `Task.start/1` in `deliver_enqueued_async/2`, purely so tests can reproduce
+# the async-start exception channel (process table exhausted -> SystemLimitError).
+# It never participates in the return value and has no operator use case.
 config :maxio, :notification_delivery, deliverer: nil, async?: true
 
 config :maxio, :notification_delivery_scheduler,

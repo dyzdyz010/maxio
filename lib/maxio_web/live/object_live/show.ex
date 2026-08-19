@@ -727,6 +727,11 @@ defmodule MaxioWeb.ObjectLive.Show do
      |> assign(:presigned_url, nil)}
   end
 
+  # 本 with 的失败集合是封闭的 5 个原子：parse_presign_method/1 → :invalid_method、
+  # parse_presign_expires/1 → :invalid_expires、parse_presign_version_id/3 → :invalid_version_id、
+  # create_presigned_url/5 自己的 else 已把凭据/签名侧的任意失败归一成 :invalid_public_url 或
+  # :credential_unavailable（并在那里打结构化 log_presign_failure）。归一层是承重的那一层，
+  # 这里再挂一条 {:error, _reason} 通用兜底只是重叠层，用户永远看不到它的文案。
   @impl true
   def handle_event("create_presigned_url", %{"presign" => params}, socket) do
     method_value = presign_method_value(Map.get(params, "method"))
@@ -777,9 +782,6 @@ defmodule MaxioWeb.ObjectLive.Show do
 
       {:error, :invalid_public_url} ->
         {:noreply, put_flash(socket, :error, "S3 public URL 配置非法，无法生成预签名 URL")}
-
-      {:error, _reason} ->
-        {:noreply, put_flash(socket, :error, "预签名 URL 生成失败")}
     end
   end
 
@@ -1419,8 +1421,10 @@ defmodule MaxioWeb.ObjectLive.Show do
     to_form(%{"version_id" => object_version_id(object)}, as: :retention_clear)
   end
 
-  defp retention_configured?(nil), do: false
-
+  # 唯一调用点在模板 `:if={@object_lock_enabled? && @object_lock_target}` 收窄的卡片里，
+  # @object_lock_target 在那里恒非 nil；nil 情形由同级 `:if={... && !@object_lock_target}`
+  # 分支单独渲染提示文案（"当前对象只有 delete marker 版本…"）。承重守卫在模板，
+  # 这里的 nil 子句是重叠层，删掉不改变任何渲染结果。
   defp retention_configured?(object) do
     not is_nil(object.object_lock_mode) or not is_nil(object.object_lock_retain_until)
   end
@@ -1510,7 +1514,9 @@ defmodule MaxioWeb.ObjectLive.Show do
   defp legal_hold_options, do: [{"OFF", "OFF"}, {"ON", "ON"}]
   defp retention_mode_options, do: [{"GOVERNANCE", "GOVERNANCE"}, {"COMPLIANCE", "COMPLIANCE"}]
 
-  defp retention_summary(nil), do: "无可编辑版本"
+  # 同 retention_configured?/1：唯一调用点在模板被 @object_lock_target 收窄的卡片内，
+  # 无 target 时整张卡片不渲染，原 nil 子句的 "无可编辑版本" 文案永远到不了页面
+  # （该场景的提示由 #object-lock-no-target 分支承担）。
   defp retention_summary(%{object_lock_mode: nil}), do: "未设置"
   defp retention_summary(%{object_lock_mode: mode, object_lock_retain_until: nil}), do: mode
 

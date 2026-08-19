@@ -1250,6 +1250,13 @@ defmodule Maxio.STS do
     end)
   end
 
+  # 外层 with 的失败集合只有 {:error, :inherited_transitive_tag_conflict} 一种：
+  # inherited_transitive_session_tags/1 两条子句都恒返回 {:ok, tags}，
+  # reject_inherited_transitive_tag_override/2 只会返回 :ok 或该冲突原子。
+  # 内层 with 无 else，validate_session_tags/1 的 {:error, :invalid_session_tags} 是 do 块的
+  # 返回值、本就不经外层 else——所以原来的 else 里，冲突分支是恒等透传、`_error` 归一分支不可达。
+  # 去掉整个 else 后语义逐字节不变（with 无 else 时失败值原样返回），同时不再把未来新增的失败
+  # 原子静默改写成 :invalid_session_tags（AGENTS.md §3：失败必须是显式、如实的结构化状态）。
   defp assume_role_tag_state(caller_principal, session_tags, requested_transitive_tag_keys) do
     with {:ok, inherited_tags} <- inherited_transitive_session_tags(caller_principal),
          :ok <- reject_inherited_transitive_tag_override(inherited_tags, session_tags) do
@@ -1266,10 +1273,6 @@ defmodule Maxio.STS do
            tag_session_required?: effective_session_tags != []
          }}
       end
-    else
-      {:error, :inherited_transitive_tag_conflict} = error -> error
-      # 其余（含 :invalid_session_tags）统一归一为 :invalid_session_tags 兜底。
-      _error -> {:error, :invalid_session_tags}
     end
   end
 

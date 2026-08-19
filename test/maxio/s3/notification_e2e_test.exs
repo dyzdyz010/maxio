@@ -1,6 +1,7 @@
 defmodule Maxio.S3.NotificationE2ETest do
   use Maxio.DataCase, async: false
 
+  import ExUnit.CaptureLog
   import Plug.Conn
 
   alias Maxio.Auth.CredentialStore
@@ -700,6 +701,46 @@ defmodule Maxio.S3.NotificationE2ETest do
     assert delivered.status == "delivered"
     assert delivered.attempts == 2
     assert delivered.delivered_at
+  end
+
+  # `Task.start/1` 永远不会返回 {:error, _}：启动失败（进程表打满）只走异常通道，实测抛
+  # SystemLimitError。事件此刻已经落进 outbox，按本模块契约这类失败只应记账 + 交给 drain/1
+  # 重投——绝不能穿透 deliver_enqueued/1 的 :ok 契约，把一个已经提交的对象写请求炸成 500，
+  # 也绝不能被静默吞掉（AGENTS.md §3）。
+  test "async delivery start failure is logged and leaves the outbox row drainable" do
+    assert create_bucket("notifyasyncfail").status == 200
+
+    assert put_notification("notifyasyncfail", @queue_config,
+             headers: [{"x-amz-skip-destination-validation", "true"}]
+           ).status == 200
+
+    enable_notification_delivery!(self(),
+      async?: true,
+      async_start_failure_fun: fn -> raise SystemLimitError end
+    )
+
+    log =
+      capture_log([level: :warning], fn ->
+        # 写请求本身必须照常 200：字节和 outbox 行都已提交，投递侧失败不回滚已提交的写。
+        assert put_object("notifyasyncfail", "images/async.jpg", "async").status == 200
+      end)
+
+    # 失败必须留痕，且带上真实的异常原因（结构化 reason 元数据）。
+    assert log =~ "bucket notification delivery failed"
+    assert log =~ "SystemLimitError"
+
+    # 行仍是 pending，投递债务没有被吞掉，drain/1 能把它收敛掉。
+    assert [%{status: "pending"} = row] = NotificationOutbox.list(status: "pending")
+
+    enable_notification_delivery!()
+
+    assert {:ok, %{claimed: 1, delivered: 1, failed: 0}} = NotificationDelivery.drain()
+    assert_receive {:maxio_notification, event}
+
+    {_destination, _record} =
+      assert_object_event(event, "notifyasyncfail", "images/async.jpg", "ObjectCreated:Put")
+
+    assert NotificationOutbox.get!(row.id).status == "delivered"
   end
 
   test "CopyObject emits ObjectCreated Copy notifications through EventBridge config" do

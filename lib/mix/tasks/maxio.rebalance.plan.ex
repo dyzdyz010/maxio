@@ -60,13 +60,14 @@ defmodule Mix.Tasks.Maxio.Rebalance.Plan do
           print_report(report)
         end
 
+      # Rebalance.plan/1 的失败面只有 validate_decommission_set/2 这一处，形状固定为
+      # {:unknown_set_id, set_id, set_ids}；其余步骤都汇入 {:ok, report}。原通用
+      # {:error, reason} 兜底与上面的专用子句完全重叠且文案更差，删除后失败仍是显式的
+      # （新增失败形状会以 CaseClauseError 当场炸出，不会被静默吞掉）。
       {:error, {:unknown_set_id, set_id, set_ids}} ->
         Mix.raise(
           "unknown --decommission-set #{inspect(set_id)}; configured set ids: #{inspect(set_ids)}"
         )
-
-      {:error, reason} ->
-        Mix.raise("rebalance plan failed: #{inspect(reason)}")
     end
   end
 
