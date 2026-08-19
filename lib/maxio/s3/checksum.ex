@@ -82,7 +82,6 @@ defmodule Maxio.S3.Checksum do
     "ChecksumXXHASH128" => "XXHASH128",
     "ChecksumXXHASH64" => "XXHASH64"
   }
-  @unsupported_object_metadata_algorithms %{}
 
   @composite_multipart_algorithms ~w(CRC32 CRC32C MD5 SHA1 SHA256 SHA512 XXHASH3 XXHASH128 XXHASH64)
   @full_object_multipart_algorithms ~w(CRC32 CRC32C CRC64NVME)
@@ -1181,17 +1180,6 @@ defmodule Maxio.S3.Checksum do
       fields == [] ->
         nil
 
-      unsupported_source_metadata_fields(fields) != [] ->
-        unsupported =
-          fields
-          |> unsupported_source_metadata_fields()
-          |> Enum.map(&Map.fetch!(@unsupported_object_metadata_algorithms, &1))
-          |> Enum.join(", ")
-
-        raise Error.new(:not_implemented,
-                message: "CopyObject source checksum algorithm is not implemented: #{unsupported}"
-              )
-
       unknown_source_metadata_fields(fields) != [] ->
         raise Error.new(:not_implemented,
                 message:
@@ -1223,15 +1211,9 @@ defmodule Maxio.S3.Checksum do
     end)
   end
 
-  defp unsupported_source_metadata_fields(fields) do
-    Enum.filter(fields, &Map.has_key?(@unsupported_object_metadata_algorithms, &1))
-  end
-
+  # 未建模的 Checksum* 源元数据字段一律走 :not_implemented（绝不静默放行）。
   defp unknown_source_metadata_fields(fields) do
-    Enum.reject(fields, fn field ->
-      Map.has_key?(@object_metadata_algorithms, field) or
-        Map.has_key?(@unsupported_object_metadata_algorithms, field)
-    end)
+    Enum.reject(fields, &Map.has_key?(@object_metadata_algorithms, &1))
   end
 
   defp modeled_response_headers(checks) do

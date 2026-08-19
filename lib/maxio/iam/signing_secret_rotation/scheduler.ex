@@ -16,6 +16,9 @@ defmodule Maxio.IAM.SigningSecretRotation.Scheduler do
   @default_initial_delay_ms 60_000
   @default_rotate_after_seconds 86_400 * 90
 
+  # 轮换未落地的终态：任何一个都意味着密钥没换成，必须走 error 级日志。
+  @failure_statuses [:blocked, :rewrap_blocked, :crashed, :caught, :bad_rotation_result]
+
   @option_keys [
     :keyring_file,
     :rotate_after_seconds,
@@ -131,11 +134,11 @@ defmodule Maxio.IAM.SigningSecretRotation.Scheduler do
 
     case cfg[:runner].(rotate_opts) do
       {:ok, report} = result ->
-        log_report(report, trigger)
+        log_report(report, trigger, :ok)
         result
 
       {:error, report} = result when is_map(report) ->
-        log_report(report, trigger)
+        log_report(report, trigger, :error)
         result
 
       other ->
@@ -166,16 +169,31 @@ defmodule Maxio.IAM.SigningSecretRotation.Scheduler do
       {:error, %{status: :caught, errors: [{kind, reason}]}}
   end
 
-  defp log_report(report, trigger) do
-    Log.info("iam signing secret rotation scheduler pass complete",
+  # 调度器是生产环境唯一的自动轮换路径：失败（含磁盘写满 / 权限错误）必须以 error 级别
+  # 连同**完整根因**出现在日志里，绝不能与成功报告一样降级成 info + 计数（AGENTS.md §3/§4.4）。
+  defp log_report(report, trigger, outcome) do
+    fields = [
       action: :iam_signing_secret_rotation,
       reason:
         "trigger=#{trigger} status=#{Map.get(report, :status)} dry_run=#{Map.get(report, :dry_run)} " <>
           "previous_key_id=#{inspect(Map.get(report, :previous_key_id))} " <>
           "next_key_id=#{inspect(Map.get(report, :next_key_id))} " <>
-          "errors=#{length(Map.get(report, :errors, []))}"
-    )
+          "errors=#{inspect(Map.get(report, :errors, []))}"
+    ]
+
+    message = "iam signing secret rotation scheduler pass complete"
+
+    if failed?(outcome, report) do
+      Log.error(message, fields)
+    else
+      Log.info(message, fields)
+    end
   end
+
+  defp failed?(:error, _report), do: true
+
+  defp failed?(_outcome, report),
+    do: Map.get(report, :status) in @failure_statuses or Map.get(report, :errors, []) != []
 
   defp schedule(state, delay_ms) do
     cancel_timer(state.timer_ref)

@@ -1,6 +1,8 @@
 defmodule Maxio.IAM.SigningSecretRotationTest do
   use Maxio.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Maxio.Auth.CredentialStore.EctoStore
   alias Maxio.IAM
   alias Maxio.IAM.{AccessKey, SigningSecretKeyring, SigningSecretRotation}
@@ -282,6 +284,31 @@ defmodule Maxio.IAM.SigningSecretRotationTest do
     end)
   end
 
+  test "read-only secret file device blocks rotation instead of escaping as an exception" do
+    keyring_file = Path.join(@data_dir, "readonly-io-keyring.json")
+
+    # 打开成功但写入失败：`IO.binwrite/2` 的错误通道是异常（:eacces），不是 {:error, reason}。
+    open_fun = fn path, _modes ->
+      File.write!(path, "")
+      File.open(path, [:read, :binary])
+    end
+
+    assert_write_failure_is_blocked(keyring_file, "rotation-readonly-io", open_fun)
+  end
+
+  test "terminated secret file device blocks rotation instead of escaping as an exception" do
+    keyring_file = Path.join(@data_dir, "terminated-io-keyring.json")
+
+    # 设备进程已终止：`IO.binwrite/2` 抛出 :terminated。
+    open_fun = fn path, modes ->
+      {:ok, io} = File.open(path, modes)
+      :ok = File.close(io)
+      {:ok, io}
+    end
+
+    assert_write_failure_is_blocked(keyring_file, "rotation-terminated-io", open_fun)
+  end
+
   test "scheduler is disabled by default and manual run invokes configured runner" do
     parent = self()
 
@@ -353,6 +380,104 @@ defmodule Maxio.IAM.SigningSecretRotationTest do
 
     assert_receive {:guarded_runner_called, opts}
     assert Keyword.fetch!(opts, :dry_run) == true
+  end
+
+  test "scheduler logs failed rotation passes at error level with the full root cause" do
+    for status <- [:blocked, :rewrap_blocked] do
+      assert_scheduler_logs_failure_at_error_level(status)
+    end
+  end
+
+  defp assert_scheduler_logs_failure_at_error_level(status) do
+    report = %{
+      status: status,
+      dry_run: false,
+      previous_key_id: "old",
+      next_key_id: "new",
+      errors: [{:access_key_secret_keyring_file_write_failed, :eacces}]
+    }
+
+    pid =
+      start_supervised!(
+        {Scheduler,
+         name: nil,
+         enabled: false,
+         confirm_rotation: true,
+         runner: fn _opts -> {:error, report} end},
+        id: {:scheduler, status}
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:error, %{status: ^status}} = Scheduler.run_now(pid, keyring_file: "k")
+      end)
+
+    # 生产唯一自动路径上的失败不得降级成 info，且必须原样带出 reason（不是 errors 计数）。
+    assert log =~ "[error]"
+    assert log =~ "iam signing secret rotation scheduler pass complete"
+    assert log =~ "status=#{status}"
+    assert log =~ "errors=#{inspect(report.errors)}"
+    assert log =~ "access_key_secret_keyring_file_write_failed"
+    assert log =~ ":eacces"
+    refute log =~ "[info]"
+  end
+
+  defp assert_write_failure_is_blocked(keyring_file, label, open_fun) do
+    old_key = b64_secret("#{label}-old")
+    new_key = b64_secret("#{label}-new")
+    parent = self()
+
+    with_access_key_secret_config(
+      [keyring_file: keyring_file, current_key_id: "old", secret_key: old_key],
+      fn ->
+        log =
+          capture_log(fn ->
+            send(
+              parent,
+              {:rotate_result,
+               SigningSecretRotation.rotate(
+                 keyring_file: keyring_file,
+                 key_id: "new",
+                 key_b64: new_key,
+                 now: @now,
+                 dry_run: false,
+                 rewrap: false,
+                 open_fun: open_fun
+               )}
+            )
+          end)
+
+        assert_received {:rotate_result, {:error, report}}
+
+        assert report.status == :blocked
+
+        # 根因不得被丢弃：报告里带 OS 级 reason，日志里以 error 级别留痕。
+        assert {:access_key_secret_keyring_file_write_failed, reason} =
+                 Enum.find(
+                   report.errors,
+                   &match?({:access_key_secret_keyring_file_write_failed, _reason}, &1)
+                 )
+
+        assert log =~ "[error]"
+        assert log =~ "iam signing secret keyring file write failed"
+        assert log =~ inspect(reason)
+
+        # 绝不静默落盘：失败后既不留下半截 keyring，也不改运行时配置。
+        refute File.exists?(keyring_file)
+        assert Application.fetch_env!(:maxio, :access_key_secret)[:current_key_id] == "old"
+
+        # `Path.wildcard/1` 的 `*` 不跨 `.` 匹配，对 `<name>.json.tmp.<N>` 恒返回 []，
+        # 是空转断言；必须直接列目录再按 `.tmp.` 过滤才有保护力。
+        assert residual_tmp_files() == []
+      end
+    )
+  end
+
+  defp residual_tmp_files do
+    @data_dir
+    |> File.ls!()
+    |> Enum.filter(&String.contains?(&1, ".tmp."))
+    |> Enum.sort()
   end
 
   defp write_keyring!(path, key_id, key_b64, started_at) do

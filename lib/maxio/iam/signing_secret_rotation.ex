@@ -9,6 +9,7 @@ defmodule Maxio.IAM.SigningSecretRotation do
   """
 
   alias Maxio.IAM.SigningSecretKeyring
+  alias Maxio.S3.Log
 
   @version 1
   @default_rotate_after_seconds 86_400 * 90
@@ -109,7 +110,7 @@ defmodule Maxio.IAM.SigningSecretRotation do
       "keys" => key_metadata
     }
 
-    with :ok <- write_keyring_file(path, payload),
+    with :ok <- write_keyring_file(path, payload, opts),
          :ok <- put_runtime_env(path, key_id, key_b64, payload["keys"]),
          {:ok, rewrap_report} <- maybe_rewrap(opts) do
       {:ok,
@@ -143,11 +144,23 @@ defmodule Maxio.IAM.SigningSecretRotation do
   defp try_acquire_keyring_lock(lock_path, deadline) do
     case File.open(lock_path, [:write, :exclusive, :binary]) do
       {:ok, io} ->
-        _ =
-          IO.binwrite(
-            io,
-            "pid=#{inspect(self())} acquired_at=#{DateTime.utc_now() |> DateTime.to_iso8601()}\n"
-          )
+        # 锁文件正文只是取证元数据，写失败不应阻断加锁；但同样必须接住
+        # `IO.binwrite/2` 的异常通道，否则会绕开 acquire_keyring_lock/1 的元组契约。
+        # 不阻断 ≠ 静默：正文是「谁持有这把锁」的唯一取证来源，写失败必须留痕。
+        case write_secret_contents(
+               io,
+               "pid=#{inspect(self())} acquired_at=#{DateTime.utc_now() |> DateTime.to_iso8601()}\n"
+             ) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Log.warn("iam signing secret keyring lock file body write failed",
+              action: :iam_signing_secret_rotation,
+              resource: lock_path,
+              reason: inspect(reason)
+            )
+        end
 
         {:ok, {lock_path, io}}
 
@@ -195,23 +208,32 @@ defmodule Maxio.IAM.SigningSecretRotation do
     :ok
   end
 
-  defp write_keyring_file(path, payload) do
+  defp write_keyring_file(path, payload, opts) do
     dir = Path.dirname(path)
     tmp = "#{path}.tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- File.mkdir_p(dir),
          {:ok, json} <- Jason.encode(payload, pretty: true),
-         :ok <- write_new_secret_file(tmp, json <> "\n"),
-         :ok <- replace_file(tmp, path) do
+         :ok <- write_new_secret_file(tmp, json <> "\n", opts),
+         :ok <- replace_file(tmp, path, opts) do
       :ok
     else
-      {:error, _reason} ->
+      {:error, reason} ->
+        # 根因（:eacces / :enospc / :terminated / Jason.EncodeError …）绝不能在此丢弃：
+        # 既经结构化日志立即留痕（AGENTS.md §3 + §4.4，运维无 GUI 只能看日志），
+        # 也随语义化 term 一起回到报告 errors 里，供 scheduler / mix 任务原样透出。
+        Log.error("iam signing secret keyring file write failed",
+          action: :iam_signing_secret_rotation,
+          resource: path,
+          reason: inspect(reason)
+        )
+
         File.rm(tmp)
-        {:error, :access_key_secret_keyring_file_write_failed}
+        {:error, {:access_key_secret_keyring_file_write_failed, reason}}
     end
   end
 
-  defp replace_file(tmp, path) do
+  defp replace_file(tmp, path, opts) do
     case File.rename(tmp, path) do
       :ok ->
         with :ok <- restrict_file(path),
@@ -220,24 +242,24 @@ defmodule Maxio.IAM.SigningSecretRotation do
         end
 
       {:error, :eexist} ->
-        overwrite_existing_file(tmp, path)
+        overwrite_existing_file(tmp, path, opts)
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp overwrite_existing_file(tmp, path) do
+  defp overwrite_existing_file(tmp, path, opts) do
     with {:ok, contents} <- File.read(tmp),
-         :ok <- write_existing_secret_file(path, contents),
+         :ok <- write_existing_secret_file(path, contents, opts),
          :ok <- File.rm(tmp),
          :ok <- sync_parent_dir_best_effort(path) do
       :ok
     end
   end
 
-  defp write_new_secret_file(path, contents) do
-    case File.open(path, [:write, :exclusive, :binary]) do
+  defp write_new_secret_file(path, contents, opts) do
+    case open_secret_file(opts, path, [:write, :exclusive, :binary]) do
       {:ok, io} ->
         try do
           with :ok <- restrict_file(path),
@@ -254,9 +276,9 @@ defmodule Maxio.IAM.SigningSecretRotation do
     end
   end
 
-  defp write_existing_secret_file(path, contents) do
+  defp write_existing_secret_file(path, contents, opts) do
     with :ok <- restrict_file(path) do
-      case File.open(path, [:write, :binary]) do
+      case open_secret_file(opts, path, [:write, :binary]) do
         {:ok, io} ->
           try do
             with :ok <- write_secret_contents(io, contents),
@@ -273,11 +295,20 @@ defmodule Maxio.IAM.SigningSecretRotation do
     end
   end
 
+  # 与 storage 层 `rename_fun`/`stat_fun` 同一注入约定：默认走 `File.open/2`，
+  # 测试可注入只读/已关闭的 io 设备来复现真实写盘失败通道。
+  defp open_secret_file(opts, path, modes) do
+    Keyword.get(opts, :open_fun, &File.open/2).(path, modes)
+  end
+
+  # `IO.binwrite/2` 的 @spec 是 `:ok`——写盘失败（:enospc/:eacces/设备 :terminated）
+  # 走的是**异常**通道而非 {:error, reason}。若不接住，异常会穿过 `after File.close(io)`
+  # 逃逸出本模块通篇的 {:error, reason} 契约（AGENTS.md §3「绝不静默失败」要求
+  # 失败必须是显式、结构化的状态，而不是把调用方炸掉）。
   defp write_secret_contents(io, contents) do
-    case IO.binwrite(io, contents) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+    IO.binwrite(io, contents)
+  rescue
+    error in ErlangError -> {:error, error.original}
   end
 
   defp sync_secret_file(io) do
