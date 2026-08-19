@@ -179,19 +179,21 @@ defmodule Maxio.IAM.OIDCProviderRefresh do
   defp discovery_attrs(discovery, opts) when is_map(discovery) do
     now = now(opts)
 
-    attrs = %{
-      jwks: map_get(discovery, :jwks),
-      jwks_fetched_at: map_get(discovery, :jwks_fetched_at) || now,
-      discovery_document: map_get(discovery, :discovery_document) || %{},
-      thumbprints: discovery_thumbprints(discovery)
-    }
+    with {:ok, thumbprints} <- discovery_thumbprints(discovery) do
+      attrs = %{
+        jwks: map_get(discovery, :jwks),
+        jwks_fetched_at: map_get(discovery, :jwks_fetched_at) || now,
+        discovery_document: map_get(discovery, :discovery_document) || %{},
+        thumbprints: thumbprints
+      }
 
-    with %{} <- attrs.jwks,
-         %DateTime{} <- attrs.jwks_fetched_at,
-         %{} <- attrs.discovery_document do
-      {:ok, attrs}
-    else
-      _other -> {:error, :oidc_discovery_malformed_json}
+      with %{} <- attrs.jwks,
+           %DateTime{} <- attrs.jwks_fetched_at,
+           %{} <- attrs.discovery_document do
+        {:ok, attrs}
+      else
+        _other -> {:error, :oidc_discovery_malformed_json}
+      end
     end
   end
 
@@ -453,17 +455,34 @@ defmodule Maxio.IAM.OIDCProviderRefresh do
     end
   end
 
-  # 唯一调用方 `discovery_attrs/2` 已经用 `when is_map(discovery)` + `_discovery` 兜底
-  # 把非 map 的 discovery 结构化拒成 `{:error, :oidc_discovery_malformed_json}`。
-  # 这里原来重复了一层 map 守卫，且兜底返回 `[]` —— 那等于把畸形 discovery 静默当成
-  # 「没有 thumbprint」（AGENTS.md §3 明令禁止的静默放行），何况永远不可达。去掉重复层，
-  # 让上游那道**可达且结构化**的关卡成为唯一契约边界。
+  # 非 map 的 discovery 由唯一调用方 `discovery_attrs/2` 的 `when is_map(discovery)` +
+  # `_discovery` 兜底结构化拒成 `{:error, :oidc_discovery_malformed_json}`，这里不再重复
+  # 一层 map 守卫（重复层既不可达，兜底返回 `[]` 还等于把畸形 discovery 静默当成
+  # 「没有 thumbprint」——AGENTS.md §3 明令禁止的静默放行）。
+  #
+  # 但 `:thumbprints` 的**内容**来自远端 JSON，可以是任意 term：原来直接 `to_string/1`，
+  # 碰到 `{"thumbprints": [{...}]}` 这类合法 JSON 会抛 Protocol.UndefinedError，
+  # 只能被 `run_refresh/3` 的 rescue 记成 `%{code: :crashed}` —— 抛异常不是结构化失败。
+  # 现在先判定可字符串化，畸形内容走与其它畸形字段**同一个**结构化错误。
   defp discovery_thumbprints(discovery) do
-    discovery
-    |> map_get(:thumbprints)
-    |> normalize_thumbprints()
-    |> Enum.uniq_by(&String.downcase/1)
+    values = map_get(discovery, :thumbprints)
+
+    if stringable_thumbprints?(values) do
+      {:ok, values |> normalize_thumbprints() |> Enum.uniq_by(&String.downcase/1)}
+    else
+      {:error, :oidc_discovery_malformed_json}
+    end
   end
+
+  defp stringable_thumbprints?(nil), do: true
+
+  defp stringable_thumbprints?(values) when is_list(values),
+    do: Enum.all?(values, &stringable_thumbprint?/1)
+
+  defp stringable_thumbprints?(value), do: stringable_thumbprint?(value)
+
+  defp stringable_thumbprint?(value),
+    do: is_binary(value) or is_atom(value) or is_number(value)
 
   defp normalize_thumbprints(nil), do: []
   defp normalize_thumbprints(values) when is_list(values), do: Enum.map(values, &to_string/1)

@@ -197,6 +197,34 @@ defmodule Maxio.Ops.LiveRehearsalBundleTest do
     assert scheduler_artifact["scenario"] == "scheduler_enabled_multinode_rehearsal"
   end
 
+  test "non-map child rehearsal result is counted as a failure instead of crashing the bundle" do
+    # 通过既有的注入缝驱动一个**非 map** 的子任务结果：`capture_result/1` 必须把它归一成
+    # exit_code=1 的失败结果，bundle 继续产出制品，而不是在 `result_view/1` / `result_field/3`
+    # 里 BadMapError 炸掉整个编排（AGENTS.md §3 失败按失败计）。
+    # 注意这里子任务返回的是 `{:ok, ...}`：制品里的 `status` 必须跟着 `exit_code` 一起降级成
+    # `"error"`，不能出现 `"status" => "ok"` 配 `"exit_code" => 1` 的自相矛盾记录。
+    scheduler_enabled_runner = fn _args, _opts -> {:ok, :not_a_map} end
+
+    {:error, result} =
+      run_bundle(
+        ok_responses(),
+        ["--scheduler-enabled", "--scheduler", "all"],
+        scheduler_enabled_runner: scheduler_enabled_runner
+      )
+
+    scheduler_view = result.artifact["child_results"]["scheduler_live_rehearsal"]
+
+    assert scheduler_view["status"] == "error"
+    assert scheduler_view["exit_code"] == 1
+    assert scheduler_view["stderr"] =~ "unexpected child result"
+    assert scheduler_view["stderr"] =~ ":not_a_map"
+    assert scheduler_view["artifact_path"] == nil
+    assert result.exit_code == 1
+    assert result.gate_status == "error"
+    assert result.stdout =~ "scheduler_exit=1"
+    assert File.exists?(result.artifact["artifact_paths"]["bundle"])
+  end
+
   test "scheduler-enabled requires at least two expected nodes before running children" do
     {:error, result} =
       LiveRehearsalBundle.run([

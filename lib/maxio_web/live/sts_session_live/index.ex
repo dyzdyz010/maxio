@@ -505,9 +505,14 @@ defmodule MaxioWeb.StsSessionLive.Index do
     end
   end
 
+  # 原来的 `caller_principal_type(_key)` 兜底是可证不可达的死代码，已删：非长期凭据的拒绝
+  # 发生在**上游**，本函数根本收不到它们。两道上游关卡（`IAM.public_active_access_key_principal/1`
+  # 的总括 `%AccessKey{} -> :error`，以及 `AccessKey.changeset/2` 的
+  # `validate_inclusion(:type, ["root", "iam_user"])`）保证进到这里的 `:type` 只可能是
+  # `:root | :iam_user`；`active_long_term_principal/1` 又保证入参是 map。真正的安全拒绝在上游，
+  # 不在这里（见 `test/maxio_web/live/sts_session_live_test.exs` 里钉住上游关卡的用例）。
   defp caller_principal_type(%{type: :root}), do: {:ok, :root}
   defp caller_principal_type(%{type: :iam_user}), do: {:ok, :iam_user}
-  defp caller_principal_type(_key), do: {:error, "Caller access key cannot assume roles"}
 
   defp role(params) do
     role_arn = params |> Map.get("role_arn") |> trim()

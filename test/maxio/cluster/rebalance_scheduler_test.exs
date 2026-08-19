@@ -474,6 +474,45 @@ defmodule Maxio.Cluster.RebalanceSchedulerTest do
     assert {:error, :no_runnable_job} = Scheduler.run_now(pid, [])
   end
 
+  # 覆盖 `select_deployment_or_closure_job(cfg, true)` 这一跳：部署拓扑自动化已开启但
+  # 没有可跑的部署拓扑作业时，选择器必须继续下探到 rebalance 收口作业，而不是就地
+  # 返回 `{:error, :not_found}`。原来的用例都走 `auto_deployment_topology: false` 分支，
+  # 这一跳全仓无覆盖。
+  test "auto deployment topology falls through to the rebalance closure job", ctx do
+    :persistent_term.put(@topology_key, ctx.topology)
+
+    bucket = bucket_name("rebalance-scheduler-deploy-closure")
+    key = key_for_set(bucket, ctx.topology, 1, "deploy-closure")
+    body = "scheduler-deployment-closure"
+    opts = dist_opts(ctx)
+    source_opts = Keyword.put(opts, :placement_set_id, 0)
+
+    {:ok, _bucket} = Buckets.create(bucket, @owner)
+    :ok = Distributed.put_bucket(bucket, opts)
+    {:ok, _object} = put_object_version!(bucket, key, "v1", body, source_opts)
+    {:ok, job} = Jobs.start_rebalance(topology: ctx.topology, include_drive_stats: false)
+
+    pid =
+      start_scheduler!(
+        enabled: false,
+        topology: ctx.topology,
+        transport: InProcess,
+        auto_runtime_topology: false,
+        auto_deployment_topology: true,
+        auto_rebalance_closure: true
+      )
+
+    assert {:ok, %{phase: :copy, status: :ok}} = Scheduler.run_now(pid, [])
+    assert {:ok, %{phase: :source_cleanup, status: :ok}} = Scheduler.run_now(pid, [])
+
+    assert {:ok, closure} = Scheduler.run_now(pid, [])
+    assert closure.phase == :rebalance_closure
+    assert closure.status == :verified
+
+    assert {:ok, verified} = Jobs.get(job.id)
+    assert verified.rebalance_closure_status == "verified"
+  end
+
   test "blocked closure next action is recorded in scheduler ledger summary", ctx do
     :persistent_term.put(@topology_key, ctx.topology)
 

@@ -68,8 +68,11 @@ defmodule Maxio.IAM.STSSessionSecret do
         plaintext -> {:ok, plaintext}
       end
     else
+      # `Base.url_decode64/2` 用裸 `:error` 表示解码失败，与"信封结构非法"是同一类。
+      # 原来 `:error` 与 `_other` 两条子句体逐字相同，`_other` 因此恒不可达。
+      # 合并成一条兜底：`:error` 仍然映射到同一个错误，而兜底重新可达 ——
+      # 任何非 `{:error, _}` 的意外返回都会被结构化拒绝而不是 WithClauseError。
       {:error, reason} -> {:error, reason}
-      :error -> {:error, :invalid_sts_session_secret_envelope}
       _other -> {:error, :invalid_sts_session_secret_envelope}
     end
   rescue
@@ -93,8 +96,8 @@ defmodule Maxio.IAM.STSSessionSecret do
          {:ok, key_id} <- envelope_key_id(envelope) do
       {:ok, %{alg: "AES-256-GCM", key_id: key_id}}
     else
+      # 同 `unwrap/2`：`:error`（`Base.url_decode64/2`）与兜底体逐字相同，合并成一条可达兜底。
       {:error, reason} -> {:error, reason}
-      :error -> {:error, :invalid_sts_session_secret_envelope}
       _other -> {:error, :invalid_sts_session_secret_envelope}
     end
   rescue

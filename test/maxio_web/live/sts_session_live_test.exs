@@ -355,6 +355,61 @@ defmodule MaxioWeb.StsSessionLiveTest do
     assert [] = STS.list_sessions(issuer_access_key_id: issuer.access_key_id)
   end
 
+  test "rejects a caller access key whose principal type is not a long-term identity",
+       %{conn: conn} do
+    # 本例钉的是**上游关卡**，不是 `Index.caller_principal_type/1`（那里已无兜底分支）：
+    # 非长期凭据在 `IAM.get_active_access_key_principal/1` 就被
+    # `public_active_access_key_principal(%AccessKey{})` 的总括子句拒成 `:error`，
+    # 压根到不了 LiveView 的类型判定。`AccessKey.changeset/2` 的
+    # `validate_inclusion(:type, ["root", "iam_user"])` 挡住了正常写入路径，所以这里绕过
+    # changeset 直接篡改 `type` 列造出这种凭据，先断言上游返回 `:error`，再断言控制台
+    # **不会**为它签发扮演角色会话（AGENTS.md §3 失败必须结构化拒绝）。
+    {:ok, caller} =
+      IAM.create_access_key(
+        access_key_id: unique_ak("CONSOLENOTLONGTERM"),
+        secret_key: "caller-secret"
+      )
+
+    {:ok, role} =
+      IAM.create_role(
+        role_name: unique_name("console-not-long-term-role"),
+        trust_policy: trust_policy(caller.principal_arn)
+      )
+
+    Maxio.IAM.AccessKey
+    |> Repo.get_by!(access_key_id: caller.access_key_id)
+    |> Ecto.Changeset.change(%{type: "sts_session"})
+    |> Repo.update!()
+
+    assert :error = IAM.get_active_access_key_principal(caller.access_key_id)
+
+    {:ok, view, _html} = live(conn, ~p"/sts-sessions")
+
+    view
+    |> form("#assume-role-session-form",
+      assume_role: %{
+        caller_access_key_id: caller.access_key_id,
+        role_arn: role.role_arn,
+        session_name: "not-long-term-session",
+        duration_seconds: "900",
+        external_id: "",
+        source_identity: "",
+        mfa_serial: "",
+        mfa_token_code: "",
+        session_tags: "",
+        transitive_tag_keys: "",
+        policy_arns: "",
+        session_policy: ""
+      }
+    )
+    |> render_submit()
+
+    assert has_element?(view, "#sts-sessions-empty")
+    refute has_element?(view, "#sts-new-secret-banner")
+    assert [] = STS.list_sessions(principal_arn: role.role_arn)
+    assert [] = STS.list_sessions(issuer_access_key_id: caller.access_key_id)
+  end
+
   test "rejects invalid assume role params without creating sessions", %{conn: conn} do
     {:ok, role} =
       IAM.create_role(

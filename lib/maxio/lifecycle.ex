@@ -770,8 +770,11 @@ defmodule Maxio.Lifecycle do
           opts
         )
       else
+        # `current_transition_candidate_still_eligible?/5` 自己已经把
+        # `{:error, :not_found}` 归一成 `{:error, :stale_candidate}`（对象在锁窗口内被删
+        # 视为候选过期），这里再收一层 `:not_found` 是重复的第二层、永远不可达。
+        # 去掉后语义逐字相同：候选失效 → `:skipped`，其余原因照旧结构化上抛。
         {:error, :stale_candidate} -> :skipped
-        {:error, :not_found} -> :skipped
         {:error, reason} -> {:error, reason}
       end
     end)
@@ -806,8 +809,9 @@ defmodule Maxio.Lifecycle do
           opts
         )
       else
+        # 同 `transition_current_object/6`：`noncurrent_transition_candidate_still_eligible?/5`
+        # 已把 `{:error, :not_found}` 归一成 `{:error, :stale_candidate}`，这里不再重复一层。
         {:error, :stale_candidate} -> :skipped
-        {:error, :not_found} -> :skipped
         {:error, reason} -> {:error, reason}
       end
     end)

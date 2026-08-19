@@ -145,6 +145,45 @@ defmodule Maxio.IAMOIDCProviderRefreshTest do
     assert DateTime.compare(after_private_failure.jwks_fetched_at, @old_time) == :eq
   end
 
+  test "malformed discovery payloads fail structurally instead of crashing the refresh" do
+    issuer = unique_issuer("malformed-discovery")
+    old_jwks = public_jwks(JOSE.JWK.generate_key({:rsa, 2048}), "old")
+    new_jwks = public_jwks(JOSE.JWK.generate_key({:rsa, 2048}), "new")
+
+    assert {:ok, provider} =
+             IAM.create_oidc_provider(
+               url: issuer,
+               client_ids: ["sts.amazonaws.com"],
+               thumbprints: [sha1_hex("root-ca")],
+               jwks: old_jwks,
+               jwks_fetched_at: @old_time
+             )
+
+    # 1) discovery 本身不是 map：`discovery_attrs/2` 的 is_map 守卫 + 兜底把它结构化拒掉。
+    put_raw_oidc_discovery_fixture(issuer, :not_a_map)
+
+    assert {:error, non_map_report} =
+             IAM.refresh_oidc_provider_jwks(provider.provider_arn, dry_run: false)
+
+    assert non_map_report.status == :failed
+    assert [%{reason: :oidc_discovery_malformed_json}] = non_map_report.errors
+
+    # 2) discovery 是 map，但 `thumbprints` 里混进了不可字符串化的 JSON 值。
+    #    这条路径以前会让 `to_string/1` 抛 Protocol.UndefinedError，只能被 rescue 记成
+    #    `%{code: :crashed}`；现在必须是与其它畸形字段一致的结构化错误（AGENTS.md §3）。
+    put_oidc_discovery_fixture(issuer, new_jwks, @new_time, thumbprints: [%{"nested" => 1}])
+
+    assert {:error, thumbprint_report} =
+             IAM.refresh_oidc_provider_jwks(provider.provider_arn, dry_run: false)
+
+    assert thumbprint_report.status == :failed
+    assert [%{reason: :oidc_discovery_malformed_json}] = thumbprint_report.errors
+
+    assert {:ok, unchanged} = IAM.get_oidc_provider(provider.provider_arn)
+    assert unchanged.jwks == old_jwks
+    assert DateTime.compare(unchanged.jwks_fetched_at, @old_time) == :eq
+  end
+
   test "TLS thumbprint mismatch leaves the last known good snapshot intact" do
     issuer = unique_issuer("thumbprint-mismatch")
     old_jwk = JOSE.JWK.generate_key({:rsa, 2048})
@@ -398,6 +437,11 @@ defmodule Maxio.IAMOIDCProviderRefreshTest do
 
     fixtures = Application.get_env(:maxio, :oidc_discovery_fixtures, %{})
     Application.put_env(:maxio, :oidc_discovery_fixtures, Map.put(fixtures, issuer, fixture))
+  end
+
+  defp put_raw_oidc_discovery_fixture(issuer, discovery) do
+    fixtures = Application.get_env(:maxio, :oidc_discovery_fixtures, %{})
+    Application.put_env(:maxio, :oidc_discovery_fixtures, Map.put(fixtures, issuer, discovery))
   end
 
   defp put_oidc_discovery_error(issuer, reason) do

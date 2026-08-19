@@ -1250,8 +1250,11 @@ defmodule Maxio.IAM do
           {:error, changeset}
       end
     else
+      # `get_user/1` 与 `get_group/1` 的契约都是 `{:ok, map()} | :error`（见各自实现：
+      # `fetch_*_record/1` 返回 nil 时归一成裸 `:error`），从不返回 `{:error, _}`。
+      # 原来那条 `{:error, reason} -> {:error, reason}` 是恒等映射且恒不可达，删除后
+      # 唯一可达的失败仍然是结构化的 `{:error, :not_found}`。
       :error -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1741,17 +1744,18 @@ defmodule Maxio.IAM do
              Store.create_managed_session_policy_version(policy_arn, json, set_as_default) do
         {:ok, version}
       else
-        :error ->
-          {:error, :not_found}
-
+        # 两条被删的子句都恒不可达：
+        # * `:error ->` —— `Store.create_managed_session_policy_version/3` 用
+        #   `Repo.rollback({:error, :not_found})` 表达"策略不存在"，返回的是
+        #   `{:error, :not_found}` 而不是裸 `:error`；这条 not_found 已由下面的透传原样带出。
+        # * `_other ->` —— `Maxio.Policy.Store` 自己就用 `case result do {:ok, _} | {:error, _} end`
+        #   把可插拔后端的返回值收窄成这两种形状（后端跑偏会在 Store 那一层炸掉，
+        #   而不是把畸形值漏到这里），`validate_managed_policy_document/1` 同理。
         {:error, reason} when reason in [:malformed, :malformed_policy_document] ->
           {:error, :malformed_policy_document}
 
         {:error, reason} ->
           {:error, reason}
-
-        _other ->
-          {:error, :malformed_policy_document}
       end
     else
       {:error, reason} -> {:error, reason}
@@ -3237,12 +3241,14 @@ defmodule Maxio.IAM do
   end
 
   @doc "Fetches one local MFA device without exposing encrypted or plaintext seeds."
-  @spec get_mfa_device(String.t()) :: {:ok, map()} | :error | {:error, term()}
+  @spec get_mfa_device(String.t()) :: {:ok, map()} | :error
   def get_mfa_device(serial) when is_binary(serial) do
+    # `fetch_mfa_device/1` 只有两种返回：`{:ok, %MFADevice{}}` 与
+    # `{:error, :mfa_device_not_found}`（`Repo.get_by/2` 的 nil 已在那里归一）。
+    # 原来的 `{:error, reason} -> {:error, reason}` 是恒不可达的恒等映射，删除。
     case fetch_mfa_device(serial) do
       {:ok, device} -> {:ok, public_mfa_device(device)}
       {:error, :mfa_device_not_found} -> :error
-      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -5331,8 +5337,10 @@ defmodule Maxio.IAM do
         {:error, reason} -> {:error, reason}
       end
     else
+      # `validate_inline_policy_document/1` 唯一的失败原因就是 `:malformed`
+      # （三个分支——超长、非法字符、解析失败——都返回它），因此下面那条
+      # `{:error, reason} -> {:error, reason}` 恒不可达且只是恒等映射，删除。
       {:error, :malformed} -> {:error, :malformed_policy_document}
-      {:error, reason} -> {:error, reason}
     end
   end
 

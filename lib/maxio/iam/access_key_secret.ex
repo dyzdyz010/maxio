@@ -93,8 +93,10 @@ defmodule Maxio.IAM.AccessKeySecret do
          {:ok, key_id} <- envelope_key_id(envelope) do
       {:ok, %{alg: "AES-256-GCM", key_id: key_id}}
     else
+      # `Base.url_decode64/2` 的裸 `:error` 与兜底子句体逐字相同，兜底因此恒不可达。
+      # 合并成一条兜底：`:error` 仍映射到同一错误，兜底重新可达（非 `{:error, _}` 的
+      # 意外返回被结构化拒绝，而不是 WithClauseError）。
       {:error, reason} -> {:error, reason}
-      :error -> {:error, :invalid_access_key_secret_envelope}
       _other -> {:error, :invalid_access_key_secret_envelope}
     end
   rescue

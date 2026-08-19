@@ -223,8 +223,8 @@ defmodule Maxio.Ops.LiveRehearsalBundle do
 
   defp capture_result(fun) do
     case fun.() do
-      {:ok, result} -> %{status: :ok, result: result}
-      {:error, result} -> %{status: :error, result: result}
+      {:ok, result} -> child_outcome(:ok, result)
+      {:error, result} -> child_outcome(:error, result)
     end
   rescue
     error ->
@@ -232,6 +232,25 @@ defmodule Maxio.Ops.LiveRehearsalBundle do
         status: :exception,
         result: %{exit_code: 1, stderr: Exception.message(error), stdout: nil}
       }
+  end
+
+  # 子任务（`Rehearsal.run/2` / 注入的 runner）的 `{:ok | :error, result}` 里 `result` 是**任意
+  # term**。归一化收在这一个点上：非 map 一律折成"失败"结果，让下游 `result_view/1` /
+  # `result_field/3` 只面对 map，既不会 BadMapError 炸掉整个 bundle，也不静默当成成功
+  # （AGENTS.md §3 失败按失败计）。归一化后下游不再需要重复的 map 守卫。
+  # 注意 `:status` 必须跟着一起降级：否则 `{:ok, 非 map}` 会在制品里写出
+  # `"status" => "ok"` 配 `"exit_code" => 1` 的自相矛盾记录。
+  defp child_outcome(status, %{} = result), do: %{status: status, result: result}
+
+  defp child_outcome(_status, other) do
+    %{
+      status: :error,
+      result: %{
+        exit_code: 1,
+        stderr: "[maxio ops.live_rehearsal_bundle] unexpected child result: #{inspect(other)}\n",
+        stdout: nil
+      }
+    }
   end
 
   defp replacement_args(parsed, artifact_path, mix_cmd) do
@@ -368,15 +387,9 @@ defmodule Maxio.Ops.LiveRehearsalBundle do
     }
   end
 
-  # `capture_result/1` 保证外层一定带 `:result`，但 `:result` 本身来自被捕获的子任务返回值，
-  # 可以是任意 term。没有 `is_map/1` 这层收窄时，第一个子句会把非 map 的 result 送进
-  # `Map.get/3` 直接 BadMapError 炸掉整个 bundle，而下面的兜底子句永远轮不到 ——
-  # 加上守卫后兜底重新可达：拿不到字段就回落到调用方给的默认值（gate_status="error"/exit 1），
-  # 失败按失败计（AGENTS.md §3），而不是让编排进程崩掉。
-  defp result_field(%{result: result}, key, default) when is_map(result),
-    do: Map.get(result, key, default)
-
-  defp result_field(_result, _key, default), do: default
+  # `capture_result/1` 已把 `:result` 归一成 map（见 `child_outcome/2`），这里不再重复守卫：
+  # 非 map 的子任务返回值在唯一入口就已经折成 `status: :error` + exit_code=1 的失败结果。
+  defp result_field(%{result: result}, key, default), do: Map.get(result, key, default)
 
   defp stdout(artifact, %{json?: true}), do: Jason.encode!(artifact) <> "\n"
 

@@ -5949,11 +5949,17 @@ defmodule Maxio.IAM.QueryPlug do
         {:error,
          QueryError.new(:no_such_entity, message: "MFA device is not assigned to UserName.")}
 
+      # `IAM.get_mfa_device/1` 的契约是 `{:ok, map()} | :error`（唯一失败来源
+      # `fetch_mfa_device/1` 把 `Repo.get_by/2` 的 nil 归一成 not_found），从不返回
+      # `{:error, _}`，所以原来那条 `{:error, reason} -> {:error, reason}` 透传恒不可达。
+      # 即便可达也不会退化成崩溃或错误状态码：唯一调用方 `deactivate_mfa_device/1` 的
+      # `else` 同时有 `{:error, %QueryError{} = error}` 与 `{:error, reason} ->
+      # reject(conn, error_from_reason(reason))` 两条子句，`error_from_reason/1` 把
+      # `:mfa_device_not_found` 映射成 `no_such_entity`（404 NoSuchEntity），未知 atom
+      # 也落到它的结构化兜底（`Log.warn` + `service_failure` 500 XML，不是崩溃）。
+      # 删除的实际收益只有一个：让本函数的返回契约与本文件其余分支统一为 `%QueryError{}`。
       :error ->
         {:error, QueryError.new(:no_such_entity, message: "MFA device does not exist.")}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
@@ -5969,11 +5975,12 @@ defmodule Maxio.IAM.QueryPlug do
            QueryError.new(:access_denied, message: "Caller cannot manage another principal.")}
         end
 
+      # 同 `fetch_owned_mfa_device/2`：`IAM.get_mfa_device/1` 只返回 `{:ok, map()} | :error`，
+      # 这条透传恒不可达；即便可达，唯一调用方 `delete_virtual_mfa_device/1` 的 `else`
+      # 同样有 `{:error, reason} -> reject(conn, error_from_reason(reason))` 做结构化映射，
+      # 不会崩溃。删除只是把返回契约统一成 `%QueryError{}`。
       :error ->
         {:error, QueryError.new(:no_such_entity, message: "MFA device does not exist.")}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 

@@ -1026,6 +1026,40 @@ defmodule Maxio.Cluster.RebalanceTopologyMutationTest do
              TopologyMutation.verify_removal_deployment(job.id)
   end
 
+  # `ensure_runtime_removal_audited/1` 的 proposed-hash 审计门（"已 apply 但没记录
+  # proposed hash"→`{:error, :missing_proposed_topology_hash}`）是持久化/校验两条部署
+  # 路径共同的第一道关卡，也是 `ensure_cluster_runtime_topology_matches_audit/3`
+  # 不再重复 nil 检查的依据。这里直接把 Job 改写成该状态，钉死这个不变量。
+  test "persist/verify removal deployment refuse runtime-applied jobs without proposed hash",
+       ctx do
+    {:ok, job} = complete_empty_decommission(ctx)
+    Application.put_env(:maxio, Topology, Topology.to_config(ctx.topology))
+
+    {:ok, job} = Jobs.get(job.id)
+
+    unaudited =
+      job
+      |> Job.changeset(%{
+        topology_removal_status: "runtime_local_applied",
+        topology_removal_scope: "runtime_local",
+        topology_removal_proposed_hash: nil
+      })
+      |> Repo.update!()
+
+    assert unaudited.topology_removal_status == "runtime_local_applied"
+    assert unaudited.topology_removal_scope == "runtime_local"
+    assert is_nil(unaudited.topology_removal_proposed_hash)
+
+    assert {:error, :missing_proposed_topology_hash} =
+             TopologyMutation.persist_removal_deployment(unaudited.id)
+
+    assert {:error, :missing_proposed_topology_hash} =
+             TopologyMutation.verify_removal_deployment(unaudited.id)
+
+    assert {:ok, unchanged} = Jobs.get(unaudited.id)
+    assert unchanged.topology_removal_deployment_status == "not_started"
+  end
+
   test "verify_removal_deployment refuses audit-only job when runtime topology is still old",
        ctx do
     :persistent_term.put(@topology_key, ctx.topology)

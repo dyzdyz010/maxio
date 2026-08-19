@@ -318,6 +318,20 @@ defmodule Maxio.IAMTest do
              AccessKeySecret.unwrap(wrong_alg, "AKIAALGSECRET")
   end
 
+  test "access-key secret envelopes reject undecodable base64 payloads" do
+    # `Base.url_decode64/2` 用**裸 `:error`**（不是 `{:error, _}`）表示解码失败，
+    # 这是 `envelope_metadata/1` else 兜底子句唯一可达的入口。
+    corrupt = "maxio-ak-secret-v1:" <> "not*valid*base64url"
+
+    assert AccessKeySecret.encrypted?(corrupt)
+
+    assert {:error, :invalid_access_key_secret_envelope} =
+             AccessKeySecret.envelope_metadata(corrupt)
+
+    assert {:error, :invalid_access_key_secret_envelope} =
+             AccessKeySecret.unwrap(corrupt, "AKIAB64SECRET")
+  end
+
   test "access-key secret key ring rejects conflicting duplicate key ids" do
     old_key = b64_secret("iam-dup-old-key")
     new_key = b64_secret("iam-dup-new-key")
@@ -592,6 +606,13 @@ defmodule Maxio.IAMTest do
     assert [%{group_arn: ^group_arn}] = IAM.list_groups_for_user(user_name)
 
     assert :ok = IAM.remove_user_from_group(user_name, group_name)
+    assert [] = IAM.list_users_in_group(group_name)
+    assert [] = IAM.list_groups_for_user(user_name)
+
+    # `get_user/1` 与 `get_group/1` 用裸 `:error` 表示"不存在"，`add_user_to_group/2`
+    # 必须把它归一成结构化的 `{:error, :not_found}`，而不是静默成功建出悬空成员关系。
+    assert {:error, :not_found} = IAM.add_user_to_group(unique_name("ghost-user"), group_name)
+    assert {:error, :not_found} = IAM.add_user_to_group(user_name, unique_name("ghost-group"))
     assert [] = IAM.list_users_in_group(group_name)
     assert [] = IAM.list_groups_for_user(user_name)
   end

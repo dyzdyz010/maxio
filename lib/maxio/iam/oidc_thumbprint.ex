@@ -43,8 +43,17 @@ defmodule Maxio.IAM.OIDCThumbprint do
          :ok <- configured_thumbprint_allowed?(selected.der, opts) do
       {:ok, sha1_hex(selected.der)}
     else
+      # 删除原 `_other` 兜底安全的依据是**值形状穷尽**：五步（`https_host_port/1`、
+      # `peer_chain/3`、`hostname_matches?/2`、`top_intermediate_or_leaf/1`、
+      # `configured_thumbprint_allowed?/2`）的返回形状只有 `:ok | {:ok, _} | {:error, atom()}`，
+      # `else` 里 `{:error, reason}` 已覆盖全部可进入 `else` 的形状，`_other` 接不到任何东西。
+      # 注意 `_other` 从来**不是异常防线** —— `else` 子句本就接不到异常。各步的异常防护并
+      # 不齐整：`peer_chain/3`、`hostname_matches?/2` 有 rescue+catch，`https_host_port/1`
+      # 只有 rescue，`top_intermediate_or_leaf/1`、`configured_thumbprint_allowed?/2` 两者都没有。
+      # 既存债务：本函数（以及 `thumbprints_for_urls/2`、`OIDCDiscovery.HTTP.discover/2`）自身
+      # 也无 rescue，真抛异常会一路冒到 `OIDCProviderRefresh.run_refresh/3` 的 rescue，
+      # 记成 `%{code: :crashed}`；当前不可达（`selected.der` 恒为 binary）。
       {:error, reason} -> {:error, reason}
-      _other -> {:error, :oidc_discovery_tls_thumbprint_failed}
     end
   end
 

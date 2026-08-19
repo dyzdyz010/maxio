@@ -456,22 +456,27 @@ defmodule Maxio.Cluster.Rebalance.Scheduler do
     end
   end
 
+  # `Jobs.next_runnable_runtime_topology/1` 的契约（含实现）只有 `{:ok, %Job{}}` 与
+  # `{:error, :not_found}` 两种返回：它内部的 `Jobs.get/1` 把 `nil` 归一成 `:not_found`，
+  # 其余失败（Repo 断连等）走异常、由 scheduler 进程的监督树接管。这里再写一条
+  # `{:error, reason} -> {:error, reason}` 的透传既恒不可达、也不构成任何防御（它只是
+  # 恒等映射），故删除；真正的选择器契约违规由上一层
+  # `{:error, {:bad_job_selector_result, other}}` 结构化拒绝。
   defp select_default_followup_job(cfg, true, auto_deployment_topology?) do
     case Jobs.next_runnable_runtime_topology(cfg[:run_opts]) do
       {:ok, %Job{} = job} -> {:ok, job}
       {:error, :not_found} -> select_deployment_or_closure_job(cfg, auto_deployment_topology?)
-      {:error, reason} -> {:error, reason}
     end
   end
 
   defp select_default_followup_job(cfg, false, auto_deployment_topology?),
     do: select_deployment_or_closure_job(cfg, auto_deployment_topology?)
 
+  # 同上：`Jobs.next_runnable_deployment_topology/1` 只返回 `{:ok, %Job{}} | {:error, :not_found}`。
   defp select_deployment_or_closure_job(cfg, true) do
     case Jobs.next_runnable_deployment_topology(cfg[:run_opts]) do
       {:ok, %Job{} = job} -> {:ok, job}
       {:error, :not_found} -> select_rebalance_closure_job(cfg)
-      {:error, reason} -> {:error, reason}
     end
   end
 

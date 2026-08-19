@@ -219,8 +219,13 @@ defmodule Maxio.IAM.OIDCDiscovery.HTTP do
          :ok <- configured_thumbprint_allowed?(selected.der, opts) do
       :ok
     else
+      # 三个 `with` 步骤的返回**值形状**穷尽为 `:ok | {:ok, _} | {:error, atom()}`，`{:error, reason}`
+      # 已覆盖全部可进入 `else` 的形状，故 `_other` 兜底是纯死代码。（依据是值形状而非异常防护：
+      # `hostname_matches?/2` 确有 rescue+catch，但 `top_intermediate_or_leaf/1` 两者都没有；
+      # 而 `else` 子句本来就接不到异常。）
+      # 删除还是**净改进**：本函数真实的失败通道是异常，由下面的 `rescue` 接管，而 `rescue`
+      # 会 `:ssl.close(socket)`，被删的 `_other` 分支直接返回、**不关 socket** —— 少一条泄漏路径。
       {:error, reason} -> {:error, reason}
-      _other -> {:error, :oidc_discovery_http_error}
     end
   rescue
     _error ->

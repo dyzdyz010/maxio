@@ -6163,6 +6163,15 @@ defmodule Maxio.IAM.QueryAPITest do
     assert delete.status == 200
     assert delete.resp_body =~ "<DeleteVirtualMFADeviceResponse"
     assert IAM.get_mfa_device(serial) == :error
+
+    # `IAM.get_mfa_device/1` 用裸 `:error` 表示"设备不存在"，
+    # `fetch_manageable_mfa_device/2` 必须把它翻成 404 NoSuchEntity 的 `%QueryError{}`。
+    missing_delete =
+      signed_iam_conn(%{"Action" => "DeleteVirtualMFADevice", "SerialNumber" => serial})
+      |> call()
+
+    assert missing_delete.status == 404
+    assert missing_delete.resp_body =~ "<Code>NoSuchEntity</Code>"
   end
 
   test "root can create a pending virtual MFA device and enable it for an IAM user" do

@@ -92,6 +92,26 @@ defmodule Maxio.IAM.OIDCThumbprintTest do
              OIDCThumbprint.hostname_matches?(certs, wrong_hostname(hostname))
   end
 
+  test "thumbprint_for_url refuses non-https and non-binary issuer urls" do
+    # 覆盖 `thumbprint_for_url/2` 的 `{:error, reason}` 透传子句（它是这条 `with` 唯一可达的
+    # 失败出口）：`https_host_port/1` 拒绝非 https / 无主机名，错误原因必须原样上抛，
+    # 不能被吞成成功的指纹。
+    assert {:error, :oidc_discovery_tls_thumbprint_failed} =
+             OIDCThumbprint.thumbprint_for_url("http://plain.oidc.example.test/tenant")
+
+    assert {:error, :oidc_discovery_tls_thumbprint_failed} =
+             OIDCThumbprint.thumbprint_for_url("https:///no-host")
+
+    assert {:error, :oidc_discovery_tls_thumbprint_failed} =
+             OIDCThumbprint.thumbprint_for_url(:not_a_url)
+
+    assert {:error, :oidc_discovery_tls_thumbprint_failed} =
+             OIDCThumbprint.thumbprints_for_urls(
+               ["http://plain.oidc.example.test/tenant"],
+               []
+             )
+  end
+
   defp self_signed?(der) do
     case cert_names(der) do
       {:ok, subject, issuer} -> subject == issuer

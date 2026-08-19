@@ -197,6 +197,21 @@ defmodule Maxio.STSTest do
              STSSessionSecret.unwrap(wrong_alg, session_access_key_id)
   end
 
+  test "STS session secret envelopes reject undecodable base64 payloads" do
+    # `Base.url_decode64/2` 用**裸 `:error`**（不是 `{:error, _}`）表示解码失败，
+    # 这是 `unwrap/2` 与 `envelope_metadata/1` else 兜底子句唯一可达的入口。
+    session_access_key_id = unique_session_ak("B64")
+    corrupt = "maxio-sts-secret-v1:" <> "not*valid*base64url"
+
+    assert STSSessionSecret.encrypted?(corrupt)
+
+    assert {:error, :invalid_sts_session_secret_envelope} =
+             STSSessionSecret.unwrap(corrupt, session_access_key_id)
+
+    assert {:error, :invalid_sts_session_secret_envelope} =
+             STSSessionSecret.envelope_metadata(corrupt)
+  end
+
   test "STS session secret storage rejects empty secrets and fails closed for empty rows" do
     {:ok, issuer} =
       IAM.create_access_key(access_key_id: unique_ak("EMPTYSTS"), secret_key: "issuer-secret")
