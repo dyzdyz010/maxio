@@ -661,13 +661,9 @@ defmodule Maxio.Cluster.Rebalance.TopologyMutation do
   defp ensure_expected_proposed_topology_hash(%Job{}, _opts),
     do: {:error, :missing_proposed_topology_hash}
 
-  defp ensure_cluster_runtime_topology_matches_audit(
-         %Job{topology_removal_proposed_hash: nil},
-         _deployment_topology,
-         _opts
-       ),
-       do: {:error, :missing_proposed_topology_hash}
-
+  # 缺 proposed hash 由两处调用方共同的第一道关卡 `ensure_runtime_removal_audited/1`
+  # 以**同一个** `{:error, :missing_proposed_topology_hash}` 拒绝，这里不再重复一层；
+  # 万一 nil 真的漏到这里，`build_cluster_runtime_report/4` 也不会收敛，仍然结构化报错。
   defp ensure_cluster_runtime_topology_matches_audit(
          %Job{topology_removal_proposed_hash: expected} = job,
          deployment_topology,
@@ -695,9 +691,8 @@ defmodule Maxio.Cluster.Rebalance.TopologyMutation do
     end
   end
 
-  defp ensure_deployment_hash_matches(%Job{topology_removal_proposed_hash: nil}, _topology),
-    do: {:error, :missing_proposed_topology_hash}
-
+  # 同上：缺 proposed hash 已被 `ensure_runtime_removal_audited/1` 以同一错误拒绝；
+  # 漏到这里也只会 hash 不相等，退化成结构化的 `:deployment_topology_hash_mismatch`。
   defp ensure_deployment_hash_matches(%Job{topology_removal_proposed_hash: expected}, topology) do
     actual = Placement.topology_hash(topology)
 

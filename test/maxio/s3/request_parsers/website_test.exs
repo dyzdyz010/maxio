@@ -174,6 +174,21 @@ defmodule Maxio.S3.RequestParsers.WebsiteTest do
     }
 
     assert_raise Error, ~r/Invalid RoutingRule/, fn -> Handler.validate!(replace_conflict) end
+
+    # Redirect 不是 map（解析器/上游任何路径塞进标量或列表）同样必须被结构化拒绝，
+    # 而不是绕过 valid_redirect?/1 的形态校验。
+    for bad_redirect <- ["example.com", ["example.com"], 42, nil] do
+      non_map_redirect = %{
+        "index_document" => %{"suffix" => "index.html"},
+        "error_document" => nil,
+        "redirect_all_requests_to" => nil,
+        "routing_rules" => [
+          %{"condition" => %{"key_prefix_equals" => "docs/"}, "redirect" => bad_redirect}
+        ]
+      }
+
+      assert_raise Error, ~r/Invalid RoutingRule/, fn -> Handler.validate!(non_map_redirect) end
+    end
   end
 
   test "validation rejects more than 50 routing rules" do

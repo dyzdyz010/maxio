@@ -15,6 +15,8 @@ defmodule Maxio.IAM.SigningSecretRotation do
   @default_rotate_after_seconds 86_400 * 90
   @keyring_lock_wait_ms 30_000
   @keyring_lock_retry_ms 50
+  # rewrap 根因样本上限：日志行必须有界，但不能一条根因都不带。
+  @rewrap_error_sample_limit 5
 
   @type report :: map()
 
@@ -119,11 +121,17 @@ defmodule Maxio.IAM.SigningSecretRotation do
        |> Map.put(:rewrap, summarize_rewrap(rewrap_report))}
     else
       {:error, %{} = rewrap_report} ->
+        # rewrap 失败的根因只存在于 rewrap 报告里（哪个 scope / 哪个 access key / 什么原因）。
+        # 裸 atom `:signing_secret_rewrap_blocked` 会让 scheduler 与 mix 任务的
+        # `errors=` 字段只剩一个「失败了」标签，运维仍然看不到为什么密钥没换成
+        # （AGENTS.md §3 + §4.4）。因此摘要连同错误一起进 errors，随报告原样透出。
+        rewrap_summary = summarize_rewrap(rewrap_report)
+
         {:error,
          report
          |> Map.put(:status, :rewrap_blocked)
-         |> Map.put(:rewrap, summarize_rewrap(rewrap_report))
-         |> add_error(:signing_secret_rewrap_blocked)}
+         |> Map.put(:rewrap, rewrap_summary)
+         |> add_error({:signing_secret_rewrap_blocked, rewrap_summary})}
 
       {:error, reason} ->
         {:error, report |> Map.put(:status, :blocked) |> add_error(reason)}
@@ -421,13 +429,16 @@ defmodule Maxio.IAM.SigningSecretRotation do
 
   defp add_error(report, reason), do: Map.update!(report, :errors, &(&1 ++ [reason]))
 
+  # `errors` 只是计数，根因在 `totals.error_details`（scope / access_key_id / reason）。
+  # 摘要必须带上有界的根因样本，否则报告与日志里只剩「errors=1」这种无法定位的数字。
   defp summarize_rewrap(%{status: status, totals: totals}) do
     %{
       status: status,
       scanned: Map.get(totals, :scanned, 0),
       candidates: Map.get(totals, :candidates, 0),
       rewrapped: Map.get(totals, :rewrapped, 0),
-      errors: Map.get(totals, :errors, 0)
+      errors: Map.get(totals, :errors, 0),
+      error_sample: totals |> Map.get(:error_details, []) |> Enum.take(@rewrap_error_sample_limit)
     }
   end
 

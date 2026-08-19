@@ -141,7 +141,10 @@ defmodule Maxio.S3.Handlers.Website do
 
   defp valid_redirect_all?(_other), do: false
 
-  defp valid_routing_rule?(%{"redirect" => redirect} = rule) when is_map(redirect) do
+  # 这里原先用 `when is_map(redirect)` 再收窄一次，与 `valid_redirect?/1` 自己的
+  # map 守卫 + false 兜底完全重复，且让后者的兜底永远不可达。两层合并成一层：
+  # 非 map 的 Redirect 直接进 `valid_redirect?/1` 兜底，同样得到 false（结果逐字相同）。
+  defp valid_routing_rule?(%{"redirect" => redirect} = rule) do
     valid_condition?(rule["condition"]) and valid_redirect?(redirect)
   end
 

@@ -132,6 +132,60 @@ defmodule Maxio.IAM.SigningSecretRotationTest do
     end)
   end
 
+  test "rewrap failure carries the rewrap root cause into the rotation report errors" do
+    keyring_file = Path.join(@data_dir, "rewrap-blocked-keyring.json")
+    old_key = b64_secret("rotation-rewrap-old")
+    new_key = b64_secret("rotation-rewrap-new")
+
+    with_access_key_secret_config(
+      [keyring_file: keyring_file, current_key_id: "old", secret_key: old_key],
+      fn ->
+        {:ok, access_key} =
+          IAM.create_access_key(
+            access_key_id: unique_ak("REWRAPFAIL"),
+            secret_key: "rewrap-fail-secret"
+          )
+
+        # 真实的 rewrap 失败通道：信封前缀合法但载荷不是合法 url-safe base64，
+        # `AccessKeySecret.unwrap/2` 返回结构化错误 → rewriter 计入 error_details。
+        {1, _} =
+          Repo.update_all(
+            from(a in AccessKey, where: a.access_key_id == ^access_key.access_key_id),
+            set: [secret_key: "maxio-ak-secret-v1:%%%not-base64%%%"]
+          )
+
+        assert {:error, report} =
+                 SigningSecretRotation.rotate(
+                   keyring_file: keyring_file,
+                   key_id: "new",
+                   key_b64: new_key,
+                   now: @now,
+                   dry_run: false
+                 )
+
+        assert report.status == :rewrap_blocked
+
+        # 错误 term 必须自带 rewrap 摘要：scheduler / mix 任务只透出 errors，
+        # 裸 atom 会让「为什么密钥没换成」在运维侧彻底丢失。
+        assert {:signing_secret_rewrap_blocked, summary} =
+                 Enum.find(report.errors, &match?({:signing_secret_rewrap_blocked, _summary}, &1))
+
+        assert summary == report.rewrap
+        assert summary.errors >= 1
+
+        assert Enum.any?(summary.error_sample, fn detail ->
+                 detail.scope == :access_keys and
+                   detail.access_key_id == access_key.access_key_id and
+                   detail.reason == :invalid_access_key_secret_envelope
+               end)
+
+        # 根因随 errors 一路进日志正文（scheduler 的 errors= 字段就是 inspect 这个列表）。
+        assert inspect(report.errors) =~ "invalid_access_key_secret_envelope"
+        refute inspect(report) =~ new_key
+      end
+    )
+  end
+
   test "rotate_if_due rotates only when the current key age crosses threshold" do
     keyring_file = Path.join(@data_dir, "due-keyring.json")
     old_key = b64_secret("rotation-due-old")
@@ -383,18 +437,97 @@ defmodule Maxio.IAM.SigningSecretRotationTest do
   end
 
   test "scheduler logs failed rotation passes at error level with the full root cause" do
-    for status <- [:blocked, :rewrap_blocked] do
-      assert_scheduler_logs_failure_at_error_level(status)
+    # 两种失败终态的 errors 形态刻意与生产产出一致：`:blocked` 带写盘 OS 根因，
+    # `:rewrap_blocked` 带 rewrap 摘要（含 error_sample 根因），见
+    # `SigningSecretRotation.write_rotation/7`。
+    for {status, errors} <- [
+          {:blocked, [{:access_key_secret_keyring_file_write_failed, :eacces}]},
+          {:rewrap_blocked,
+           [
+             {:signing_secret_rewrap_blocked,
+              %{
+                status: :blocked,
+                scanned: 3,
+                candidates: 2,
+                rewrapped: 0,
+                errors: 1,
+                error_sample: [
+                  %{
+                    scope: :access_keys,
+                    access_key_id: "AKIAROTATEEXAMPLE",
+                    reason: :access_key_secret_decrypt_failed
+                  }
+                ]
+              }}
+           ]}
+        ] do
+      assert_scheduler_logs_failure_at_error_level(status, errors)
     end
   end
 
-  defp assert_scheduler_logs_failure_at_error_level(status) do
+  test "scheduler treats an unrecognised ok status as a failed pass" do
+    # 失败判据是「成功白名单」而不是「失败黑名单」：新增/未登记的终态默认按没换成处理，
+    # 否则一个漏登记的失败状态就会静默降级成 info（AGENTS.md §3）。
+    unknown =
+      start_supervised!(
+        {Scheduler,
+         name: nil,
+         enabled: false,
+         runner: fn _opts -> {:ok, %{status: :some_new_terminal_state, errors: []}} end},
+        id: :scheduler_unknown_status
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{status: :some_new_terminal_state}} =
+                 Scheduler.run_now(unknown, keyring_file: "k")
+      end)
+
+    assert log =~ "[error]"
+    assert log =~ "status=some_new_terminal_state"
+
+    landed =
+      start_supervised!(
+        {Scheduler,
+         name: nil, enabled: false, runner: fn _opts -> {:ok, %{status: :not_due, errors: []}} end},
+        id: :scheduler_landed_status
+      )
+
+    # 反向守卫：真正落地的终态不得被这条判据误升级成 error（否则告警会被噪声淹没）。
+    quiet =
+      capture_log(fn ->
+        assert {:ok, %{status: :not_due}} = Scheduler.run_now(landed, keyring_file: "k")
+      end)
+
+    refute quiet =~ "iam signing secret rotation scheduler pass complete"
+  end
+
+  test "scheduler logs an unusable runner result at error level with the raw value" do
+    pid =
+      start_supervised!(
+        {Scheduler,
+         name: nil, enabled: false, confirm_rotation: true, runner: fn _opts -> :not_a_report end}
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:error, %{status: :bad_rotation_result, errors: [:not_a_report]}} =
+                 Scheduler.run_now(pid, keyring_file: "k")
+      end)
+
+    # runner 返回垃圾值 = 密钥没换成，且没有报告可看：必须 error 级并原样带出该值。
+    assert log =~ "[error]"
+    assert log =~ "iam signing secret rotation scheduler returned unexpected result"
+    assert log =~ ":not_a_report"
+  end
+
+  defp assert_scheduler_logs_failure_at_error_level(status, errors) do
     report = %{
       status: status,
       dry_run: false,
       previous_key_id: "old",
       next_key_id: "new",
-      errors: [{:access_key_secret_keyring_file_write_failed, :eacces}]
+      errors: errors
     }
 
     pid =
@@ -412,14 +545,22 @@ defmodule Maxio.IAM.SigningSecretRotationTest do
         assert {:error, %{status: ^status}} = Scheduler.run_now(pid, keyring_file: "k")
       end)
 
-    # 生产唯一自动路径上的失败不得降级成 info，且必须原样带出 reason（不是 errors 计数）。
-    assert log =~ "[error]"
-    assert log =~ "iam signing secret rotation scheduler pass complete"
-    assert log =~ "status=#{status}"
-    assert log =~ "errors=#{inspect(report.errors)}"
-    assert log =~ "access_key_secret_keyring_file_write_failed"
-    assert log =~ ":eacces"
-    refute log =~ "[info]"
+    # 防降级判据必须落在「pass complete 这一条记录本身」上：
+    # `config/test.exs` 把 logger level 设成 :warning，info 级日志根本不进 capture，
+    # 所以 `refute log =~ "[info]"` 恒真、守不住任何东西（`capture_log(level: :info)`
+    # 也不会放宽 primary level）。改成锁定这一行：一旦降级成 `Log.info`，
+    # 该行整条从 capture 里消失，下面第一条断言立刻失败。
+    pass_line =
+      log
+      |> String.split("\n", trim: true)
+      |> Enum.find(&(&1 =~ "iam signing secret rotation scheduler pass complete"))
+
+    assert pass_line, "rotation pass was not logged at :warning or above (silently downgraded?)"
+    assert pass_line =~ "[error]"
+    assert pass_line =~ "status=#{status}"
+
+    # 原样带出 reason（不是 errors 计数）：运维只看日志也能定位根因。
+    assert pass_line =~ "errors=#{inspect(report.errors)}"
   end
 
   defp assert_write_failure_is_blocked(keyring_file, label, open_fun) do

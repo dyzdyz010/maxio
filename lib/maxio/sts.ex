@@ -203,8 +203,9 @@ defmodule Maxio.STS do
     with {:ok, role_arn} <- role_field(role, :role_arn),
          {:ok, web_identity} <- normalize_web_identity(web_identity),
          {:ok, session_name} <- session_name(opts),
-         {:ok, source_identity} <- web_identity_source_identity(web_identity),
-         {:ok, session_tags, transitive_tag_keys} <- web_identity_session_tag_state(web_identity),
+         {:ok, claims} <- web_identity_claims(web_identity),
+         {:ok, source_identity} <- web_identity_source_identity(claims),
+         {:ok, session_tags, transitive_tag_keys} <- web_identity_session_tag_state(claims),
          {:ok, session_policy} <- session_policy(opts),
          opts =
            opts
@@ -1009,7 +1010,15 @@ defmodule Maxio.STS do
     }
   end
 
-  defp web_identity_source_identity(%{claims: claims}) when is_map(claims) do
+  # `normalize_web_identity/1` 的 `claims:` 只保证「非 nil」（`|| %{}`），不保证是 map，
+  # 所以「claims 必须是 map」这道防线必须存在。原先它在 web_identity_source_identity/1 与
+  # web_identity_session_tag_state/1 里各写了一份、返回同一个 {:error, :invalid_web_identity}；
+  # 后者因为在 `with` 里排在前者之后，永远轮不到。这里把两层重复合并成调用方 `with` 上
+  # 唯一一道**真正可达**的关卡，两个消费者直接收 claims。
+  defp web_identity_claims(%{claims: claims}) when is_map(claims), do: {:ok, claims}
+  defp web_identity_claims(_web_identity), do: {:error, :invalid_web_identity}
+
+  defp web_identity_source_identity(claims) do
     case Map.get(claims, @source_identity_claim) do
       nil ->
         {:ok, nil}
@@ -1026,9 +1035,7 @@ defmodule Maxio.STS do
     end
   end
 
-  defp web_identity_source_identity(_web_identity), do: {:error, :invalid_web_identity}
-
-  defp web_identity_session_tag_state(%{claims: claims}) when is_map(claims) do
+  defp web_identity_session_tag_state(claims) do
     with {:ok, nested_tags, nested_transitive_keys} <- nested_web_identity_session_tags(claims),
          {:ok, flat_tags} <- flat_web_identity_session_tags(claims),
          {:ok, flat_transitive_keys} <- flat_web_identity_transitive_tag_keys(claims),
@@ -1045,8 +1052,6 @@ defmodule Maxio.STS do
       _error -> {:error, :invalid_session_tags}
     end
   end
-
-  defp web_identity_session_tag_state(_web_identity), do: {:error, :invalid_web_identity}
 
   defp nested_web_identity_session_tags(claims) do
     case Map.get(claims, @web_identity_tags_claim) do

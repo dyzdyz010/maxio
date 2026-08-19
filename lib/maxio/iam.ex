@@ -3787,16 +3787,17 @@ defmodule Maxio.IAM do
 
   defp access_key_principal_arn(_type, _access_key_id, _opts), do: {:error, :malformed}
 
-  defp validate_access_key_user_arn(user_arn, access_key_id) when is_binary(user_arn) do
-    if Regex.match?(@local_user_arn_pattern, user_arn) do
+  # 原先是「`when is_binary` 子句 + 非二进制兜底子句」，两支对非法输入产出同一个
+  # `{:error, :invalid_principal_arn}`，而调用方已把 arn 收窄成二进制，兜底永远不可达。
+  # 合并成一个总函数：判定逐字保留（二进制且匹配本地 user ARN 形态才继续），
+  # 其余一切仍被同一个结构化错误拒绝，且这条分支现在真正可达。
+  defp validate_access_key_user_arn(user_arn, access_key_id) do
+    if is_binary(user_arn) and Regex.match?(@local_user_arn_pattern, user_arn) do
       validate_existing_access_key_user_arn(user_arn, access_key_id)
     else
       {:error, :invalid_principal_arn}
     end
   end
-
-  defp validate_access_key_user_arn(_principal_arn, _access_key_id),
-    do: {:error, :invalid_principal_arn}
 
   defp validate_existing_access_key_user_arn(user_arn, access_key_id) do
     case Repo.get_by(User, user_arn: user_arn) do
@@ -4107,15 +4108,15 @@ defmodule Maxio.IAM do
 
   defp validate_managed_policy_path(_path), do: {:error, :malformed}
 
-  defp validate_managed_policy_version_id(version_id) when is_binary(version_id) do
-    if Regex.match?(@managed_policy_version_id_pattern, version_id) do
+  # 同 `validate_access_key_user_arn/2`：两支子句对非法输入产出同一个 `{:error, :malformed}`，
+  # 调用方已把 version_id 收窄成二进制使兜底不可达。合并成一个总函数，判定与错误码逐字不变。
+  defp validate_managed_policy_version_id(version_id) do
+    if is_binary(version_id) and Regex.match?(@managed_policy_version_id_pattern, version_id) do
       :ok
     else
       {:error, :malformed}
     end
   end
-
-  defp validate_managed_policy_version_id(_version_id), do: {:error, :malformed}
 
   defp managed_policy_resource_path(policy_name, "/"), do: policy_name
 
@@ -5680,10 +5681,11 @@ defmodule Maxio.IAM do
   defp tag_value(nil), do: ""
   defp tag_value(value), do: to_string(value)
 
-  defp map_get(map, key) when is_map(map),
-    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
-
-  defp map_get(_map, _key), do: nil
+  # 两支子句合并成一个总函数：非 map 仍然回落到 nil（逐字不变），但这条分支不再因为
+  # 调用方已收窄成 map 而变成死代码。
+  defp map_get(map, key) do
+    if is_map(map), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  end
 
   defp normalize_iam_text(nil), do: nil
   defp normalize_iam_text(value) when is_binary(value), do: String.trim(value)

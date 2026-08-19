@@ -16,8 +16,13 @@ defmodule Maxio.IAM.SigningSecretRotation.Scheduler do
   @default_initial_delay_ms 60_000
   @default_rotate_after_seconds 86_400 * 90
 
-  # 轮换未落地的终态：任何一个都意味着密钥没换成，必须走 error 级日志。
-  @failure_statuses [:blocked, :rewrap_blocked, :crashed, :caught, :bad_rotation_result]
+  # 只有这三个终态代表「本轮没有留下未落地的轮换」：`:rotated` 真换了，`:dry_run`/`:not_due`
+  # 本来就不该换。其余一切（含未来新增、尚未登记的终态）一律按失败处理 —— 用「成功白名单」
+  # 而不是「失败黑名单」，是为了让新增失败状态默认走 error 级，而不是静默降级成 info
+  # （AGENTS.md §3 绝不静默失败）。
+  # 注意：`safe_rotate/2` 的 rescue/catch/other 分支自己构造 `:crashed`/`:caught`/
+  # `:bad_rotation_result` 并各自打 error 级日志，从不经过 `log_report/3`，故此处不列。
+  @rotation_landed_statuses [:rotated, :dry_run, :not_due]
 
   @option_keys [
     :keyring_file,
@@ -142,7 +147,9 @@ defmodule Maxio.IAM.SigningSecretRotation.Scheduler do
         result
 
       other ->
-        Log.warn("iam signing secret rotation scheduler returned unexpected result",
+        # runner 返回垃圾值 = 这一轮的密钥没换成，且我们连报告都拿不到：与 crash 同级的
+        # 失败，必须 error 级（warn 级会被运维告警规则漏掉，等于静默降级）。
+        Log.error("iam signing secret rotation scheduler returned unexpected result",
           action: :iam_signing_secret_rotation,
           reason: inspect({trigger, other})
         )
@@ -193,7 +200,9 @@ defmodule Maxio.IAM.SigningSecretRotation.Scheduler do
   defp failed?(:error, _report), do: true
 
   defp failed?(_outcome, report),
-    do: Map.get(report, :status) in @failure_statuses or Map.get(report, :errors, []) != []
+    do:
+      Map.get(report, :status) not in @rotation_landed_statuses or
+        Map.get(report, :errors, []) != []
 
   defp schedule(state, delay_ms) do
     cancel_timer(state.timer_ref)

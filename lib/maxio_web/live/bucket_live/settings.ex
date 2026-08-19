@@ -1093,9 +1093,9 @@ defmodule MaxioWeb.BucketLive.Settings do
   end
 
   defp map_object_lock_validation({:ok, config}), do: {:ok, config}
-  defp map_object_lock_validation({:error, :malformed_xml}), do: {:error, :invalid_object_lock}
 
-  # 其余错误形态（含 {:error, _}）统一走下面的兜底子句，产出同一结构化错误。
+  # 所有失败形态（`{:error, :malformed_xml}` 与任何未来新增的错误）产出同一结构化错误，
+  # 因此不再单列 `:malformed_xml` 子句 —— 那一支被兜底逐字覆盖，且反过来让兜底不可达。
   defp map_object_lock_validation(_other), do: {:error, :invalid_object_lock}
 
   defp persist_object_lock_config(bucket, config) do

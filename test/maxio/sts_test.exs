@@ -629,6 +629,29 @@ defmodule Maxio.STSTest do
                session_name: "webid-direct",
                duration_seconds: 900
              )
+
+    # normalize_web_identity/1 只保证 claims 非 nil（`|| %{}`），不保证是 map。
+    # 非 map 的 claims 必须被 web_identity_claims/1 这道唯一关卡结构化拒绝，
+    # 而不是漏进 source-identity / session-tag 解析里。
+    for bad_claims <- ["not-a-map", ["sub"], 7] do
+      non_map_claims = %{
+        issuer: issuer,
+        issuer_host_path: issuer_host_path,
+        provider_arn: provider_arn,
+        provider: issuer,
+        subject: subject,
+        subject_sha256: sha256_hex(subject),
+        audience: audience,
+        audiences: [audience],
+        claims: bad_claims
+      }
+
+      assert {:error, :invalid_web_identity} =
+               STS.assume_role_with_web_identity(role, non_map_claims,
+                 session_name: "webid-direct",
+                 duration_seconds: 900
+               )
+    end
   end
 
   test "web identity verifier derives provider ARN from HTTPS issuer and rejects HTTP issuers" do

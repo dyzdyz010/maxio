@@ -35,11 +35,13 @@ defmodule Maxio.Cluster.Placement do
           resolve_routed(bucket, key, view)
 
         set_id ->
-          with :ok <- validate_set_id(set_id, view) do
+          with {:ok, topology} <- validate_set_id(set_id, view) do
             {:ok,
              %{
                set_id: set_id,
-               pool_id: Keyword.get(opts, :placement_pool_id) || pool_id_for_set(set_id, view),
+               pool_id:
+                 Keyword.get(opts, :placement_pool_id) ||
+                   Topology.pool_id_for_set_from(topology, set_id),
                topology_hash: topology_hash(view),
                source: :override
              }}
@@ -192,7 +194,7 @@ defmodule Maxio.Cluster.Placement do
 
       with {:ok, placement} <- resolve_write_candidate(bucket, key, topology, view, opts),
            {:ok, set_id} <- WriteRouting.reroute_set(placement.set_id, opts),
-           :ok <- validate_set_id(set_id, view) do
+           {:ok, validated_topology} <- validate_set_id(set_id, view) do
         source =
           if set_id == placement.set_id do
             placement.source
@@ -201,7 +203,12 @@ defmodule Maxio.Cluster.Placement do
           end
 
         {:ok,
-         %{placement | set_id: set_id, pool_id: pool_id_for_set(set_id, view), source: source}}
+         %{
+           placement
+           | set_id: set_id,
+             pool_id: Topology.pool_id_for_set_from(validated_topology, set_id),
+             source: source
+         }}
       end
     end
   end
@@ -278,22 +285,22 @@ defmodule Maxio.Cluster.Placement do
     }
   end
 
+  # 校验通过时把 topology 一并交回调用方：pool_id 只有在 set_id 已被这道关卡确认后
+  # 才有意义。原先另有一个 `pool_id_for_set/2` 对同样的 view 形态再分派一次，
+  # 其中 `{:configured, nil} -> nil` 这支永远轮不到 —— 因为无拓扑时本函数早已返回
+  # `{:error, {:unknown_set_id, ...}}`（比返回 nil pool_id 更严格）。合并成一层后
+  # 无拓扑仍被结构化拒绝，重复分派消失。
   defp validate_set_id(set_id, {:configured, nil}), do: {:error, {:unknown_set_id, set_id, []}}
 
   defp validate_set_id(set_id, {:injected, topology}) do
     set_ids = Topology.all_set_ids_from(topology)
 
     if set_id in set_ids do
-      :ok
+      {:ok, topology}
     else
       {:error, {:unknown_set_id, set_id, set_ids}}
     end
   end
-
-  defp pool_id_for_set(_set_id, {:configured, nil}), do: nil
-
-  defp pool_id_for_set(set_id, {:injected, topology}),
-    do: Topology.pool_id_for_set_from(topology, set_id)
 
   defp normalize_set_id(nil), do: nil
   defp normalize_set_id(set_id) when is_integer(set_id), do: set_id

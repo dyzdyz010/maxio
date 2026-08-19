@@ -63,7 +63,7 @@ defmodule Maxio.Ops.CompatMatrix.Artifacts do
     with {:ok, names} <- File.ls(dir),
          {:ok, matcher} <- safe_glob_matcher(opts.glob) do
       names
-      |> Enum.filter(&safe_candidate_name?/1)
+      |> Enum.filter(&safe_path_segment?/1)
       |> Enum.filter(matcher)
       |> Enum.sort(:desc)
       |> regular_artifact_candidates(dir, opts.max_candidates)
@@ -90,7 +90,11 @@ defmodule Maxio.Ops.CompatMatrix.Artifacts do
     Enum.reverse(candidates)
   end
 
-  defp safe_glob_matcher(glob) when is_binary(glob) do
+  # 两个调用方原先各自用 `when is_binary(...)` + 非二进制兜底再包一层，
+  # 与 `safe_path_segment?/1` 自己的 `is_binary` 守卫 + false 兜底完全重复，
+  # 并让后者的兜底永远不可达。合并成一层：非二进制输入直接进谓词兜底得到 false，
+  # 结果逐字相同（`safe_glob_matcher` 仍是 `:error`，候选名仍被过滤掉）。
+  defp safe_glob_matcher(glob) do
     if safe_path_segment?(glob) do
       regex = glob_to_regex(glob)
       {:ok, fn name -> Regex.match?(regex, name) end}
@@ -98,11 +102,6 @@ defmodule Maxio.Ops.CompatMatrix.Artifacts do
       :error
     end
   end
-
-  defp safe_glob_matcher(_glob), do: :error
-
-  defp safe_candidate_name?(name) when is_binary(name), do: safe_path_segment?(name)
-  defp safe_candidate_name?(_name), do: false
 
   defp safe_path_segment?(value) when is_binary(value) do
     value not in ["", ".", ".."] and

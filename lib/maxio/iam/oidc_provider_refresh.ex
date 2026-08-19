@@ -200,7 +200,9 @@ defmodule Maxio.IAM.OIDCProviderRefresh do
   defp validate_discovery_thumbprints(%OIDCProvider{} = provider, attrs) do
     discovered = Map.get(attrs, :thumbprints, [])
 
-    if discovered == [] or thumbprints_cover?(provider.thumbprints || [], discovered) do
+    # `discovered == [] or` 这层短路与 `thumbprints_cover?(_, [])` 完全重复，且让后者不可达。
+    # 空发现集合的语义（无可校验指纹 → 放行）现在只由谓词自己表达，结果逐字相同。
+    if thumbprints_cover?(provider.thumbprints || [], discovered) do
       :ok
     else
       {:error, :oidc_discovery_thumbprint_mismatch}
@@ -451,14 +453,17 @@ defmodule Maxio.IAM.OIDCProviderRefresh do
     end
   end
 
-  defp discovery_thumbprints(discovery) when is_map(discovery) do
+  # 唯一调用方 `discovery_attrs/2` 已经用 `when is_map(discovery)` + `_discovery` 兜底
+  # 把非 map 的 discovery 结构化拒成 `{:error, :oidc_discovery_malformed_json}`。
+  # 这里原来重复了一层 map 守卫，且兜底返回 `[]` —— 那等于把畸形 discovery 静默当成
+  # 「没有 thumbprint」（AGENTS.md §3 明令禁止的静默放行），何况永远不可达。去掉重复层，
+  # 让上游那道**可达且结构化**的关卡成为唯一契约边界。
+  defp discovery_thumbprints(discovery) do
     discovery
     |> map_get(:thumbprints)
     |> normalize_thumbprints()
     |> Enum.uniq_by(&String.downcase/1)
   end
-
-  defp discovery_thumbprints(_discovery), do: []
 
   defp normalize_thumbprints(nil), do: []
   defp normalize_thumbprints(values) when is_list(values), do: Enum.map(values, &to_string/1)

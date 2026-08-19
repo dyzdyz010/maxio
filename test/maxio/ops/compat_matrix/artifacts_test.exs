@@ -51,6 +51,12 @@ defmodule Maxio.Ops.CompatMatrix.ArtifactsTest do
     write_json(nested, "s3_compat_matrix_nested.json", ready_artifact())
 
     assert Artifacts.list_recent(dir: dir, glob: "../*.json") == []
+
+    # 非二进制 glob（配置写错类型）同样必须被 safe_path_segment?/1 拒绝成空结果，
+    # 而不是穿到 glob_to_regex/1 里炸掉 console 页面。
+    assert Artifacts.list_recent(dir: dir, glob: :not_a_binary) == []
+    assert Artifacts.list_recent(dir: dir, glob: ["s3_compat_matrix_*.json"]) == []
+
     assert [%{file_name: "s3_compat_matrix_ready.json"}] = Artifacts.list_recent(dir: dir)
   end
 
