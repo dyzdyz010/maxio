@@ -331,6 +331,17 @@ defmodule Maxio.ObjectMutationTest do
   end
 
   test "prepare rejects caller supplied protocol state" do
+    # 本用例要证明的性质是「prepare 拒绝调用方提供的 protocol state 时，一行 journal 都不产生」。
+    # 该性质**不能**写成全表 `count == 0`：`object_mutations` 是共享表，测试库里任何在 sandbox
+    # 之外提交过的历史行（本机 test 库里就残留着 4 行 `mcreview/*`，来自手工端到端会话）都会
+    # 让断言失败，而它们与本次 prepare 是否写入毫无关系。
+    #
+    # 改为两条与表初始状态无关、却同样强的断言：
+    #   1) 调用前后**全表行数差为 0**——仍然捕获本次调用产生的任何写入，包括写到别的 target 上的行；
+    #   2) 注入 attrs 指向的 target 上**一行都没有**——点名本用例自己的目标，杜绝「刚好有别的行被
+    #      删掉抵消了新增」这种理论上的抵消。
+    before_count = Repo.aggregate(Maxio.ObjectMutation.Journal, :count)
+
     injected =
       attrs()
       |> Map.merge(%{
@@ -356,7 +367,17 @@ defmodule Maxio.ObjectMutationTest do
     assert errors.published_fingerprint
     assert errors.recovery_evidence
     assert errors.finalized_at
-    assert Repo.aggregate(Maxio.ObjectMutation.Journal, :count) == 0
+
+    assert Repo.aggregate(Maxio.ObjectMutation.Journal, :count) == before_count
+
+    assert Repo.aggregate(
+             from(j in Maxio.ObjectMutation.Journal,
+               where:
+                 j.bucket_name == ^injected.bucket_name and
+                   j.object_key == ^injected.object_key
+             ),
+             :count
+           ) == 0
   end
 
   test "sidecar publish is the authority commit line and can only finalize" do

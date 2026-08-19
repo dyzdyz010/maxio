@@ -61,6 +61,26 @@ defmodule Maxio.S3.ListQuery do
 
   **非空游标的分页语义逐字不变**——本模块只动 `""`。
 
+  ### 为什么 `part-number-marker` 不在这六个之列
+
+  ListParts 的 `part-number-marker` 是**整型**游标，不是字符串游标，故不共享本模块的
+  `String.t() | nil` 契约。它在 `s3/handlers/multipart.ex` 经 `parse_int/2` 读取，而
+  `Integer.parse("")` 返回 `:error` → 落到 default `0`，即「从第 0 个 part 之后开始」＝未指定；
+  同理 `x-amz-part-number-marker`（`s3/handlers/object.ex`）经
+  `parse_limited_integer_header!/5` 也归到 `0`。空串在整型游标上既不会崩、也不会遮蔽任何别的
+  参数（ListParts 只有这一个游标），所以它**不是**本模块要收敛的那类边界歧义——把它塞进
+  `@cursor_params` 反而会让一个整型参数被当成字符串游标处理。
+
+  ### 白名单的强度：运行期守卫，不是编译期检查
+
+  `cursor/2` 的 `name in @cursor_params` 是函数子句守卫，未列举的参数名在**运行期**抛
+  `FunctionClauseError`（不是编译期错误，也不是静默放行）。它之所以仍然足以防住"漏审参数"：
+  `cursor/2` 的全部调用点（`s3/handlers/bucket.ex`、`s3/handlers/multipart.ex`）传的都是
+  **编译期字面量**，参数名从不来自请求数据，故用户输入**不可能**触发这条守卫——它约束的是
+  开发者（新增列举路径时必须先把参数补进这张表并核过空串语义），而不是运行期的攻击面。
+  真要在编译期挡住漏审，得把 `cursor/2` 改成宏或为每个参数生成具名函数；当前调用点数量下
+  这不划算，故明确记为"运行期守卫 + 全字面量调用点"，而不是声称编译期保证。
+
   ## 空 `continuation-token` 的 S3 语义（VERIFY-AT-IMPL：已核验，结论与既有假设相反）
 
   * **AWS 官方 API Reference 无明文**：ListObjectsV2 的 `continuation-token` 条目只说
@@ -88,7 +108,9 @@ defmodule Maxio.S3.ListQuery do
   """
 
   # 允许经 `cursor/2` 归一的 query 参数白名单——逐个核过空串语义（见上表）。
-  # 未列举的参数名视为编程错误而非静默放行：新增列举路径须先把参数补进这张表并核语义。
+  # 未列举的参数名不会被静默放行，而是在 `cursor/2` 的子句守卫上**运行期**抛 FunctionClauseError
+  # （非编译期检查）；全部调用点传编译期字面量，故这条守卫只对开发者生效，用户输入到不了它。
+  # 新增列举路径须先把参数补进这张表并核语义（见 moduledoc「白名单的强度」）。
   @cursor_params ~w(continuation-token start-after marker key-marker version-id-marker upload-id-marker)
 
   @doc """
@@ -111,6 +133,8 @@ defmodule Maxio.S3.ListQuery do
   从 query 参数 map 取归一化后的分页游标：`nil`（未指定/空串/非法形态）或非空字符串。
 
   `name` 必须是 `#{inspect(@cursor_params)}` 之一——白名单即「空串语义已逐个核过」的证据。
+  该约束是子句守卫，其余参数名在**运行期**抛 `FunctionClauseError`；因所有调用点传的都是编译期
+  字面量，它实际上只是对开发者的护栏（见 moduledoc「白名单的强度：运行期守卫，不是编译期检查」）。
   """
   @spec cursor(map(), String.t()) :: String.t() | nil
   def cursor(query_params, name) when is_map(query_params) and name in @cursor_params do

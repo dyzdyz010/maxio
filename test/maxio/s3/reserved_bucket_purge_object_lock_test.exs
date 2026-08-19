@@ -71,6 +71,20 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
         object_lock_legal_hold: "ON"
       })
 
+    # 纯 COMPLIANCE + 保留期未过、**无 legal hold**。
+    #
+    # 为什么必须单列这一条：`ObjectLock.lock_status/2` 先判 legal hold 再判 retention，
+    # 所以 "COMPLIANCE + legal hold" 那条版本永远在第一个分支短路——本文件标题主张的
+    # 「绕过只对 GOVERNANCE 生效：COMPLIANCE 永不可绕过」在没有这条种子数据时**从未被执行**
+    # （已用变异取证：把 bypass 改成同样放行 COMPLIANCE，原来的 8 条测试照样全过）。
+    # 有了这条纯 COMPLIANCE 版本，`--bypass-governance` 必须仍然保留它，该路径才真正被走到。
+    :ok =
+      put_version("admin/v3/compliance", %{
+        object_lock_mode: "COMPLIANCE",
+        object_lock_retain_until: retain_until(),
+        object_lock_legal_hold: "OFF"
+      })
+
     # GOVERNANCE + 保留期未过（可被显式 bypass，对齐 S3）。
     :ok =
       put_version("health/live", %{
@@ -87,8 +101,9 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
 
     assert {:ok, summary} = ReservedBucketAudit.purge(confirm_delete: true)
 
-    # ── RED 主张：修复前这两个版本已被 Repo.delete! 无条件销毁 ──
+    # ── RED 主张：修复前这三个版本已被 Repo.delete! 无条件销毁 ──
     assert {:ok, _} = Objects.get_version("minio", "admin/v3/info", "null")
+    assert {:ok, _} = Objects.get_version("minio", "admin/v3/compliance", "null")
     assert {:ok, _} = Objects.get_version("minio", "health/live", "null")
 
     # 无锁的那条照常清除
@@ -97,11 +112,19 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
 
     # ── 保留必须**显式列出**，绝不报成成功 ──
     assert summary.failed == 0
-    assert summary.retained_count == 2
+    assert summary.retained_count == 3
 
     retained = Enum.sort_by(summary.retained, & &1.key)
 
     assert [
+             %{
+               bucket: "minio",
+               key: "admin/v3/compliance",
+               version_id: "null",
+               reason: :retention,
+               mode: "COMPLIANCE",
+               bypassable?: false
+             },
              %{
                bucket: "minio",
                key: "admin/v3/info",
@@ -121,7 +144,8 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
            ] =
              Enum.map(retained, &Map.take(&1, ~w(bucket key version_id reason mode bypassable?)a))
 
-    assert %DateTime{} = Enum.at(retained, 1).retain_until
+    assert %DateTime{} = Enum.find(retained, &(&1.key == "health/live")).retain_until
+    assert %DateTime{} = Enum.find(retained, &(&1.key == "admin/v3/compliance")).retain_until
   end
 
   test "dry-run 必须预告哪些版本会被保留，而不是假装全部可删" do
@@ -130,10 +154,13 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
     assert {:ok, summary} = ReservedBucketAudit.purge([])
 
     assert summary.dry_run
-    assert summary.versions == 3
-    assert summary.retained_count == 2
-    assert Enum.map(summary.retained, & &1.key) |> Enum.sort() == ["admin/v3/info", "health/live"]
-    assert ReservedBucketAudit.shadowed_keys() |> length() == 3
+    assert summary.versions == 4
+    assert summary.retained_count == 3
+
+    assert Enum.map(summary.retained, & &1.key) |> Enum.sort() ==
+             ["admin/v3/compliance", "admin/v3/info", "health/live"]
+
+    assert ReservedBucketAudit.shadowed_keys() |> length() == 4
   end
 
   test "绕过只对 GOVERNANCE 生效：COMPLIANCE 与 legal hold 永不可绕过" do
@@ -142,13 +169,28 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
     assert {:ok, summary} =
              ReservedBucketAudit.purge(confirm_delete: true, bypass_governance: true)
 
+    # 只有 GOVERNANCE 保留期与无锁那条被放行（health/live + health/ready）。
     assert summary.deleted == 2
     assert {:error, :not_found} = Objects.get_version("minio", "health/live", "null")
+    assert {:error, :not_found} = Objects.get_version("minio", "health/ready", "null")
 
-    assert [%{key: "admin/v3/info", reason: :legal_hold, bypassable?: false}] =
-             Enum.map(summary.retained, &Map.take(&1, ~w(key reason bypassable?)a))
+    # 两条 COMPLIANCE 都必须留下，且**分别**走两条不同的判定分支：
+    #   * admin/v3/compliance —— 纯 retention（无 legal hold 可短路）→ 这一条才真正证明
+    #     「COMPLIANCE 单独不可绕过」；
+    #   * admin/v3/info —— legal hold（与 bypass 无关的第二道闸）。
+    assert [
+             %{
+               key: "admin/v3/compliance",
+               reason: :retention,
+               mode: "COMPLIANCE",
+               bypassable?: false
+             },
+             %{key: "admin/v3/info", reason: :legal_hold, mode: "COMPLIANCE", bypassable?: false}
+           ] = Enum.map(summary.retained, &Map.take(&1, ~w(key reason mode bypassable?)a))
 
+    assert summary.retained_count == 2
     assert {:ok, _} = Objects.get_version("minio", "admin/v3/info", "null")
+    assert {:ok, _} = Objects.get_version("minio", "admin/v3/compliance", "null")
   end
 
   test "CLI 明说该桶仍然无法清空及原因，并以非零退出（绝不报成成功）" do
@@ -161,12 +203,18 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
         end
       end)
 
-    assert out =~ "retained=2"
+    assert out =~ "retained=3"
     assert out =~ "retained bucket=minio key=admin/v3/info"
     assert out =~ "legal_hold"
     assert out =~ "retained bucket=minio key=health/live"
     assert out =~ "retention"
     assert out =~ "GOVERNANCE"
+
+    # 纯 COMPLIANCE 保留期那条同样必须被逐条点名（含 mode 与不可绕过标志）。
+    assert out =~
+             "retained bucket=minio key=admin/v3/compliance version_id=null lock=retention " <>
+               "mode=COMPLIANCE"
+
     assert out =~ "still cannot be emptied"
   end
 
@@ -182,12 +230,12 @@ defmodule Maxio.S3.ReservedBucketPurgeObjectLockTest do
 
     payload = Jason.decode!(out)
 
-    assert payload["retained_count"] == 2
+    assert payload["retained_count"] == 3
     assert payload["deleted"] == 1
 
     assert payload["retained"]
            |> Enum.map(& &1["reason"])
-           |> Enum.sort() == ["legal_hold", "retention"]
+           |> Enum.sort() == ["legal_hold", "retention", "retention"]
   end
 
   describe "I-1 —— :sidecar 写权威下 purge 必须走写权威介质，绝不只删 PG 派生索引" do
