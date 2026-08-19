@@ -633,7 +633,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.list_account_aliases_response(page, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -823,7 +822,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> halt()
     else
       :error -> reject(conn, QueryError.new(:no_such_entity))
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -884,7 +882,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.list_users_response(page, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -986,7 +983,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.get_account_summary_response(summary, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -1900,7 +1896,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.list_policies_response(page, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -1983,7 +1978,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> halt()
     else
       :error -> reject(conn, QueryError.new(:no_such_entity))
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -2041,7 +2035,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.list_groups_response(page, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -2240,7 +2233,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> halt()
     else
       :error -> reject(conn, QueryError.new(:no_such_entity))
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -2327,7 +2319,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.list_roles_response(page, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -2575,7 +2566,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.list_instance_profiles_response(page, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -2875,7 +2865,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> send_resp(200, QueryView.list_server_certificates_response(page, request_id(conn)))
       |> halt()
     else
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -3380,7 +3369,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> halt()
     else
       :error -> reject(conn, QueryError.new(:no_such_entity))
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -3412,7 +3400,6 @@ defmodule Maxio.IAM.QueryPlug do
       |> halt()
     else
       :error -> reject(conn, QueryError.new(:no_such_entity))
-      {:error, %QueryError{} = error} -> reject(conn, error)
       {:error, reason} -> reject(conn, error_from_reason(reason))
     end
   end
@@ -4714,24 +4701,16 @@ defmodule Maxio.IAM.QueryPlug do
   end
 
   defp managed_policy_path(conn) do
-    case Map.get(params(conn), "Path", "/") do
-      path when is_binary(path) ->
-        if valid_managed_policy_path?(path) do
-          {:ok, path}
-        else
-          {:error,
-           QueryError.new(:invalid_parameter_value,
-             message:
-               "Path must start and end with / and contain only managed policy path characters."
-           )}
-        end
+    path = Map.get(params(conn), "Path", "/")
 
-      _other ->
-        {:error,
-         QueryError.new(:invalid_parameter_value,
-           message:
-             "Path must start and end with / and contain only managed policy path characters."
-         )}
+    if valid_managed_policy_path?(path) do
+      {:ok, path}
+    else
+      {:error,
+       QueryError.new(:invalid_parameter_value,
+         message:
+           "Path must start and end with / and contain only managed policy path characters."
+       )}
     end
   end
 
@@ -5076,24 +5055,16 @@ defmodule Maxio.IAM.QueryPlug do
   defp server_certificate_path_prefix(conn), do: instance_profile_path_prefix(conn)
 
   defp managed_policy_path_prefix(conn) do
-    case Map.get(params(conn), "PathPrefix", "/") do
-      path_prefix when is_binary(path_prefix) ->
-        if valid_managed_policy_path?(path_prefix) do
-          {:ok, path_prefix}
-        else
-          {:error,
-           QueryError.new(:invalid_parameter_value,
-             message:
-               "PathPrefix must start and end with / and contain only managed policy path characters."
-           )}
-        end
+    path_prefix = Map.get(params(conn), "PathPrefix", "/")
 
-      _other ->
-        {:error,
-         QueryError.new(:invalid_parameter_value,
-           message:
-             "PathPrefix must start and end with / and contain only managed policy path characters."
-         )}
+    if valid_managed_policy_path?(path_prefix) do
+      {:ok, path_prefix}
+    else
+      {:error,
+       QueryError.new(:invalid_parameter_value,
+         message:
+           "PathPrefix must start and end with / and contain only managed policy path characters."
+       )}
     end
   end
 
@@ -5120,24 +5091,16 @@ defmodule Maxio.IAM.QueryPlug do
   defp valid_managed_policy_path?(_path), do: false
 
   defp policy_entity_path_prefix(conn) do
-    case Map.get(params(conn), "PathPrefix", "/") do
-      path_prefix when is_binary(path_prefix) ->
-        if valid_iam_entity_path_prefix?(path_prefix) do
-          {:ok, path_prefix}
-        else
-          {:error,
-           QueryError.new(:invalid_parameter_value,
-             message:
-               "PathPrefix must start and end with / and contain only IAM entity path characters."
-           )}
-        end
+    path_prefix = Map.get(params(conn), "PathPrefix", "/")
 
-      _other ->
-        {:error,
-         QueryError.new(:invalid_parameter_value,
-           message:
-             "PathPrefix must start and end with / and contain only IAM entity path characters."
-         )}
+    if valid_iam_entity_path_prefix?(path_prefix) do
+      {:ok, path_prefix}
+    else
+      {:error,
+       QueryError.new(:invalid_parameter_value,
+         message:
+           "PathPrefix must start and end with / and contain only IAM entity path characters."
+       )}
     end
   end
 
@@ -6239,6 +6202,10 @@ defmodule Maxio.IAM.QueryPlug do
 
   defp maybe_put_metadata(metadata, _key, nil), do: metadata
   defp maybe_put_metadata(metadata, key, value), do: Keyword.put(metadata, key, value)
+
+  # Already-structured IAM Query errors pass through unchanged, so every `with/else`
+  # branch can funnel through a single mapping point without losing the original code.
+  defp error_from_reason(%QueryError{} = error), do: error
 
   defp error_from_reason(%Changeset{} = changeset) do
     cond do
