@@ -5,8 +5,12 @@ defmodule Maxio.Application do
 
   use Application
 
+  @pt_started_at {__MODULE__, :started_at}
+
   @impl true
   def start(_type, _args) do
+    record_started_at()
+
     children =
       [
         MaxioWeb.Telemetry,
@@ -16,6 +20,10 @@ defmodule Maxio.Application do
         [
           {DNSCluster, query: Application.get_env(:maxio, :dns_cluster_query) || :ignore},
           {Phoenix.PubSub, name: Maxio.PubSub},
+          # 运行时配置快照（设计 D2/D5）：必须在 PubSub 之后（要订阅失效广播）、在任何
+          # 读配置的子系统之前（否则第一批请求会读到空快照然后回落 app env——那是安全的
+          # 降级，但没必要）。它自身对 PG 不可达是容错的：空快照 = 纯 Application env 行为。
+          Maxio.Config.Store,
           # M8 live-IO 自适应限流：本节点 S3 handler in-flight 计数器，由长期进程持有 ETS。
           Maxio.S3.InFlight,
           Maxio.S3.NotificationDelivery.Scheduler,
@@ -66,6 +74,39 @@ defmodule Maxio.Application do
 
       other ->
         other
+    end
+  end
+
+  # ── 进程启动时刻（madmin ServerInfo 的 servers[].uptime 数据源）──
+  # monotonic 时钟：uptime 必须单调，绝不能被系统时钟回拨改写成负数。
+  # 同时记一份 wall-clock 起始时刻供 CLI/Console 展示"什么时候起来的"。
+  defp record_started_at do
+    :persistent_term.put(@pt_started_at, %{
+      monotonic_s: System.monotonic_time(:second),
+      system_time: DateTime.utc_now()
+    })
+  end
+
+  @doc """
+  本节点 maxio 应用启动至今的秒数。
+
+  应用未经 `start/2` 起来时（例如某些只跑单模块的 Mix 任务）返回 `nil`——绝不返回 0
+  冒充"刚启动"，`0` 与"不知道"在监控里是两个完全不同的信号（ServerInfo 据此 omit 该字段）。
+  """
+  @spec uptime_seconds() :: non_neg_integer() | nil
+  def uptime_seconds do
+    case :persistent_term.get(@pt_started_at, nil) do
+      %{monotonic_s: started} -> max(System.monotonic_time(:second) - started, 0)
+      nil -> nil
+    end
+  end
+
+  @doc "本节点 maxio 应用的启动时刻（wall clock）；未记录时为 nil。"
+  @spec started_at() :: DateTime.t() | nil
+  def started_at do
+    case :persistent_term.get(@pt_started_at, nil) do
+      %{system_time: at} -> at
+      nil -> nil
     end
   end
 

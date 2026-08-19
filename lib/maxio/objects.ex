@@ -1559,7 +1559,9 @@ defmodule Maxio.Objects do
   # ROUTE B B1-3 SQL LIST 临时硬 LIMIT 闸：有界取数行数 = min(sql_hard_limit, max_keys*4+1000)。
   # 折叠 delimiter 余量取 *4+1000（一个公共前缀可吃掉很多行，max_keys+1 不够）；上限硬 LIMIT 防 DoS。
   defp list_fetch_limit(max_keys) do
-    hard_limit = Application.get_env(:maxio, :listing, [])[:sql_hard_limit] || 100_000
+    # 经 Maxio.Config 门面读（config store 白名单键，可热改）；未命中运行时覆盖时
+    # 逐字回落 Application env，行为与改造前完全相同。
+    hard_limit = Maxio.Config.get(:listing, :sql_hard_limit, 100_000)
     min(hard_limit, max_keys * 4 + 1000)
   end
 

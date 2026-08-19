@@ -17,24 +17,30 @@ defmodule Maxio.Admin.Plug do
   `<bucket>` 里 key 为 `minio/admin/v3/info` 的对象；管控面若把它认领掉，客户端会拿到
   admin JSON 而不是自己的对象——静默数据劫持（铁律 3）。
 
-  ## 本批范围
+  ## 已实现的端点
 
-  **不实现任何真实 admin 端点**：认证通过的请求一律 501 `NotImplemented`(JSON)，
-  匿名请求 403 `AccessDenied`(JSON)。
+  | 路径 | 方法 | admin action | 响应 |
+  |---|---|---|---|
+  | `/minio/admin/v3/info` | GET | `admin:ServerInfo` | 200 明文 JSON `InfoMessage` |
+
+  其余一切 `/minio/admin/*`（含 `/minio/admin/v4/*`）落 501 `NotImplemented`(JSON)；
+  匿名请求一律 403 `AccessDenied`(JSON)。
 
   501 而非 404 是刻意的（设计 §9.2）：运维必须看到"该功能未实现"，而不是"路径不存在"
   ——后者会把人引向版本/路径的无效排查（铁律 3：绝不用一个误导性的状态码掩盖真相）。
   `/minio/admin/v4/*` 同样落 501（本批不做 v4→426 回落：实测当前 mc 的 madmin 硬编码
   打 v3，做了无法活体验证，绝不实现无法取证的分支）。
 
-  真实端点接入后，本 plug 的 `route/1` 会按路径分发到 handler，并由 handler 层做
-  per-endpoint 的 admin action 授权（`admin:ServerInfo` 等，复用 `Maxio.Policy.Evaluator`，
-  对齐 `Maxio.S3.PrometheusAuthz`）；`try/rescue` 结构与错误契约此刻已就位，不必再改。
+  ## 为什么鉴权判定在路由**之前**
+
+  未认证请求无论打哪条路径都是 403，不是 501。反过来（先路由再鉴权）会让匿名请求从
+  501 的措辞里读出"这个端点存在/不存在"，把管控面的实现进度泄露给未认证方；而且
+  "未认证"是比"未实现"更根本的拒绝理由，先报它才对得上因果。
   """
 
   import Plug.Conn
 
-  alias Maxio.Admin.ErrorView
+  alias Maxio.Admin.{Authz, ErrorView, ServerInfo}
   alias Maxio.S3.{Error, Log, PipelineOrderError, RawPath, ReservedNamespace}
 
   @behaviour Plug
@@ -80,18 +86,75 @@ defmodule Maxio.Admin.Plug do
     end
   end
 
-  # 本批唯一的"路由"：认证通过 → 501；匿名 → 403。两者都是结构化 JSON 错误，绝不静默。
   defp route(conn) do
     if authenticated?(conn) do
-      render_error(
-        conn,
-        Error.new(:not_implemented,
-          message:
-            "The MinIO admin API endpoint #{RawPath.decoded_path(conn)} is not implemented by maxio."
-        )
-      )
+      dispatch(conn, conn.method, RawPath.decoded_path(conn))
     else
       render_error(conn, Error.new(:access_denied))
+    end
+  end
+
+  # madmin 的 ServerInfo 硬编码打 v3（实测 mc RELEASE.2025-08-13）。
+  defp dispatch(conn, "GET", "/minio/admin/v3/info"), do: server_info(conn)
+
+  defp dispatch(conn, _method, path) do
+    render_error(
+      conn,
+      Error.new(:not_implemented,
+        message: "The MinIO admin API endpoint #{path} is not implemented by maxio."
+      )
+    )
+  end
+
+  defp server_info(conn) do
+    case Authz.authorize(conn, conn.assigns[:principal], "admin:ServerInfo") do
+      :ok ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode_to_iodata!(server_info_body(conn)))
+        |> halt()
+
+      {:error, reason} ->
+        Log.warn("admin server info denied",
+          action: "admin_server_info",
+          required_action: "admin:ServerInfo",
+          decision: "deny",
+          reason: to_string(reason),
+          method: conn.method,
+          resource: RawPath.decoded_path(conn),
+          auth_type: conn.assigns[:auth_type],
+          principal_arn: principal_arn(conn)
+        )
+
+        render_error(conn, Error.new(:access_denied))
+    end
+  end
+
+  # VERIFY-AT-IMPL V-A13：madmin **v3** 的 ServerInfo() 是否也发 `no-cache` query 未抓包核实
+  # （v4 确定发；实测 mc RELEASE.2025-08-13 打的是 `/minio/admin/v3/info?metrics=false`）。
+  # 无论它发不发，服务端支持这个参数都是正确的：收到就绕过 usage / 盘容量的短 TTL 快照，
+  # 这个参数存在的全部意义就是"我要最新的，别给我缓存的"。
+  defp server_info_body(conn) do
+    conn = fetch_query_params(conn)
+
+    ServerInfo.build(
+      no_cache: no_cache?(conn),
+      host: conn.host,
+      scheme: conn.scheme
+    )
+  end
+
+  defp no_cache?(conn) do
+    case conn.query_params["no-cache"] do
+      nil -> false
+      value -> String.downcase(to_string(value)) not in ["false", "0", ""]
+    end
+  end
+
+  defp principal_arn(conn) do
+    case conn.assigns[:principal] do
+      %{arn: arn} -> arn
+      _other -> nil
     end
   end
 

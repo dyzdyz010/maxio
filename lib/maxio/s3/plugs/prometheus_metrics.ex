@@ -75,11 +75,10 @@ defmodule Maxio.S3.Plugs.PrometheusMetrics do
     end
   end
 
-  defp public? do
-    :maxio
-    |> Application.get_env(:prometheus_metrics, [])
-    |> Keyword.get(:public, false)
-  end
+  # 经 Maxio.Config 门面读：该键在 config store 白名单里，运维可以 `mix maxio.config.set
+  # prometheus_metrics public true` 热改。门面未命中运行时覆盖时逐字回落 Application env，
+  # 行为与改造前完全相同（Maxio.Config 的迁移策略）。
+  defp public?, do: Maxio.Config.get(:prometheus_metrics, :public, false)
 
   defp bearer_token(conn) do
     case get_req_header(conn, "authorization") do

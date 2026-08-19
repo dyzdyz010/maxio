@@ -78,3 +78,18 @@ config :maxio, :scrubber, enabled: false, initial_delay_ms: 0, page_size: 50
 # 扫 journal，R1）；测试用 start_supervised!({Recovery.Scheduler, name: nil, ...}) + run_now
 # 同步驱动。
 config :maxio, :object_mutation_recovery_scheduler, enabled: false
+
+# 运行时配置快照：test 里全局那个 Store **完全惰性**——不启动期读 PG（此刻还没有 sandbox
+# owner）、不跑周期对账、也不订阅失效广播。
+#
+# 不订阅这一条是必须的，不是图省事：Maxio.Config.set/4 提交后会广播，全局 Store 收到后会
+# 在**自己的进程**里异步重载快照。这个异步重载可能落在测试的 on_exit 清理**之后**、sandbox
+# 事务回滚**之前**，于是它把一个即将被回滚掉的值写进了 :persistent_term——DB 干净了，进程
+# 内快照却留着脏值，泄漏给随后任意一个测试。（这不是生产问题：生产没有会回滚的事务。）
+#
+# 需要覆盖值的测试自己调 Maxio.Config.set/4 或 Store.load_all!/1；订阅/对账行为由专门的
+# 用例 start_supervised!({Store, subscribe: true, ...}) 显式驱动。
+config :maxio, Maxio.Config.Store,
+  refresh_interval_ms: 0,
+  load_on_boot: false,
+  subscribe: false

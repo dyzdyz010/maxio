@@ -9,8 +9,12 @@ defmodule Maxio.Admin.PlugTest do
   alias Maxio.S3.Endpoint
   alias Maxio.Test.SigV4Request
 
+  # /minio/admin/v3/info 已在 ServerInfo 批次实现（见 Maxio.Admin.InfoEndpointTest）；
+  # 本文件断言的是**未实现端点**的骨架契约，故一律用仍未实现的路径取样。
+  @unimplemented "/minio/admin/v3/storageinfo"
+
   test "authenticated admin request returns 501 JSON instead of S3 XML" do
-    conn = signed(:get, "/minio/admin/v3/info", query: %{"metrics" => "false"})
+    conn = signed(:get, @unimplemented, query: %{"metrics" => "false"})
 
     assert conn.status == 501
     assert content_type(conn) =~ "application/json"
@@ -18,7 +22,7 @@ defmodule Maxio.Admin.PlugTest do
     body = Jason.decode!(conn.resp_body)
     assert body["Code"] == "NotImplemented"
     assert is_binary(body["Message"]) and body["Message"] != ""
-    assert body["Resource"] == "/minio/admin/v3/info"
+    assert body["Resource"] == @unimplemented
     assert Map.has_key?(body, "RequestId")
     assert Map.has_key?(body, "HostId")
     refute conn.resp_body =~ "<Error>"
@@ -26,7 +30,7 @@ defmodule Maxio.Admin.PlugTest do
 
   test "madmin style empty region credential scope still reaches the admin surface" do
     # madmin 的 credential scope region 段恒为空（".../<date>//s3/aws4_request"）。
-    conn = signed(:get, "/minio/admin/v3/info", region: "")
+    conn = signed(:get, @unimplemented, region: "")
 
     assert conn.status == 501
     assert Jason.decode!(conn.resp_body)["Code"] == "NotImplemented"

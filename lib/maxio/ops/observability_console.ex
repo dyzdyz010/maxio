@@ -55,9 +55,10 @@ defmodule Maxio.Ops.ObservabilityConsole do
   defp prometheus_section(opts) do
     config_result =
       opts
-      |> Keyword.get(:prometheus_config_fun, fn ->
-        Application.get_env(:maxio, :prometheus_metrics, [])
-      end)
+      # 经 Maxio.Config 门面读（config store 白名单键）：Console 展示的必须是**生效值**，
+      # 直读 Application env 会在运维刚做完 `mix maxio.config.set` 之后显示旧值——
+      # 一个和数据面不一致的观测台比没有观测台更糟。
+      |> Keyword.get(:prometheus_config_fun, fn -> Maxio.Config.get_all(:prometheus_metrics) end)
       |> safe_call0()
 
     case config_result do

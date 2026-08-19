@@ -53,7 +53,16 @@ defmodule Maxio.S3.Log do
     :destination_arn,
     :configuration_id,
     :notification_event_id,
-    :attempts
+    :attempts,
+    # 运行时配置面固定字段（设计 §6）。formatter 侧的 metadata 白名单必须同步放行，
+    # 否则结构化字段被静默丢弃——ObjectMutation 已有前车之鉴。
+    :config_subsystem,
+    :config_key,
+    :config_version,
+    :config_apply_mode,
+    :config_source,
+    :config_digest,
+    :config_local_digest
   ]
 
   @doc "把关键字参数中已知的 S3 元数据键提取为 Logger metadata keyword 列表。"

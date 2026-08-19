@@ -41,6 +41,21 @@ if data_dir = System.get_env("MAXIO_DATA_DIR") do
   config :maxio, :s3, data_dir: data_dir
 end
 
+# 部署标识（madmin ServerInfo 的 deploymentID）。不设时首次被读取即自动生成 UUIDv4 并
+# 持久化进 runtime_configs；容器编排里想让它跨重建保持稳定就用这个变量在部署期钉住。
+# 运行时覆盖（mix maxio.config.set cluster deployment_id ...）优先级仍高于本变量——
+# "运维时意图"晚于"部署时意图"，见 Maxio.Config 的优先级说明。
+if deployment_id = System.get_env("MAXIO_DEPLOYMENT_ID") do
+  if deployment_id == "" do
+    raise """
+    environment variable MAXIO_DEPLOYMENT_ID must not be empty.
+    Unset it to let maxio generate and persist a UUIDv4 on first read.
+    """
+  end
+
+  config :maxio, :cluster, deployment_id: deployment_id
+end
+
 dev_sse_master_key = "bWF4aW8tc3NlLXMzLW1hc3Rlci1rZXktMzJieXRlcyE="
 dev_access_key_secret_key = "bWF4aW8tYWNjZXNzLWtleS1zZWNyZXQta2V5LTMyYiE="
 

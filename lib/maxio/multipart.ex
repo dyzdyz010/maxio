@@ -1293,7 +1293,8 @@ defmodule Maxio.Multipart do
   # ROUTE B B1-3 SQL LIST 临时硬 LIMIT 闸（同 Objects.list_fetch_limit/1）：
   # min(sql_hard_limit, max_uploads*4+1000)，折叠 delimiter 余量 *4+1000，上限防 DoS。
   defp list_fetch_limit(max_uploads) do
-    hard_limit = Application.get_env(:maxio, :listing, [])[:sql_hard_limit] || 100_000
+    # 经 Maxio.Config 门面读（config store 白名单键，可热改），同 Objects.list_fetch_limit/1。
+    hard_limit = Maxio.Config.get(:listing, :sql_hard_limit, 100_000)
     min(hard_limit, max_uploads * 4 + 1000)
   end
 

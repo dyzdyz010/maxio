@@ -102,7 +102,18 @@ config :logger, :default_formatter,
     :authority_mode,
     :backend,
     :placement_set_id,
-    :outcome
+    :outcome,
+    # 运行时配置面固定字段（设计 §6）：Maxio.S3.Log 只放行白名单键，formatter 侧必须
+    # 同步放行，否则 config_subsystem/config_key/... 会被静默丢弃。
+    :config_subsystem,
+    :config_key,
+    :config_version,
+    :config_apply_mode,
+    :config_source,
+    # 对账取证：漂移日志必须同时说出本地与权威的内容指纹，否则运维只知道"漂了"，
+    # 无从判断是丢广播还是有人直接改了库。
+    :config_digest,
+    :config_local_digest
   ]
 
 # Use Jason for JSON parsing in Phoenix
@@ -217,6 +228,17 @@ config :maxio, :durability, fsync: true
 # list_uploads）无界 Repo.all 大桶 = DoS。每次 SQL 取数行数封顶 sql_hard_limit（默认 100_000），
 # 实际取 min(sql_hard_limit, max_keys*4+1000)。B3 drive-walk 上线后 PG 仅作快路径，此闸保留为 DoS 兜底。
 config :maxio, :listing, sql_hard_limit: 100_000
+
+# 运行时配置存储的节点本地快照（Maxio.Config.Store）。
+# refresh_interval_ms 是**兜底对账**周期，不是失效通路：失效走 Cluster.Notify 广播（快路径），
+# 但那条广播是 best-effort（PubSub 未起时静默 :ok），丢一次就会让某节点长期用旧配置。
+# 周期性拉 PG 的**整表内容指纹**（md5(string_agg(subsystem/key/version/md5(value)))）比对，
+# 把最坏情况从"永久静默分歧"收敛成"最多落后一个周期"，且漂移会打结构化 warning（丢广播必须可见）。
+# 判据刻意不是 (行数, 版本和)：那会碰撞（删一行 + 插一行即恒等），而碰撞在这里等于**永久**漏判。
+# 摘要里 **`value` 不能省**：`reset` 是删行、`set` 又从 1 开始编号，"set → reset → set 成别的值"
+# 会复用同一个版本号，只摘 subsystem/key/version 的话摘要逐字不变 —— 纯门面操作即可造出永久分歧。
+# load_on_boot: false 时进程仍起（仍订阅广播、仍对账），只是不在启动瞬间读 PG。
+config :maxio, Maxio.Config.Store, refresh_interval_ms: 30_000, load_on_boot: true
 
 # ROUTE B 元数据权威来源（读/列/写分别可切；P2 引入 :read，P3 引入 :list，B4-2 引入 :write；
 # 默认全 :pg = 今天行为，shadow 比对不翻权威）。

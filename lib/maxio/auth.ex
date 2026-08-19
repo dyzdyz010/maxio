@@ -219,7 +219,7 @@ defmodule Maxio.Auth do
 
   defp parse_amz_date(_), do: :error
 
-  defp clock_skew_ms do
-    Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:clock_skew_ms)
-  end
+  # 经 Maxio.Config 门面读（config store 白名单键，可热改）。仍是 fetch! 语义：
+  # 缺了就 raise——一个没有时钟偏移上界的验签路径是安全问题，绝不静默取默认值。
+  defp clock_skew_ms, do: Maxio.Config.fetch!(:s3, :clock_skew_ms)
 end

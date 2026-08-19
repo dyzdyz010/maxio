@@ -854,3 +854,127 @@ M8 剩余：
   不自动补 rollup、不启用后台清理。
   已有默认关闭的 SMART allowlist 子证据；尚未接入硬件 service time/物理吞吐或物理 replacement identity、secure erase、
   真实硬件拔盘证明，或 replacement/rebalance 的生产级全自动策略与更多活体端到端取证。
+
+## MinIO 管控面（Admin API）与运行时配置存储
+
+`mc admin *` 走的是 MinIO 专有的 `/minio/admin/v3/*` 命名空间，与 S3 数据面**同一个端口**
+（madmin 的 `makeTargetURL` 用的就是 alias 的 host:port，没有选择空间）。maxio 把它挂在
+`Maxio.S3.Endpoint` 的 plug 链上，SigV4 之后、Dispatch 之前。
+
+### 已实现
+
+| 端点 | 方法 | 鉴权 | admin action |
+|---|---|---|---|
+| `/minio/health/live` | GET, HEAD | 无（探针不带凭据） | —— |
+| `/minio/health/ready` | GET, HEAD | 无 | —— |
+| `/minio/admin/v3/info` | GET | SigV4 | `admin:ServerInfo` |
+
+其余一切 `/minio/admin/*`（含 `/minio/admin/v4/*`）返回 **501 JSON** `NotImplemented`，
+匿名请求返回 **403 JSON** `AccessDenied`。**绝不返回 404**——用"路径不存在"掩盖"功能未实现"
+会把运维引向无效排查。
+
+CLI 取证：`mix maxio.admin.info [--json] [--no-cache]` 在本机 BEAM 内直接复算同一份响应体，
+不经 HTTP、不经签名。`mc admin info` 报错时它把排查空间对半砍（数据源坏了 vs 线格式/签名坏了）。
+
+### 保留路径面只在 path-style 寻址下生效（对 MinIO 的已知偏离）
+
+MinIO 把 health / admin / metrics 注册在顶层 mux、不看 Host；maxio 额外要求
+`s3_address_style == :path`。原因是数据完整性：vhost 下 `Host: <bucket>.<domain>` +
+`GET /minio/health/live` 指的是**桶 `<bucket>` 里 key 为 `minio/health/live` 的对象**，
+认领它等于把任意桶的这批 key 静默劫持成 200 空 body（备份/同步工具会当成合法的空对象）。
+
+**运维要求**：k8s/LB 探针、`mc admin`、Prometheus 抓取一律用 **path-style endpoint**
+（Host 里不带桶名）。被寻址方式跳过时 `ReservedNamespace.claimed?/2` 打结构化 warning
+（`reason: "reserved_surface_skipped_non_path_addressing"`），不会静默返回 NoSuchBucket。
+
+### ServerInfo 的诚实性口径（读这份数据前必读）
+
+madmin 的 `InfoMessage` 字段远多于 maxio 拥有的概念。maxio 的规则是**没有真实数据源的字段
+一律 omit（键不出现），绝不填 0/空串冒充"已测量"**——在监控里 `0` 与"没有这个概念"是两个
+完全不同的信号。
+
+本批**明确 omit**的字段：
+
+- 顶层：`sqsARN`（无全局 SQS ARN 注册表）、`objectNamingMode`、`pools`、`services`
+  （v3 的 `Services` 子结构 json tag 未逐字核实，发一个形状没验过的对象有让 madmin 解码
+  失败的风险）；
+- `servers[]`：`commitID`（无 build 期 git sha 注入）、`network`（`Maxio.Cluster.nodes/0`
+  是 BEAM mesh 视图，不是 HTTP peer 探活，口径不同）、`go_max_procs` / `minio_env_vars` /
+  `minio_env_hash` / `edition` / `license` / `is_leader` / `leaders` / `gc_stats` /
+  `api_version` / `restarting_since`（无对应概念）、`host` / `pid` / `cmd_line` / `username`
+  （低价值）、`poolNumber` / `poolNumbers`；
+- `drives[]`：`readthroughput` / `writethroughput` / `readlatency` / `writelatency` /
+  `utilization`（maxio `DriveIO` 的口径与 MinIO `Disk.*` 是否可比未核实，不可比就不发）、
+  `major` / `minor` / `used_inodes` / `free_inodes` / `model` / `pool_index` / `set_index` /
+  `disk_index`；FS 后端下还 omit `uuid`（DriveIdentity marker 只写在纠删/分布式盘上）。
+
+**`rrSCParity` 永远不出现**，且**绝不从 `standardSCParity` 回填**——那等于宣称存在一个
+maxio 根本没实现的存储类分级（REDUCED_REDUNDANCY），是伪造能力而不是兼容。FS 后端下
+`standardSCParity` 同样 omit（FS 没有 parity 概念，填 0 会被读成 EC 语义的"零冗余"）。
+
+**口径必须看清楚的三个字段**：
+
+- `usage.size` 是**逻辑字节**（与 Prometheus / quota 共用 `Prometheus.usage_stats/1` 同一
+  口径），不是物理占用，纠删码/副本放大不计入；
+- `servers[].mem_stats.alloc` 是 **BEAM** 的 `:erlang.memory(:total)`，不是 Go runtime 的
+  堆。`mallocs` / `frees` / `total_alloc` / `heap_alloc` 在 BEAM 没有同口径对应物，故不发；
+- `servers[].runtime_version` 如实写 `Elixir x.y.z / OTP nn`，**不伪装成 `go1.x`**；
+  `servers[].version` 是 `mix.exs` 的版本，**不冒充 MinIO 的 `RELEASE.` 串**。
+
+`drives[].state` 只用 `"ok"` / `"offline"` 两个值：maxio 的 `DriveHealth` 是三态，
+`:suspect` **保守计入 `"offline"` 与 `offlineDisks`**——把一块可疑盘报成 ok 会让运维以为
+冗余完好，健康度只允许被低估，不允许被夸大。
+
+`mode` 恒为 `"online"`：这个响应本身就是"服务器在服务请求"的证据。盘/集群健康在
+`backend.offlineDisks` 与 `drives[].state` 里单独表达，不塞进 `mode`。
+
+ServerInfo 的 usage 与盘容量走 30s TTL 快照缓存（`usage_stats/1` 是一次 `objects` 全表
+group-by；盘容量要走 os_mon）。madmin 自己发的 `?no-cache=true` 会绕过缓存。
+
+### 运行时配置存储（`Maxio.Config`）
+
+Admin API 的硬前置，也是 `deploymentID` 的落脚点。
+
+- **权威**：Postgres `runtime_configs`（每个白名单键一行 + 版本号 + previous_value）与
+  `runtime_config_audits`（只追加的变更流水）。
+- **读**：统一门面 `Maxio.Config.get/2,3` / `fetch!/2` / `get_all/1` / `source/2`，
+  优先级 **runtime override > env var > 编译期默认**。读路径走 `:persistent_term` 快照，
+  永不打 DB；未命中运行时覆盖时逐字回落 `Application.get_env`（行为与改造前完全相同）。
+- **白名单**：`Maxio.Config.Schema` 是编译期数据结构，不是 DB 数据。第一批只放四个低风险键
+  `cluster.deployment_id` / `prometheus_metrics.public` / `listing.sql_hard_limit` /
+  `s3.clock_skew_ms`。未知键 400、§4 禁止清单（密钥 / behaviour 绑定 / 改变既有落盘数据解释 /
+  config store 自举依赖 / compile_env）403，且**绝不落库**。
+- **写成功 ≠ 生效**：写路径返回 `applied: hot | next_cycle | restart`，CLI 原样打印。
+- **多节点**：PG 是单一事实来源。失效走 `Cluster.Notify` 广播（快路径，best-effort），
+  外加 30s 周期的**内容指纹**对账兜底（`md5(string_agg(subsystem/key/version/md5(value)))`）——
+  广播丢一次最多落后一个周期，并打结构化 warning，不会变成永久静默分歧。判据刻意不是
+  `(行数, 版本和)`：那会碰撞（reset 一个键 + 首次 set 另一个键即恒等），而碰撞在这里等于
+  **永久**漏判。摘要里 **`value` 不能省**：`reset` 是删行、`set` 又从 1 开始编号，于是
+  "set → reset → set 成别的值"会复用同一个版本号，只摘 `subsystem/key/version` 的话摘要逐字
+  不变，纯门面操作就能造出永久分歧。同理**任何重载都是整体重载**（没有"只装一个子系统"的
+  路径）：只装一个子系统却记下整表指纹，等于把没读过的行记成"已核对"，一次丢广播 + 一次
+  任意其它子系统的广播就会永久关掉这条兜底。
+  边界（如实说明，不是承诺之外的保证）：指纹只覆盖 `runtime_configs` 表本身，且收敛下界是
+  一个对账周期；`Cluster.Notify` 眼下只是节点本地 transport（V-C2），跨节点唯一的收敛通路
+  就是这次周期对账。
+
+CLI：
+
+```bash
+mix maxio.config.list [--subsystem S] [--json]
+mix maxio.config.get <subsystem> <key> [--json]     # 三层取证：定位"我改了怎么没生效"
+mix maxio.config.set <subsystem> <key> <value> [--expected-version N]
+mix maxio.config.reset <subsystem> <key>
+mix maxio.config.history <subsystem> <key> [--limit N] [--json]
+mix maxio.config.status [--json] [--reconcile]      # 本节点快照 vs PG、漂移、orphan 键
+```
+
+`MAXIO_DEPLOYMENT_ID` 可在部署期钉住部署标识；不设时首次被读取即生成 UUIDv4 并持久化。
+
+### 本批显式不做（文档化，绝不静默）
+
+`mc admin config get/set`（依赖 madmin 的 Argon2id 加密封装，属独立的密码学互操作批次）、
+`mc admin user/policy/group *`、`mc admin heal/trace/console`、Tiers / Site Replication /
+Batch Jobs、`/minio/health/cluster[/read]`（FS 后端没有 quorum 概念，一个恒真的 200 是用假
+答案冒充集群健康判定）、`/minio/admin/v4/*` → 426 回落（当前 mc 的 madmin 硬编码打 v3，
+做了无法活体验证）。

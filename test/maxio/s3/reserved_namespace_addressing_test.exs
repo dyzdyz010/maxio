@@ -110,9 +110,16 @@ defmodule Maxio.S3.ReservedNamespaceAddressingTest do
     assert live.status == 200
     assert live.resp_body == ""
 
-    admin = call(signed(:get, "/minio/admin/v3/info"))
-    assert admin.status == 501
-    assert Jason.decode!(admin.resp_body)["Code"] == "NotImplemented"
+    # 已实现的 admin 端点（ServerInfo）在 path-style 下正常出内容……
+    info = call(signed(:get, "/minio/admin/v3/info"))
+    assert info.status == 200
+    assert Jason.decode!(info.resp_body)["backend"]["backendType"] == "FS"
+
+    # ……未实现的仍是 501 JSON（本用例守的是"认领生效"，两种响应都证明请求进了 admin 面，
+    # 而不是被 Dispatch 当成桶 minio 的对象返回 S3 XML）。
+    unimplemented = call(signed(:get, "/minio/admin/v3/storageinfo"))
+    assert unimplemented.status == 501
+    assert Jason.decode!(unimplemented.resp_body)["Code"] == "NotImplemented"
   end
 
   defp signed(method, path, opts \\ []), do: SigV4Request.signed_conn(method, path, opts)
