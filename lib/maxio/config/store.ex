@@ -22,6 +22,10 @@ defmodule Maxio.Config.Store do
     * CLI（`mix maxio.config.*`）在没有 Store 进程的 Mix 环境里照样能用同一套函数；
     * 测试可以在 sandbox 拥有的进程里直接调用，无需为 GenServer 单独授权连接。
 
+  代价是**并发装载**：查询谁都能同时跑，但把结果写进 `:persistent_term` 的那一段必须
+  互斥，否则两次装载的写会交错出一份没有任何指纹能描述的快照（见下面「快照与它的指纹
+  必须一起落地」）。锁只圈住提交，查询仍留在调用方进程里——上面这三条因此原样成立。
+
   ## 广播是快路径，周期对账是**兜底**（D5）
 
   `Maxio.Cluster.Notify.broadcast/1` 自陈 best-effort：PubSub 未起时它静默返回 `:ok`。
@@ -110,6 +114,37 @@ defmodule Maxio.Config.Store do
   `put_term/2` 与这条运行时行为**完全重合**，它只是把这条依赖写在明处，并不是它创造了
   这个约束。
 
+  ## 快照与它的指纹必须**一起**落地（提交阶段互斥）
+
+  上一节把"记录的断言不得宽于实际装载的范围"变成了结构性质，但那只管**一次**装载内部。
+  一次装载的提交并不是一次原子替换：per-subsystem term、`@pt_subsystems`、`@pt_meta` 是
+  好几次**各自独立**的 `:persistent_term` 写。两个并发 `load_all!/1`（新 X、旧 Y）交错成
+
+      t_X写快照 < t_Y写快照 < t_Y写meta < t_X写meta
+
+  终态就是**旧快照 + 新指纹**——而新指纹会让周期对账**永远满意**，旧值被静默固化。这与
+  上一节是同一形态（记录的指纹描述的不是在位的那份快照），只是这次跨的是两次装载。
+  逐个子系统写还有个更细的变体：X 写完 `s3`、Y 写完 `s3` 与 `listing`、X 再写 `listing`，
+  终态是一份**从未在 PG 里存在过**的混合快照，任何一份指纹都无法如实描述它。
+
+  所以提交阶段（读 `loaded_subsystems/0` + 写全部 term + 写 meta）在**节点内互斥**执行，
+  `reset_local!/0` 走同一把锁。于是终态永远是某一次装载的**完整**一对，且那一对里
+  `aggregate` 取自它自己的两次查询（先指纹后行），指纹只可能比快照旧——自愈方向原样保住：
+  最坏是"提交晚的那次装载数据更旧"，下个周期对账判为漂移、多重载一次。
+
+  ## 为什么不是"把 `load_all!` 收口进 Store GenServer"，也不是"给 meta 加 CAS"
+
+  **收口进 GenServer**会把 DB 查询搬进 Store 进程，上一节那三条性质全得重谈：写路径要跨进程
+  调用、测试要给 Store 单独授权 sandbox 连接，而 CLI 环境里**根本没有 Store 进程**——只能
+  补一句"没有进程就退回本地执行"，于是互斥又变成"看调用环境而定"，正是这里要消灭的东西。
+  而且它顺带把 DB 查询也串行化了，代价却买不到任何额外正确性：真正非原子的是提交，不是查询。
+
+  **给 meta 加 CAS**（"只接受更新的装载"）缺一个可靠的偏序：指纹之间不可比大小；装载开始/
+  结束的时刻、`unique_integer` 这类单调计数器都排不出**两次查询各自看见的 PG 快照**的先后
+  （先开始的装载完全可能后取快照）；真要问 PG 要 LSN/xid，那次取值又与取行的语句不原子。
+  退一步说，即便有了偏序，per-subsystem term 上也没有可用的 CAS 原语——read-compare-write
+  跨 N+2 个 key，本身仍需要一把锁。CAS 方案需要的原子性，正是它想替代的那把锁。
+
   ## 启动期严格性（§5）
 
     * PG 里有**白名单外**的 orphan 键 → 忽略该行 + `Log.error` + 在
@@ -132,6 +167,9 @@ defmodule Maxio.Config.Store do
   @pt_namespace Maxio.Config
   @pt_meta {Maxio.Config, :__meta__}
   @pt_subsystems {Maxio.Config, :__subsystems__}
+
+  # 写这三类 term 的**唯一**互斥点（见 moduledoc「快照与它的指纹必须一起落地」）。
+  @commit_lock {__MODULE__, :__commit__}
 
   # VERIFY-AT-IMPL V-C1：per-subsystem 大 term 写入触发的 :persistent_term 全局 GC 代价，
   # 在 maxio 的实际负载下是否可接受，尚未基准测试（需在高并发 S3 读写下做一次配置变更、
@@ -190,6 +228,10 @@ defmodule Maxio.Config.Store do
   @doc """
   从 PG 全量重装本节点快照。白名单内值无法解码即 raise（fail-fast）。
 
+  两次查询跑在**调用方进程**里；把结果写进 `:persistent_term` 的那一段（含读
+  `loaded_subsystems/0`）在**节点内互斥**——快照与它的指纹必须一起落地，否则并发装载能
+  交错出「旧快照 + 新指纹」（见 moduledoc「快照与它的指纹必须一起落地」）。
+
   返回 `%{aggregate:, orphan_config_keys:, subsystems:}`。
   """
   @spec load_all!(keyword()) :: map()
@@ -202,21 +244,85 @@ defmodule Maxio.Config.Store do
 
     {by_subsystem, orphans} = materialize(rows)
 
-    previous = loaded_subsystems()
-    Enum.each(previous -- Map.keys(by_subsystem), &:persistent_term.erase({@pt_namespace, &1}))
-    Enum.each(by_subsystem, fn {subsystem, map} -> put_subsystem(subsystem, map) end)
-    put_term(@pt_subsystems, Map.keys(by_subsystem))
-
-    put_meta(%{
-      aggregate: aggregate,
-      loaded_at: DateTime.utc_now(),
-      last_reload_reason: Keyword.get(opts, :reason, :load_all),
-      orphan_config_keys: orphans
-    })
+    checkpoint(opts, :queried)
+    commit(by_subsystem, aggregate, orphans, opts)
 
     report_orphans(orphans)
 
     %{aggregate: aggregate, orphan_config_keys: orphans, subsystems: map_size(by_subsystem)}
+  end
+
+  defp commit(by_subsystem, aggregate, orphans, opts) do
+    with_commit_lock(opts, fn ->
+      previous = loaded_subsystems()
+      Enum.each(previous -- Map.keys(by_subsystem), &:persistent_term.erase({@pt_namespace, &1}))
+      Enum.each(by_subsystem, fn {subsystem, map} -> put_subsystem(subsystem, map) end)
+      put_term(@pt_subsystems, Map.keys(by_subsystem))
+
+      checkpoint(opts, :snapshot_written)
+
+      put_meta(%{
+        aggregate: aggregate,
+        loaded_at: DateTime.utc_now(),
+        last_reload_reason: Keyword.get(opts, :reason, :load_all),
+        orphan_config_keys: orphans
+      })
+    end)
+  end
+
+  # 提交阶段的**节点内**互斥（见 moduledoc「快照与它的指纹必须一起落地」）。
+  #
+  # 用 `:global.trans/3` 而不是自造一个锁进程：`global_name_server` 是 `:kernel` 的一部分，
+  # 在 release、`mix maxio.config.*` 的 Mix 环境、ExUnit sandbox 里**同样存在**——而"CLI 在
+  # 没有 Store 进程的环境里也能用同一套函数"正是本模块必须保住的性质之一。任何"懒启动一个
+  # 锁进程"的方案都得先解决"谁来创建它"的注册竞态，等于用一个新的竞态换掉旧的。
+  # `trans/3` 还给了两条免费的正确性：`Fun` 抛异常时 `try/after` 释放锁；持锁进程猝死时
+  # global 经 monitor 回收锁（两条都在本机 OTP 29 上实测过）。
+  #
+  # 锁只锁 `[node()]`：快照是**节点本地**的，跨节点各自装载各自的，集群级锁只会平白多出
+  # 网络往返与一次跨节点故障耦合。
+  #
+  # 临界区里只有 `:persistent_term` 的几次写（DB 查询留在调用方进程、留在锁**外**），
+  # 实测一次无竞争的 set+del 约 5.7 µs，所以 `trans/3` 的"无限重试"不是一个会把 Admin API
+  # 请求挂死的承诺——它换来的是"绝不因为抢不到锁而**静默跳过**一次提交"。
+  #
+  # 代价说清楚（数字与 OTP 29 / kernel-11.0.3 的 `global.erl` 原文核对过）：等待方**不是**
+  # 队列，是随机退避轮询——`set_lock/3` 以 `Times = 1` 起步调 `random_sleep/1`，
+  # `Tmax = (1 bsl 1) * 1000 div 8 = 250`，所以**第一次重试睡 `rand:uniform(250)` ms**，
+  # 之后依次 250/500/1000/2000/4000，`Times > 5` 封顶 8000。而 `can_set_lock` 只查 ETS 里
+  # 当前的持有者，等待方之间**没有 FIFO**，也就没有"最多晚 N 秒"这种上界：`trans/3` 默认
+  # `Retries = infinity`，总等待时间**无界**（人为拉长临界区 + 紧循环竞争下实测到过单次 92 s）。
+  #
+  # 因此这条代价可接受的依据**不是**某个等待上界（它不存在），而是**临界区本身实测 µs 级**：
+  # `put_meta/1` ≈1 µs 且与进程数无关（200 次 put 在 55/555/2555/10555 进程下都是 205 µs）；
+  # 真实临界区量级下 32 个紧循环竞争者的等待 p50 = 0 µs / p95 = 103 µs / max = 4.4 ms，无饥饿；
+  # 真实用例里被挡住的那次等待实测 15–228 ms。且这份延迟落在**管理面**的写路径上，不在 S3
+  # 数据面上。反过来自造一把"握手更快"的锁，等于把 OTP 已经做对的东西（monitor 回收、异常
+  # 释放）重写一遍，去换一个几乎不会发生的场景的延迟。
+  #
+  # 重入约束（今天不可达，但必须写在这里）：LockRequesterId 取的是 `self()`，同一进程**重入**
+  # 这把锁时 `can_set_lock` 命中 `pid_is_locking/2` ⇒ 不插新记录，而内层 `del_lock` 走
+  # `remove_lock/6` 第一子句直接 `ets:delete(global_locks, ResourceId)` ⇒ **整把锁被删掉**，
+  # 外层临界区自此裸奔、外层 `del_lock` 变 no-op（实测：嵌套 `trans` 返回后 `:global_locks`
+  # 为空表，外层临界区里另起的进程立刻拿到锁）。所以临界区内（**含 `:checkpoint` 注入的
+  # fun**）绝不许再调 `load_all!/1` / `reset_local!/0`。当前临界区只有 `loaded_subsystems/0`、
+  # 几次 `:persistent_term` 写、`DateTime.utc_now/0` 与生产恒 `nil` 的 `checkpoint/2`，
+  # 无 DB、无 `GenServer.call`、无 Logger，性质成立。
+  defp with_commit_lock(opts, fun) do
+    checkpoint(opts, :commit_lock_wait)
+    :global.trans({@commit_lock, self()}, fun, [node()])
+  end
+
+  # 编排注入点：**只有测试**会传 `:checkpoint`，生产路径恒为 no-op（`nil`）。
+  # 竞态回归必须能确定性地摆出交错顺序——靠 sleep 或靠运气的竞态测试等于没有测试，
+  # 它既证明不了 bug 存在，也证明不了修复有效。
+  defp checkpoint(opts, phase) do
+    case Keyword.get(opts, :checkpoint) do
+      nil -> :ok
+      fun when is_function(fun, 1) -> fun.(phase)
+    end
+
+    :ok
   end
 
   @doc """
@@ -226,12 +332,19 @@ defmodule Maxio.Config.Store do
   刻意**不**给它一个 CLI 开关：Mix 任务每次都在自己的进程里从 PG 重新装载快照，
   "清掉再装"在那里是个无意义的动作；而对**正在服务请求的节点**，清快照等于让它悄悄
   回退到 env 值——那种事必须是有意为之的 IEx 操作，不能是一个顺手敲的 flag。
+
+  清空同样走提交锁：它写的是 `load_all!/1` 写的那**同一批** term，留一个不上锁的写入者，
+  "快照与它的指纹一起落地"就又退回成纪律了（清到一半被一次装载插进来，终态是"半张快照 +
+  一份指纹"，与本模块要消灭的形态同构）。
   """
   @spec reset_local!() :: :ok
   def reset_local! do
-    Enum.each(loaded_subsystems(), &:persistent_term.erase({@pt_namespace, &1}))
-    :persistent_term.erase(@pt_subsystems)
-    :persistent_term.erase(@pt_meta)
+    with_commit_lock([], fn ->
+      Enum.each(loaded_subsystems(), &:persistent_term.erase({@pt_namespace, &1}))
+      :persistent_term.erase(@pt_subsystems)
+      :persistent_term.erase(@pt_meta)
+    end)
+
     :ok
   end
 

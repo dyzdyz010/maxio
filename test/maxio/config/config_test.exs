@@ -565,6 +565,103 @@ defmodule Maxio.ConfigTest do
     end
   end
 
+  describe "并发整表装载（提交阶段必须原子）" do
+    test "交错的两次 load_all! 绝不留下「旧快照 + 新指纹」" do
+      # 一次装载的提交**不是**一次原子替换：per-subsystem term、`__subsystems__`、`__meta__`
+      # 是好几次各自独立的 `:persistent_term` 写。两个并发 `load_all!` 若交错成
+      #
+      #     t_新写快照 < t_旧写快照 < t_旧写meta < t_新写meta
+      #
+      # 终态就是「旧快照 + 新指纹」——而新指纹会让周期对账**永远满意**，旧值被静默固化。
+      # 这与「只重装一个子系统的装载器」是同一形态：记录的断言比实际装载的内容更宽/更新。
+      assert {:ok, %{version: 1}} = Config.set(:listing, :sql_hard_limit, 111, source: "cli")
+      stale_aggregate = Store.authoritative_aggregate()
+
+      # 旧装载：在 PG 还是 111 的时刻读完整表（指纹 + 行都读完了），然后停在提交之前。
+      stale = start_loader(:stale, [:queried])
+      assert_receive {:stale, :queried}
+
+      # 另一个写入方把 PG 推到 999。下一批的 Admin API 配置写端点就是这个形态：同一 BEAM 内
+      # 的并发 HTTP 请求进程，各自在提交后**同步**重装快照（Maxio.Config.finish_write/5）。
+      assert {:ok, %{version: 2}} = Config.set(:listing, :sql_hard_limit, 999, source: "cli")
+      fresh_aggregate = Store.authoritative_aggregate()
+      assert stale_aggregate != fresh_aggregate
+
+      # 新装载：读到 999，写完快照后停住。修复后此刻它**正持有提交锁**——park 在锁里是本用例
+      # 刻意要的形态，且安全：loader 是 `spawn_link` 起的，测试进程挂掉即杀 loader，global 经
+      # monitor 回收那把锁（已实测），不会把锁泄漏给同一 BEAM 里后续的用例。
+      fresh = start_loader(:fresh, [:queried, :snapshot_written])
+      assert_receive {:fresh, :queried}
+      send(fresh, :continue)
+      assert_receive {:fresh, :snapshot_written}
+
+      # 放行旧装载：修复前它把整个提交跑完（旧快照 + 旧指纹都落地），修复后它被挡在提交锁外。
+      #
+      # 下面这个 receive **不是**互斥的证据，别把它当判据：`:commit_lock_wait` 是在
+      # `:global.trans` **之前**发出的，而 `:commit_lock_wait` / `:snapshot_written` / `:done`
+      # 由**同一个** loader 进程发给测试进程、消息保序 ⇒ `:commit_lock_wait` 必然排最前，
+      # 这个 receive 恒取到它（把 `:global.trans` 整个去掉也一样恒取到）。它只说明"注入点
+      # 存在"，作用是决定下面那笔等待预算要不要花。真正的互斥判据是紧接着那句 `refute_receive`。
+      send(stale, :continue)
+
+      stale_progress =
+        receive do
+          {:stale, :done} -> :committed_while_fresh_was_mid_commit
+          {:stale, :commit_lock_wait} -> :queued_behind_commit_lock
+        end
+
+      # 互斥的**真**判据在这里：此刻 `fresh` 仍持有提交锁、仍停在 `:snapshot_written` 的 park
+      # 点，所以 `stale` 的临界区必须一步都还没走。有锁 ⇒ `{:stale, :snapshot_written}` 恒不
+      # 发生；把 `:global.trans` 去掉（只留注入点）⇒ 它在 µs 级就发生。
+      # 变异验证过：去锁 6 个不同 seed 全部 FAIL，恢复后 6 个不同 seed 全部 PASS。
+      refute_receive {:stale, :snapshot_written}, 200
+
+      # 新装载写下它的指纹。修复前这一笔正好盖在旧快照之上——静默固化就发生在这一刻。
+      send(fresh, :continue)
+      assert_receive {:fresh, :done}
+
+      # 修复后旧装载此刻才拿到锁、才提交；修复前它的 `:done` 早已在上面那个 receive 里收掉了。
+      #
+      # 这个预算**不是**从 global 推出来的上界——`trans/3` 默认 `Retries = infinity`、等待方
+      # 之间无 FIFO，总等待时间原则上无界，任何数字都只是 flake 预算。数字按 global 的退避
+      # **阶梯**来定：`random_sleep(Times)` 的 `Tmax = (1 bsl Times) * 1000 div 8`，即依次
+      # 250 / 500 / 1000 / 2000 / 4000，`Times > 5` 封顶 8000（核对 kernel-11.0.3 `global.erl`
+      # 原文）。关键是上面那句 `refute_receive` 的 200 ms 窗口**排在这段等待前面**，会把等待方
+      # 往阶梯深处推：凡是累计睡眠还没超过 200 ms 的，都要再睡下一档。所以真实分布比"第一次
+      # 退避 ≤250 ms"宽得多——实测 200 轮：max 1919 ms、>1000 ms 有 3 轮、>500 ms 有 21 轮。
+      # 也就是说原来那个 2 秒预算离实测峰值只剩 81 ms，会稳定地漏出约 1% 的假失败。
+      # 15 秒要被击穿，得等待方连着 6 次睡眠加起来还不到 200 ms 才能爬到 8000 那一档（~1e-8）。
+      # 预算给大不花钱：消息一到 `assert_receive` 就返回，只有**真**失败时才等满。
+      if stale_progress == :queued_behind_commit_lock, do: assert_receive({:stale, :done}, 15_000)
+
+      # 终态必须自洽：meta 里的指纹**必须**是"本快照物化自的那次整表状态"的指纹。
+      snapshot_value = Config.get(:listing, :sql_hard_limit)
+      drifted? = Store.drifted?()
+
+      expected_aggregate =
+        case snapshot_value do
+          999 -> fresh_aggregate
+          111 -> stale_aggregate
+        end
+
+      assert Store.meta().aggregate == expected_aggregate,
+             "快照在位的是 #{inspect(snapshot_value)}，meta 记的却是另一次表状态的指纹" <>
+               "（drifted? = #{drifted?}）：记录的指纹只可能比快照**旧**（自愈方向，最坏" <>
+               "多重载一次），绝不能比快照新——那会让对账永远满意，把旧值永久固化"
+
+      # 快照落后时对账必须看得见，而且真能把本节点拉回权威值——这正是修复前做不到的事。
+      assert drifted? == (snapshot_value != 999)
+      assert %{reloaded?: reloaded?} = Store.reconcile!()
+      assert reloaded? == (snapshot_value != 999)
+      assert Config.get(:listing, :sql_hard_limit) == 999
+      assert Store.drifted?() == false
+
+      # 最后锚一下走的确实是"被挡住"那条分支（`:commit_lock_wait` 注入点存在、且发在加锁之
+      # 前）。互斥**本身**由上面那句 `refute_receive` 证明，不是这一句。
+      assert stale_progress == :queued_behind_commit_lock
+    end
+  end
+
   describe "apply 诚实性（D4 第 8 步）" do
     @samples %{
       {:cluster, :deployment_id} => "sample-deployment-id",
@@ -585,6 +682,24 @@ defmodule Maxio.ConfigTest do
         assert {:ok, _} = Config.reset(subsystem, key, source: "cli")
       end
     end
+  end
+
+  # 一次完全受测试编排的整表装载：每到一个注入点就向测试进程报告，并在 `park_phases`
+  # 列出的注入点停下等 `:continue`。全程只用消息同步——竞态测试一旦靠 sleep 或靠调度运气，
+  # 它既证明不了 bug 存在，也证明不了修复有效。
+  defp start_loader(tag, park_phases) do
+    test_pid = self()
+
+    spawn_link(fn ->
+      checkpoint = fn phase ->
+        send(test_pid, {tag, phase})
+        if phase in park_phases, do: receive(do: (:continue -> :ok))
+        :ok
+      end
+
+      Store.load_all!(checkpoint: checkpoint, reason: {:test_loader, tag})
+      send(test_pid, {tag, :done})
+    end)
   end
 
   # 修复前的摘要 fragment（只摘 subsystem/key/version，不含 value）。留在测试里当**判据**：
