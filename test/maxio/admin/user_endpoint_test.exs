@@ -3,7 +3,10 @@ defmodule Maxio.Admin.UserEndpointTest do
 
   import ExUnit.CaptureLog
 
+  alias Maxio.Admin.Envelope
   alias Maxio.Auth.CredentialStore
+  alias Maxio.Auth.CredentialStore.EctoStore
+  alias Maxio.Auth.SigningSecret
   alias Maxio.IAM
   alias Maxio.Policy.{Statement, Store}
   alias Maxio.S3.Endpoint
@@ -11,6 +14,214 @@ defmodule Maxio.Admin.UserEndpointTest do
 
   @base "/minio/admin/v3"
   @path "#{@base}/user-info"
+  @root_access_key "AKIAIOSFODNN7EXAMPLE"
+  @root_secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+  test "root atomically adds a user and the persisted credential authenticates" do
+    use_ecto_credentials!()
+    access_key = unique_access_name("ADDROOT")
+    new_secret = "new-root-created-secret"
+    body = add_user_body(@root_secret, new_secret)
+
+    conn = signed_body(:put, "#{@base}/add-user", body, query: %{"accessKey" => access_key})
+
+    assert conn.status == 200
+    assert conn.resp_body == ""
+    assert {:ok, %{user_name: ^access_key}} = IAM.get_user(access_key)
+    assert {:ok, %{secret_key: ^new_secret}} = EctoStore.get_secret(access_key)
+
+    authenticated =
+      signed(:get, @path,
+        query: %{"accessKey" => access_key},
+        access_key: access_key,
+        secret: new_secret,
+        region: ""
+      )
+
+    assert_admin_error(authenticated, 403, "AccessDenied")
+  end
+
+  test "root lists an encrypted exact UserInfo map that only its signing secret opens" do
+    enabled = unique_access_name("LISTROOT")
+    disabled = unique_access_name("LISTOFF")
+
+    assert {:ok, %{user: enabled_user}} =
+             IAM.create_minio_user_strict(enabled, "list-root-secret", "active")
+
+    assert {:ok, disabled_user} = IAM.create_user(name: disabled, status: "inactive")
+
+    conn = signed(:get, "#{@base}/list-users", region: "")
+
+    assert conn.status == 200
+    assert content_type(conn) =~ "application/json"
+    refute String.starts_with?(conn.resp_body, "{")
+
+    assert {:ok, plaintext} =
+             Envelope.decrypt(SigningSecret.new(@root_secret), conn.resp_body)
+
+    assert Jason.decode!(plaintext) == %{
+             disabled => %{
+               "status" => "disabled",
+               "updatedAt" => DateTime.to_iso8601(disabled_user.updated_at)
+             },
+             enabled => %{
+               "status" => "enabled",
+               "updatedAt" => DateTime.to_iso8601(enabled_user.updated_at)
+             }
+           }
+
+    assert {:error, :not_authentic} =
+             Envelope.decrypt(SigningSecret.new("wrong-root-secret"), conn.resp_body)
+  end
+
+  test "U1 and U2 require their exact identity actions" do
+    for action <- ["admin:CreateUser", "admin:ListUsers"] do
+      {access_key, secret, _arn} = put_action_key(action)
+      allowed = action_request(action, access_key, secret, "allowed")
+      assert allowed.status == 200
+
+      wrong_action =
+        if action == "admin:CreateUser", do: "admin:ListUsers", else: "admin:CreateUser"
+
+      {wrong_key, wrong_secret, _arn} = put_action_key(wrong_action)
+
+      assert_admin_error(
+        action_request(action, wrong_key, wrong_secret, "wrong"),
+        403,
+        "AccessDenied"
+      )
+    end
+  end
+
+  test "explicit deny, STS policy boundary, and bucket policy cannot grant U1 or U2" do
+    for action <- ["admin:CreateUser", "admin:ListUsers"] do
+      {deny_key, deny_secret, _arn} =
+        put_action_key([
+          %{"Effect" => "Allow", "Action" => action},
+          %{"Effect" => "Deny", "Action" => action}
+        ])
+
+      assert_admin_error(
+        action_request(action, deny_key, deny_secret, "deny"),
+        403,
+        "AccessDenied"
+      )
+
+      {:ok, boundary} =
+        Statement.parse_identity_policy(
+          Jason.encode!(%{
+            "Version" => "2012-10-17",
+            "Statement" => %{
+              "Effect" => "Allow",
+              "Action" => "s3:GetObject",
+              "Resource" => "arn:aws:s3:::session-boundary/*"
+            }
+          })
+        )
+
+      {session_key, session_secret, _arn} =
+        put_action_key(action, principal_extra: %{session_policy_statements: boundary})
+
+      assert_admin_error(
+        action_request(action, session_key, session_secret, "session"),
+        403,
+        "AccessDenied"
+      )
+
+      {bucket_key, bucket_secret, bucket_arn} = put_action_key(nil)
+
+      :ok =
+        Store.put_bucket_policy(
+          unique_name("admin-user-bucket"),
+          Jason.encode!(%{
+            "Version" => "2012-10-17",
+            "Statement" => %{
+              "Effect" => "Allow",
+              "Principal" => %{"AWS" => bucket_arn},
+              "Action" => action,
+              "Resource" => "arn:aws:s3:::*"
+            }
+          })
+        )
+
+      assert_admin_error(
+        action_request(action, bucket_key, bucket_secret, "bucket"),
+        403,
+        "AccessDenied"
+      )
+    end
+  end
+
+  test "ciphertext hash mismatch wins before decrypt and IAM mutation" do
+    access_key = unique_access_name("HASHFAIL")
+    new_secret = "hash-failure-new-secret"
+    body = add_user_body(@root_secret, new_secret)
+
+    conn =
+      signed_body(:put, "#{@base}/add-user", body,
+        query: %{"accessKey" => access_key},
+        content_sha256_override: Maxio.Auth.SigV4.Signer.hex_sha256("different-ciphertext")
+      )
+
+    assert_admin_error(conn, 400, "XAmzContentSHA256Mismatch")
+    assert :error = IAM.get_user(access_key)
+    assert :error = EctoStore.get_secret(access_key)
+
+    invalid_body = <<0>>
+
+    invalid =
+      signed_body(:put, "#{@base}/add-user", invalid_body,
+        query: %{"accessKey" => unique_access_name("HASHFIRST")},
+        content_sha256_override: Maxio.Auth.SigV4.Signer.hex_sha256("different-ciphertext")
+      )
+
+    assert_admin_error(invalid, 400, "XAmzContentSHA256Mismatch")
+  end
+
+  test "duplicate U1 leaves the original credential unchanged and redacts all evidence" do
+    access_key = unique_access_name("DUPUSER")
+    original_secret = "original-user-secret"
+    replacement_secret = "replacement-user-secret"
+    original_body = add_user_body(@root_secret, original_secret)
+    replacement_body = add_user_body(@root_secret, replacement_secret)
+
+    replacement_plaintext =
+      Jason.encode!(%{"secretKey" => replacement_secret, "status" => "enabled"})
+
+    owner = self()
+
+    assert signed_body(:put, "#{@base}/add-user", original_body,
+             query: %{"accessKey" => access_key}
+           ).status == 200
+
+    log =
+      capture_log(fn ->
+        conn =
+          signed_body(:put, "#{@base}/add-user", replacement_body,
+            query: %{"accessKey" => access_key}
+          )
+
+        send(owner, {:duplicate_response, conn})
+      end)
+
+    assert_receive {:duplicate_response, duplicate}
+    assert_admin_error(duplicate, 400, "XMaxioAdminUserAlreadyExists")
+    assert {:ok, %{secret_key: ^original_secret}} = EctoStore.get_secret(access_key)
+
+    for forbidden <- [
+          @root_secret,
+          original_secret,
+          replacement_secret,
+          replacement_plaintext,
+          binary_part(replacement_body, 0, 16),
+          Base.encode16(binary_part(replacement_body, 0, 16))
+        ] do
+      refute duplicate.resp_body =~ forbidden
+      refute log =~ forbidden
+    end
+
+    refute log =~ "bucket=minio"
+  end
 
   test "root receives strict plaintext UserInfo with exact UTC and omit discipline" do
     name = unique_name("root-info")
@@ -279,24 +490,91 @@ defmodule Maxio.Admin.UserEndpointTest do
     assert_admin_error(conn, 403, "AccessDenied")
   end
 
-  test "authenticated U1 U2 U4 and U5 remain explicit JSON 501" do
+  test "list bucket variant authorizes first while U4 U5 and wrong routes remain JSON 501" do
     for {method, path, query} <- [
-          {:put, "#{@base}/add-user", %{"accessKey" => "alice"}},
-          {:get, "#{@base}/list-users", %{}},
           {:get, "#{@base}/list-users", %{"bucket" => ""}},
           {:delete, "#{@base}/remove-user", %{"accessKey" => "alice"}},
-          {:put, "#{@base}/set-user-status", %{"accessKey" => "alice", "status" => "enabled"}}
+          {:put, "#{@base}/set-user-status", %{"accessKey" => "alice", "status" => "enabled"}},
+          {:post, "#{@base}/add-user", %{"accessKey" => "alice"}},
+          {:get, "#{@base}/unknown-user-route", %{}}
         ] do
       conn = signed(method, path, query: query, region: "")
       assert_admin_error(conn, 501, "NotImplemented")
       assert content_type(conn) =~ "application/json"
     end
+
+    {access_key, secret, _arn} = put_action_key(nil)
+
+    denied =
+      signed(:get, "#{@base}/list-users",
+        query: %{"bucket" => "bucket-a"},
+        access_key: access_key,
+        secret: secret,
+        region: ""
+      )
+
+    assert_admin_error(denied, 403, "AccessDenied")
   end
 
   defp signed(method, path, opts) do
     method
     |> SigV4Request.signed_conn(path, opts)
     |> Endpoint.call(Endpoint.init([]))
+  end
+
+  defp signed_body(method, path, body, opts) do
+    headers =
+      [{"content-length", Integer.to_string(byte_size(body))} | Keyword.get(opts, :headers, [])]
+
+    signed(method, path, Keyword.merge(opts, body: body, headers: headers, region: ""))
+  end
+
+  defp add_user_body(signing_secret, new_secret) do
+    plaintext = Jason.encode!(%{"secretKey" => new_secret, "status" => "enabled"})
+
+    assert {:ok, body} =
+             Envelope.encrypt(SigningSecret.new(signing_secret), plaintext,
+               algorithm_id: 2,
+               salt: :crypto.strong_rand_bytes(32),
+               nonce: :crypto.strong_rand_bytes(8)
+             )
+
+    body
+  end
+
+  defp action_request("admin:CreateUser", access_key, secret, suffix) do
+    target = unique_access_name("ACT#{suffix}")
+    body = add_user_body(secret, "action-new-user-secret")
+
+    signed_body(:put, "#{@base}/add-user", body,
+      query: %{"accessKey" => target},
+      access_key: access_key,
+      secret: secret
+    )
+  end
+
+  defp action_request("admin:ListUsers", access_key, secret, _suffix) do
+    signed(:get, "#{@base}/list-users",
+      access_key: access_key,
+      secret: secret,
+      region: ""
+    )
+  end
+
+  defp use_ecto_credentials! do
+    previous = Application.fetch_env!(:maxio, :credential_store)
+    Application.put_env(:maxio, :credential_store, EctoStore)
+    on_exit(fn -> Application.put_env(:maxio, :credential_store, previous) end)
+
+    assert {:ok, _root} =
+             IAM.create_access_key(
+               access_key_id: @root_access_key,
+               secret_key: @root_secret,
+               type: "root",
+               principal_arn: IAM.root_principal_arn()
+             )
+
+    :ok
   end
 
   defp put_action_key(action_or_statements, opts \\ []) do

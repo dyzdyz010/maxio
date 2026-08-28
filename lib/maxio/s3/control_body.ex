@@ -11,6 +11,8 @@ defmodule Maxio.S3.ControlBody do
 
   alias Maxio.S3.{BodyReader, Checksum, Error}
 
+  @sha256_pattern ~r/\A[0-9a-f]{64}\z/
+
   @type integrity_requirement :: :optional | :content_md5 | :content_md5_or_flexible
 
   @spec read!(Plug.Conn.t(), pos_integer(), String.t(), keyword()) ::
@@ -44,7 +46,12 @@ defmodule Maxio.S3.ControlBody do
   end
 
   defp read_small_with_error_mapping!(conn, limit, too_large_message, opts) do
-    BodyReader.read_small_with_trailers!(conn, limit, too_large_message)
+    {conn, body, trailers} =
+      BodyReader.read_small_with_trailers!(conn, limit, too_large_message)
+
+    verify_expected_length!(conn, body, opts)
+    verify_payload_sha256!(conn, body, opts)
+    {conn, body, trailers}
   rescue
     err in Error ->
       if err.code == "MalformedXML" and err.message == too_large_message do
@@ -53,6 +60,42 @@ defmodule Maxio.S3.ControlBody do
       else
         reraise(err, __STACKTRACE__)
       end
+  end
+
+  defp verify_expected_length!(conn, body, opts) do
+    case Keyword.fetch(opts, :expected_length) do
+      :error ->
+        :ok
+
+      {:ok, expected_length}
+      when is_integer(expected_length) and expected_length >= 0 and
+             byte_size(body) == expected_length ->
+        :ok
+
+      {:ok, _expected_length} ->
+        error = Keyword.get(opts, :length_mismatch_error, :incomplete_body)
+        raise Error.new(error, resource: resource(conn))
+    end
+  end
+
+  defp verify_payload_sha256!(conn, body, opts) do
+    case Keyword.fetch(opts, :verify_payload_sha256) do
+      :error ->
+        :ok
+
+      {:ok, expected_hash} when is_binary(expected_hash) ->
+        actual_hash = :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
+
+        if Regex.match?(@sha256_pattern, expected_hash) and
+             Plug.Crypto.secure_compare(actual_hash, expected_hash) do
+          :ok
+        else
+          raise Error.new(:x_amz_content_sha256_mismatch, resource: resource(conn))
+        end
+
+      {:ok, _expected_hash} ->
+        raise Error.new(:x_amz_content_sha256_mismatch, resource: resource(conn))
+    end
   end
 
   defp verify_without_content_md5!(conn, body, trailers, :optional) do

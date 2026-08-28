@@ -48,13 +48,16 @@ defmodule Maxio.Admin.Plug do
   alias Maxio.Admin.{
     Authz,
     ErrorMap,
+    Envelope,
     ErrorView,
     PolicyAdapter,
     PolicyRequest,
     ServerInfo,
-    UserAdapter
+    UserAdapter,
+    UserRequest
   }
 
+  alias Maxio.Auth.SigningSecret
   alias Maxio.S3.{Error, Log, PipelineOrderError, RawPath, ReservedNamespace}
 
   @behaviour Plug
@@ -130,6 +133,8 @@ defmodule Maxio.Admin.Plug do
   defp dispatch(conn, "DELETE", "/minio/admin/v3/remove-canned-policy"),
     do: remove_policy(conn)
 
+  defp dispatch(conn, "PUT", "/minio/admin/v3/add-user"), do: add_user(conn)
+  defp dispatch(conn, "GET", "/minio/admin/v3/list-users"), do: list_users(conn)
   defp dispatch(conn, "GET", "/minio/admin/v3/user-info"), do: user_info(conn)
 
   defp dispatch(conn, _method, path) do
@@ -193,6 +198,77 @@ defmodule Maxio.Admin.Plug do
         {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
       end
     end)
+  end
+
+  defp add_user(conn) do
+    authorize_and_run(
+      conn,
+      "admin:CreateUser",
+      "admin_user_add",
+      [target_user: conn.query_params["accessKey"]],
+      fn conn ->
+        with {:ok, caller_secret} <- signing_secret(conn) do
+          {conn, request} = UserRequest.read_add_body!(conn, caller_secret)
+
+          case UserAdapter.add(conn.query_params["accessKey"], request) do
+            {:ok, _created} -> send_empty_success(conn)
+            {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+          end
+        else
+          {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+        end
+      end
+    )
+  end
+
+  defp list_users(conn) do
+    authorize_and_run(conn, "admin:ListUsers", "admin_user_list", fn conn ->
+      if Map.has_key?(conn.query_params, "bucket") do
+        render_not_implemented(conn, RawPath.decoded_path(conn))
+      else
+        with {:ok, caller_secret} <- signing_secret(conn),
+             {:ok, result} <- UserAdapter.list(),
+             plaintext = Jason.encode_to_iodata!(result.wire),
+             {:ok, encrypted} <- Envelope.encrypt(caller_secret, plaintext) do
+          log_user_list_projection(conn, result.evidence)
+          send_encrypted_json(conn, encrypted)
+        else
+          {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+          {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+        end
+      end
+    end)
+  end
+
+  defp signing_secret(%{
+         assigns: %{sigv4_context: %{caller_secret: %SigningSecret{} = caller_secret}}
+       }),
+       do: {:ok, caller_secret}
+
+  defp signing_secret(_conn), do: {:error, :missing_signing_secret}
+
+  defp log_user_list_projection(conn, evidence) do
+    metadata =
+      [
+        action: "admin_user_list",
+        admin_action: "admin_user_list",
+        user_count: evidence.user_count,
+        credential_bearing_count: evidence.credential_bearing_count,
+        managed_policies: evidence.managed_policies,
+        inline_policies: evidence.inline_policies,
+        group_inherited: evidence.group_inherited,
+        role_attached: evidence.role_attached,
+        minio_view_partial_count: evidence.minio_view_partial_count,
+        omitted_reason: Enum.join(evidence.omitted_reason, ","),
+        request_id: request_id(conn),
+        surface: conn.assigns[:maxio_surface]
+      ]
+
+    Log.info("admin user list projected", metadata)
+
+    if evidence.minio_view_partial_count > 0 do
+      Log.warn("admin user list contains partial MinIO UserInfo projections", metadata)
+    end
   end
 
   defp user_info(conn) do
@@ -294,6 +370,13 @@ defmodule Maxio.Admin.Plug do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(200, Jason.encode_to_iodata!(body))
+    |> halt()
+  end
+
+  defp send_encrypted_json(conn, body) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, body)
     |> halt()
   end
 
