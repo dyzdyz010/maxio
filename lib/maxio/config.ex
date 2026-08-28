@@ -37,6 +37,7 @@ defmodule Maxio.Config do
   alias Maxio.S3.Log
 
   @no_default :"$maxio_config_no_default"
+  @test_env Mix.env() == :test
 
   @type subsystem :: atom()
   @type key :: atom()
@@ -146,6 +147,37 @@ defmodule Maxio.Config do
       doc: schema_doc(subsystem, key)
     }
   end
+
+  @doc "Synchronously reconcile the runtime snapshot before returning ordered effective values."
+  @spec authoritative_effective(subsystem(), [key()], keyword()) ::
+          {:ok, [map()]} | {:error, {:config_store_unavailable, atom()}}
+  def authoritative_effective(subsystem, keys, opts \\ [])
+
+  def authoritative_effective(subsystem, keys, opts)
+      when is_atom(subsystem) and is_list(keys) and is_list(opts) do
+    %{repo: repo, store: store} = authoritative_dependencies(opts)
+
+    case store.reconcile!(repo: repo) do
+      %{reloaded?: reloaded?} when is_boolean(reloaded?) ->
+        versions = authoritative_version_index(repo)
+
+        {:ok,
+         Enum.map(keys, fn key ->
+           effective(subsystem, key, versions: versions)
+         end)}
+
+      _unexpected ->
+        {:error, {:config_store_unavailable, :reconcile_failed}}
+    end
+  rescue
+    _error -> {:error, {:config_store_unavailable, :reconcile_failed}}
+  catch
+    :exit, _reason -> {:error, {:config_store_unavailable, :reconcile_exited}}
+    _kind, _reason -> {:error, {:config_store_unavailable, :reconcile_failed}}
+  end
+
+  def authoritative_effective(_subsystem, _keys, _opts),
+    do: {:error, {:config_store_unavailable, :invalid_request}}
 
   @doc "白名单全量的三层取证视图（`mix maxio.config.list` / Console 用）。"
   @spec list(keyword()) :: [map()]
@@ -347,6 +379,13 @@ defmodule Maxio.Config do
     _kind, _reason -> %{}
   end
 
+  defp authoritative_version_index(repo) do
+    repo.all(from r in RuntimeConfig, select: {r.subsystem, r.key, r.version})
+    |> Map.new(fn {subsystem, key, version} ->
+      {{safe_atom(subsystem), safe_atom(key)}, version}
+    end)
+  end
+
   defp safe_atom(name) do
     String.to_existing_atom(name)
   rescue
@@ -359,5 +398,15 @@ defmodule Maxio.Config do
     Enum.filter(keys, fn {s, _k} -> to_string(s) == to_string(subsystem) end)
   end
 
-  defp repo(opts), do: Keyword.get(opts, :repo, Maxio.Repo)
+  defp authoritative_dependencies(opts) do
+    if @test_env do
+      %{repo: Keyword.get(opts, :repo, Maxio.Repo), store: Keyword.get(opts, :store, Store)}
+    else
+      %{repo: Maxio.Repo, store: Store}
+    end
+  end
+
+  defp repo(opts) do
+    if @test_env, do: Keyword.get(opts, :repo, Maxio.Repo), else: Maxio.Repo
+  end
 end
