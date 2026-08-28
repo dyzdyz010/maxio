@@ -26,6 +26,7 @@ defmodule Mix.Tasks.Maxio.Admin.Config.Reset do
     case Adapter.reset(command, source: "cli", request_id: request_id) do
       {:ok, result} -> Mix.shell().info(SetTask.format_result(result))
       {:error, reason} -> Mix.raise(Adapter.describe_error(reason))
+      _unexpected -> Mix.raise("configuration operation failed")
     end
   end
 
@@ -34,7 +35,7 @@ defmodule Mix.Tasks.Maxio.Admin.Config.Reset do
   defp boot! do
     case CLI.boot() do
       :ok -> :ok
-      {:error, _reason} -> Mix.raise("configuration CLI boot failed")
+      _failure -> Mix.raise("configuration CLI boot failed")
     end
   end
 end

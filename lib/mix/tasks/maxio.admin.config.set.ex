@@ -25,6 +25,7 @@ defmodule Mix.Tasks.Maxio.Admin.Config.Set do
     case Adapter.set(command, source: "cli", request_id: request_id) do
       {:ok, result} -> Mix.shell().info(format_result(result))
       {:error, reason} -> Mix.raise(Adapter.describe_error(reason))
+      _unexpected -> Mix.raise("configuration operation failed")
     end
   end
 
@@ -42,43 +43,80 @@ defmodule Mix.Tasks.Maxio.Admin.Config.Set do
       })
       when is_integer(changed_count) and changed_count >= 0 and is_map(outcomes) and
              is_boolean(attention?) do
-    "committed=true changed_count=#{changed_count} " <>
-      "apply_modes=#{format_apply_modes(outcomes)} " <>
-      "local_reload=#{format_local_reload(local_reload)} " <>
-      "broadcast=#{format_broadcast(broadcast)} attention=#{attention?}"
+    with {:ok, apply_modes} <- validate_outcomes(outcomes, changed_count),
+         :ok <- validate_postcommit(changed_count, local_reload, broadcast, attention?) do
+      "committed=true changed_count=#{changed_count} " <>
+        "apply_modes=#{format_apply_modes(apply_modes)} " <>
+        "local_reload=#{format_local_reload(local_reload)} " <>
+        "broadcast=#{format_broadcast(broadcast)} attention=#{attention?}"
+    else
+      _invalid -> invalid_result!()
+    end
   end
 
-  def format_result(_result), do: Mix.raise("configuration operation returned an invalid result")
+  def format_result(_result), do: invalid_result!()
 
   defp boot! do
     case CLI.boot() do
       :ok -> :ok
-      {:error, _reason} -> Mix.raise("configuration CLI boot failed")
+      _failure -> Mix.raise("configuration CLI boot failed")
     end
   end
 
-  defp format_apply_modes(outcomes) do
-    modes =
-      outcomes
-      |> Map.values()
-      |> Enum.filter(&match?(%{changed?: true}, &1))
-      |> Enum.map(&format_apply_mode/1)
-      |> Enum.uniq()
-      |> Enum.sort()
+  defp validate_outcomes(outcomes, changed_count) do
+    outcomes
+    |> Map.values()
+    |> Enum.reduce_while({:ok, 0, []}, fn
+      %{changed?: changed?, applied: mode}, {:ok, count, modes}
+      when is_boolean(changed?) and mode in @apply_modes ->
+        if changed? do
+          {:cont, {:ok, count + 1, [mode | modes]}}
+        else
+          {:cont, {:ok, count, modes}}
+        end
 
-    if modes == [], do: "none", else: Enum.join(modes, ",")
+      _outcome, _accumulator ->
+        {:halt, :error}
+    end)
+    |> validate_changed_count(changed_count)
   end
 
-  defp format_apply_mode(%{applied: mode}) when mode in @apply_modes, do: Atom.to_string(mode)
-  defp format_apply_mode(_outcome), do: "unknown"
+  defp validate_changed_count({:ok, changed_count, modes}, changed_count) do
+    {:ok, modes |> Enum.uniq() |> Enum.sort()}
+  end
+
+  defp validate_changed_count(_result, _changed_count), do: :error
+
+  defp validate_postcommit(0, :not_needed, :not_needed, false), do: :ok
+
+  defp validate_postcommit(changed_count, local_reload, broadcast, attention?)
+       when changed_count > 0 do
+    reload_valid? = local_reload in [:ok, {:error, :reload_failed}]
+    broadcast_valid? = broadcast in [:ok, {:error, :broadcast_failed}]
+
+    expected_attention? =
+      local_reload == {:error, :reload_failed} or broadcast == {:error, :broadcast_failed}
+
+    if reload_valid? and broadcast_valid? and attention? == expected_attention?,
+      do: :ok,
+      else: :error
+  end
+
+  defp validate_postcommit(_changed_count, _local_reload, _broadcast, _attention), do: :error
+
+  defp format_apply_modes([]), do: "none"
+
+  defp format_apply_modes(modes) do
+    Enum.map_join(modes, ",", &Atom.to_string/1)
+  end
 
   defp format_local_reload(:ok), do: "ok"
   defp format_local_reload(:not_needed), do: "not_needed"
   defp format_local_reload({:error, :reload_failed}), do: "reload_failed"
-  defp format_local_reload(_result), do: "failed"
 
   defp format_broadcast(:ok), do: "ok"
   defp format_broadcast(:not_needed), do: "not_needed"
   defp format_broadcast({:error, :broadcast_failed}), do: "broadcast_failed"
-  defp format_broadcast(_result), do: "failed"
+
+  defp invalid_result!, do: Mix.raise("configuration operation returned an invalid result")
 end
