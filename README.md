@@ -26,6 +26,21 @@ Ready to run in production? Please [check our deployment guides](https://hexdocs
 - `AssumeRoleWithWebIdentity` now resolves active persisted IAM OIDC providers before static `MAXIO_WEB_IDENTITY_PROVIDERS` / `config :maxio, :web_identity_providers`; disabled persisted providers fail closed and do not fall back to static config. Static providers remain a fallback only when no DB provider exists for the issuer, or when direct callers explicitly pass `providers:`.
 - OIDC discovery and JWKS parsing happen at provider management time with bounded HTTP/JWK validation; persisted providers reject private/symmetric JWK material and public projections expose only public keys. Create/refresh now collect TLS certificate-chain thumbprints for both issuer discovery and JWKS endpoints, auto-fill omitted `ThumbprintList`, and use configured/stored thumbprints as a private/non-public CA TLS trust fallback before failing closed on mismatch while preserving the last known good JWKS. STS does not fetch network resources on the token path. DB-backed provider JWKS refresh is available through `mix maxio.iam.oidc.refresh_jwks` and a disabled-by-default `config :maxio, :iam_oidc_provider_jwks_refresh` scheduler; both are dry-run by default and keep the last known good JWKS on refresh failure. WebIdentity now consumes AWS JWT `source_identity` and session tag claims. Still deferred: OAuth `ProviderId` access-token path, `ProvidedContexts`, remaining AWS IAM Query/API surface beyond the implemented user/group/OIDC/MFA actions, and cross-account/multi-account IAM semantics.
 
+## MinIO Admin managed-policy status (2026-08-28)
+
+The S3 endpoint now serves the S1 MinIO admin managed-policy slice through four exact, SigV4-authenticated v3 routes:
+
+- `PUT /minio/admin/v3/add-canned-policy?name=NAME` (`mc admin policy create`) returns `200` with an empty body after creating a root-path managed policy. Reusing a name creates a new default version; the IAM five-version quota is preserved and old versions are never silently discarded.
+- `GET /minio/admin/v3/list-canned-policies` (`mc admin policy ls`) returns `200` with a JSON object whose values are policy document objects. A fresh maxio database returns `{}`: maxio does not seed MinIO's built-in policies.
+- `GET /minio/admin/v3/info-canned-policy?name=NAME&v=2` (`mc admin policy info`) returns `200` with exactly `PolicyName`, `Policy`, `CreateDate`, and `UpdateDate`; omitting `v` (or using an empty value) returns the raw policy object.
+- `DELETE /minio/admin/v3/remove-canned-policy?name=NAME` (`mc admin policy rm`) returns `200` with an empty body. Removal never cascades attachments and refuses policies that still have attached entities or non-default versions.
+
+Only managed policies with IAM `path=/` are visible through mc. `mix maxio.admin.policy.list [--json]` reports both visible policies and every non-root policy omitted from the compatibility view; `mix maxio.admin.policy.show NAME [--json]` recomputes the v2 `PolicyInfo` projection locally without HTTP or signing.
+
+Admin calls must use the path-style server-root endpoint. A virtual-host request whose object key happens to start with `/minio/admin/` remains S3 data-plane traffic. Claimed admin requests bypass S3 request metrics and access-log delivery, so they are not miscounted as activity for a bucket named `minio`.
+
+Policy attach/detach/entity endpoints, user/group admin endpoints, and encrypted madmin endpoints remain explicit `501 NotImplemented`; the `?bucket=` list-policy variant is also `501` rather than silently returning the global list.
+
 ## 高级特性（M4）
 
 maxio 在 S3 核心读写（M1）、分段上传/流式签名（M2）、IAM/策略/授权（M3）之上，实现了以下 S3 高级特性子系统。本节同时**诚实标注**每个特性的边界与显式 defer（不会假装「已生效」）。

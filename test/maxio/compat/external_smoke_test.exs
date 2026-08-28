@@ -233,6 +233,19 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       File.write!(Path.join(config_dir, "initialized-by-mc"), "temporary")
 
       cond do
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
+          ["policy", "create", "maxiocompat", policy_name, policy_path] = command_args
+          Process.put(:policy_name, policy_name)
+          Process.put(:policy_fixture, File.read!(policy_path))
+          {"Created policy `#{policy_name}` successfully.", 0}
+
+        subcommand == "admin" and Enum.take(command_args, 3) == ["policy", "ls", "maxiocompat"] ->
+          {Process.get(:policy_name), 0}
+
+        subcommand == "admin" and Enum.take(command_args, 3) == ["policy", "info", "maxiocompat"] ->
+          ["policy", "info", "maxiocompat", policy_name] = command_args
+          {"PolicyName: #{policy_name}", 0}
+
         subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
           payload_path = Enum.find(command_args, &File.regular?/1)
           Process.put(:payload, File.read!(payload_path))
@@ -272,12 +285,17 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "copy_object",
              "stat_copied_object",
              "get_copied_object",
+             "admin_policy_create",
+             "admin_policy_list",
+             "admin_policy_info",
+             "admin_policy_remove",
              "delete_copied_object",
              "delete_object",
              "delete_bucket"
            ]
 
     assert entry["scenario_counts"]["object_copy"] == 3
+    assert entry["scenario_counts"]["admin_policy_lifecycle"] == 4
 
     encoded = Jason.encode!(entry)
     refute encoded =~ "super-secret"
@@ -289,7 +307,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert config_dir |> Path.dirname() |> Path.dirname() |> Path.expand() |> Path.split() ==
              tmp_root |> Path.expand() |> Path.split()
 
-    assert length(calls) == 10
+    assert length(calls) == 14
 
     Enum.each(calls, fn {command, args, opts} ->
       assert command == "mc.exe"
@@ -319,8 +337,115 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              _object
            ] = elem(Enum.at(calls, 1), 1)
 
+    assert [
+             "--config-dir",
+             ^config_dir,
+             "admin",
+             "policy",
+             "create",
+             "maxiocompat",
+             policy_name,
+             policy_path
+           ] = elem(Enum.at(calls, 7), 1)
+
+    assert String.starts_with?(policy_name, "maxio-compat-policy-")
+    assert Path.basename(policy_path) == "policy.json"
+
+    assert Jason.decode!(Process.get(:policy_fixture)) == %{
+             "Version" => "2012-10-17",
+             "Statement" => %{
+               "Effect" => "Allow",
+               "Action" => "s3:GetObject",
+               "Resource" => "arn:aws:s3:::maxio-compat-*/*"
+             }
+           }
+
+    assert ["--config-dir", ^config_dir, "admin", "policy", "ls", "maxiocompat"] =
+             elem(Enum.at(calls, 8), 1)
+
+    assert [
+             "--config-dir",
+             ^config_dir,
+             "admin",
+             "policy",
+             "info",
+             "maxiocompat",
+             ^policy_name
+           ] = elem(Enum.at(calls, 9), 1)
+
+    assert [
+             "--config-dir",
+             ^config_dir,
+             "admin",
+             "policy",
+             "rm",
+             "maxiocompat",
+             ^policy_name
+           ] = elem(Enum.at(calls, 10), 1)
+
     refute File.exists?(config_dir)
     refute File.exists?(Path.dirname(config_dir))
+  end
+
+  test "mc cleanup retries policy removal when a later S3 cleanup step fails" do
+    Process.put(:cleanup_policy_remove_seen, false)
+    Process.put(:mc_cleanup_failed, false)
+
+    runner = fn _command, args, _opts ->
+      ["--config-dir", _config_dir, subcommand | command_args] = args
+
+      if Process.get(:mc_cleanup_failed) do
+        if subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "rm"] do
+          Process.put(:cleanup_policy_remove_seen, true)
+        end
+
+        {"cleanup", 0}
+      else
+        cond do
+          subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
+            payload_path = Enum.find(command_args, &File.regular?/1)
+            Process.put(:cleanup_payload, File.read!(payload_path))
+            {"copied", 0}
+
+          subcommand == "stat" ->
+            {"maxio-smoke: deep-matrix", 0}
+
+          subcommand == "cat" ->
+            {Process.get(:cleanup_payload), 0}
+
+          subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
+            ["policy", "create", "maxiocompat", policy_name, _policy_path] = command_args
+            Process.put(:cleanup_policy_name, policy_name)
+            {"created", 0}
+
+          subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "ls"] ->
+            {Process.get(:cleanup_policy_name), 0}
+
+          subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "info"] ->
+            {"PolicyName #{Process.get(:cleanup_policy_name)}", 0}
+
+          subcommand == "rm" ->
+            Process.put(:mc_cleanup_failed, true)
+            {"late cleanup failure", 9}
+
+          true ->
+            {"ok", 0}
+        end
+      end
+    end
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0
+      )
+
+    assert entry["status"] == "blocked"
+    assert [%{"step" => "delete_copied_object"}] = entry["blockers"]
+    assert Process.get(:cleanup_policy_remove_seen)
   end
 
   test "mc smoke blocks when stat output does not include metadata" do
@@ -475,7 +600,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert Enum.map(entries, & &1["status"]) == ["blocked", "blocked", "blocked"]
 
     calls = Process.get(:proxy_env_calls)
-    assert length(calls) == 10
+    assert length(calls) == 11
     expected = "example.com,LOCALHOST,service.internal,127.0.0.1"
 
     Enum.each(calls, fn {_command, _args, opts} ->

@@ -4,8 +4,8 @@ defmodule Maxio.Compat.ExternalSmoke do
 
   These checks deliberately do not start Maxio. They use an already-running
   endpoint and configured credentials to exercise bucket lifecycle, object
-  write/read, metadata, range reads, server-side copy, and cleanup through
-  external clients.
+  write/read, metadata, range reads, server-side copy, MinIO admin policy
+  lifecycle, and cleanup through external clients.
   """
 
   @clients [
@@ -461,7 +461,9 @@ defmodule Maxio.Compat.ExternalSmoke do
       )
     ]
 
-    cleanup_steps = Enum.slice(steps, 9, 3)
+    cleanup_steps =
+      select_steps(steps, ["delete_copied_object", "delete_object", "delete_bucket"])
+
     {steps, cleanup_steps}
   end
 
@@ -526,6 +528,48 @@ defmodule Maxio.Compat.ExternalSmoke do
         scenario: "object_copy",
         assertion: "copied object body matches the source bytes"
       ),
+      step(
+        "admin_policy_create",
+        executable,
+        base_args ++
+          [
+            "admin",
+            "policy",
+            "create",
+            "maxiocompat",
+            paths.policy_name,
+            paths.policy_path
+          ],
+        opts,
+        scenario: "admin_policy_lifecycle",
+        assertion: "managed policy can be created through mc admin"
+      ),
+      step(
+        "admin_policy_list",
+        executable,
+        base_args ++ ["admin", "policy", "ls", "maxiocompat"],
+        opts,
+        {:output_contains, [paths.policy_name]},
+        scenario: "admin_policy_lifecycle",
+        assertion: "created managed policy is visible through mc admin policy ls"
+      ),
+      step(
+        "admin_policy_info",
+        executable,
+        base_args ++ ["admin", "policy", "info", "maxiocompat", paths.policy_name],
+        opts,
+        {:output_contains, ["PolicyName", paths.policy_name]},
+        scenario: "admin_policy_lifecycle",
+        assertion: "mc admin policy info returns the named PolicyInfo projection"
+      ),
+      step(
+        "admin_policy_remove",
+        executable,
+        base_args ++ ["admin", "policy", "rm", "maxiocompat", paths.policy_name],
+        opts,
+        scenario: "admin_policy_lifecycle",
+        assertion: "managed policy can be removed through mc admin"
+      ),
       step("delete_copied_object", executable, base_args ++ ["rm", copied_object], opts,
         scenario: "cleanup",
         assertion: "copied object can be deleted"
@@ -540,8 +584,20 @@ defmodule Maxio.Compat.ExternalSmoke do
       )
     ]
 
-    cleanup_steps = Enum.slice(steps, 7, 3)
+    cleanup_steps =
+      select_steps(steps, [
+        "admin_policy_remove",
+        "delete_copied_object",
+        "delete_object",
+        "delete_bucket"
+      ])
+
     {steps, cleanup_steps}
+  end
+
+  defp select_steps(steps, ids) do
+    steps_by_id = Map.new(steps, &{&1.id, &1})
+    Enum.map(ids, &Map.fetch!(steps_by_id, &1))
   end
 
   defp step(id, command, args, opts, metadata) when is_list(metadata) do
@@ -742,7 +798,21 @@ defmodule Maxio.Compat.ExternalSmoke do
     range_download_path = Path.join(tmp_dir, "download-range.txt")
     copy_download_path = Path.join(tmp_dir, "download-copy.txt")
     mc_config_dir = Path.join(tmp_dir, "mc-config")
+    policy_name = "maxio-compat-policy-#{unique_id()}"
+    policy_path = Path.join(tmp_dir, "policy.json")
     File.write!(payload_path, payload)
+
+    File.write!(
+      policy_path,
+      Jason.encode!(%{
+        "Version" => "2012-10-17",
+        "Statement" => %{
+          "Effect" => "Allow",
+          "Action" => "s3:GetObject",
+          "Resource" => "arn:aws:s3:::maxio-compat-*/*"
+        }
+      })
+    )
 
     range_payload = binary_part(payload, 0, min(6, byte_size(payload)))
 
@@ -757,6 +827,8 @@ defmodule Maxio.Compat.ExternalSmoke do
       range_download_path: range_download_path,
       copy_download_path: copy_download_path,
       mc_config_dir: mc_config_dir,
+      policy_name: policy_name,
+      policy_path: policy_path,
       range_header: "bytes=0-#{byte_size(range_payload) - 1}",
       range_payload: range_payload
     }
