@@ -53,6 +53,9 @@
 - MinIO：`7aac2a2c5b7c882e68c1ce017d8256be2feea27f`
   - `cmd/admin-router.go`
   - `cmd/admin-handlers-config-kv.go`
+  - `cmd/admin-handler-utils.go`
+  - `cmd/handler-utils.go`
+  - `cmd/api-errors.go`
   - `internal/config/config.go`
 - madmin-go：`4b504b82db633e978a57d49443b2be75824244c3`
   - `config-kv-commands.go`
@@ -62,6 +65,7 @@
   - `cmd/admin-config-get.go`
   - `cmd/admin-config-set.go`
   - `cmd/admin-config-reset.go`
+  - `cmd/print.go`
 
 固定源码表明：
 
@@ -70,6 +74,10 @@
 - GET 的成功 body 同样是 ciphertext，解密后才是 Config KVS 文本。
 - madmin 的 `api.go` 只设置 `Content-Length`、`X-Amz-Content-Sha256` 和 SigV4 头，**不设置
   `Content-Type`**。因此本批不得复制其他 Admin 请求的 `application/octet-stream` 门禁。
+- MinIO `SubsysInfo.WriteTo` 在最后一个 `key=value` 后仍写一个 ASCII space，再写 LF；mc human
+  输出保留该尾空格。
+- mc 非 TTY `--json` 经 `printMsg` compact 后只输出单行 JSON + LF，不输出 `MarshalIndent` 的
+  pretty 形态。
 - `x-minio-config-applied: true` 的含义是“不需要重启”；缺失或任何其他值都被 madmin 解释为
   `restart == true`。
 - MinIO 先保存配置、再保存 history，两次对象写不是一个原子事务。Maxio 不复制这个安全缺口，
@@ -132,8 +140,19 @@ get/set/reset 失败。
 | set | PUT | `/minio/admin/v3/set-config-kv` | `subsystem key=value ...` | 空 body |
 | reset | DELETE | `/minio/admin/v3/del-config-kv` | `subsystem [key ...]` | 空 body |
 
-只有 method 与 path 同时匹配才进入对应 handler。query `key` 缺失或为空是结构化输入错误；不能
-回退到 help，不能把请求交给 S3 object dispatch。
+固定 router 的 `.Queries("key", "{key:.*}")` 使缺失与空值走不同路径，必须分别冻结：
+
+- `GET /minio/admin/v3/get-config-kv`（完全没有 `key` 参数）不匹配 handler，落 Admin
+  `NotFoundHandler`：HTTP 426、Code `XMinioAdminVersionMismatch`、Description 模板
+  `This 'admin' API is not supported by server in '<mode>'`。
+- `GET /minio/admin/v3/get-config-kv?key=` 的参数存在且 `.*` 接受空串，会进入 handler；获准
+  `admin:ConfigUpdate` 后，空 subsystem 返回 HTTP 400、Code `XMinioConfigError`、Description
+  `unknown subsystem: `（冒号后保留一个空格）。
+
+Maxio 继续遵守既有“未认证先 403、不向匿名方暴露路由”的全局 Admin 安全裁决。因此上述 426 是
+**已认证请求**的结果；固定 MinIO 的 NotFound route 本身不进入 `validateAdminReq`。这是既有 Admin
+surface 的 deliberate security deviation，不是本批新造的 parser 偏差。两种 query 都不能回退
+到 help，也不能交给 S3 object dispatch。
 
 ### 3.2 鉴权与授权
 
@@ -165,7 +184,7 @@ madmin 总是发送一个 concrete Content-Length。Maxio 在两者交集上再�
 
 “必须恰好一个显式 Content-Length”比固定 Go handler 对手写 raw HTTP 的可见行为更严格，是
 一项**deliberate framing safety deviation**；它不影响 madmin/mc。缺失/重复 length 的 upstream
-与 Maxio 结果必须纳入 V-KV2 fixture，不能被描述成完全相同的上游 parser 行为。
+与 Maxio 结果必须纳入 protocol fixture，不能被描述成完全相同的上游 parser 行为。
 
 ### 3.4 envelope 与响应
 
@@ -174,15 +193,28 @@ madmin 总是发送一个 concrete Content-Length。Maxio 在两者交集上再�
 - get：先构造明文 KVS → `Envelope.encrypt(caller_secret, plaintext)` → 返回 ciphertext。
 - 解密失败统一为 `XMinioAdminConfigBadJSON`，日志只能记失败阶段和错误类别，不能记 ciphertext、
   plaintext 或 caller secret。
-- get 成功为 HTTP 200，body 是 ciphertext，沿用现有 Admin encrypted JSON helper 的
-  `application/json` 响应类型，兼容 madmin 直接 `DecryptData(resp.Body)`。
+- get 成功为 HTTP 200，body 是 ciphertext，兼容 madmin 直接 `DecryptData(resp.Body)`。
 - set/reset 成功为 HTTP 200、空 body。正常动态应用时设置
   `x-minio-config-applied: true`；需要重启或本地 postcommit reload 失败时省略该头。禁止发送
   `false` 冒充另一种稳定协议值。
 
+固定 madmin/MinIO 的 entity framing 必须逐 header 测试，不能只断言 body：
+
+| 流向 | Content-Length | Transfer-Encoding | Content-Type | Body |
+|---|---|---|---|---|
+| GET request | header 缺失 | header 缺失 | header 缺失 | 0 bytes |
+| PUT/DELETE request | 十进制 ciphertext 精确 byte size | header 缺失 | header 缺失 | ciphertext exact bytes |
+| GET 200 response | ciphertext 精确 byte size | header 缺失 | `application/json` | ciphertext exact bytes |
+| PUT/DELETE 200 response | `0` | header 缺失 | header 缺失 | 0 bytes |
+
+这里的“缺失”是 header 不存在，不是存在且值为空。SigV4、Host、User-Agent 等非 entity header
+照常存在。GET request 即使 `http.NewRequest` 内部使用 empty reader，固定 Go transport 的 wire
+结果仍是不发送 CL/TE/CT；实现与 fixture 以 wire 为准。mutation success 不能由 JSON helper
+发送 `null`、`{}`、换行或默认 Content-Type。
+
 ### 3.5 固定错误优先级
 
-一次请求同时包含多个错误时，必须按以下顺序只报告第一个：
+一次**已经匹配具体 handler**的请求同时包含多个错误时，必须按以下顺序只报告第一个：
 
 1. Admin surface 是否已认证；
 2. 路由是否匹配以及 `admin:ConfigUpdate` 是否获准；
@@ -192,11 +224,12 @@ madmin 总是发送一个 concrete Content-Length。Maxio 在两者交集上再�
 6. SIO envelope 解密；
 7. Config KVS 词法/语法；
 8. subsystem/key 暴露边界；
-9. 类型、范围与跨键语义校验；
-10. 权威存储事务；
+9. 锁前 scalar 类型、静态范围校验；
+10. 权威存储事务内的 lock/read/apply、跨键语义校验与 mutation；
 11. postcommit reload/broadcast。
 
 第 11 步发生时事务已经提交，不能再返回一个暗示“配置未写入”的错误，详见 §8。
+缺失 `key` 因根本不匹配 get handler，按 §3.1 的 route fallback 处理，不套用本列表。
 
 ### 3.6 公共错误映射
 
@@ -204,17 +237,33 @@ madmin 总是发送一个 concrete Content-Length。Maxio 在两者交集上再�
 |---|---|---|
 | 未认证/未授权 | 403 `AccessDenied` | 先于 body/query 细节 |
 | 非具体长度、超限、chunked | 400 `XMinioAdminConfigTooLarge` | 复用现有精确 message |
-| envelope/长度不符/语法或值校验失败 | 400 `XMinioAdminConfigBadJSON` | 可用安全 custom message 指出 subsystem/key，绝不带 secret value |
+| envelope 解密失败、实读长度不符 | 400 `XMinioAdminConfigBadJSON` | 默认 message：`JSON configuration provided is of incorrect format` |
 | payload hash 不符 | 400 `XAmzContentSHA256Mismatch` | 复用现有错误表 |
 | 明确请求 target | 400 `XMinioAdminInvalidArgument` | 本批不支持 target 的显式偏差 |
-| wire registry 未暴露（含 `cluster.deployment_id`） | 400 `XMinioAdminConfigBadJSON` | 对 Admin Config KVS 表现为 unknown，不泄露内部可写 schema |
+| set/get 的 unknown subsystem、set unknown-only/语法 generic error | 400 `XMinioConfigError` | Description 逐字使用 `config.ErrConfigGeneric.Error()`；固定 `toAdminAPIErr` 映射 |
+| set 最终 typed/cross-key validator 失败 | 400 `XMinioAdminConfigBadJSON` | handler 的 `badConfigErr` 分支；Description 使用安全 validator message |
+| Maxio cross-subsystem / unknown-prefix safety deviation | 400 `XMinioAdminConfigBadJSON` | §4.2/§4.4 明确列举的本地防静默验证；不能泛化成 duplicate/unknown gate |
+| reset 不存在的 key/target | 404 `XMinioConfigNotFoundError` | Description 逐字使用 `config.ErrConfigNotFound.Error()` |
+| wire registry 未暴露（含 `cluster.deployment_id`） | 400 `XMinioConfigError` | 对 Admin Config KVS 表现为 unknown，不泄露内部可写 schema |
 | 命中 Maxio secret/backend 禁止清单 | 403 `AccessDenied` | 禁止判定先于 unknown，避免把根信任材料伪装成普通 typo |
 | commit 前 Repo/事务不可用 | 500 `InternalError` | 详细原因只进结构化日志 |
 | commit 后 reload/broadcast 异常 | 200 committed | 不回滚、不诱导盲重试；见 §8 |
 
-未知 subsystem 与完全没有 registered marker 的 unknown-only line 在固定 MinIO 中会被拒绝；
-unknown token 的位置敏感例外见 §4.4，不能用本错误表抹平。其精确 wire code/message 由 V-KV2
-冻结，未取证前统一落现有 ConfigBadJSON 家族，不新增猜测的 `XMaxio*` code。
+这些映射已由固定源码冻结，不再列 VERIFY：`config.ErrConfigGeneric` → 400 `XMinioConfigError`，
+`config.ErrConfigNotFound` → 404 `XMinioConfigNotFoundError`，只有 handler 包装的 `badConfigErr` →
+400 `XMinioAdminConfigBadJSON`。unknown token 的位置敏感例外仍按 §4.4，不能用本表抹平；不得把
+所有 parser/validator 错误笼统改写成 ConfigBadJSON，也不得新增猜测的 `XMaxio*` code。
+
+固定源码中可直接确定的 Description 也进入 fixture，不再等待活体猜测：
+
+- GET unknown：`unknown subsystem: <subsystem>`；空 `key` 即 `unknown subsystem: `；
+- set/reset unknown subsystem：`unknown sub-system <完整明文输入>`；
+- set 没有任何 registered marker：`sub-system '<subsystem>' cannot have empty keys`；
+- reset 不存在的单键：`key <key> doesn't exist`；
+- reset 已不存在的整个默认 target：`sub-system <subsystem>:_ already deleted or does not exist`。
+
+错误 JSON 可以回显调用者自己提交的非敏感输入，但 forbidden secret/backend 分支必须在此之前
+截断为 AccessDenied，不能把 secret value 拼进 Description 或日志。
 
 ---
 
@@ -270,7 +319,8 @@ s3 clock_skew_ms=1000 clock_skew_ms=2000
 
 固定 MinIO 只为 registered `clock_skew_ms` 记录第一个下标，得到 value
 `1000 clock_skew_ms=2000`；随后由 subsystem validator 决定失败。Maxio 必须走同一路径：把完整
-value 交 integer parser，得到 ConfigBadJSON 家族错误。不得预扫描 duplicate 后创造一个新的
+value 交 integer parser，最终 validator 经 `badConfigErr` 得到 400 `XMinioAdminConfigBadJSON`。
+不得预扫描 duplicate 后创造一个新的
 “duplicate key”错误，也不得把第二个 token 当成覆盖。
 
 **多行重复才是后行覆盖前行。** 例如 envelope plaintext：
@@ -326,11 +376,22 @@ listing sql_hard_limit
   env 状态。no-op 不造审计行、不造版本，但命令整体仍返回 200。
 - reset 以 whitespace fields 读取 key；同一 key 重复出现时第一次已恢复 fallback，后续重复是
   同一候选配置上的幂等操作，不创造 duplicate 错误。
-- unknown 或仅 core 可见但 wire hidden 的 key 返回 ConfigBadJSON；命中 secret/backend 禁止清单
+- unknown 或仅 core 可见但 wire hidden 的 key 返回 `XMinioConfigError`；命中 secret/backend 禁止清单
   返回 AccessDenied。任一失败都不能在同批里先 reset 其他合法键。
 
 固定 MinIO 的 `DelKVS` 是“恢复 registered default 或删除目标”，Maxio 删除 runtime override 后
 回到 env/application fallback，与其运维语义同构。
+
+**完整 subsystem 重复 reset 是 deliberate idempotency deviation。** 固定 MinIO 对已删除的整个
+target/subsystem 可返回 `config.ErrConfigNotFound`；Maxio 的 per-key override 模型没有“已删除的
+default target”状态，故以下两种重试一律成功 no-op：
+
+- 同一 envelope 明文重复两行 `s3\ns3\n`；
+- 第一次 `DELETE` 成功后，以相同 `s3` 明文再次发送完整 HTTP retry。
+
+第二次/重复行不增 version、不写 audit、不 reload、不 broadcast，返回 200、
+`x-minio-config-applied: true`、`Content-Length: 0`、无 Content-Type、空 body。protocol fixture 必须
+锁住“固定 MinIO 可报 404，而 Maxio 200 no-op”的两边证据，防止以后把安全重试退化成错误。
 
 ### 4.6 get
 
@@ -460,14 +521,23 @@ Maxio.Config public API ── 唯一 mutation/read facade
 
 Admin/mc 线协议没有 version 参数，不能伪造 If-Match 或私有 query。
 
-### 7.2 事务前验证
+### 7.2 验证分层：纯输入可锁前，依赖快照必须锁内
 
-parser、wire mapping、类型/范围、禁止清单与跨键语义必须在拿 DB lock 前完成。任一失败时：
+只有不读取可变权威状态的验证可以在拿 DB lock 前完成：
 
-- 不启动 mutation；
-- 不写 runtime row；
-- 不写 audit；
-- 不 reload、不 broadcast。
+- envelope 解密后的 KVS 词法/行结构；
+- wire subsystem/key mapping 与 forbidden/hidden 边界；
+- 多行 input-only 折叠；
+- 最终 scalar 的类型与静态范围；
+- 只依赖 command + code schema 的约束。
+
+任何依赖“未出现在 patch 中的当前键”、effective/current snapshot、row 是否存在、version 或 source
+的跨键 validator，**禁止**在锁前读旧快照后作决定。它必须在同一 transaction 内：拿 subsystem
+advisory lock → 权威读取 → 把 patch 应用到候选 snapshot → 验证完整候选 → mutation。否则 validator
+通过到实际 UPDATE 之间存在 TOCTOU 窗口。
+
+锁前纯验证失败时不启动 mutation、不写 runtime/audit、不 reload、不 broadcast；锁内候选验证失败
+时 transaction 整体回滚，同样无 postcommit 副作用。
 
 ### 7.3 advisory lock
 
@@ -493,13 +563,15 @@ namespace（十六进制 `0x4D584346`，即 `MXCF`）；第二个 int 由同一 
 
 拿到 advisory lock 后：
 
-1. 按 wire registry 的稳定 key 顺序读取并 `FOR UPDATE` 已存在行；
+1. 按 wire registry 的稳定 key 顺序权威读取该 subsystem 完整候选所需的 rows，并对已有 row
+   `FOR UPDATE`；同时读取 env/application fallback 所需的稳定材料；
 2. 再次核对本地 CLI 提供的 expected versions；任一冲突则整批回滚；
-3. 对 set：逐键 insert/update；未指定键不变；
-4. 对 reset：逐键 delete runtime override；subsystem reset 展开为全部 exposed keys 后执行；
-5. 每个**实际变化**的键插入一条 `runtime_config_audits`；
-6. 所有 audit 共用本次 HTTP/request command 的同一个 `request_id`、principal 与 source；
-7. 一次 transaction commit。
+3. 在权威 snapshot 上按原始多行顺序应用已解析 patch/reset，构造完整候选 snapshot；
+4. 运行所有依赖 snapshot 的跨键 validator；失败则在 mutation 前整批回滚；
+5. 仅在候选验证通过后计算实际 diff；对 set insert/update，对 reset delete runtime override；
+6. 每个**实际变化**的键插入一条 `runtime_config_audits`；
+7. 所有 audit 共用本次 HTTP/request command 的同一个 `request_id`、principal 与 source；
+8. 一次 transaction commit。
 
 任何 insert/update/delete/audit 失败都回滚整批，不存在“前两个键成功、第三个失败”。
 
@@ -635,12 +707,13 @@ apply modes、request_id、principal ARN、auth type、local_reload、broadcast�
 
 ### 9.2 明文输出
 
-每个请求的明文恰好一条配置行和一个 LF：
+每个请求的明文恰好一条配置行。固定 `SubsysInfo.WriteTo` 在**每个 KV 后写一个 ASCII space**，
+再写 LF；因此单键响应也必须保留尾空格。用可见字节标记表达三个精确结果：
 
 ```text
-s3 clock_skew_ms=900000
-listing sql_hard_limit=100000
-prometheus_metrics public=false
+s3 clock_skew_ms=900000<SP><LF>
+listing sql_hard_limit=100000<SP><LF>
+prometheus_metrics public=false<SP><LF>
 ```
 
 规则：
@@ -649,7 +722,7 @@ prometheus_metrics public=false
 - key 按 registry 稳定顺序；
 - integer 用无分隔十进制，boolean 用小写 `true|false`；
 - 值含空白时用双引号，规则与 madmin `KV.String()` 一致；
-- 行尾允许 key/value 之间的标准单空格，但必须有且只有一个最终 LF；
+- 每个 `key=value` 后恰好一个 ASCII space，包括最后一个；其后恰好一个 LF；
 - 首批无 exposed env var，因此不输出 `# MINIO_*` 注释；不得伪造 envOverride；
 - 默认 target 不加 `:`，这样 madmin JSON parser 输出省略 `target`。
 
@@ -664,35 +737,24 @@ GET 是 reporting API，不是 secret export。renderer 在任何值序列化前
 ## 10. 非 TTY `mc` 可见输出
 
 测试统一设置隔离 `MC_CONFIG_DIR`、`--no-color`、stdout 非 TTY，并分别验证 human 与 `--json`；
-不得把彩色 ANSI 或本机 alias 状态混入 fixture。
+不得把彩色 ANSI 或本机 alias 状态混入 fixture。固定 mc 的非 TTY `--json` 经过 compact 输出，
+所有 JSON 都是**单行无多余空白 + 一个 LF**，不允许 pretty JSON。
 
 ### 10.1 get
 
-Human stdout 是解密后的服务器文本逐字输出。例如：
+Human stdout 是解密后的服务器文本逐字输出。单键 exact bytes 为：
 
 ```text
-s3 clock_skew_ms=900000
+s3 clock_skew_ms=900000<SP><LF>
 ```
 
-`--json` 经 `madmin.ParseServerConfigOutput` 变为以下字段语义；具体缩进和最终 LF 也由固定 mc
-fixture 锁定：
+`--json` 经 `madmin.ParseServerConfigOutput` 后的 exact stdout 为：
 
 ```json
-{
- "status": "success",
- "config": [
-  {
-   "subSystem": "s3",
-   "kv": [
-    {
-     "key": "clock_skew_ms",
-     "value": "900000"
-    }
-   ]
-  }
- ]
-}
+{"status":"success","config":[{"subSystem":"s3","kv":[{"key":"clock_skew_ms","value":"900000"}]}]}
 ```
+
+即上述单行后紧跟一个 LF，无前导/尾随空格。
 
 默认 target 的 `target` 字段省略。首批没有 `envOverride`。
 
@@ -713,10 +775,10 @@ Please restart your server 'mc admin service restart ALIAS'.
 JSON 成功只含导出字段 `status`；`targetAlias` 与 `restart` 在 mc struct 中未导出，因此不出现：
 
 ```json
-{
- "status": "success"
-}
+{"status":"success"}
 ```
+
+Exact bytes：`{"status":"success"}<LF>`。
 
 ### 10.3 reset
 
@@ -732,13 +794,13 @@ header 缺失时第二行是：
 Please restart your server with `mc admin service restart ALIAS`.
 ```
 
-JSON 同样是带一空格缩进的：
+JSON exact stdout 同样 compact：
 
 ```json
-{
- "status": "success"
-}
+{"status":"success"}
 ```
+
+Exact bytes：`{"status":"success"}<LF>`。
 
 输入回显是 mc join 后的完整 string，不只是 subsystem。
 
@@ -778,16 +840,22 @@ non-TTY 输出。测试应证明：
 
 - GET/PUT/DELETE exact path/method/query；
 - GET 也要求 `admin:ConfigUpdate`；
-- madmin 请求无 Content-Type；
+- 缺失 `key` 的 authenticated 426 与 `?key=` 的 authorized 400 `XMinioConfigError` 分支；
+- GET request 无 CL/TE/CT，PUT/DELETE request 为 ciphertext exact CL 且无 TE/CT；
+- GET ciphertext 200 response 为 exact CL，mutation 200 response 为 CL0/no CT/empty body；
 - applied header 的 true/缺失分支；
-- get human/JSON、set/reset human/JSON 的 stdout 与 exit status。
+- 固定源码的 `XMinioConfigError` / `XMinioConfigNotFoundError` /
+  `XMinioAdminConfigBadJSON` 分流；
+- get human 的 `<SP><LF>`、compact JSON，以及 set/reset compact
+  `{"status":"success"}<LF>` stdout 与 exit status。
 
 ### 12.2 parser/renderer
 
 覆盖合法空白/quote、单行 duplicate 被 value 吸收后由 validator 决定、同 subsystem 多行重复后写覆盖、
 首行非法 raw value 被后行合法值覆盖后只验证最终值、
 unknown-only/unknown-suffix 的固定行为、unknown-prefix deliberate deviation、合法 reset no-op、reset
-subset/full subsystem、跨 subsystem deliberate deviation、target 显式拒绝、稳定顺序、单 LF、
+subset/full subsystem、full-subsystem repeated reset/HTTP retry 的 200 no-op deviation、跨 subsystem
+deliberate deviation、target 显式拒绝、稳定顺序、尾 `<SP><LF>`、
 boolean/integer 格式、redaction 静态断言。
 
 ### 12.3 核心事务与并发
@@ -798,6 +866,8 @@ boolean/integer 格式、redaction 静态断言。
 - 同 batch audit 共用 request_id，版本逐键正确；
 - reset 删除 row，未来 set 从 version 1 新 incarnation 开始；
 - single-key writer 与 batch writer 同 subsystem 串行，不丢不重叠键；
+- 用锁内改变未 patch sibling key 的并发 writer 证明跨键 validator 在 lock + authoritative read +
+  patch 之后运行，不接受锁前旧 snapshot；
 - 不同 subsystem 可并发；
 - no-op 不增 version/audit；
 - 一个 batch 恰好一次 reload、一次 checked broadcast。
@@ -814,9 +884,11 @@ boolean/integer 格式、redaction 静态断言。
 
 ### 12.5 endpoint
 
-覆盖 root、policy allow、无 policy/explicit deny、错误优先级、缺失/重复/超限 length、chunked、
+覆盖 root、policy allow、无 policy/explicit deny、错误优先级、GET 缺失/空 key 的路由差异、
+缺失/重复/超限 length、chunked、
 实读长度不符、payload hash mismatch、wrong caller secret、malformed KVS、unknown/hidden/forbidden、
-encrypted GET、empty success body 与 applied header。每类错误断言 JSON code/status/message/resource，
+encrypted GET、四类 exact entity framing、full reset retry、empty success body 与 applied header。
+每类错误断言 JSON code/status/message/resource，
 并捕获日志证明没有 plaintext/ciphertext/value。
 
 ### 12.6 external smoke 与数据面效果
@@ -826,9 +898,10 @@ encrypted GET、empty success body 与 applied header。每类错误断言 JSON 
 `prometheus_metrics.public == false` 且没有 runtime override：
 
 1. 匿名请求 metrics → 403；
-2. `mc admin config get ALIAS prometheus_metrics` → `public=false`；
+2. `mc admin config get ALIAS prometheus_metrics` → human exact
+   `prometheus_metrics public=false<SP><LF>`，`--json` 为 compact 单行 + LF；
 3. `mc admin config set ALIAS prometheus_metrics public=true` → 成功且无 restart 行；
-4. get human 与 JSON 都读到 true；
+4. get human 以 `<SP><LF>`、JSON 以 compact + LF 精确读到 true；
 5. 匿名请求 metrics → 200，证明不是只写 DB 无消费者；
 6. `mc admin config reset ALIAS prometheus_metrics public`；
 7. get 回到 false，匿名 metrics 再次 403；
@@ -838,26 +911,10 @@ encrypted GET、empty success body 与 applied header。每类错误断言 JSON 
 
 ---
 
-## 13. 三项 VERIFY-AT-IMPL
+## 13. VERIFY-AT-IMPL
 
-以下恰好三项必须在实现批开始时用固定 fixture/活体证据消解；它们不是可延期占位符。消解结果
-写入 fixture README 与 STATUS，代码中不得留下猜测分支。
-
-### V-KV1 —— 当前目标 mc 的非 TTY 字节输出
-
-用本批声明支持的真实 mc binary 记录 `--version`，在 `--no-color`、stdout pipe、独立
-`MC_CONFIG_DIR` 下捕获 get/set/reset 的 human/JSON stdout、stderr 与 exit code。核对本文 §10 的
-标点、缩进、ANSI、最终 LF 和 restart 两行文本；fixture 以实际目标 binary 为最终裁决。
-
-### V-KV2 —— MinIO Config parser 错误的 wire code/message 与复合错误优先级
-
-对固定 MinIO 启动活体，分别发送 unknown subsystem、unknown-only line、unknown prefix + known、
-known + unknown suffix、单行同名 duplicate、同 subsystem 多行同名覆盖、跨 subsystem 多行、
-invalid typed value、target、bad envelope、payload hash mismatch 及“无权限 + bad body”、
-“oversize + bad envelope”复合请求；同时发送缺失/重复 Content-Length 的 raw HTTP。记录最终配置和
-status/Code/Message/Resource。源码已冻结分支顺序，但 tokenizer 的位置行为及 `toAdminAPIErr` 的
-具体映射必须靠此证据冻结；Maxio 只在有证据后选择 exact upstream code，否则采用 §3.6 的安全
-ConfigBadJSON 家族。
+mc compact JSON、KVS 尾空格、固定错误映射和 route/framing 均已由固定源码冻结，属于普通 protocol
+fixture，不再列 VERIFY。只保留一项必须用 Maxio 活体消解的分布式事实：
 
 ### V-KV3 —— Maxio checked broadcast 故障与数据面热应用
 
@@ -871,7 +928,7 @@ ConfigBadJSON 家族。
 
 实现批只有在以下证据齐全时才可完成：
 
-- 固定协议 fixture 与三项 VERIFY 均消解；
+- 固定协议 fixture 与 V-KV3 均消解；
 - parser、事务、并发、fault injection、endpoint、CLI、external smoke 全部通过；
 - `mix compile --warnings-as-errors` 与相关 focused tests 通过；
 - coherent batch 收口时只跑一次完整 `mix precommit`；
@@ -887,6 +944,9 @@ ConfigBadJSON 家族。
 
 - <https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go>
 - <https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-config-kv.go>
+- <https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handler-utils.go>
+- <https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/handler-utils.go>
+- <https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/api-errors.go>
 - <https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go>
 - <https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/config-kv-commands.go>
 - <https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/parse-config.go>
@@ -894,3 +954,4 @@ ConfigBadJSON 家族。
 - <https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-get.go>
 - <https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-set.go>
 - <https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-reset.go>
+- <https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go>
