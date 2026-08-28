@@ -85,6 +85,14 @@ defmodule Maxio.Policy.Store do
   @callback managed_session_policy_attachment_count(policy_arn :: String.t()) :: non_neg_integer()
   @callback managed_session_policy_permissions_boundary_count(policy_arn :: String.t()) ::
               non_neg_integer()
+  @callback update_builtin_managed_policy_associations(
+              :user | :group,
+              principal_arn :: String.t(),
+              :attach | :detach,
+              policy_arns :: [String.t()]
+            ) ::
+              {:ok, %{changed_policy_arns: [String.t()], updated_at: DateTime.t()}}
+              | {:error, term()}
 
   @optional_callbacks put_principal_policy: 3,
                       principal_permissions_boundary: 1,
@@ -117,7 +125,8 @@ defmodule Maxio.Policy.Store do
                       list_attached_group_managed_policies: 1,
                       managed_session_policy_attached?: 1,
                       managed_session_policy_attachment_count: 1,
-                      managed_session_policy_permissions_boundary_count: 1
+                      managed_session_policy_permissions_boundary_count: 1,
+                      update_builtin_managed_policy_associations: 4
 
   @doc "当前配置的策略后端模块。"
   @spec impl() :: module()
@@ -634,6 +643,45 @@ defmodule Maxio.Policy.Store do
       backend.list_attached_group_managed_policies(group_arn)
     else
       []
+    end
+  end
+
+  @doc false
+  @spec update_builtin_managed_policy_associations_without_notify(
+          :user | :group,
+          String.t(),
+          :attach | :detach,
+          [String.t()]
+        ) ::
+          {:ok, %{changed_policy_arns: [String.t()], updated_at: DateTime.t()}}
+          | {:error, term()}
+  def update_builtin_managed_policy_associations_without_notify(
+        kind,
+        principal_arn,
+        operation,
+        policy_arns
+      ) do
+    backend = impl()
+
+    if callback_exported?(backend, :update_builtin_managed_policy_associations, 4) do
+      case backend.update_builtin_managed_policy_associations(
+             kind,
+             principal_arn,
+             operation,
+             policy_arns
+           ) do
+        {:ok, %{changed_policy_arns: changed, updated_at: %DateTime{}} = result}
+        when is_list(changed) ->
+          {:ok, result}
+
+        {:error, reason} ->
+          {:error, reason}
+
+        _invalid_backend_result ->
+          {:error, :invalid_backend_result}
+      end
+    else
+      {:error, :not_supported}
     end
   end
 

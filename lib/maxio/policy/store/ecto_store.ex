@@ -16,6 +16,7 @@ defmodule Maxio.Policy.Store.EctoStore do
     GroupMembership,
     Role,
     RoleManagedPolicyAttachment,
+    STSSession,
     User,
     UserIdentity,
     UserManagedPolicyAttachment
@@ -725,6 +726,263 @@ defmodule Maxio.Policy.Store.EctoStore do
   end
 
   def list_attached_group_managed_policies(_group_arn), do: []
+
+  @impl true
+  def update_builtin_managed_policy_associations(kind, principal_arn, operation, policy_arns)
+      when kind in [:user, :group] and operation in [:attach, :detach] and
+             is_binary(principal_arn) and is_list(policy_arns) do
+    policy_arns = policy_arns |> Enum.uniq() |> Enum.sort()
+    snapshot = builtin_principal_snapshot(kind, principal_arn)
+
+    Repo.transaction(fn ->
+      with {:ok, _principal} <- lock_builtin_principal(kind, principal_arn, snapshot),
+           :ok <- lock_builtin_principal_quota(principal_arn),
+           {:ok, changed} <-
+             mutate_builtin_policy_associations(kind, principal_arn, operation, policy_arns) do
+        %{changed_policy_arns: changed, updated_at: database_timestamp!()}
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def update_builtin_managed_policy_associations(_kind, _principal_arn, _operation, _policy_arns),
+    do: {:error, :malformed}
+
+  defp builtin_principal_snapshot(:user, "arn:aws:iam:::user/" <> user_name),
+    do: UserIdentity.snapshot(Repo, user_name)
+
+  defp builtin_principal_snapshot(:group, "arn:aws:iam:::group/" <> group_name) do
+    case fetch_group_by_name(group_name) do
+      %Group{id: id} -> {:existing, id}
+      nil -> :missing
+    end
+  end
+
+  defp builtin_principal_snapshot(_kind, _principal_arn), do: :invalid
+
+  defp lock_builtin_principal(:user, "arn:aws:iam:::user/" <> user_name, snapshot) do
+    cond do
+      Repo.exists?(from s in STSSession, where: s.access_key_id == ^user_name) ->
+        {:error, :minio_action_not_allowed}
+
+      user_name == configured_root_user() ->
+        {:error, :minio_action_not_allowed}
+
+      true ->
+        case UserIdentity.lock_snapshot(Repo, user_name, snapshot) do
+          {:ok, :missing} -> {:error, :user_not_found}
+          result -> result
+        end
+    end
+  end
+
+  defp lock_builtin_principal(:group, "arn:aws:iam:::group/" <> group_name, snapshot) do
+    lock_group_name!(group_name)
+
+    case {snapshot, fetch_group_by_name(group_name, "FOR UPDATE")} do
+      {{:existing, id}, %Group{id: current_id, status: "active"} = group}
+      when current_id == id ->
+        {:ok, group}
+
+      {{:existing, id}, %Group{id: current_id}} when current_id == id ->
+        {:error, :group_disabled}
+
+      {{:existing, _old_id}, %Group{}} ->
+        {:error, :identity_changed}
+
+      {_snapshot, nil} ->
+        {:error, :group_not_found}
+
+      _other ->
+        {:error, :group_not_found}
+    end
+  end
+
+  defp lock_builtin_principal(:user, _principal_arn, _snapshot), do: {:error, :user_not_found}
+  defp lock_builtin_principal(:group, _principal_arn, _snapshot), do: {:error, :group_not_found}
+
+  defp mutate_builtin_policy_associations(_kind, _principal_arn, _operation, []) do
+    {:error, :policy_change_already_applied}
+  end
+
+  defp mutate_builtin_policy_associations(kind, principal_arn, :attach, requested) do
+    policies =
+      Repo.all(
+        from p in ManagedPolicy,
+          where: p.policy_arn in ^requested,
+          order_by: [asc: p.policy_arn],
+          lock: "FOR UPDATE",
+          select: p.policy_arn
+      )
+
+    if policies != requested do
+      {:error, :policy_not_found}
+    else
+      current = current_attachment_arns(kind, principal_arn)
+      changed = requested -- current
+
+      cond do
+        changed == [] ->
+          {:error, :policy_change_already_applied}
+
+        length(Enum.uniq(current ++ changed)) > 10 ->
+          {:error, :policy_limit_exceeded}
+
+        true ->
+          insert_builtin_attachments(kind, principal_arn, changed)
+          {:ok, changed}
+      end
+    end
+  end
+
+  defp mutate_builtin_policy_associations(kind, principal_arn, :detach, requested) do
+    changed = lock_matching_attachment_arns(kind, principal_arn, requested)
+
+    if changed == [] do
+      {:error, :policy_change_already_applied}
+    else
+      delete_builtin_attachments(kind, principal_arn, changed)
+      {:ok, changed}
+    end
+  end
+
+  defp current_attachment_arns(:user, principal_arn) do
+    Repo.all(
+      from a in UserManagedPolicyAttachment,
+        where: a.user_arn == ^principal_arn,
+        order_by: [asc: a.policy_arn],
+        select: a.policy_arn
+    )
+  end
+
+  defp current_attachment_arns(:group, principal_arn) do
+    Repo.all(
+      from a in GroupManagedPolicyAttachment,
+        where: a.group_arn == ^principal_arn,
+        order_by: [asc: a.policy_arn],
+        select: a.policy_arn
+    )
+  end
+
+  defp lock_matching_attachment_arns(:user, principal_arn, requested) do
+    Repo.all(
+      from a in UserManagedPolicyAttachment,
+        where: a.user_arn == ^principal_arn and a.policy_arn in ^requested,
+        order_by: [asc: a.policy_arn],
+        lock: "FOR UPDATE",
+        select: a.policy_arn
+    )
+  end
+
+  defp lock_matching_attachment_arns(:group, principal_arn, requested) do
+    Repo.all(
+      from a in GroupManagedPolicyAttachment,
+        where: a.group_arn == ^principal_arn and a.policy_arn in ^requested,
+        order_by: [asc: a.policy_arn],
+        lock: "FOR UPDATE",
+        select: a.policy_arn
+    )
+  end
+
+  defp insert_builtin_attachments(:user, principal_arn, policy_arns) do
+    now = DateTime.utc_now()
+
+    rows =
+      Enum.map(policy_arns, fn policy_arn ->
+        %{
+          id: Ecto.UUID.generate(),
+          user_arn: principal_arn,
+          policy_arn: policy_arn,
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    {_count, nil} = Repo.insert_all(UserManagedPolicyAttachment, rows)
+  end
+
+  defp insert_builtin_attachments(:group, principal_arn, policy_arns) do
+    now = DateTime.utc_now()
+
+    rows =
+      Enum.map(policy_arns, fn policy_arn ->
+        %{
+          id: Ecto.UUID.generate(),
+          group_arn: principal_arn,
+          policy_arn: policy_arn,
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    {_count, nil} = Repo.insert_all(GroupManagedPolicyAttachment, rows)
+  end
+
+  defp delete_builtin_attachments(:user, principal_arn, policy_arns) do
+    Repo.delete_all(
+      from a in UserManagedPolicyAttachment,
+        where: a.user_arn == ^principal_arn and a.policy_arn in ^policy_arns
+    )
+  end
+
+  defp delete_builtin_attachments(:group, principal_arn, policy_arns) do
+    Repo.delete_all(
+      from a in GroupManagedPolicyAttachment,
+        where: a.group_arn == ^principal_arn and a.policy_arn in ^policy_arns
+    )
+  end
+
+  defp lock_builtin_principal_quota(principal_arn) do
+    Ecto.Adapters.SQL.query!(
+      Repo,
+      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+      ["maxio.principal_policy_quota", principal_arn]
+    )
+
+    :ok
+  end
+
+  defp lock_group_name!(group_name) do
+    Ecto.Adapters.SQL.query!(
+      Repo,
+      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+      ["maxio.iam.group_identity", String.downcase(group_name)]
+    )
+
+    :ok
+  end
+
+  defp fetch_group_by_name(group_name, nil),
+    do: Repo.one(group_name_query(group_name))
+
+  defp fetch_group_by_name(group_name, "FOR UPDATE"),
+    do: Repo.one(from(g in group_name_query(group_name), lock: "FOR UPDATE"))
+
+  defp fetch_group_by_name(group_name), do: fetch_group_by_name(group_name, nil)
+
+  defp group_name_query(group_name) do
+    from g in Group,
+      where: fragment("lower(?)", g.group_name) == ^String.downcase(group_name),
+      limit: 1
+  end
+
+  defp configured_root_user do
+    :maxio
+    |> Application.fetch_env!(:s3)
+    |> Keyword.fetch!(:root_user)
+  end
+
+  defp database_timestamp! do
+    %{rows: [[timestamp]]} =
+      Ecto.Adapters.SQL.query!(Repo, "SELECT clock_timestamp()", [])
+
+    timestamp
+  end
 
   defp insert_managed_policy_row(policy_arn, doc, attrs) do
     %ManagedPolicy{}

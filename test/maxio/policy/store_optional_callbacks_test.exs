@@ -124,6 +124,15 @@ defmodule Maxio.Policy.StoreOptionalCallbacksTest do
                )
 
       assert [] = Store.list_attached_group_managed_policies("arn:aws:iam:::group/legacy")
+
+      assert {:error, :not_supported} =
+               Store.update_builtin_managed_policy_associations_without_notify(
+                 :user,
+                 "arn:aws:iam:::user/legacy",
+                 :attach,
+                 ["arn:aws:iam:::policy/readwrite"]
+               )
+
       refute Store.managed_session_policy_attached?("arn:aws:iam:::policy/legacy")
     after
       Application.put_env(:maxio, :policy_store, previous_store)

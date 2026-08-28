@@ -2177,6 +2177,50 @@ defmodule Maxio.IAM do
 
   def list_managed_policy_entities_strict(_policy_arn, _opts), do: {:error, :malformed}
 
+  @doc "Atomically attaches or detaches root-path builtin managed policies for one local entity."
+  @spec update_managed_policy_associations_strict(
+          :attach | :detach,
+          {:user | :group, String.t()},
+          [String.t()]
+        ) ::
+          {:ok, %{changed_policy_arns: [String.t()], updated_at: DateTime.t()}}
+          | {:error, term()}
+  def update_managed_policy_associations_strict(operation, {kind, name}, policy_names)
+      when operation in [:attach, :detach] and kind in [:user, :group] and is_binary(name) and
+             is_list(policy_names) do
+    with true <- name != "",
+         {:ok, policy_arns} <- builtin_policy_arns(policy_names),
+         principal_arn <- builtin_principal_arn(kind, name),
+         {:ok, result} <-
+           Store.update_builtin_managed_policy_associations_without_notify(
+             kind,
+             principal_arn,
+             operation,
+             policy_arns
+           ) do
+      Notify.broadcast({:principal_policy_changed, principal_arn})
+      {:ok, result}
+    else
+      false -> {:error, :malformed}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def update_managed_policy_associations_strict(_operation, _principal, _policy_names),
+    do: {:error, :malformed}
+
+  defp builtin_policy_arns(policy_names) do
+    if policy_names != [] and
+         Enum.all?(policy_names, &(is_binary(&1) and &1 != "" and not String.contains?(&1, "/"))) do
+      {:ok, policy_names |> Enum.uniq() |> Enum.map(&managed_policy_arn(&1, "/")) |> Enum.sort()}
+    else
+      {:error, :malformed}
+    end
+  end
+
+  defp builtin_principal_arn(:user, name), do: user_arn(name)
+  defp builtin_principal_arn(:group, name), do: group_arn(name)
+
   @doc "Attaches a local managed policy to a user using AWS Query strict semantics."
   @spec attach_user_policy_strict(String.t(), String.t()) :: :ok | {:error, term()}
   def attach_user_policy_strict(user_name_or_arn, policy_arn)
