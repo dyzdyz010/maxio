@@ -20,6 +20,15 @@ defmodule Maxio.Admin.UserAdapterTest do
     assert {:error, :user_not_found} = UserAdapter.info(unique_name("missing-user"))
   end
 
+  test "a user deleted after lookup is still normalized as user-not-found" do
+    user_name = unique_name("deleted-between-queries")
+    assert {:ok, _user} = IAM.create_user(name: user_name)
+    assert {:ok, fetched_user} = IAM.get_user(user_name)
+    assert :ok = IAM.delete_user(user_name)
+
+    assert {:error, :user_not_found} = UserAdapter.project_fetched_user(fetched_user)
+  end
+
   test "projects the exact partial UserInfo wire view and safe source evidence" do
     user_name = unique_name("adapter-user")
     assert {:ok, user} = IAM.create_user(name: user_name, status: "active")

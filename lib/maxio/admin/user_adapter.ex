@@ -35,11 +35,21 @@ defmodule Maxio.Admin.UserAdapter do
   @spec info(term()) :: {:ok, %{wire: map(), evidence: map()}} | {:error, reason()}
   def info(name) do
     with :ok <- validate_name(name),
-         {:ok, user} <- fetch_user(name),
-         {:ok, sources} <- collect_sources(user) do
+         {:ok, user} <- fetch_user(name) do
+      project_fetched_user(user)
+    end
+  end
+
+  @doc false
+  @spec project_fetched_user(map()) ::
+          {:ok, %{wire: map(), evidence: map()}} | {:error, reason()}
+  def project_fetched_user(%{} = user) do
+    with {:ok, sources} <- collect_sources(user) do
       project(user, sources)
     end
   end
+
+  def project_fetched_user(_user), do: {:error, :invalid_argument}
 
   @doc false
   @spec project(map(), map()) ::
@@ -134,6 +144,9 @@ defmodule Maxio.Admin.UserAdapter do
            |> IAM.list_attached_role_policies()
            |> safe_managed_policies()
        }}
+    else
+      {:error, :not_found} -> {:error, :user_not_found}
+      {:error, reason} -> {:error, reason}
     end
   end
 

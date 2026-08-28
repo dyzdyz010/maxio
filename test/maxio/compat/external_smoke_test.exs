@@ -201,8 +201,6 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "create_bucket",
              "head_bucket",
              "put_object",
-             "delete_copied_object",
-             "delete_object",
              "delete_bucket"
            ]
 
@@ -221,12 +219,10 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert entry["status"] == "error"
 
-    assert [%{"reason" => "external_smoke_command_failed", "message" => message} | cleanup] =
+    assert [%{"reason" => "external_smoke_command_failed", "message" => message}] =
              entry["blockers"]
 
     assert message =~ "boom"
-    assert length(cleanup) == 3
-    assert Enum.all?(cleanup, &(&1["reason"] == "external_smoke_cleanup_failed"))
     refute Jason.encode!(entry) =~ "super-secret"
   end
 
@@ -427,53 +423,53 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     refute File.exists?(Path.dirname(config_dir))
   end
 
-  test "mc cleanup retries policy removal when a later S3 cleanup step fails" do
-    Process.put(:cleanup_policy_remove_seen, false)
-    Process.put(:mc_cleanup_failed, false)
+  test "late mc failure does not replay resources already removed successfully" do
+    Process.put(:policy_remove_calls, 0)
+    Process.put(:delete_copied_calls, 0)
 
     runner = fn _command, args, _opts ->
       ["--config-dir", _config_dir, subcommand | command_args] = args
 
-      if Process.get(:mc_cleanup_failed) do
-        if subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "rm"] do
-          Process.put(:cleanup_policy_remove_seen, true)
-        end
+      cond do
+        subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
+          payload_path = Enum.find(command_args, &File.regular?/1)
+          Process.put(:cleanup_payload, File.read!(payload_path))
+          {"copied", 0}
 
-        {"cleanup", 0}
-      else
-        cond do
-          subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
-            payload_path = Enum.find(command_args, &File.regular?/1)
-            Process.put(:cleanup_payload, File.read!(payload_path))
-            {"copied", 0}
+        subcommand == "stat" ->
+          {"maxio-smoke: deep-matrix", 0}
 
-          subcommand == "stat" ->
-            {"maxio-smoke: deep-matrix", 0}
+        subcommand == "cat" ->
+          {Process.get(:cleanup_payload), 0}
 
-          subcommand == "cat" ->
-            {Process.get(:cleanup_payload), 0}
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
+          ["policy", "create", "maxiocompat", policy_name, _policy_path] = command_args
+          Process.put(:cleanup_policy_name, policy_name)
+          {"created", 0}
 
-          subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
-            ["policy", "create", "maxiocompat", policy_name, _policy_path] = command_args
-            Process.put(:cleanup_policy_name, policy_name)
-            {"created", 0}
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "ls"] ->
+          {Process.get(:cleanup_policy_name), 0}
 
-          subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "ls"] ->
-            {Process.get(:cleanup_policy_name), 0}
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "info"] ->
+          {"PolicyName #{Process.get(:cleanup_policy_name)}", 0}
 
-          subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "info"] ->
-            {"PolicyName #{Process.get(:cleanup_policy_name)}", 0}
+        subcommand == "admin" and Enum.take(command_args, 2) == ["user", "info"] ->
+          {"Status: enabled", 0}
 
-          subcommand == "admin" and Enum.take(command_args, 2) == ["user", "info"] ->
-            {"Status: enabled", 0}
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "rm"] ->
+          calls = Process.get(:policy_remove_calls) + 1
+          Process.put(:policy_remove_calls, calls)
 
-          subcommand == "rm" ->
-            Process.put(:mc_cleanup_failed, true)
-            {"late cleanup failure", 9}
+          if calls == 1, do: {"removed", 0}, else: {"policy not found", 1}
 
-          true ->
-            {"ok", 0}
-        end
+        subcommand == "rm" and String.contains?(List.last(command_args), "-copy") ->
+          calls = Process.get(:delete_copied_calls) + 1
+          Process.put(:delete_copied_calls, calls)
+
+          if calls == 1, do: {"late cleanup failure", 9}, else: {"removed", 0}
+
+        true ->
+          {"ok", 0}
       end
     end
 
@@ -489,7 +485,56 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert entry["status"] == "blocked"
     assert [%{"step" => "delete_copied_object"}] = entry["blockers"]
-    assert Process.get(:cleanup_policy_remove_seen)
+    assert Process.get(:policy_remove_calls) == 1
+    assert Process.get(:delete_copied_calls) == 2
+    assert entry["scenario_counts"]["admin_policy_lifecycle"] == 4
+    assert entry["scenario_counts"]["cleanup"] == 4
+
+    assert Enum.all?(Enum.frequencies(Enum.map(entry["steps"], & &1["id"])), fn {_id, n} ->
+             n == 1
+           end)
+  end
+
+  test "failed first mc creation does not clean resources that were never created" do
+    owner = self()
+
+    runner = fn _command, args, _opts ->
+      ["--config-dir", _config_dir, subcommand | _command_args] = args
+
+      if subcommand == "mb" do
+        {"bucket creation failed", 9}
+      else
+        send(owner, {:unexpected_cleanup, args})
+        {"resource not found", 1}
+      end
+    end
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    assert entry["status"] == "blocked"
+
+    assert [%{"reason" => "external_smoke_step_failed", "step" => "make_bucket"}] =
+             entry["blockers"]
+
+    assert Enum.map(entry["steps"], & &1["id"]) == [
+             "make_bucket",
+             "admin_user_fixture_cleanup"
+           ]
+
+    assert entry["scenario_counts"] == %{
+             "bucket_lifecycle" => 1,
+             "cleanup" => 1
+           }
+
+    refute_received {:unexpected_cleanup, _args}
   end
 
   test "mc smoke blocks when stat output does not include metadata" do
@@ -665,10 +710,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     runner = fn command, args, opts ->
       Process.put(:proxy_env_calls, [{command, args, opts} | Process.get(:proxy_env_calls)])
 
-      if Enum.join(args, " ") =~ "importlib.util.find_spec('boto3')" do
-        {"", 0}
-      else
-        {"blocked for env inspection", 9}
+      cond do
+        Enum.join(args, " ") =~ "importlib.util.find_spec('boto3')" -> {"", 0}
+        "create-bucket" in args -> {"", 0}
+        "mb" in args -> {"", 0}
+        true -> {"blocked for env inspection", 9}
       end
     end
 
@@ -694,7 +740,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert Enum.map(entries, & &1["status"]) == ["blocked", "blocked", "blocked"]
 
     calls = Process.get(:proxy_env_calls)
-    assert length(calls) == 11
+    assert length(calls) == 8
     expected = "example.com,LOCALHOST,service.internal,127.0.0.1"
 
     Enum.each(calls, fn {_command, _args, opts} ->

@@ -336,14 +336,20 @@ defmodule Maxio.Compat.ExternalSmoke do
         ok_entry(spec, config, paths, started, step_views)
 
       {:blocked, step_views, blocker} ->
-        cleanup = run_cleanup_steps(cleanup_steps, command_runner, redactions)
+        cleanup =
+          cleanup_steps
+          |> pending_cleanup_steps(step_views)
+          |> run_cleanup_steps(command_runner, redactions)
 
         spec
         |> blocked_entry(config, paths, started, step_views, [blocker])
         |> merge_cleanup(cleanup, redactions)
 
       {:error, step_views, blocker} ->
-        cleanup = run_cleanup_steps(cleanup_steps, command_runner, redactions)
+        cleanup =
+          cleanup_steps
+          |> pending_cleanup_steps(step_views)
+          |> run_cleanup_steps(command_runner, redactions)
 
         spec.id
         |> error_entry(spec.label, started, step_views, [blocker], config, paths)
@@ -539,7 +545,11 @@ defmodule Maxio.Compat.ExternalSmoke do
     ]
 
     cleanup_steps =
-      select_steps(steps, ["delete_copied_object", "delete_object", "delete_bucket"])
+      select_cleanup_steps(steps, [
+        {"delete_copied_object", "copy_object"},
+        {"delete_object", "put_object"},
+        {"delete_bucket", "create_bucket"}
+      ])
 
     {steps, cleanup_steps}
   end
@@ -671,19 +681,24 @@ defmodule Maxio.Compat.ExternalSmoke do
     ]
 
     cleanup_steps =
-      select_steps(steps, [
-        "admin_policy_remove",
-        "delete_copied_object",
-        "delete_object",
-        "delete_bucket"
+      select_cleanup_steps(steps, [
+        {"admin_policy_remove", "admin_policy_create"},
+        {"delete_copied_object", "copy_object"},
+        {"delete_object", "put_object"},
+        {"delete_bucket", "make_bucket"}
       ])
 
     {steps, cleanup_steps}
   end
 
-  defp select_steps(steps, ids) do
+  defp select_cleanup_steps(steps, cleanup_pairs) do
     steps_by_id = Map.new(steps, &{&1.id, &1})
-    Enum.map(ids, &Map.fetch!(steps_by_id, &1))
+
+    Enum.map(cleanup_pairs, fn {cleanup_id, created_by} ->
+      steps_by_id
+      |> Map.fetch!(cleanup_id)
+      |> Map.put(:created_by, created_by)
+    end)
   end
 
   defp step(id, command, args, opts, metadata) when is_list(metadata) do
@@ -719,6 +734,18 @@ defmodule Maxio.Compat.ExternalSmoke do
       {:ok, step_views} -> {:ok, Enum.reverse(step_views)}
       other -> other
     end
+  end
+
+  defp pending_cleanup_steps(cleanup_steps, step_views) do
+    successful_ids =
+      step_views
+      |> Enum.filter(&(&1["status"] == "ok"))
+      |> MapSet.new(& &1["id"])
+
+    Enum.filter(cleanup_steps, fn step ->
+      MapSet.member?(successful_ids, step.created_by) and
+        not MapSet.member?(successful_ids, step.id)
+    end)
   end
 
   defp run_step(step, command_runner, redactions) do
@@ -850,7 +877,9 @@ defmodule Maxio.Compat.ExternalSmoke do
 
   defp merge_cleanup(entry, cleanup, redactions) do
     cleanup = redact_value(cleanup, redactions)
-    steps = entry["steps"] ++ cleanup.steps
+    existing_ids = MapSet.new(entry["steps"], & &1["id"])
+    unique_cleanup_steps = Enum.reject(cleanup.steps, &MapSet.member?(existing_ids, &1["id"]))
+    steps = entry["steps"] ++ unique_cleanup_steps
     blockers = entry["blockers"] ++ cleanup.blockers
 
     status =
