@@ -20,7 +20,7 @@
 - lock SQL 固定为 `SELECT pg_advisory_xact_lock(1297638214, hashtext($1))`；transaction 中第一条协调语句必须是该 lock，之后才能读 runtime rows。batch、现有单键 `set/reset` 和新本地 KVS CLI 均不得绕过。
 - 锁前只做 command/code-schema 的纯验证；任何依赖 current/effective snapshot、row existence、version、source 或未 patch sibling 的 validator 必须在 lock + authoritative read + patch 之后、mutation 之前执行。
 - runtime rows 与 audits 同一 transaction；任一 validation/DB/audit 失败整批回滚。set/reset no-op 不增 version、不写 audit、不 reload、不 broadcast。
-- commit 后 reload 或 broadcast 失败不得把已提交操作改报 5xx。local reload 失败仍须尝试 checked broadcast；返回结果和结构化日志只能携带枚举化 safe reason，不能携带值或异常 inspect。
+- commit 后 reload、broadcast 或 postcommit attention recorder 失败都不得把已提交操作改报 5xx。local reload 失败仍须尝试 checked broadcast；attention recorder 必须经 best-effort safe wrapper 捕获 raise、exit、transport error 与 unavailable。返回结果和结构化日志只能携带枚举化 safe reason，不能携带值或异常 inspect。
 - GET 必须先同步 `Store.reconcile!/1` 并经 `Maxio.Config` facade 取 effective value；不得直接查 Repo 后自行合并，也不得在权威不可达时用旧 snapshot 假成功。
 - 日志严禁 raw command、`key=value`、plaintext、ciphertext、old/new value、caller secret 或含这些内容的 `inspect(reason)`；只允许 subsystem、稳定 key 名/count、changed_count、apply modes、request_id、principal、auth type 和 postcommit 枚举结果。
 - 开发中只运行任务内 focused tests、changed-file format、`mix compile --warnings-as-errors`；独立双审关闭所有 Critical/Important 后，coherent batch 只运行一次 final `mix precommit`。
@@ -34,7 +34,7 @@
 ### Existing files to modify
 
 - `lib/maxio/config.ex`：当前 public read/write facade；`set/4`、`reset/3` 的旧逐键事务和 `Notify.broadcast/1` 必须迁入共享 coordinator。
-- `lib/maxio/config/store.ex`：已有 full load、digest reconcile、legacy三元 config event handler 和 status；增加二元 subsystem event与有界 postcommit attention。
+- `lib/maxio/config/store.ex`：已有 full load、digest reconcile、legacy三元 config event handler 和 status；增加二元 subsystem event与有界 postcommit attention，所有 recorder 调用由 coordinator 的 best-effort wrapper 隔离。
 - `lib/maxio/cluster/notify.ex`：已有 `broadcast_checked/1`；扩展 event type 为 `{:config_changed, subsystem}`，保留三元 legacy event。
 - `lib/maxio/cluster/cache_invalidator.ex`：显式认领二元和三元 config event 为已知 no-op。
 - `lib/maxio/admin/plug.ex`：增加三条 exact v3 route、ConfigUpdate auth、caller-secret envelope 和精确 entity response。
@@ -180,6 +180,20 @@ prometheus_metrics public=false<SP><LF>
 
 `mutate_subsystem/3` opts 固定支持 `source`、`principal_arn`、`access_key_id`、`request_id`、可选 `expected_versions` map 和 candidate `validator`。production caller 不得传 test dependency；`Coordinator` 的 `repo/schema/store/notify/checkpoint` dependency injection 只用于 `test/support` 的确定性失败与时序证明。
 
+Coordinator 内部 attention recorder 结果只允许以下安全枚举；它不加入 `batch_result`，不能覆盖已经冻结的 `local_reload`、`broadcast`、`attention?` 或 committed truth：
+
+```elixir
+@type attention_record_result ::
+  :not_needed
+  | :ok
+  | {:error,
+     :recorder_raised
+     | :recorder_exited
+     | :recorder_transport_failed
+     | :recorder_unavailable
+     | :recorder_failed}
+```
+
 ---
 
 ## Ownership and Review Lanes
@@ -314,6 +328,8 @@ end
 - Modify: `lib/maxio/config/store.ex`
 - Modify: `lib/maxio/cluster/notify.ex`
 - Modify: `lib/maxio/cluster/cache_invalidator.ex`
+- Modify: `lib/maxio/s3/log.ex`
+- Modify: `config/config.exs`
 - Create: `test/maxio/config/coordinator_postcommit_test.exs`
 - Create: `test/maxio/config/store_batch_event_test.exs`
 - Create: `test/support/config_postcommit_store.ex`
@@ -324,7 +340,7 @@ end
 **Interfaces:**
 
 - Consumes: committed batch result from Task 3, `Store.load_all!/1`, `Notify.broadcast_checked/1` and existing digest reconcile.
-- Produces: exactly one full local reload, one `{:config_changed, subsystem}` checked broadcast, safe result enums, attention status and legacy event compatibility.
+- Produces: exactly one full local reload, one `{:config_changed, subsystem}` checked broadcast, safe result enums, attention status and legacy event compatibility. Attention-recorder failure is a log-only safe enum and cannot replace or mutate the committed `batch_result`.
 
 **Critical implementation shape:**
 
@@ -333,25 +349,47 @@ local_reload = safe_reload(store, repo, subsystem)
 broadcast = safe_broadcast(notify, {:config_changed, subsystem})
 attention? = match?({:error, _}, local_reload) or match?({:error, _}, broadcast)
 
-if attention? do
-  store.note_postcommit_attention(%{
-    subsystem: subsystem,
-    local_reload: local_reload,
-    broadcast: broadcast
-  })
-end
+attention_record =
+  if attention? do
+    safe_record_attention(store, %{
+      subsystem: subsystem,
+      local_reload: local_reload,
+      broadcast: broadcast
+    })
+  else
+    :not_needed
+  end
+
+log_postcommit(subsystem, local_reload, broadcast, attention?, attention_record)
 
 %{committed?: true, local_reload: local_reload, broadcast: broadcast,
   attention?: attention?}
+
+defp safe_record_attention(store, fields) do
+  case store.note_postcommit_attention(fields) do
+    :ok -> :ok
+    {:error, :unavailable} -> {:error, :recorder_unavailable}
+    {:error, :transport} -> {:error, :recorder_transport_failed}
+    {:error, {:transport, _discarded}} -> {:error, :recorder_transport_failed}
+    {:error, _discarded} -> {:error, :recorder_failed}
+    _unexpected -> {:error, :recorder_failed}
+  end
+rescue
+  _error -> {:error, :recorder_raised}
+catch
+  :exit, _reason -> {:error, :recorder_exited}
+  _kind, _reason -> {:error, :recorder_failed}
+end
 ```
 
-- [ ] **Step 1: Lane A writes postcommit RED.** Assert changed batch commits before callbacks, calls full reload once then checked broadcast once, attempts broadcast after reload failure, never retries mutation, and maps injected raise/exit/transport error to fixed atoms without values.
+- [ ] **Step 1: Lane A writes postcommit RED.** Assert changed batch commits before callbacks, calls full reload once then checked broadcast once, attempts broadcast after reload failure, never retries mutation, and maps injected reload/broadcast dependency raise, exit and transport errors to fixed atoms without values.
 - [ ] **Step 2: Lock commit-truth cases.** Reload failure returns committed result with `local_reload: {:error, :reload_failed}`, omitted applied eligibility and visible attention; broadcast failure remains committed and does not imply restart; both failures preserve rows/audits. No-op calls neither dependency and is applied-eligible.
-- [ ] **Step 3: Lock event/reconcile cases.** Store handles new two-tuple event with one full load, continues handling legacy three-tuple, CacheInvalidator recognizes both as no-op, and a deliberately dropped broadcast converges through digest reconcile with `last_reload_reason: :reconcile`.
-- [ ] **Step 4: Prove RED and commit tests.** Run the four affected suites; expected failures name missing two-tuple event/postcommit result/attention. Commit Lane A files with `test(config): specify committed postcommit truth`.
-- [ ] **Step 5: Lane B implements postcommit.** Catch reload and checked-broadcast failures independently after transaction success; call `Store.note_postcommit_attention/1` with only subsystem/result atoms; return `attention?: true` without rewriting commit status.
-- [ ] **Step 6: Extend Store and events.** Add bounded latest attention data to Store status; never store values/reasons containing values. Handle two-tuple event with full reload and recognize it in CacheInvalidator. Keep legacy three-tuple until a later migration batch.
-- [ ] **Step 7: Run GREEN and commit.** Run focused tests and `mix compile --warnings-as-errors`; commit production files with `feat(config): report postcommit convergence`.
+- [ ] **Step 3: Lock recorder-after-failure RED.** For a committed row/audit, inject reload failure followed separately by recorder raise, exit and `{:error, :unavailable}`; inject broadcast failure followed by recorder `{:error, :transport}` and `{:error, {:transport, secret_bearing_reason}}`. Every case must return the original committed result, keep HTTP-facing status eligible for 200, preserve the row/audit, avoid a second mutation, and never report a false rollback. Logs may contain only `recorder_raised|recorder_exited|recorder_unavailable|recorder_transport_failed` plus safe subsystem/request metadata. Captured log and result must not contain the injected secret-bearing reason, submitted value, plaintext, ciphertext or caller secret.
+- [ ] **Step 4: Lock event/reconcile cases.** Store handles new two-tuple event with one full load, continues handling legacy three-tuple, CacheInvalidator recognizes both as no-op, and a deliberately dropped broadcast converges through digest reconcile with `last_reload_reason: :reconcile`.
+- [ ] **Step 5: Prove RED and commit tests.** Run `mix test test/maxio/config/coordinator_postcommit_test.exs test/maxio/config/store_batch_event_test.exs test/maxio/config/config_test.exs test/maxio/cluster/notify_test.exs`; expected failures name the unsafe bare recorder, missing two-tuple event/postcommit result/attention and missing safe metadata. Commit Lane A files with `test(config): specify committed postcommit truth`.
+- [ ] **Step 6: Lane B implements postcommit and safe recorder.** Catch reload and checked-broadcast failures independently after transaction success; when either needs attention, call `Store.note_postcommit_attention/1` only through `safe_record_attention/2`. Normalize raise, exit, transport, unavailable and all unknown returns to the frozen safe enum, log that enum, discard the underlying term, and return `attention?: true` without rewriting commit status or throwing.
+- [ ] **Step 7: Extend Store, events and safe logging.** Add bounded latest attention data to Store status; never store values/reasons containing values. Handle two-tuple event with full reload and recognize it in CacheInvalidator. Keep legacy three-tuple until a later migration batch. Add only `config_attention_record` to both `Maxio.S3.Log` and Logger formatter allowlists in this task.
+- [ ] **Step 8: Run GREEN and commit.** Run the exact focused command from Step 5 plus `mix compile --warnings-as-errors`; commit production files with `feat(config): report postcommit convergence`.
 
 ### Task 5: Add typed Adapter and authoritative GET projection
 
@@ -474,12 +512,12 @@ end
 - [ ] **Step 1: Lane A writes dispatch/entity RED.** Exact methods/paths leave 501; wrong method, help/export/history, v4 and adjacent paths remain existing authenticated 501. Missing GET key is authenticated 426; empty key reaches ConfigUpdate then 400. Assert every request/response CL/TE/CT/body cell from Frozen Protocol Contract.
 - [ ] **Step 2: Lane A writes auth RED.** For each route cover root, exact allow, no policy, explicit deny, STS boundary and bucket-policy attempted grant. GET requires ConfigUpdate. Denied mutation with body-read probe returns AccessDenied and reads zero bytes.
 - [ ] **Step 3: Lane A writes error-priority RED.** Combine auth/framing/hash/decrypt/parser/exposure/type/DB failures and assert only the first stage’s exact code/status/message/resource/request_id. Lock unknown subsystem 400, ordinary reset-key 404, hidden reset deliberate 400 and forbidden 403.
-- [ ] **Step 4: Lane A writes success/postcommit RED.** Decrypt GET and compare exact plaintext; changed/no-op applied true; `:next_cycle` remains true; reload failure omits header; broadcast failure keeps true; future injected restart apply mode omits header. Mutation body is exactly empty.
-- [ ] **Step 5: Lane A writes log redaction RED.** Capture success/failure logs and require action/subsystem/key count/changed count/request_id/principal/auth/postcommit enums while rejecting raw command, known submitted value, plaintext, ciphertext hex, old/new maps and caller secret.
+- [ ] **Step 4: Lane A writes success/postcommit RED.** Decrypt GET and compare exact plaintext; changed/no-op applied true; `:next_cycle` remains true; reload failure omits header; broadcast failure keeps true; future injected restart apply mode omits header. For both reload-failed and broadcast-failed paths, a subsequent attention recorder raise/exit/error must still produce committed HTTP 200 with the header decision derived only from apply modes + local reload. Mutation body is exactly empty.
+- [ ] **Step 5: Lane A writes log redaction RED.** Capture success/failure logs and require action/subsystem/key count/changed count/request_id/principal/auth/postcommit enums plus safe `config_attention_record`, while rejecting raw command, known submitted value, plaintext, ciphertext hex, old/new maps, recorder reason and caller secret.
 - [ ] **Step 6: Prove RED and commit tests.** Run endpoint/auth/error/plug tests; commit Lane A changes with `test(admin): specify config KVS endpoints`.
 - [ ] **Step 7: Lane B adds public errors.** Add `admin_version_mismatch`, `config_error` and `config_not_found` entries with pinned code/status/default message; ErrorMap tuple clauses may override only safe pinned descriptions.
 - [ ] **Step 8: Lane B adds thin handlers.** Missing-key route fallback does not parse body. Concrete handlers authorize ConfigUpdate first, obtain exact caller secret, call Request/Adapter once with `source: "admin_api"` plus principal/access-key/request-id audit context, and render exact response. Applied header predicate uses only apply modes + local reload, never broadcast success.
-- [ ] **Step 9: Lane B updates log allowlists.** Add only `config_key_count`, `config_changed_count`, `config_apply_modes`, `config_local_reload`, `config_broadcast`, `config_attention` and `config_failure_stage` to both `Log` and formatter config.
+- [ ] **Step 9: Lane B updates remaining log allowlists.** Preserve Task 4 的 `config_attention_record` and add only `config_key_count`, `config_changed_count`, `config_apply_modes`, `config_local_reload`, `config_broadcast`, `config_attention` and `config_failure_stage` to both `Log` and formatter config.
 - [ ] **Step 10: Run GREEN and commit.** Run `mix test test/maxio/admin/config_kv_endpoint_test.exs test/maxio/admin/authz_test.exs test/maxio/admin/error_map_test.exs test/maxio/admin/plug_test.exs`; run compile; commit production files with `feat(admin): expose config KVS endpoints`.
 
 ### Task 8: Add first-party Config KVS Mix CLI without duplicating logic
@@ -563,7 +601,7 @@ reset_args = ["admin", "config", "reset", alias_name,
 
 - [ ] **Step 1: Lane B runs author checks without precommit.** Run all focused commands above together, changed-file `mix format --check-formatted`, `mix compile --warnings-as-errors`, and `git diff --check b816897..HEAD`. Any failure returns to Lane A for a failing regression and Lane B for the minimal architecture-consistent fix.
 - [ ] **Step 2: Lane C performs protocol/client review.** Audit pins/excerpt hashes, three routes/ConfigUpdate, missing-vs-empty key, exact CL/TE/CT/body, caller-secret SIO, error priority/mapping, single-line versus multi-line parser, hidden/forbidden/reset distinctions, same-body/full-retry correction, KVS trailing space, non-TTY compact JSON and help/export/history/target non-goals. Any invented duplicate/unknown gate or upstream 404 claim is Important.
-- [ ] **Step 3: Lane D performs architecture/concurrency review.** Audit Admin→Adapter→Config boundary, literal registry, no atom creation, advisory lock as first transaction coordination, lock/read/patch/validator/mutation order, atomic audit/version, single-key delegation, no-op, commit-truth, checked broadcast, Store attention/reconcile, authoritative GET and log redaction. Any direct Admin Repo access, postcommit rollback fiction, unlocked old writer or migration is Important.
+- [ ] **Step 3: Lane D performs architecture/concurrency review.** Audit Admin→Adapter→Config boundary, literal registry, no atom creation, advisory lock as first transaction coordination, lock/read/patch/validator/mutation order, atomic audit/version, single-key delegation, no-op, commit-truth, checked broadcast, best-effort safe attention recorder, Store attention/reconcile, authoritative GET and log redaction. A recorder raise/exit/error that can escape after commit, any raw recorder reason in logs, direct Admin Repo access, postcommit rollback fiction, unlocked old writer or migration is Important.
 - [ ] **Step 4: Lane A/B close findings.** Lane A adds a failing regression for each accepted finding; Lane B fixes production only; rerun owning focused suite and commit. Lanes C and D re-review the amended range until both report no Critical/Important.
 - [ ] **Step 5: Lane E runs combined focused batch.** Run all new ConfigKV/coordinator/event/endpoint/CLI/smoke suites plus affected existing config/admin/envelope/control-body/notify/prometheus tests. Record exact commands, exits and counts for STATUS.
 - [ ] **Step 6: Run the single final precommit gate.** After dual approval and clean focused/compile/format/diff evidence, Lane E runs `mix precommit` once. If later production/test code changes, the recorded gate is invalid; reopen focused review and retain only the replacement final result as completion evidence.
@@ -587,7 +625,7 @@ reset_args = ["admin", "config", "reset", alias_name,
 
 - Modify only: `docs/superpowers/STATUS.md`
 
-- [ ] **Step 1: Record implementation facts.** Add exact routes/action/framing, three extension keys, parser deviations, atomic advisory-lock coordinator, single-key migration, audit/version/no-op, postcommit truth, authoritative GET, CLI and metrics data-plane behavior.
+- [ ] **Step 1: Record implementation facts.** Add exact routes/action/framing, three extension keys, parser deviations, atomic advisory-lock coordinator, single-key migration, audit/version/no-op, postcommit truth including best-effort attention recorder isolation, authoritative GET, CLI and metrics data-plane behavior.
 - [ ] **Step 2: Record evidence.** Include commit range, combined focused command/count, compile/format/diff, Lane C/D verdicts, the single final precommit result, pinned human/JSON live result and V-KV3 PASS or exact BLOCKED reason.
 - [ ] **Step 3: Record remaining scope.** Keep help/export/history/targets/official catalog/secrets/backend bindings/service restart explicit; do not claim full MinIO config compatibility or production readiness.
 - [ ] **Step 4: Lane F reviews STATUS.** Cross-check every “implemented/passed” sentence against commits, command output and live artifact. Fixture-derived bytes must not be described as observed live when strict live was blocked.
