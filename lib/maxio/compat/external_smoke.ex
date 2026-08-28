@@ -1297,6 +1297,15 @@ defmodule Maxio.Compat.ExternalSmoke do
 
     [
       step(
+        "admin_group_human_list_baseline_empty",
+        executable,
+        ["admin", "group", "ls", alias_name],
+        opts,
+        {:output_exact, "\n"},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "isolated human group baseline is exactly the one-LF empty list"
+      ),
+      step(
         "admin_group_human_add",
         executable,
         ["admin", "group", "add", alias_name, group_name, user_name],
@@ -1338,9 +1347,9 @@ defmodule Maxio.Compat.ExternalSmoke do
         executable,
         ["admin", "group", "ls", alias_name],
         opts,
-        {:output_contains, [group_name]},
+        {:output_exact, "#{group_name}\n"},
         scenario: "admin_group_human_lifecycle",
-        assertion: "mc group ls contains the temporary group"
+        assertion: "mc group ls is exactly the sorted temporary group and one trailing LF"
       ),
       step(
         "admin_group_human_info",
@@ -1432,6 +1441,15 @@ defmodule Maxio.Compat.ExternalSmoke do
         {:output_exact, "Removed group #{group_name} successfully.\n"},
         scenario: "admin_group_human_lifecycle",
         assertion: "mc removes the now-empty temporary group"
+      ),
+      step(
+        "admin_group_human_list_after_remove",
+        executable,
+        ["admin", "group", "ls", alias_name],
+        opts,
+        {:output_exact, "\n"},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "post-delete human group list is exactly the one-LF empty list"
       )
     ]
   end

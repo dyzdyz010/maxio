@@ -514,6 +514,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "admin_user_human_info_reenabled",
              "admin_user_human_mc_ls_reenabled",
              "admin_policy_human_cleanup_detach",
+             "admin_group_human_list_baseline_empty",
              "admin_group_human_add",
              "admin_group_human_mc_ls_baseline_denied",
              "admin_group_human_attach",
@@ -528,6 +529,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "admin_group_human_mc_ls_removed",
              "admin_group_human_cleanup_detach",
              "admin_group_human_remove",
+             "admin_group_human_list_after_remove",
              "admin_user_human_remove",
              "admin_user_human_remove_again",
              "admin_user_human_remove_root",
@@ -580,7 +582,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert entry["scenario_counts"]["admin_user_info"] == 1
     assert entry["scenario_counts"]["admin_user_human_lifecycle"] == 10
     assert entry["scenario_counts"]["admin_user_json_lifecycle"] == 8
-    assert entry["scenario_counts"]["admin_group_human_lifecycle"] == 14
+    assert entry["scenario_counts"]["admin_group_human_lifecycle"] == 16
     assert entry["scenario_counts"]["admin_group_json_lifecycle"] == 14
 
     encoded = Jason.encode!(entry)
@@ -599,7 +601,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert config_dir |> Path.dirname() |> Path.dirname() |> Path.expand() |> Path.split() ==
              tmp_root |> Path.expand() |> Path.split()
 
-    assert length(calls) == 82
+    assert length(calls) == 84
 
     Enum.each(calls, fn {command, args, opts} ->
       assert command == "mc.exe"
@@ -974,13 +976,21 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert entry["status"] == "ok"
     calls = Process.get(:group_mc_calls) |> Enum.reverse()
-    assert length(calls) == 18
+    assert length(calls) == 20
 
     {human, json} = Enum.split_with(calls, fn {_command, args, _opts} -> "--json" not in args end)
-    assert length(human) == 9
+    assert length(human) == 11
     assert length(json) == 9
 
-    assert {"mc.exe", ["admin", "group", "add", "maxiocompat" | _], human_opts} = hd(human)
+    assert [
+             {"mc.exe", ["admin", "group", "ls", "maxiocompat"], human_opts},
+             {"mc.exe", ["admin", "group", "add", "maxiocompat" | _], _add_opts}
+             | _rest
+           ] = human
+
+    assert {"mc.exe", ["admin", "group", "ls", "maxiocompat"], _after_remove_opts} =
+             List.last(human)
+
     refute "--config-dir" in elem(hd(human), 1)
 
     assert {"MC_CONFIG_DIR", _dir} =
@@ -995,6 +1005,43 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
       assert Path.basename(config_dir) == "mc-config-json"
     end)
+  end
+
+  for mutation <- [:extra_group, :unsorted, :missing_lf, :double_lf] do
+    @human_group_list_mutation mutation
+    test "human group list exact bytes reject #{mutation}" do
+      mutation = @human_group_list_mutation
+      base_runner = successful_mc_runner()
+
+      runner = fn command, args, opts ->
+        result = base_runner.(command, args, opts)
+
+        case {result, json_mode?(args), admin_group_action(args)} do
+          {{stdout, 0}, false, action} when action in ["ls", "list"] ->
+            if Process.get(:admin_group_exists) do
+              {mutate_human_group_list(stdout, mutation), 0}
+            else
+              result
+            end
+
+          _other ->
+            result
+        end
+      end
+
+      [entry] =
+        @config
+        |> Map.put(:clients, ["minio_mc"])
+        |> ExternalSmoke.run(
+          executable_finder: fn "mc" -> "mc.exe" end,
+          command_runner: runner,
+          tmp_root_fun: &tmp_root/0,
+          admin_user_fixture_opts: fixture_opts(self())
+        )
+
+      assert entry["status"] == "blocked"
+      assert hd(entry["blockers"])["step"] == "admin_group_human_list"
+    end
   end
 
   for mutation <- [:missing_lf, :double_lf, :pretty] do
@@ -2006,6 +2053,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         Process.put(:admin_fixture_status, :enabled)
         Process.put(:admin_fixture_policy_attached, false)
         Process.put(:admin_group_policy_attached, false)
+        Process.put(:admin_group_exists, false)
         Process.put(:admin_group_member, false)
         Process.put(:admin_group_status, :enabled)
         send(owner, {:admin_fixture_created, name})
@@ -2057,6 +2105,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   defp append_lifecycle_trace(value) do
     Process.put(:admin_lifecycle_trace, [value | Process.get(:admin_lifecycle_trace, [])])
   end
+
+  defp mutate_human_group_list(output, :extra_group), do: output <> "unexpected-group\n"
+  defp mutate_human_group_list(output, :unsorted), do: "z-group\n" <> output
+  defp mutate_human_group_list(output, :missing_lf), do: String.trim_trailing(output, "\n")
+  defp mutate_human_group_list(output, :double_lf), do: output <> "\n"
 
   defp put_json_mode({:mc, :json_mode, action}, json?), do: {:mc, json?, action}
 
@@ -2194,6 +2247,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         subcommand == "admin" and Enum.take(command_args, 2) == ["group", "add"] ->
           ["group", "add", _mc_alias, group_name, member_name] = command_args
           Process.put(:admin_group_name, group_name)
+          Process.put(:admin_group_exists, true)
           Process.put(:admin_group_member_name, member_name)
           Process.put(:admin_group_member, true)
           Process.put(:admin_group_status, :enabled)
@@ -2208,9 +2262,13 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             Enum.take(command_args, 2) in [["group", "ls"], ["group", "list"]] ->
           group_name = Process.get(:admin_group_name)
 
-          if json?,
-            do: {json_group_output(:list, group_name, nil), 0},
-            else: {"#{group_name}\n", 0}
+          if Process.get(:admin_group_exists) do
+            if json?,
+              do: {json_group_output(:list, group_name, nil), 0},
+              else: {"#{group_name}\n", 0}
+          else
+            {"\n", 0}
+          end
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["group", "info"] ->
           group_name = List.last(command_args)
@@ -2256,6 +2314,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
               end
 
             ["group", "remove", _mc_alias, group_name] ->
+              Process.put(:admin_group_exists, false)
+
               if json?,
                 do: {json_group_output(:remove_group, group_name, nil), 0},
                 else: {"Removed group #{group_name} successfully.\n", 0}
