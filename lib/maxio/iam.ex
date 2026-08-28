@@ -1174,37 +1174,17 @@ defmodule Maxio.IAM do
         :ok
 
       %User{} = initial ->
-        snapshot = {:existing, initial.id}
-
-        Repo.transaction(fn ->
-          with {:ok, %User{} = user} <-
-                 UserIdentity.lock_snapshot(Repo, initial.user_name, snapshot) do
-            credential_ids = UserIdentity.descendant_credential_ids(Repo, user)
-            session_access_key_ids = revoke_user_sessions(user.user_arn, credential_ids.long_term)
-
-            Repo.delete_all(from p in PrincipalPolicy, where: p.principal_arn == ^user.user_arn)
-            Repo.delete_all(from m in MFADevice, where: m.principal_arn == ^user.user_arn)
-            Repo.delete_all(from a in AccessKey, where: a.principal_arn == ^user.user_arn)
-            Repo.delete_all(from c in SigningCertificate, where: c.user_arn == ^user.user_arn)
-            Repo.delete_all(from k in SSHPublicKey, where: k.user_arn == ^user.user_arn)
-            Repo.delete!(user)
-
-            {user.user_arn,
-             Enum.uniq(
-               credential_ids.long_term ++ credential_ids.sessions ++ session_access_key_ids
-             )}
-          else
-            {:error, :user_not_found} -> Repo.rollback(:already_missing)
-            {:error, reason} -> Repo.rollback(reason)
-          end
-        end)
+        delete_user_cascade_transaction(initial.user_name, {:existing, initial.id})
         |> case do
-          {:ok, {user_arn, credential_ids}} ->
-            Notify.broadcast({:principal_policy_changed, user_arn})
-            Enum.each(credential_ids, &Notify.broadcast({:iam_changed, &1}))
+          {:ok, result} ->
+            _invalidation =
+              invalidate_minio_credentials_after_commit(result.credential_ids, [
+                {:principal_policy_changed, result.user.user_arn}
+              ])
+
             :ok
 
-          {:error, :already_missing} ->
+          {:error, {:error, reason}} when reason in [:user_not_found, :identity_changed] ->
             :ok
 
           {:error, reason} ->
@@ -1214,6 +1194,53 @@ defmodule Maxio.IAM do
   end
 
   def delete_user(_user_name_or_arn), do: {:error, :malformed}
+
+  @doc "Atomically removes a MinIO regular user and permanently revokes descendant sessions."
+  @spec delete_minio_user_strict(String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def delete_minio_user_strict(user_name, actor_access_key_id)
+      when is_binary(user_name) and is_binary(actor_access_key_id) do
+    with :ok <- classify_static_minio_remove_target(user_name, actor_access_key_id) do
+      snapshot = UserIdentity.snapshot(Repo, user_name)
+
+      Repo.transaction(fn ->
+        with {:ok, %User{} = user} <- lock_minio_remove_target(Repo, user_name, snapshot),
+             {:ok, result} <- delete_locked_user_cascade(Repo, user) do
+          result
+        else
+          {:error, reason} -> Repo.rollback({:error, reason})
+        end
+      end)
+      |> case do
+        {:ok, result} ->
+          invalidation =
+            invalidate_minio_credentials_after_commit(result.credential_ids, [
+              {:principal_policy_changed, result.user.user_arn}
+            ])
+
+          {:ok,
+           %{
+             user: result.user,
+             affected: result.affected,
+             invalidation: invalidation
+           }}
+
+        {:error, {:error, reason}} when reason in [:user_not_found, :identity_changed] ->
+          {:error, :minio_user_not_found}
+
+        {:error, {:error, reason}} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def delete_minio_user_strict(_user_name, _actor_access_key_id),
+    do: {:error, :invalid_argument}
 
   @doc "Deletes an IAM user only when no subordinate IAM resources remain."
   @spec delete_user_strict(String.t()) :: {:ok, map()} | {:error, term()}
@@ -4234,43 +4261,6 @@ defmodule Maxio.IAM do
     |> Enum.each(&Notify.broadcast({:iam_changed, &1}))
   end
 
-  defp revoke_user_sessions(user_arn, access_key_ids) do
-    now = utc_now()
-    revoke_user_sessions(user_arn, MapSet.new(access_key_ids), MapSet.new(), now)
-  end
-
-  defp revoke_user_sessions(user_arn, issuer_ids, revoked_ids, now) do
-    issuer_list = MapSet.to_list(issuer_ids)
-
-    newly_revoked =
-      Repo.all(
-        from s in STSSession,
-          where:
-            s.status == "active" and
-              (s.principal_arn == ^user_arn or s.issuer_access_key_id in ^issuer_list),
-          select: s.access_key_id
-      )
-      |> Enum.reject(&MapSet.member?(revoked_ids, &1))
-
-    case newly_revoked do
-      [] ->
-        MapSet.to_list(revoked_ids)
-
-      access_key_ids ->
-        Repo.update_all(
-          from(s in STSSession, where: s.access_key_id in ^access_key_ids),
-          set: [status: "revoked", revoked_at: now, updated_at: now]
-        )
-
-        revoke_user_sessions(
-          user_arn,
-          MapSet.union(issuer_ids, MapSet.new(access_key_ids)),
-          MapSet.union(revoked_ids, MapSet.new(access_key_ids)),
-          now
-        )
-    end
-  end
-
   defp default_role_arn(role_name) when is_binary(role_name) and role_name != "",
     do: role_arn(role_name)
 
@@ -5694,6 +5684,138 @@ defmodule Maxio.IAM do
           {:error, :minio_user_not_found}
       end
     end
+  end
+
+  defp classify_static_minio_remove_target(user_name, actor_access_key_id) do
+    root_access_key_id =
+      Application.fetch_env!(:maxio, :s3)
+      |> Keyword.fetch!(:root_user)
+
+    cond do
+      user_name == root_access_key_id -> {:error, :minio_user_not_found}
+      user_name == actor_access_key_id -> {:error, :minio_action_not_allowed}
+      true -> :ok
+    end
+  end
+
+  defp lock_minio_remove_target(repo, user_name, snapshot) do
+    with {:ok, identity} <- UserIdentity.lock_snapshot(repo, user_name, snapshot),
+         :ok <- CredentialNamespace.lock_exact(repo, user_name) do
+      expected_user_arn = user_arn(user_name)
+
+      cond do
+        repo.exists?(from(s in STSSession, where: s.access_key_id == ^user_name)) ->
+          {:error, :minio_action_not_allowed}
+
+        match?(
+          %AccessKey{principal_arn: principal_arn} when principal_arn != expected_user_arn,
+          repo.get_by(AccessKey, access_key_id: user_name)
+        ) ->
+          {:error, :minio_action_not_allowed}
+
+        match?(%User{}, identity) ->
+          {:ok, identity}
+
+        true ->
+          {:error, :minio_user_not_found}
+      end
+    end
+  end
+
+  defp delete_user_cascade_transaction(user_name, snapshot) do
+    Repo.transaction(fn ->
+      with {:ok, %User{} = user} <- UserIdentity.lock_snapshot(Repo, user_name, snapshot),
+           {:ok, result} <- delete_locked_user_cascade(Repo, user) do
+        result
+      else
+        {:error, reason} -> Repo.rollback({:error, reason})
+      end
+    end)
+  end
+
+  defp delete_locked_user_cascade(repo, %User{} = user) do
+    credential_projection = UserIdentity.descendant_credential_ids(repo, user)
+
+    credential_ids =
+      Enum.uniq(credential_projection.long_term ++ credential_projection.sessions)
+
+    credential_ids
+    |> Enum.sort()
+    |> Enum.each(&CredentialNamespace.lock_exact(repo, &1))
+
+    access_key_rows =
+      repo.all(
+        from(a in AccessKey,
+          where: a.principal_arn == ^user.user_arn,
+          order_by: [asc: a.access_key_id],
+          lock: "FOR UPDATE"
+        )
+      )
+
+    session_rows =
+      repo.all(
+        from(s in STSSession,
+          where: s.access_key_id in ^credential_projection.sessions,
+          order_by: [asc: s.access_key_id],
+          lock: "FOR UPDATE"
+        )
+      )
+
+    membership_count =
+      repo.aggregate(
+        from(m in GroupMembership, where: m.user_arn == ^user.user_arn),
+        :count
+      )
+
+    managed_attachment_count =
+      repo.aggregate(
+        from(a in UserManagedPolicyAttachment, where: a.user_arn == ^user.user_arn),
+        :count
+      )
+
+    now = utc_now()
+    session_ids = Enum.map(session_rows, & &1.access_key_id)
+
+    {sessions_revoked, nil} =
+      repo.update_all(
+        from(s in STSSession,
+          where: s.access_key_id in ^session_ids and s.status != "revoked"
+        ),
+        set: [status: "revoked", revoked_at: now, updated_at: now]
+      )
+
+    {principal_policies_deleted, nil} =
+      repo.delete_all(from(p in PrincipalPolicy, where: p.principal_arn == ^user.user_arn))
+
+    {mfa_devices_deleted, nil} =
+      repo.delete_all(from(m in MFADevice, where: m.principal_arn == ^user.user_arn))
+
+    {access_keys_deleted, nil} =
+      repo.delete_all(from(a in AccessKey, where: a.principal_arn == ^user.user_arn))
+
+    {signing_certificates_deleted, nil} =
+      repo.delete_all(from(c in SigningCertificate, where: c.user_arn == ^user.user_arn))
+
+    {ssh_public_keys_deleted, nil} =
+      repo.delete_all(from(k in SSHPublicKey, where: k.user_arn == ^user.user_arn))
+
+    repo.delete!(user)
+
+    {:ok,
+     %{
+       user: public_user(user),
+       credential_ids: Enum.uniq(Enum.map(access_key_rows, & &1.access_key_id) ++ session_ids),
+       affected: %{
+         access_keys_deleted: access_keys_deleted,
+         sessions_revoked: sessions_revoked,
+         principal_policies_deleted: principal_policies_deleted,
+         memberships_deleted: membership_count,
+         managed_policy_attachments_deleted: managed_attachment_count,
+         mfa_devices_deleted: mfa_devices_deleted,
+         signing_certificates_deleted: signing_certificates_deleted,
+         ssh_public_keys_deleted: ssh_public_keys_deleted
+       }
+     }}
   end
 
   defp invalidate_minio_credentials_after_commit(credential_ids, legacy_events) do

@@ -4,7 +4,19 @@ defmodule Maxio.IAM.MinioAdminUserTest do
   alias Maxio.Auth.CredentialStore.EctoStore
   alias Maxio.Cluster.Notify
   alias Maxio.IAM
-  alias Maxio.IAM.{AccessKey, AccessKeySecret, STSSession, User}
+
+  alias Maxio.IAM.{
+    AccessKey,
+    AccessKeySecret,
+    CredentialNamespace,
+    Group,
+    GroupMembership,
+    MFADevice,
+    STSSession,
+    User
+  }
+
+  alias Maxio.Policy.PrincipalPolicy
   alias Maxio.S3.Plugs.SigV4
   alias Maxio.STS
   alias Maxio.Test.SigV4Request
@@ -406,6 +418,205 @@ defmodule Maxio.IAM.MinioAdminUserTest do
 
     after_write = Repo.get_by!(User, user_name: user.user_name)
     assert DateTime.compare(after_write.updated_at, before.updated_at) == :gt
+  end
+
+  test "U4 atomically cascades user state and permanently revokes descendant sessions" do
+    access_key = unique_access_key("REMOVE")
+    direct_key = unique_access_key("REMOVEDIRECT")
+    chained_key = unique_access_key("REMOVECHAIN")
+    direct_token = "remove-direct-token"
+    chained_token = "remove-chain-token"
+    group_name = "remove-group-#{System.unique_integer([:positive, :monotonic])}"
+    managed_policy_name = "remove-policy-#{System.unique_integer([:positive, :monotonic])}"
+
+    policy =
+      ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::remove/*"}})
+
+    assert {:ok, %{user: user}} =
+             IAM.create_minio_user_strict(access_key, "remove-user-secret", "active")
+
+    assert {:ok, subordinate} = IAM.create_access_key_strict(user.user_name)
+    assert {:ok, group} = IAM.create_group(name: group_name)
+
+    assert {:ok, managed_policy} =
+             IAM.create_managed_policy(name: managed_policy_name, document: policy)
+
+    assert :ok = IAM.add_user_to_group_strict(user.user_name, group.group_name)
+    assert :ok = IAM.put_user_policy_strict(user.user_name, "remove-inline", policy)
+    assert :ok = IAM.put_group_policy(group.group_name, "retained-inline", policy)
+    assert :ok = IAM.attach_user_policy(user.user_name, managed_policy.policy_arn)
+
+    assert {:ok, _mfa} =
+             IAM.create_mfa_device(
+               principal_arn: user.user_arn,
+               device_name: "remove-device",
+               serial: "arn:aws:iam:::mfa/#{user.user_name}"
+             )
+
+    assert {:ok, direct} =
+             STS.issue_session(
+               issuer_access_key_id: access_key,
+               session_access_key_id: direct_key,
+               secret_key: "remove-direct-secret",
+               session_token: direct_token,
+               duration_seconds: 900
+             )
+
+    chained =
+      Repo.insert!(%STSSession{
+        access_key_id: chained_key,
+        secret_key: "fixture-encrypted-secret",
+        session_token_sha256: :crypto.hash(:sha256, chained_token) |> Base.encode16(case: :lower),
+        issuer_access_key_id: direct_key,
+        principal_arn: "arn:aws:iam:::role/remove-chain",
+        principal_type: "assumed_role",
+        session_name: "remove-chain",
+        status: "active",
+        issued_at: direct.issued_at,
+        expires_at: direct.expires_at,
+        tags: %{}
+      })
+
+    assert {:ok, removed} = IAM.delete_minio_user_strict(user.user_name, direct_key)
+
+    assert removed.user.user_name == user.user_name
+    assert removed.affected.access_keys_deleted == 2
+    assert removed.affected.sessions_revoked == 2
+    assert removed.affected.principal_policies_deleted == 1
+    assert removed.affected.memberships_deleted == 1
+    assert removed.affected.managed_policy_attachments_deleted == 1
+    assert removed.affected.mfa_devices_deleted == 1
+    assert removed.invalidation.failures == []
+
+    refute Repo.get_by(User, id: user.id)
+    refute Repo.get_by(AccessKey, access_key_id: access_key)
+    refute Repo.get_by(AccessKey, access_key_id: subordinate.access_key_id)
+    refute Repo.get_by(PrincipalPolicy, principal_arn: user.user_arn)
+    refute Repo.get_by(GroupMembership, user_arn: user.user_arn)
+    refute Repo.get_by(MFADevice, principal_arn: user.user_arn)
+    assert Repo.get_by!(Group, group_name: group_name).id == group.id
+    assert {:ok, %{policy_arn: policy_arn}} = IAM.get_managed_policy(managed_policy.policy_arn)
+    assert policy_arn == managed_policy.policy_arn
+
+    assert [%{policy_name: "retained-inline"}] =
+             IAM.list_principal_policies(group.group_arn)
+
+    assert Repo.get_by!(STSSession, access_key_id: direct.access_key_id).status == "revoked"
+    assert Repo.get_by!(STSSession, access_key_id: chained.access_key_id).status == "revoked"
+
+    assert {:error, :access_key_id_conflict} =
+             Repo.transaction(fn -> CredentialNamespace.reserve_exact(Repo, direct_key) end)
+             |> elem(1)
+
+    assert {:ok, %{user: replacement}} =
+             IAM.create_minio_user_strict(access_key, "replacement-secret", "active")
+
+    refute replacement.id == user.id
+
+    now = DateTime.add(direct.issued_at, 1, :second)
+
+    assert {:error, :invalid_token} =
+             EctoStore.get_secret(direct_key, session_token: direct_token, now: now)
+
+    assert {:error, :invalid_token} =
+             EctoStore.get_secret(chained_key, session_token: chained_token, now: now)
+  end
+
+  test "U4 target classification and sequential removal are exact and mutation-free" do
+    access_key = unique_access_key("REMOVECLASS")
+    session_key = unique_access_key("REMOVECLASSSESSION")
+    assert {:ok, %{user: user}} = IAM.create_minio_user_strict(access_key, "secret", "active")
+    assert {:ok, subordinate} = IAM.create_access_key_strict(user.user_name)
+
+    assert {:ok, _session} =
+             STS.issue_session(
+               issuer_access_key_id: access_key,
+               session_access_key_id: session_key,
+               secret_key: "remove-class-session-secret",
+               session_token: "remove-class-session-token",
+               duration_seconds: 900
+             )
+
+    root_actor = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+
+    assert {:error, :minio_user_not_found} =
+             IAM.delete_minio_user_strict(root_actor, root_actor)
+
+    assert {:error, :minio_action_not_allowed} =
+             IAM.delete_minio_user_strict(user.user_name, access_key)
+
+    assert {:error, :minio_action_not_allowed} =
+             IAM.delete_minio_user_strict(session_key, root_actor)
+
+    assert {:error, :minio_action_not_allowed} =
+             IAM.delete_minio_user_strict(subordinate.access_key_id, root_actor)
+
+    assert Repo.get_by!(User, id: user.id).status == "active"
+    assert {:ok, _removed} = IAM.delete_minio_user_strict(user.user_name, root_actor)
+
+    assert {:error, :minio_user_not_found} =
+             IAM.delete_minio_user_strict(user.user_name, root_actor)
+  end
+
+  test "two concurrent U4 removals linearize to one success and one no-such-user" do
+    access_key = unique_access_key("REMOVERACE")
+
+    on_exit(fn ->
+      unboxed(fn ->
+        Repo.delete_all(from(a in AccessKey, where: a.access_key_id == ^access_key))
+        Repo.delete_all(from(u in User, where: u.user_name == ^access_key))
+      end)
+    end)
+
+    assert {:ok, %{user: user}} =
+             unboxed(fn -> IAM.create_minio_user_strict(access_key, "secret", "active") end)
+
+    parent = self()
+    barrier_ref = make_ref()
+    handler_id = {__MODULE__, barrier_ref}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:maxio, :iam, :user_identity, :lock_wait],
+        fn _event, _measurements, metadata, {test_pid, ref, target} ->
+          if metadata.case_folded_user_name == String.downcase(target) do
+            send(test_pid, {:u4_lock_wait, ref, self()})
+
+            receive do
+              {:release_u4_lock, ^ref} -> :ok
+            after
+              5_000 -> raise "U4 lock barrier timed out"
+            end
+          end
+        end,
+        {parent, barrier_ref, user.user_name}
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    root_actor = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+
+    tasks =
+      for _attempt <- 1..2 do
+        Task.async(fn ->
+          Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+            IAM.delete_minio_user_strict(user.user_name, root_actor)
+          end)
+        end)
+      end
+
+    waiting =
+      for _attempt <- 1..2 do
+        assert_receive {:u4_lock_wait, ^barrier_ref, pid}, 5_000
+        pid
+      end
+
+    Enum.each(waiting, &send(&1, {:release_u4_lock, barrier_ref}))
+    results = Enum.map(tasks, &Task.await(&1, 10_000))
+
+    assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+    assert Enum.count(results, &(&1 == {:error, :minio_user_not_found})) == 1
+    assert is_nil(unboxed(fn -> Repo.get_by(User, id: user.id) end))
   end
 
   test "two concurrent same-name creates commit exactly one pair and one notification" do
