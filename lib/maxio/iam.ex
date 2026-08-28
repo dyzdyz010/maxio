@@ -1696,8 +1696,8 @@ defmodule Maxio.IAM do
       when is_binary(group_name_or_arn) and is_binary(name) and is_binary(json) do
     with %Group{} = group <- fetch_group_record(group_name_or_arn),
          :ok <-
-           put_inline_policy_strict(
-             group.group_arn,
+           put_group_inline_policy_strict(
+             group,
              name,
              json,
              @group_inline_policy_quota_chars
@@ -1747,7 +1747,7 @@ defmodule Maxio.IAM do
       when is_binary(group_name_or_arn) and is_binary(name) do
     with %Group{} = group <- fetch_group_record(group_name_or_arn),
          {:ok, _policy} <- Store.get_principal_policy(group.group_arn, name) do
-      delete_principal_policy(group.group_arn, name)
+      delete_group_inline_policy_strict(group, name)
     else
       nil -> {:error, :not_found}
       {:error, :not_found} -> {:error, :not_found}
@@ -1828,10 +1828,14 @@ defmodule Maxio.IAM do
   @spec put_group_policy(String.t(), String.t(), binary()) :: :ok | {:error, term()}
   def put_group_policy(group_name_or_arn, name, json)
       when is_binary(group_name_or_arn) and is_binary(name) and is_binary(json) do
-    with {:ok, group} <- get_group(group_name_or_arn) do
-      put_principal_policy(group.group_arn, name, json)
-    else
-      :error -> {:error, :not_found}
+    case fetch_group_record(group_name_or_arn) do
+      %Group{} = group ->
+        run_group_inline_policy_mutation(group, fn canonical_group_arn ->
+          Store.put_principal_policy_without_notify(canonical_group_arn, name, json)
+        end)
+
+      nil ->
+        {:error, :not_found}
     end
   end
 
@@ -1852,9 +1856,17 @@ defmodule Maxio.IAM do
   @spec delete_group_policy(String.t(), String.t()) :: :ok
   def delete_group_policy(group_name_or_arn, name)
       when is_binary(group_name_or_arn) and is_binary(name) do
-    case get_group(group_name_or_arn) do
-      {:ok, group} -> delete_principal_policy(group.group_arn, name)
-      :error -> :ok
+    case fetch_group_record(group_name_or_arn) do
+      %Group{} = group ->
+        case run_group_inline_policy_mutation(group, fn canonical_group_arn ->
+               Store.delete_principal_policy_without_notify(canonical_group_arn, name)
+             end) do
+          :ok -> :ok
+          {:error, :identity_changed} -> :ok
+        end
+
+      nil ->
+        :ok
     end
   end
 
@@ -5777,6 +5789,71 @@ defmodule Maxio.IAM do
     )
 
     :ok
+  end
+
+  defp put_group_inline_policy_strict(%Group{} = group, name, json, quota_chars) do
+    with {:ok, _document, policy_chars} <- validate_inline_policy_document(json) do
+      case run_group_inline_policy_mutation(group, fn canonical_group_arn ->
+             with :ok <-
+                    validate_inline_policy_quota(
+                      canonical_group_arn,
+                      name,
+                      policy_chars,
+                      quota_chars
+                    ) do
+               Store.put_principal_policy_without_notify(canonical_group_arn, name, json)
+             end
+           end) do
+        {:error, :malformed} -> {:error, :malformed_policy_document}
+        {:error, :identity_changed} -> {:error, :not_found}
+        result -> result
+      end
+    else
+      {:error, :malformed} -> {:error, :malformed_policy_document}
+    end
+  end
+
+  defp delete_group_inline_policy_strict(%Group{} = group, name) do
+    case run_group_inline_policy_mutation(group, fn canonical_group_arn ->
+           with {:ok, _policy} <- Store.get_principal_policy(canonical_group_arn, name) do
+             Store.delete_principal_policy_without_notify(canonical_group_arn, name)
+           end
+         end) do
+      {:error, :identity_changed} -> {:error, :not_found}
+      result -> result
+    end
+  end
+
+  defp run_group_inline_policy_mutation(%Group{} = initial, mutation_fun)
+       when is_function(mutation_fun, 1) do
+    Repo.transaction(fn ->
+      with {:ok, %Group{} = group} <-
+             GroupIdentity.lock_snapshot(
+               Repo,
+               initial.group_name,
+               {:existing, initial.id}
+             ) do
+        lock_principal_policy_quota!(group.group_arn)
+
+        case mutation_fun.(group.group_arn) do
+          :ok -> group.group_arn
+          {:error, reason} -> Repo.rollback({:error, reason})
+        end
+      else
+        {:error, reason} -> Repo.rollback({:error, reason})
+      end
+    end)
+    |> case do
+      {:ok, canonical_group_arn} ->
+        Notify.broadcast({:principal_policy_changed, canonical_group_arn})
+        :ok
+
+      {:error, {:error, reason}} ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp put_inline_policy_strict(principal_arn, name, json, quota_chars) do

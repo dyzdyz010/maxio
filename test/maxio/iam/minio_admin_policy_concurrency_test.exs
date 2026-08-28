@@ -3,7 +3,7 @@ defmodule Maxio.IAM.MinioAdminPolicyConcurrencyTest do
 
   alias Maxio.IAM
   alias Maxio.IAM.UserManagedPolicyAttachment
-  alias Maxio.Policy.ManagedPolicy
+  alias Maxio.Policy.{AdvisoryLock, ManagedPolicy, Store}
 
   @document %{
     "Version" => "2012-10-17",
@@ -351,6 +351,182 @@ defmodule Maxio.IAM.MinioAdminPolicyConcurrencyTest do
              unboxed(fn ->
                Maxio.Policy.Store.list_attached_group_managed_policies(renamed_group.group_arn)
              end)
+  end
+
+  test "strict group deletion cannot cross a case-folded inline policy put" do
+    suffix = random_suffix()
+    group_name = "inline-delete-race-#{suffix}"
+    policy_name = "inline-delete-policy-#{suffix}"
+    policy_json = Jason.encode!(@document)
+
+    group = unboxed(fn -> elem(IAM.create_group(name: group_name), 1) end)
+
+    on_exit(fn ->
+      cleanup_group_fixture(group_name, [])
+      Store.delete_principal_policy(group.group_arn, policy_name)
+    end)
+
+    attach_pre_quota_order_barrier(:group, group_name, group.group_arn)
+
+    put_task =
+      Task.async(fn ->
+        unboxed(fn ->
+          IAM.put_group_policy_strict(String.upcase(group_name), policy_name, policy_json)
+        end)
+      end)
+
+    first_lock =
+      receive do
+        {:ordered_identity_wait, put_pid} -> {:identity, put_pid}
+        {:ordered_quota_wait, put_pid} -> {:quota, put_pid}
+      after
+        1_000 -> :missing
+      end
+
+    put_pid = elem(first_lock, 1)
+
+    if elem(first_lock, 0) == :identity do
+      assert_receive {:ordered_quota_wait, ^put_pid}
+    end
+
+    delete_task = Task.async(fn -> unboxed(fn -> IAM.delete_group_strict(group_name) end) end)
+    assert_receive {:ordered_identity_wait, delete_pid}
+    refute delete_pid == put_pid
+
+    send(put_pid, {:release_ordered_quota, put_pid})
+    assert :ok = Task.await(put_task)
+
+    delete_result = Task.await(delete_task)
+    assert {:identity, ^put_pid} = first_lock
+    assert {:error, {:group_delete_conflict, blockers}} = delete_result
+    assert :inline_policies in blockers
+    assert {:ok, _group} = unboxed(fn -> IAM.get_group(group_name) end)
+    assert [%{policy_name: ^policy_name}] = Store.list_principal_policies(group.group_arn)
+  end
+
+  test "group rename serializes with a case-folded inline policy put and moves one canonical row" do
+    suffix = random_suffix()
+    group_name = "inline-rename-put-#{suffix}"
+    renamed_name = "inline-rename-put-target-#{suffix}"
+    policy_name = "inline-rename-put-policy-#{suffix}"
+    policy_json = Jason.encode!(@document)
+    group = unboxed(fn -> elem(IAM.create_group(name: group_name), 1) end)
+
+    on_exit(fn ->
+      cleanup_group_fixture(group_name, [])
+      cleanup_group_fixture(renamed_name, [])
+      Store.delete_principal_policy(group.group_arn, policy_name)
+      Store.delete_principal_policy(IAM.group_arn(renamed_name), policy_name)
+    end)
+
+    attach_pre_quota_order_barrier(:group, group_name, group.group_arn)
+
+    put_task =
+      Task.async(fn ->
+        unboxed(fn ->
+          IAM.put_group_policy(String.upcase(group_name), policy_name, policy_json)
+        end)
+      end)
+
+    first_lock =
+      receive do
+        {:ordered_identity_wait, put_pid} -> {:identity, put_pid}
+        {:ordered_quota_wait, put_pid} -> {:quota, put_pid}
+      after
+        1_000 -> :missing
+      end
+
+    put_pid = elem(first_lock, 1)
+
+    if elem(first_lock, 0) == :identity do
+      assert_receive {:ordered_quota_wait, ^put_pid}
+    end
+
+    rename_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.update_group_name_strict(group_name, renamed_name) end)
+      end)
+
+    assert_receive {:ordered_identity_wait, rename_pid}
+    refute rename_pid == put_pid
+    send(put_pid, {:release_ordered_quota, put_pid})
+
+    assert :ok = Task.await(put_task)
+    assert {:ok, renamed} = Task.await(rename_task)
+    assert {:identity, ^put_pid} = first_lock
+    assert [] = Store.list_principal_policies(group.group_arn)
+    assert [%{policy_name: ^policy_name}] = Store.list_principal_policies(renamed.group_arn)
+  end
+
+  test "group rename serializes with a case-folded inline policy delete" do
+    suffix = random_suffix()
+    group_name = "inline-rename-delete-#{suffix}"
+    renamed_name = "inline-rename-delete-target-#{suffix}"
+    policy_name = "inline-rename-delete-policy-#{suffix}"
+    policy_json = Jason.encode!(@document)
+
+    group =
+      unboxed(fn ->
+        group = elem(IAM.create_group(name: group_name), 1)
+        :ok = IAM.put_group_policy(group_name, policy_name, policy_json)
+        group
+      end)
+
+    on_exit(fn ->
+      cleanup_group_fixture(group_name, [])
+      cleanup_group_fixture(renamed_name, [])
+      Store.delete_principal_policy(group.group_arn, policy_name)
+      Store.delete_principal_policy(IAM.group_arn(renamed_name), policy_name)
+    end)
+
+    owner = self()
+
+    quota_holder =
+      Task.async(fn ->
+        unboxed(fn ->
+          Repo.transaction(fn ->
+            AdvisoryLock.principal_quota!(Repo, group.group_arn)
+            send(owner, :inline_delete_quota_held)
+
+            receive do
+              :release_inline_delete_quota -> :ok
+            end
+          end)
+        end)
+      end)
+
+    assert_receive :inline_delete_quota_held
+    attach_identity_observer(:group, group_name)
+
+    delete_task =
+      Task.async(fn ->
+        unboxed(fn ->
+          IAM.delete_group_policy_strict(String.upcase(group_name), policy_name)
+        end)
+      end)
+
+    delete_identity_wait? =
+      receive do
+        {:observed_identity_lock_wait, delete_pid} when delete_pid == delete_task.pid -> true
+      after
+        250 -> false
+      end
+
+    rename_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.update_group_name_strict(group_name, renamed_name) end)
+      end)
+
+    assert_receive {:observed_identity_lock_wait, rename_pid}
+    refute rename_pid == delete_task.pid
+
+    send(quota_holder.pid, :release_inline_delete_quota)
+    assert {:ok, :ok} = Task.await(quota_holder)
+    assert :ok = Task.await(delete_task)
+    assert {:ok, renamed} = Task.await(rename_task)
+    assert delete_identity_wait?
+    assert [] = Store.list_principal_policies(group.group_arn)
+    assert [] = Store.list_principal_policies(renamed.group_arn)
   end
 
   test "a unique conflict from a legacy writer becomes a typed no-effect result" do
