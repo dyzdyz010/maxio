@@ -125,9 +125,8 @@ defmodule Maxio.Compat.AdminUserFixtureTest do
                    {"", "", 0}
                  end
 
-                 assert {"", "", 0} =
+                 assert {:external_command_capability, redactions, capability} =
                           mc_probe.(%{
-                            command_runner: command_runner,
                             executable: "mc.exe",
                             alias: "maxiocompat",
                             config_dir: "fixture-config",
@@ -139,6 +138,9 @@ defmodule Maxio.Compat.AdminUserFixtureTest do
                               ]
                             ]
                           })
+
+                 assert length(redactions) == 2
+                 assert {"", "", 0} = capability.(command_runner)
 
                  assert_received {:mc_probe_call, "mc.exe", ["ls", "maxiocompat"], opts}
                  env = Keyword.fetch!(opts, :env)

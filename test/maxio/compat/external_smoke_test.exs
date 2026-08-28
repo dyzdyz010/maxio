@@ -1258,12 +1258,16 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
       mc_probe = fn probe ->
         mode = if probe.json?, do: :json, else: :human
+        {:external_command_capability, redactions, run} = invoke_fixture_mc_probe(probe)
 
-        if Process.get(:admin_fixture_status) == :disabled and mode == invalid_mode do
-          invalid
-        else
-          invoke_fixture_mc_probe(probe)
-        end
+        {:external_command_capability, redactions,
+         fn command_runner ->
+           if Process.get(:admin_fixture_status) == :disabled and mode == invalid_mode do
+             invalid
+           else
+             run.(command_runner)
+           end
+         end}
       end
 
       opts = Keyword.put(fixture_opts(self()), :mc_probe, mc_probe)
