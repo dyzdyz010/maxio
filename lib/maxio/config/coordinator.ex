@@ -69,10 +69,9 @@ defmodule Maxio.Config.Coordinator do
     end
   end
 
-  # Tests use two small Repo facades to inject deterministic write failures and the defensive
-  # unique-row conflict. Real Ecto repos and the batch failure facade expose query!/3 and always
-  # execute this SQL. The legacy conflict facade deliberately has no SQL boundary; only that
-  # test-only facade may omit the lock because its transaction is not connected to PostgreSQL.
+  # Every Repo facade must expose a real SQL query boundary. Missing that boundary is a programmer
+  # error and must fail before checkpoint, runtime reads, or mutations; no environment may silently
+  # turn a missing advisory lock into success.
   defp acquire_advisory_lock!(repo, subsystem) do
     cond do
       function_exported?(repo, :query!, 3) ->
@@ -82,15 +81,7 @@ defmodule Maxio.Config.Coordinator do
         repo.query!(@advisory_lock_sql, [Atom.to_string(subsystem)])
 
       true ->
-        handle_missing_query!()
-    end
-  end
-
-  if @test_env do
-    defp handle_missing_query!, do: :ok
-  else
-    defp handle_missing_query! do
-      raise ArgumentError, "config coordinator repo must expose query!/3"
+        raise ArgumentError, "config coordinator repo must expose query!/2 or query!/3"
     end
   end
 
