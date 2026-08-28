@@ -171,6 +171,7 @@ defmodule Maxio.S3.Error do
        "The request is not valid with the current state of the bucket."},
     bucket_quota_exceeded: {"XMinioAdminBucketQuotaExceeded", 400, "Bucket quota exceeded."},
     admin_no_such_user: {"XMinioAdminNoSuchUser", 404, "The specified user does not exist."},
+    admin_no_such_group: {"XMinioAdminNoSuchGroup", 404, "The specified group does not exist."},
     admin_iam_action_not_allowed:
       {"XMinioIAMActionNotAllowed", 403, "Specified IAM action is not allowed"},
     admin_user_already_exists:
@@ -182,6 +183,9 @@ defmodule Maxio.S3.Error do
        "Configuration data provided exceeds the allowed maximum of 262272 bytes"},
     admin_config_bad_json:
       {"XMinioAdminConfigBadJSON", 400, "JSON configuration provided is of incorrect format"},
+    admin_policy_change_already_applied:
+      {"XMinioAdminPolicyChangeAlreadyApplied", 400,
+       "The specified policy change is already in effect. (Specified policy update has no net effect)"},
     admin_invalid_access_key: {"XMinioAdminInvalidAccessKey", 400, "The access key is invalid."},
     admin_invalid_secret_key: {"XMinioAdminInvalidSecretKey", 400, "The secret key is invalid."},
     admin_resource_invalid_argument:

@@ -10,6 +10,16 @@ defmodule Maxio.Admin.ErrorMap do
 
   @spec from_reason(term()) :: Error.t()
   def from_reason(:user_not_found), do: Error.new(:admin_no_such_user)
+  def from_reason(:group_not_found), do: Error.new(:admin_no_such_group)
+
+  def from_reason(:group_disabled) do
+    Error.new(:admin_invalid_argument,
+      message: "The specified group is disabled and cannot receive policy association updates."
+    )
+  end
+
+  def from_reason(:policy_change_already_applied),
+    do: Error.new(:admin_policy_change_already_applied)
 
   def from_reason(:minio_user_not_found) do
     Error.new(:admin_no_such_user,

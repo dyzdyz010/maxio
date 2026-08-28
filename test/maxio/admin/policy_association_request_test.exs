@@ -4,7 +4,10 @@ defmodule Maxio.Admin.PolicyAssociationRequestTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Maxio.Admin.PolicyAssociationRequest
+  alias Maxio.Admin.{Envelope, PolicyAssociationRequest}
+  alias Maxio.Auth.SigningSecret
+  alias Maxio.Auth.SigV4.Signer
+  alias Maxio.S3.Error
 
   @fixture_path Path.expand(
                   "../../fixtures/minio_admin_policy_s3/minio_p6_policy_association.json",
@@ -14,6 +17,10 @@ defmodule Maxio.Admin.PolicyAssociationRequestTest do
   setup_all do
     fixture = @fixture_path |> File.read!() |> Jason.decode!()
     {:ok, fixture: fixture}
+  end
+
+  setup do
+    {:ok, secret: SigningSecret.new("policy-association-signing-secret")}
   end
 
   test "fixture freezes provenance, route, transport and OR authorization", %{fixture: fixture} do
@@ -137,5 +144,113 @@ defmodule Maxio.Admin.PolicyAssociationRequestTest do
       |> put_req_header("content-type", "application/octet-stream")
 
     assert 1 = PolicyAssociationRequest.validate_transport!(conn)
+  end
+
+  test "transport requires exact media type and one canonical bounded length" do
+    valid = request_conn(<<0>>)
+    assert 1 = PolicyAssociationRequest.validate_transport!(valid)
+
+    invalid = [
+      request_conn(<<0>>, content_type: "application/octet-stream; charset=binary"),
+      request_conn(<<0>>, content_type: :absent),
+      request_conn(<<0>>, content_length: :absent),
+      request_conn(<<0>>, content_length: "-1"),
+      request_conn(<<0>>, content_length: "262273"),
+      request_conn(<<0>>, content_length: :absent, headers: [{"transfer-encoding", "chunked"}])
+    ]
+
+    for conn <- invalid do
+      assert %Error{http_status: 400} =
+               assert_raise(Error, fn ->
+                 PolicyAssociationRequest.validate_transport!(conn)
+               end)
+    end
+  end
+
+  test "decrypts, verifies the authenticated payload hash and normalizes policy set", %{
+    secret: secret
+  } do
+    body =
+      encrypted_body(
+        secret,
+        ~s({"policies":["z-policy","a-policy","z-policy"],"user":"alice","ignored":true})
+      )
+
+    assert {_conn, %{policies: ["a-policy", "z-policy"], principal: {:user, "alice"}}} =
+             PolicyAssociationRequest.read!(request_conn(body), secret, byte_size(body))
+
+    mismatch = request_conn(body, signed_payload_sha256: Signer.hex_sha256("different"))
+
+    assert %Error{code: "XAmzContentSHA256Mismatch"} =
+             assert_raise(Error, fn ->
+               PolicyAssociationRequest.read!(mismatch, secret, byte_size(body))
+             end)
+  end
+
+  test "zero length, bad envelope, malformed JSON and invalid IsValid shapes are bad JSON", %{
+    secret: secret
+  } do
+    invalid_plaintexts = [
+      "not-json",
+      ~s({"policies":[],"user":"alice"}),
+      ~s({"policies":[""],"user":"alice"}),
+      ~s({"policies":["readwrite"]}),
+      ~s({"policies":["readwrite"],"user":"alice","group":"ops"}),
+      ~s({"policies":"readwrite","user":"alice"})
+    ]
+
+    conns =
+      [request_conn(<<>>, content_length: "0"), request_conn(<<0>>)] ++
+        Enum.map(invalid_plaintexts, fn plaintext ->
+          body = encrypted_body(secret, plaintext)
+          request_conn(body)
+        end)
+
+    for conn <- conns do
+      length = PolicyAssociationRequest.validate_transport!(conn)
+      error = assert_raise(Error, fn -> PolicyAssociationRequest.read!(conn, secret, length) end)
+      assert error.code == "XMinioAdminConfigBadJSON"
+    end
+  end
+
+  defp encrypted_body(secret, plaintext) do
+    {:ok, body} =
+      Envelope.encrypt(secret, plaintext,
+        algorithm_id: 2,
+        salt: :binary.copy(<<4>>, 32),
+        nonce: :binary.copy(<<6>>, 8)
+      )
+
+    body
+  end
+
+  defp request_conn(body, opts \\ []) do
+    content_length = Keyword.get(opts, :content_length, Integer.to_string(byte_size(body)))
+    content_type = Keyword.get(opts, :content_type, "application/octet-stream")
+
+    conn =
+      :post
+      |> conn("/minio/admin/v3/idp/builtin/policy/attach", body)
+      |> delete_req_header("content-length")
+      |> assign(:payload_mode, :single)
+      |> assign(:sigv4_context, %{
+        signed_payload_sha256: Keyword.get(opts, :signed_payload_sha256, Signer.hex_sha256(body))
+      })
+
+    conn =
+      case content_length do
+        :absent -> conn
+        value -> put_req_header(conn, "content-length", value)
+      end
+
+    conn =
+      case content_type do
+        :absent -> conn
+        value -> put_req_header(conn, "content-type", value)
+      end
+
+    Enum.reduce(Keyword.get(opts, :headers, []), conn, fn {name, value}, acc ->
+      put_req_header(acc, name, value)
+    end)
   end
 end

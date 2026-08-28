@@ -146,6 +146,25 @@ defmodule Maxio.Admin.ErrorMapTest do
     refute unknown.message =~ "do-not-leak"
   end
 
+  test "maps P6 target, disabled-group and no-effect errors exactly" do
+    assert %{code: "XMinioAdminNoSuchGroup", http_status: 404} =
+             ErrorMap.from_reason(:group_not_found)
+
+    assert %{
+             code: "XMinioAdminInvalidArgument",
+             http_status: 400,
+             message:
+               "The specified group is disabled and cannot receive policy association updates."
+           } = ErrorMap.from_reason(:group_disabled)
+
+    assert %{
+             code: "XMinioAdminPolicyChangeAlreadyApplied",
+             http_status: 400,
+             message:
+               "The specified policy change is already in effect. (Specified policy update has no net effect)"
+           } = ErrorMap.from_reason(:policy_change_already_applied)
+  end
+
   defp assert_error(reason, code, message) do
     error = ErrorMap.from_reason(reason)
     assert error.code == code

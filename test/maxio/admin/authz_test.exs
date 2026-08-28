@@ -135,4 +135,30 @@ defmodule Maxio.Admin.AuthzTest do
 
     assert Authz.authorize(conn(), principal(), "admin:GetUser") == :ok
   end
+
+  test "authorize_any returns the first allowed action and can fall back deterministically" do
+    root = %{type: :root, arn: "arn:aws:iam:::root"}
+
+    assert {:ok, "admin:First"} =
+             Authz.authorize_any(conn(), root, ["admin:First", "admin:Second"])
+
+    put_key()
+
+    :ok =
+      Store.put_principal_policy(
+        @arn,
+        "admin-fallback",
+        ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"admin:Second"}]})
+      )
+
+    assert {:ok, "admin:Second"} =
+             Authz.authorize_any(conn(), principal(), ["admin:First", "admin:Second"])
+  end
+
+  test "authorize_any denies when no candidate action is allowed" do
+    assert {:error, :implicit_deny} =
+             Authz.authorize_any(conn(), :anonymous, ["admin:First", "admin:Second"])
+
+    assert {:error, :implicit_deny} = Authz.authorize_any(conn(), %{}, [])
+  end
 end

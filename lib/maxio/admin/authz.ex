@@ -59,6 +59,21 @@ defmodule Maxio.Admin.Authz do
 
   def authorize(_conn, _principal, _action), do: {:error, :implicit_deny}
 
+  @doc "Authorizes any one of the ordered candidate actions and returns the action that allowed."
+  @spec authorize_any(Plug.Conn.t(), map(), [String.t()]) ::
+          {:ok, String.t()} | {:error, term()}
+  def authorize_any(conn, principal, actions) when is_list(actions) do
+    actions
+    |> Enum.reduce_while({:error, :implicit_deny}, fn action, _last_error ->
+      case authorize(conn, principal, action) do
+        :ok -> {:halt, {:ok, action}}
+        {:error, reason} -> {:cont, {:error, reason}}
+      end
+    end)
+  end
+
+  def authorize_any(_conn, _principal, _actions), do: {:error, :implicit_deny}
+
   defp root?(%{type: :root}), do: true
   defp root?(_principal), do: false
 end

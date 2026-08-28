@@ -159,4 +159,41 @@ defmodule Maxio.Admin.PolicyEntitiesRequestTest do
 
     assert dimensions == MapSet.new([:group, :policy, :user])
   end
+
+  test "parser preserves requested dimensions while deduplicating decoded values" do
+    assert %{
+             users: ["", "alice+ops"],
+             groups: ["data science"],
+             policies: ["read/only"],
+             requested_dimensions: requested
+           } =
+             PolicyEntitiesRequest.parse!(
+               "user=alice%2Bops&user=alice%2Bops&user&group=data+science&policy=read%2Fonly&x=y"
+             )
+
+    assert requested == MapSet.new([:user, :group, :policy])
+  end
+
+  test "empty and unrelated queries retain empty-filter policy projection semantics" do
+    for query <- ["", "unrelated=value"] do
+      assert %{
+               users: [],
+               groups: [],
+               policies: [],
+               requested_dimensions: requested
+             } = PolicyEntitiesRequest.parse!(query)
+
+      assert requested == MapSet.new()
+    end
+  end
+
+  test "malformed percent encoding is a named Maxio structured-400 defense deviation" do
+    error =
+      assert_raise Maxio.S3.Error, fn ->
+        PolicyEntitiesRequest.parse!("user=broken%ZZ")
+      end
+
+    assert error.code == "XMinioAdminInvalidArgument"
+    assert error.http_status == 400
+  end
 end
