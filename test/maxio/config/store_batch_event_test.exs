@@ -63,16 +63,15 @@ defmodule Maxio.Config.StoreBatchEventTest do
              capture_outcome(fn -> apply(Store, :note_postcommit_attention, [first]) end)
 
     first_status = Store.status()
+    first_attention = first_status.postcommit_attention
 
-    assert %{
-             postcommit_attention: %{
-               subsystem: :listing,
-               local_reload: {:error, :reload_failed},
-               broadcast: {:error, :broadcast_failed}
-             }
-           } = first_status
+    assert first_attention == %{
+             subsystem: :listing,
+             local_reload: {:error, :reload_failed},
+             broadcast: {:error, :broadcast_failed}
+           }
 
-    first_serialized = inspect(first_status.postcommit_attention, limit: :infinity)
+    first_serialized = inspect(first_attention, limit: :infinity)
     refute first_serialized =~ "ATTENTION-RAW-RELOAD-MUST-NOT-PERSIST"
     refute first_serialized =~ "ATTENTION-RAW-BROADCAST-MUST-NOT-PERSIST"
     refute first_serialized =~ "ATTENTION-RAW-VALUE-MUST-NOT-PERSIST"
@@ -83,13 +82,11 @@ defmodule Maxio.Config.StoreBatchEventTest do
     status = Store.status()
     attention = apply(Map, :fetch!, [status, :postcommit_attention])
 
-    assert %{
-             postcommit_attention: %{
-               subsystem: :s3,
-               local_reload: :ok,
-               broadcast: {:error, :broadcast_failed}
-             }
-           } = status
+    assert attention == %{
+             subsystem: :s3,
+             local_reload: :ok,
+             broadcast: {:error, :broadcast_failed}
+           }
 
     refute is_list(attention)
 
