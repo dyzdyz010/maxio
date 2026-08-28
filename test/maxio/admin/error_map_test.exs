@@ -44,12 +44,21 @@ defmodule Maxio.Admin.ErrorMapTest do
   end
 
   test "version quota is actionable and unknown reasons are redacted" do
-    quota = ErrorMap.from_reason(:policy_version_limit_exceeded)
+    document_quota = ErrorMap.from_reason(:policy_limit_exceeded)
 
-    assert quota.code == "XMinioAdminInvalidArgument"
-    assert quota.http_status == 400
-    assert quota.message =~ "5"
-    assert quota.message =~ "non-default"
+    assert document_quota.code == "XMinioAdminInvalidArgument"
+    assert document_quota.http_status == 400
+    assert document_quota.message =~ "6,144"
+    assert document_quota.message =~ "delete an unused managed policy"
+
+    version_quota = ErrorMap.from_reason(:policy_version_limit_exceeded)
+
+    assert version_quota.code == "XMinioAdminInvalidArgument"
+    assert version_quota.http_status == 400
+    assert version_quota.message =~ "5"
+    assert version_quota.message =~ "non-default"
+    refute document_quota.message == version_quota.message
+    refute document_quota.message =~ "DeletePolicyVersion"
 
     unknown = ErrorMap.from_reason({:unexpected, "credential=do-not-leak"})
     assert unknown.code == "InternalError"

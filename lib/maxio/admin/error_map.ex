@@ -21,6 +21,14 @@ defmodule Maxio.Admin.ErrorMap do
   def from_reason(:malformed_policy_document),
     do: Error.new(:malformed_policy_wire)
 
+  def from_reason(:policy_limit_exceeded) do
+    Error.new(:admin_invalid_argument,
+      message:
+        "The managed policy quota was exceeded. Reduce the policy document to 6,144 " <>
+          "characters or delete an unused managed policy before retrying."
+    )
+  end
+
   def from_reason(:policy_version_limit_exceeded) do
     Error.new(:admin_invalid_argument,
       message:

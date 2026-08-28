@@ -3,6 +3,7 @@ defmodule Maxio.Admin.PolicyEndpointTest do
 
   alias Maxio.Admin.PolicyAdapter
   alias Maxio.Auth.CredentialStore
+  alias Maxio.IAM
   alias Maxio.Policy.Store, as: PolicyStore
   alias Maxio.S3.Endpoint
   alias Maxio.Test.SigV4Request
@@ -172,6 +173,34 @@ defmodule Maxio.Admin.PolicyEndpointTest do
       )
 
     assert_admin_error(conn, 400, "MalformedPolicy")
+  end
+
+  test "managed policy document quota returns 400 and persists nothing below the wire limit" do
+    name = unique_name("document-quota")
+
+    body =
+      Jason.encode!(%{
+        "Version" => "2012-10-17",
+        "Statement" => %{
+          "Effect" => "Allow",
+          "Action" => "s3:GetObject",
+          "Resource" => for(index <- 1..220, do: "arn:aws:s3:::policy-quota-#{index}/*")
+        }
+      })
+
+    assert String.length(body) > 6_144
+    assert byte_size(body) < 20_480
+
+    conn =
+      signed(:put, "#{@base}/add-canned-policy",
+        query: %{"name" => name},
+        body: body,
+        headers: [{"content-length", Integer.to_string(byte_size(body))}],
+        region: ""
+      )
+
+    assert_admin_error(conn, 400, "XMinioAdminInvalidArgument")
+    assert :error = IAM.get_managed_policy(IAM.managed_policy_arn(name, "/"))
   end
 
   test "create requires one positive Content-Length and rejects transfer encoding" do
