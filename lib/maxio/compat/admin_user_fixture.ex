@@ -255,7 +255,6 @@ defmodule Maxio.Compat.AdminUserFixture do
 
     fn probe ->
       with true <- is_binary(endpoint) and endpoint != "",
-           command_runner when is_function(command_runner, 3) <- Map.get(probe, :command_runner),
            executable when is_binary(executable) <- Map.get(probe, :executable),
            alias_name when is_binary(alias_name) <- Map.get(probe, :alias),
            config_dir when is_binary(config_dir) <- Map.get(probe, :config_dir) do
@@ -264,22 +263,33 @@ defmodule Maxio.Compat.AdminUserFixture do
             do: ["--json", "ls", alias_name],
             else: ["ls", alias_name]
 
+        credential_url = endpoint_with_userinfo(endpoint, access_key_id, secret_key)
+
         secret_env = [
           {"MC_CONFIG_DIR", config_dir},
-          {"MC_HOST_#{alias_name}", endpoint_with_userinfo(endpoint, access_key_id, secret_key)}
+          {"MC_HOST_#{alias_name}", credential_url}
         ]
 
         opts = replace_env(Map.get(probe, :opts, []), secret_env)
 
-        command_runner.(executable, args, opts)
+        {:external_command_capability, [secret_key, credential_url],
+         fn command_runner -> command_runner.(executable, args, opts) end}
       else
-        _other -> {"", "mc fixture probe is not configured", 2}
+        _other ->
+          {:external_command_capability, [],
+           fn _command_runner ->
+             {"", "mc fixture probe is not configured", 2}
+           end}
       end
     end
   end
 
   defp unconfigured_mc_probe(_probe),
-    do: {"", "mc fixture probe is not configured", 2}
+    do:
+      {:external_command_capability, [],
+       fn _command_runner ->
+         {"", "mc fixture probe is not configured", 2}
+       end}
 
   defp replace_env(opts, injected) do
     injected_names = MapSet.new(injected, &elem(&1, 0))

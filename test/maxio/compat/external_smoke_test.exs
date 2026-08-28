@@ -1,6 +1,8 @@
 defmodule Maxio.Compat.ExternalSmokeTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Maxio.Compat.ExternalSmoke
 
   @config %{
@@ -224,6 +226,64 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert message =~ "boom"
     refute Jason.encode!(entry) =~ "super-secret"
+  end
+
+  test "mc fixture capability redacts its temporary credentials before runner invocation" do
+    owner = self()
+    fixture_secret = "fixture-secret-that-must-not-leak"
+    raw_mc_host = "http://fixture-user:#{fixture_secret}@127.0.0.1:9900"
+    base_runner = successful_mc_runner()
+
+    echoing_runner = fn command, args, opts ->
+      {_config_dir, _json?, [subcommand | _command_args]} = parse_mc_args(args, opts)
+      result = base_runner.(command, args, opts)
+
+      if subcommand == "ls" do
+        send(owner, :fixture_mc_host_echoed)
+        {stdout, stderr, exit_status} = normalize_test_command_result(result)
+        {stdout, stderr <> " runner opts=" <> inspect(opts), exit_status}
+      else
+        result
+      end
+    end
+
+    fixture =
+      fixture_opts(owner)
+      |> Keyword.put(:mc_probe, fn probe ->
+        opts =
+          Keyword.update!(probe.opts, :env, fn env ->
+            Enum.reject(env, &(elem(&1, 0) == "MC_HOST_#{probe.alias}")) ++
+              [{"MC_HOST_#{probe.alias}", raw_mc_host}]
+          end)
+
+        {:external_command_capability, [fixture_secret, raw_mc_host],
+         fn command_runner ->
+           args = if probe.json?, do: ["--json", "ls", probe.alias], else: ["ls", probe.alias]
+           command_runner.(probe.executable, args, opts)
+         end}
+      end)
+
+    {entry, log} =
+      with_log(fn ->
+        [entry] =
+          @config
+          |> Map.put(:clients, ["minio_mc"])
+          |> ExternalSmoke.run(
+            executable_finder: fn "mc" -> "mc.exe" end,
+            command_runner: echoing_runner,
+            tmp_root_fun: &tmp_root/0,
+            admin_user_fixture_opts: fixture
+          )
+
+        entry
+      end)
+
+    assert_receive :fixture_mc_host_echoed
+
+    for evidence <- [Jason.encode!(entry), log] do
+      refute evidence =~ fixture_secret
+      refute evidence =~ raw_mc_host
+    end
   end
 
   test "mc smoke keeps credentials in env and redacts output snippets" do
@@ -1811,7 +1871,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       end,
       mc_probe: fn probe ->
         args = if probe.json?, do: ["--json", "ls", probe.alias], else: ["ls", probe.alias]
-        probe.command_runner.(probe.executable, args, probe.opts)
+
+        {:external_command_capability, [],
+         fn command_runner ->
+           command_runner.(probe.executable, args, probe.opts)
+         end}
       end,
       cleanup_user: fn name ->
         send(owner, {:admin_fixture_cleaned, name})
@@ -1822,7 +1886,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
   defp invoke_fixture_mc_probe(probe) do
     args = if probe.json?, do: ["--json", "ls", probe.alias], else: ["ls", probe.alias]
-    probe.command_runner.(probe.executable, args, probe.opts)
+
+    {:external_command_capability, [],
+     fn command_runner ->
+       command_runner.(probe.executable, args, probe.opts)
+     end}
   end
 
   defp disabled_probe do
@@ -2028,6 +2096,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       rest -> {config_dir, false, rest}
     end
   end
+
+  defp normalize_test_command_result({stdout, stderr, status}),
+    do: {stdout, stderr, status}
+
+  defp normalize_test_command_result({stdout, status}), do: {stdout, "", status}
 
   defp json_policy_output(policy_name) do
     "{\n" <>

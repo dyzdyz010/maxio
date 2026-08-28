@@ -1381,6 +1381,15 @@ defmodule Maxio.Compat.ExternalSmoke do
     json? = mode == :json
     args = if json?, do: ["--json", "ls", paths.mc_alias], else: ["ls", paths.mc_alias]
 
+    {:external_command_capability, capability_redactions, capability_fun} =
+      mc_probe.(%{
+        executable: executable,
+        alias: paths.mc_alias,
+        config_dir: paths.mc_config_dir,
+        json?: json?,
+        opts: opts
+      })
+
     %{
       id: id,
       command: executable,
@@ -1389,16 +1398,8 @@ defmodule Maxio.Compat.ExternalSmoke do
       verify: {:mc_ls, expected, mode},
       scenario: scenario,
       assertion: assertion,
-      local_fun: fn command_runner ->
-        mc_probe.(%{
-          command_runner: command_runner,
-          executable: executable,
-          alias: paths.mc_alias,
-          config_dir: paths.mc_config_dir,
-          json?: json?,
-          opts: opts
-        })
-      end
+      redactions: capability_redactions,
+      local_fun: capability_fun
     }
   end
 
@@ -1435,6 +1436,7 @@ defmodule Maxio.Compat.ExternalSmoke do
 
   defp run_step(step, command_runner, redactions) do
     started = System.monotonic_time(:millisecond)
+    redactions = merge_redactions(redactions, Map.get(step, :redactions, []))
 
     try do
       {output, stderr, exit_status} = invoke_step(step, command_runner)
@@ -1486,6 +1488,12 @@ defmodule Maxio.Compat.ExternalSmoke do
            "message" => redact(Exception.message(error), redactions)
          }}
     end
+  end
+
+  defp merge_redactions(redactions, additional) do
+    (redactions ++ additional)
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.uniq()
   end
 
   defp invoke_step(%{local_fun: fun}, _command_runner) when is_function(fun, 0) do
