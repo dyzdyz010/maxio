@@ -85,6 +85,8 @@ defmodule Maxio.S3.Log do
     :minio_view_partial,
     :omitted_reason,
     :surface,
+    :requested_policy_count,
+    :changed_policy_count,
     # 运行时配置面固定字段（设计 §6）。formatter 侧的 metadata 白名单必须同步放行，
     # 否则结构化字段被静默丢弃——ObjectMutation 已有前车之鉴。
     :config_subsystem,

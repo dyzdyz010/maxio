@@ -1,6 +1,8 @@
 defmodule Mix.Tasks.Maxio.Admin.PolicyAssociationTest do
   use Maxio.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Maxio.IAM
 
   @tasks [
@@ -77,6 +79,28 @@ defmodule Mix.Tasks.Maxio.Admin.PolicyAssociationTest do
       Mix.Task.reenable(task)
       assert_raise Mix.Error, ~r/usage:/, fn -> Mix.Task.run(task, argv) end
     end
+  end
+
+  test "association telemetry preserves the raw requested policy count", %{
+    user_name: user_name,
+    policy_name: policy_name
+  } do
+    original_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: original_level) end)
+
+    log =
+      capture_log([level: :info], fn ->
+        Mix.Task.run("maxio.admin.policy.attach", [
+          policy_name,
+          policy_name,
+          "--user",
+          user_name
+        ])
+      end)
+
+    assert log =~ "requested_policy_count=2"
+    assert log =~ "changed_policy_count=1"
   end
 
   test "entities accepts independently repeated filters and stable JSON", %{

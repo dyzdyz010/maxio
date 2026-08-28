@@ -18,7 +18,7 @@ defmodule Mix.Tasks.Maxio.Admin.Policy.Attach do
          :ok <- CLI.boot(),
          {:ok, result} <-
            IAM.update_managed_policy_associations_strict(:attach, principal, policies) do
-      emit(opts[:json], principal, result)
+      emit(opts[:json], principal, result, length(policies))
     else
       false ->
         Mix.raise(@usage)
@@ -42,7 +42,7 @@ defmodule Mix.Tasks.Maxio.Admin.Policy.Attach do
     end
   end
 
-  defp emit(json?, {kind, name}, result) do
+  defp emit(json?, {kind, name}, result, requested_policy_count) do
     changed = Enum.map(result.changed_policy_arns, &policy_name/1)
     updated_at = DateTime.to_iso8601(result.updated_at)
 
@@ -51,7 +51,7 @@ defmodule Mix.Tasks.Maxio.Admin.Policy.Attach do
       admin_action: "admin_policy_association_attach",
       principal_kind: kind,
       operation: "attach",
-      requested_policy_count: length(changed),
+      requested_policy_count: requested_policy_count,
       changed_policy_count: length(changed),
       surface: "cli"
     )
@@ -80,5 +80,9 @@ defmodule Mix.Tasks.Maxio.Admin.Policy.Attach do
   defp public_failure(:group_disabled), do: "admin group is disabled"
   defp public_failure(:policy_not_found), do: "admin policy not found"
   defp public_failure(:policy_limit_exceeded), do: "managed policy attachment quota exceeded"
+
+  defp public_failure(:managed_policy_attachment_limit_exceeded),
+    do: "managed policy attachment quota exceeded"
+
   defp public_failure(_reason), do: "admin policy attach failed"
 end

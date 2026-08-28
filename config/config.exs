@@ -123,6 +123,8 @@ config :logger, :default_formatter,
     :minio_view_partial,
     :omitted_reason,
     :surface,
+    :requested_policy_count,
+    :changed_policy_count,
     # ObjectMutation 协议 §7 固定字段（B7 日志收口，B5 审查项 1）：Log 模块只放行白名单键，
     # formatter 侧必须同步放行，否则结构化字段被静默丢弃（action/request_id/bucket/key/
     # version_id/reason 已在上方白名单）。绝不放行对象 body / 密钥 / SSE envelope 类键。
