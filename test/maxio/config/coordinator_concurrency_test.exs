@@ -287,6 +287,8 @@ defmodule Maxio.Config.CoordinatorConcurrencyTest do
   end
 
   defp assert_mutate_available! do
+    Code.ensure_loaded!(Config)
+
     assert function_exported?(Config, :mutate_subsystem, 3),
            "Maxio.Config.mutate_subsystem/3 is required for subsystem coordination"
   end

@@ -6,7 +6,7 @@ defmodule Maxio.Config.CoordinatorTest do
   alias Maxio.Admin.ConfigKV.Registry
   alias Maxio.Config
   alias Maxio.Config.{RuntimeConfig, RuntimeConfigAudit, Schema, Store}
-  alias Maxio.Test.{ConfigBatchFailureRepo, ConfigBatchSchema}
+  alias Maxio.Test.{ConfigBatchFailureRepo, ConfigBatchSchema, ConfigMissingQueryRepo}
 
   setup do
     ConfigBatchFailureRepo.clear!()
@@ -64,6 +64,58 @@ defmodule Maxio.Config.CoordinatorTest do
     assert reason =~ "integer"
     assert runtime_snapshot() == []
     assert audit_snapshot() == []
+  end
+
+  test "repo without query boundary fails before any runtime read or mutation" do
+    # Catches the test-build bypass that silently treats a missing advisory-lock API as success.
+    {outcome, queries} =
+      capture_current_process_queries(fn ->
+        try do
+          {:returned,
+           apply(Config, :mutate_subsystem, [
+             :listing,
+             [{:set, :sql_hard_limit, 321}],
+             [
+               source: "cli",
+               request_id: "req-missing-query-boundary",
+               repo: ConfigMissingQueryRepo,
+               store: ConfigBatchSchema,
+               notify: ConfigBatchSchema
+             ]
+           ])}
+        rescue
+          error in ArgumentError -> {:raised, ArgumentError, Exception.message(error)}
+        end
+      end)
+
+    evidence = %{
+      outcome: outcome,
+      explicit_query_boundary_failure?:
+        match?({:raised, ArgumentError, _message}, outcome) and
+          String.contains?(elem(outcome, 2), "query!"),
+      runtime_queries: Enum.filter(queries, &String.contains?(&1, "runtime_configs")),
+      runtime_count:
+        Repo.aggregate(
+          from(row in RuntimeConfig,
+            where: row.subsystem == "listing" and row.key == "sql_hard_limit"
+          ),
+          :count
+        ),
+      audit_count:
+        Repo.aggregate(
+          from(audit in RuntimeConfigAudit,
+            where: audit.subsystem == "listing" and audit.key == "sql_hard_limit"
+          ),
+          :count
+        )
+    }
+
+    assert %{
+             explicit_query_boundary_failure?: true,
+             runtime_queries: [],
+             runtime_count: 0,
+             audit_count: 0
+           } = evidence
   end
 
   test "candidate rejection occurs before mutation and rolls the whole batch back" do
@@ -259,5 +311,38 @@ defmodule Maxio.Config.CoordinatorTest do
           to_version: audit.to_version
         }
     )
+  end
+
+  defp capture_current_process_queries(fun) do
+    owner = self()
+    handler_id = {__MODULE__, :query_capture, make_ref()}
+    prefix = Keyword.get(Repo.config(), :telemetry_prefix) || [:maxio, :repo]
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        prefix ++ [:query],
+        fn _event, _measurements, metadata, test_pid ->
+          if self() == test_pid and is_binary(metadata.query) do
+            send(test_pid, {:config_sql, handler_id, metadata.query})
+          end
+        end,
+        owner
+      )
+
+    try do
+      outcome = fun.()
+      {outcome, collect_queries(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp collect_queries(handler_id, queries) do
+    receive do
+      {:config_sql, ^handler_id, query} -> collect_queries(handler_id, [query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
   end
 end
