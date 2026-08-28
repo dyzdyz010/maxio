@@ -567,14 +567,7 @@ defmodule Maxio.Policy.Store do
 
   @spec attach_user_managed_policy(String.t(), String.t()) :: :ok | {:error, term()}
   def attach_user_managed_policy(user_arn, policy_arn) do
-    backend = impl()
-
-    result =
-      if callback_exported?(backend, :attach_user_managed_policy, 2) do
-        backend.attach_user_managed_policy(user_arn, policy_arn)
-      else
-        {:error, :not_supported}
-      end
+    result = attach_user_managed_policy_without_notify(user_arn, policy_arn)
 
     case result do
       :ok ->
@@ -586,15 +579,32 @@ defmodule Maxio.Policy.Store do
     end
   end
 
+  @doc false
+  def attach_user_managed_policy_without_notify(user_arn, policy_arn) do
+    backend = impl()
+
+    if callback_exported?(backend, :attach_user_managed_policy, 2) do
+      backend.attach_user_managed_policy(user_arn, policy_arn)
+    else
+      {:error, :not_supported}
+    end
+  end
+
   @spec detach_user_managed_policy(String.t(), String.t()) :: :ok
   def detach_user_managed_policy(user_arn, policy_arn) do
+    :ok = detach_user_managed_policy_without_notify(user_arn, policy_arn)
+    Notify.broadcast({:principal_policy_changed, user_arn})
+    :ok
+  end
+
+  @doc false
+  def detach_user_managed_policy_without_notify(user_arn, policy_arn) do
     backend = impl()
 
     if callback_exported?(backend, :detach_user_managed_policy, 2) do
       :ok = backend.detach_user_managed_policy(user_arn, policy_arn)
     end
 
-    Notify.broadcast({:principal_policy_changed, user_arn})
     :ok
   end
 
@@ -611,14 +621,7 @@ defmodule Maxio.Policy.Store do
 
   @spec attach_group_managed_policy(String.t(), String.t()) :: :ok | {:error, term()}
   def attach_group_managed_policy(group_arn, policy_arn) do
-    backend = impl()
-
-    result =
-      if callback_exported?(backend, :attach_group_managed_policy, 2) do
-        backend.attach_group_managed_policy(group_arn, policy_arn)
-      else
-        {:error, :not_supported}
-      end
+    result = attach_group_managed_policy_without_notify(group_arn, policy_arn)
 
     case result do
       :ok ->
@@ -630,15 +633,32 @@ defmodule Maxio.Policy.Store do
     end
   end
 
+  @doc false
+  def attach_group_managed_policy_without_notify(group_arn, policy_arn) do
+    backend = impl()
+
+    if callback_exported?(backend, :attach_group_managed_policy, 2) do
+      backend.attach_group_managed_policy(group_arn, policy_arn)
+    else
+      {:error, :not_supported}
+    end
+  end
+
   @spec detach_group_managed_policy(String.t(), String.t()) :: :ok
   def detach_group_managed_policy(group_arn, policy_arn) do
+    :ok = detach_group_managed_policy_without_notify(group_arn, policy_arn)
+    Notify.broadcast({:principal_policy_changed, group_arn})
+    :ok
+  end
+
+  @doc false
+  def detach_group_managed_policy_without_notify(group_arn, policy_arn) do
     backend = impl()
 
     if callback_exported?(backend, :detach_group_managed_policy, 2) do
       :ok = backend.detach_group_managed_policy(group_arn, policy_arn)
     end
 
-    Notify.broadcast({:principal_policy_changed, group_arn})
     :ok
   end
 

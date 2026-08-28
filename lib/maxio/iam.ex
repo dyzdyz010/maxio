@@ -1440,15 +1440,19 @@ defmodule Maxio.IAM do
       when is_binary(current_group_name) and (is_binary(new_group_name) or is_nil(new_group_name)) do
     new_group_name = normalize_iam_text(new_group_name || current_group_name)
 
-    with %Group{} = group <- fetch_group_record(current_group_name),
-         :ok <- reject_group_name_update_duplicate(group, new_group_name) do
+    with %Group{} = group <- fetch_group_record(current_group_name) do
       old_arn = group.group_arn
       new_arn = default_group_arn(new_group_name)
 
       if group.group_name == new_group_name and old_arn == new_arn do
         {:ok, public_group(group)}
       else
-        update_group_name_transaction(group, new_group_name, new_arn)
+        update_group_name_transaction(
+          group,
+          new_group_name,
+          new_arn,
+          GroupIdentity.snapshot(Repo, new_group_name)
+        )
       end
     else
       nil -> {:error, :not_found}
@@ -1512,14 +1516,35 @@ defmodule Maxio.IAM do
   @spec delete_group_strict(String.t()) :: {:ok, map()} | {:error, term()}
   def delete_group_strict(group_name_or_arn) when is_binary(group_name_or_arn) do
     case fetch_group_record(group_name_or_arn) do
-      %Group{} = group ->
-        case group_delete_blockers(group) do
-          [] ->
-            Repo.delete!(group)
+      %Group{} = initial ->
+        Repo.transaction(fn ->
+          with {:ok, %Group{} = group} <-
+                 GroupIdentity.lock_snapshot(
+                   Repo,
+                   initial.group_name,
+                   {:existing, initial.id}
+                 ) do
+            case group_delete_blockers(group) do
+              [] ->
+                Repo.delete!(group)
+                group
+
+              blockers ->
+                Repo.rollback({:group_delete_conflict, blockers})
+            end
+          else
+            {:error, :identity_changed} -> Repo.rollback(:identity_changed)
+          end
+        end)
+        |> case do
+          {:ok, group} ->
             Notify.broadcast({:iam_changed, group.group_arn})
             {:ok, public_group(group)}
 
-          blockers ->
+          {:error, :identity_changed} ->
+            {:error, :not_found}
+
+          {:error, {:group_delete_conflict, blockers}} ->
             {:error, {:group_delete_conflict, blockers}}
         end
 
@@ -2299,7 +2324,7 @@ defmodule Maxio.IAM do
     with %User{} = user <- fetch_user_record(user_name_or_arn),
          :ok <- validate_managed_policy_arn(policy_arn),
          {:ok, _policy} <- get_managed_policy(policy_arn) do
-      attach_user_managed_policy_with_quota(user.user_arn, policy_arn)
+      attach_user_managed_policy_with_quota(user, policy_arn)
     else
       nil -> {:error, :not_found}
       :error -> {:error, :not_found}
@@ -2345,10 +2370,10 @@ defmodule Maxio.IAM do
     with %User{} = user <- fetch_user_record(user_name_or_arn),
          :ok <- validate_managed_policy_arn(policy_arn),
          {:ok, _policy} <- get_managed_policy(policy_arn) do
-      detach_managed_policy_with_policy_lock(
-        user.user_arn,
+      detach_identity_managed_policy_with_locks(
+        :user,
+        user,
         policy_arn,
-        &Store.detach_user_managed_policy/2,
         require_policy: true
       )
     else
@@ -2364,11 +2389,12 @@ defmodule Maxio.IAM do
   @spec attach_user_policy(String.t(), String.t()) :: :ok | {:error, term()}
   def attach_user_policy(user_name_or_arn, policy_arn)
       when is_binary(user_name_or_arn) and is_binary(policy_arn) do
-    with {:ok, user} <- get_user(user_name_or_arn),
+    with %User{} = user <- fetch_user_record(user_name_or_arn),
          :ok <- validate_managed_policy_arn(policy_arn),
          {:ok, _policy} <- get_managed_policy(policy_arn) do
-      attach_user_managed_policy_with_quota(user.user_arn, policy_arn)
+      attach_user_managed_policy_with_quota(user, policy_arn)
     else
+      nil -> {:error, :not_found}
       :error -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
     end
@@ -2404,13 +2430,10 @@ defmodule Maxio.IAM do
   def detach_user_policy(user_name_or_arn, policy_arn)
       when is_binary(user_name_or_arn) and is_binary(policy_arn) do
     with :ok <- validate_managed_policy_arn(policy_arn),
-         {:ok, user} <- get_user(user_name_or_arn) do
-      detach_managed_policy_with_policy_lock(
-        user.user_arn,
-        policy_arn,
-        &Store.detach_user_managed_policy/2
-      )
+         %User{} = user <- fetch_user_record(user_name_or_arn) do
+      detach_identity_managed_policy_with_locks(:user, user, policy_arn)
     else
+      nil -> :ok
       :error -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -2425,7 +2448,7 @@ defmodule Maxio.IAM do
     with %Group{} = group <- fetch_group_record(group_name_or_arn),
          :ok <- validate_managed_policy_arn(policy_arn),
          {:ok, _policy} <- get_managed_policy(policy_arn) do
-      attach_group_managed_policy_with_quota(group.group_arn, policy_arn)
+      attach_group_managed_policy_with_quota(group, policy_arn)
     else
       nil -> {:error, :not_found}
       :error -> {:error, :not_found}
@@ -2471,10 +2494,10 @@ defmodule Maxio.IAM do
     with %Group{} = group <- fetch_group_record(group_name_or_arn),
          :ok <- validate_managed_policy_arn(policy_arn),
          {:ok, _policy} <- get_managed_policy(policy_arn) do
-      detach_managed_policy_with_policy_lock(
-        group.group_arn,
+      detach_identity_managed_policy_with_locks(
+        :group,
+        group,
         policy_arn,
-        &Store.detach_group_managed_policy/2,
         require_policy: true
       )
     else
@@ -2558,11 +2581,12 @@ defmodule Maxio.IAM do
   @spec attach_group_policy(String.t(), String.t()) :: :ok | {:error, term()}
   def attach_group_policy(group_name_or_arn, policy_arn)
       when is_binary(group_name_or_arn) and is_binary(policy_arn) do
-    with {:ok, group} <- get_group(group_name_or_arn),
+    with %Group{} = group <- fetch_group_record(group_name_or_arn),
          :ok <- validate_managed_policy_arn(policy_arn),
          {:ok, _policy} <- get_managed_policy(policy_arn) do
-      attach_group_managed_policy_with_quota(group.group_arn, policy_arn)
+      attach_group_managed_policy_with_quota(group, policy_arn)
     else
+      nil -> {:error, :not_found}
       :error -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
     end
@@ -2598,13 +2622,10 @@ defmodule Maxio.IAM do
   def detach_group_policy(group_name_or_arn, policy_arn)
       when is_binary(group_name_or_arn) and is_binary(policy_arn) do
     with :ok <- validate_managed_policy_arn(policy_arn),
-         {:ok, group} <- get_group(group_name_or_arn) do
-      detach_managed_policy_with_policy_lock(
-        group.group_arn,
-        policy_arn,
-        &Store.detach_group_managed_policy/2
-      )
+         %Group{} = group <- fetch_group_record(group_name_or_arn) do
+      detach_identity_managed_policy_with_locks(:group, group, policy_arn)
     else
+      nil -> :ok
       :error -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -4855,20 +4876,38 @@ defmodule Maxio.IAM do
     )
   end
 
-  defp update_group_name_transaction(%Group{} = group, new_group_name, new_arn) do
+  defp update_group_name_transaction(
+         %Group{} = group,
+         new_group_name,
+         new_arn,
+         target_snapshot
+       ) do
     old_arn = group.group_arn
 
     transaction_result =
       Repo.transaction(fn ->
-        case group
-             |> Group.changeset(%{group_name: new_group_name, group_arn: new_arn})
-             |> Repo.update() do
-          {:ok, updated} ->
-            update_group_principal_references(old_arn, new_arn)
-            updated
+        case GroupIdentity.lock_snapshots(Repo, [
+               {group.group_name, {:existing, group.id}},
+               {new_group_name, target_snapshot}
+             ]) do
+          {:ok, [%Group{} = locked_group, target]} ->
+            if target == :missing or target.id == locked_group.id do
+              case locked_group
+                   |> Group.changeset(%{group_name: new_group_name, group_arn: new_arn})
+                   |> Repo.update() do
+                {:ok, updated} ->
+                  update_group_principal_references(locked_group.group_arn, new_arn)
+                  updated
 
-          {:error, changeset} ->
-            Repo.rollback(changeset)
+                {:error, changeset} ->
+                  Repo.rollback(changeset)
+              end
+            else
+              Repo.rollback(:group_already_exists)
+            end
+
+          {:error, :identity_changed} ->
+            Repo.rollback(:identity_changed)
         end
       end)
 
@@ -4881,17 +4920,6 @@ defmodule Maxio.IAM do
         {:error, reason}
     end
   end
-
-  defp reject_group_name_update_duplicate(%Group{} = group, new_group_name)
-       when is_binary(new_group_name) and new_group_name != "" do
-    case fetch_group_by_case_insensitive_name(new_group_name) do
-      nil -> :ok
-      %Group{id: id} when id == group.id -> :ok
-      %Group{} -> {:error, :group_already_exists}
-    end
-  end
-
-  defp reject_group_name_update_duplicate(_group, _new_group_name), do: :ok
 
   defp reject_role_name_case_insensitive_duplicate(role_name)
        when is_binary(role_name) and role_name != "" do
@@ -5354,25 +5382,109 @@ defmodule Maxio.IAM do
     end)
   end
 
-  defp attach_user_managed_policy_with_quota(user_arn, policy_arn) do
-    attach_managed_policy_with_quota(
-      user_arn,
+  defp attach_user_managed_policy_with_quota(%User{} = user, policy_arn) do
+    attach_identity_managed_policy_with_quota(
+      :user,
+      user,
       policy_arn,
       @user_managed_policy_attachment_quota,
       &Store.list_attached_user_managed_policies/1,
-      &Store.attach_user_managed_policy/2
+      &Store.attach_user_managed_policy_without_notify/2
     )
   end
 
-  defp attach_group_managed_policy_with_quota(group_arn, policy_arn) do
-    attach_managed_policy_with_quota(
-      group_arn,
+  defp attach_group_managed_policy_with_quota(%Group{} = group, policy_arn) do
+    attach_identity_managed_policy_with_quota(
+      :group,
+      group,
       policy_arn,
       @group_managed_policy_attachment_quota,
       &Store.list_attached_group_managed_policies/1,
-      &Store.attach_group_managed_policy/2
+      &Store.attach_group_managed_policy_without_notify/2
     )
   end
+
+  defp attach_identity_managed_policy_with_quota(
+         kind,
+         principal,
+         policy_arn,
+         quota,
+         list_attached_fun,
+         attach_fun
+       ) do
+    identity_mutation_transaction(kind, principal, policy_arn, fn principal_arn ->
+      with :ok <- require_existing_managed_policy(policy_arn) do
+        attached_policy_arns =
+          list_attached_fun.(principal_arn)
+          |> Enum.map(& &1.policy_arn)
+          |> MapSet.new()
+
+        cond do
+          MapSet.member?(attached_policy_arns, policy_arn) ->
+            attach_fun.(principal_arn, policy_arn)
+
+          MapSet.size(attached_policy_arns) < quota ->
+            attach_fun.(principal_arn, policy_arn)
+
+          true ->
+            {:error, :managed_policy_attachment_limit_exceeded}
+        end
+      end
+    end)
+  end
+
+  defp detach_identity_managed_policy_with_locks(kind, principal, policy_arn, opts \\ []) do
+    identity_mutation_transaction(kind, principal, policy_arn, fn principal_arn ->
+      with :ok <- maybe_require_existing_managed_policy(policy_arn, opts) do
+        detach_identity_managed_policy_without_notify(kind, principal_arn, policy_arn)
+      end
+    end)
+  end
+
+  defp identity_mutation_transaction(kind, principal, policy_arn, mutation_fun) do
+    Repo.transaction(fn ->
+      with {:ok, locked_principal} <- lock_principal_identity(kind, principal) do
+        principal_arn = principal_arn(kind, locked_principal)
+        lock_principal_policy_quota!(principal_arn)
+        lock_managed_policy!(policy_arn)
+
+        case mutation_fun.(principal_arn) do
+          :ok -> principal_arn
+          {:error, reason} -> Repo.rollback({:error, reason})
+        end
+      else
+        {:error, reason} -> Repo.rollback({:error, reason})
+      end
+    end)
+    |> case do
+      {:ok, principal_arn} ->
+        Notify.broadcast({:principal_policy_changed, principal_arn})
+        :ok
+
+      {:error, {:error, reason}} ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp lock_principal_identity(:user, %User{} = user) do
+    UserIdentity.lock_snapshot(Repo, user.user_name, {:existing, user.id})
+  end
+
+  defp lock_principal_identity(:group, %Group{} = group) do
+    GroupIdentity.lock_snapshot(Repo, group.group_name, {:existing, group.id})
+  end
+
+  defp principal_arn(:user, %User{} = user), do: user.user_arn
+  defp principal_arn(:group, %Group{} = group), do: group.group_arn
+
+  defp detach_identity_managed_policy_without_notify(:user, principal_arn, policy_arn),
+    do: Store.detach_user_managed_policy_without_notify(principal_arn, policy_arn)
+
+  defp detach_identity_managed_policy_without_notify(:group, principal_arn, policy_arn),
+    do: Store.detach_group_managed_policy_without_notify(principal_arn, policy_arn)
 
   defp attach_role_managed_policy_with_quota(role_arn, policy_arn) do
     attach_managed_policy_with_quota(

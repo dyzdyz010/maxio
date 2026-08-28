@@ -31,8 +31,27 @@ defmodule Maxio.IAM.GroupIdentity do
           {:ok, Group.t() | :missing} | {:error, :identity_changed}
   def lock_snapshot(repo, name_or_arn, snapshot) when is_binary(name_or_arn) do
     name = identity_name(name_or_arn)
-    lock_name!(repo, name)
+    lock_names!(repo, [name])
     validate_snapshot(repo, name, snapshot)
+  end
+
+  @doc false
+  @spec lock_snapshots(module(), [{String.t(), snapshot()}]) ::
+          {:ok, [Group.t() | :missing]} | {:error, :identity_changed}
+  def lock_snapshots(repo, named_snapshots) when is_list(named_snapshots) do
+    normalized = Enum.map(named_snapshots, fn {name, state} -> {identity_name(name), state} end)
+    lock_names!(repo, Enum.map(normalized, &elem(&1, 0)))
+
+    Enum.reduce_while(normalized, {:ok, []}, fn {name, state}, {:ok, rows} ->
+      case validate_snapshot(repo, name, state) do
+        {:ok, row} -> {:cont, {:ok, [row | rows]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, rows} -> {:ok, Enum.reverse(rows)}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp validate_snapshot(repo, name, {:existing, id}) do
@@ -66,22 +85,24 @@ defmodule Maxio.IAM.GroupIdentity do
     )
   end
 
-  defp lock_name!(repo, name) do
-    case_folded_name = String.downcase(name)
+  defp lock_names!(repo, names) do
+    names
+    |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.each(fn case_folded_name ->
+      :telemetry.execute(
+        @lock_wait_event,
+        %{system_time: System.system_time()},
+        %{case_folded_group_name: case_folded_name}
+      )
 
-    :telemetry.execute(
-      @lock_wait_event,
-      %{system_time: System.system_time()},
-      %{case_folded_group_name: case_folded_name}
-    )
-
-    Ecto.Adapters.SQL.query!(
-      repo,
-      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      [@lock_namespace, case_folded_name]
-    )
-
-    :ok
+      Ecto.Adapters.SQL.query!(
+        repo,
+        "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+        [@lock_namespace, case_folded_name]
+      )
+    end)
   end
 
   defp identity_name(@group_arn_prefix <> name), do: name
