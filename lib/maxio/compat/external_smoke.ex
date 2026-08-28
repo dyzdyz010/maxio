@@ -650,11 +650,20 @@ defmodule Maxio.Compat.ExternalSmoke do
         assertion: "mc admin policy info returns the named PolicyInfo projection"
       ),
       step(
+        "admin_user_list",
+        executable,
+        base_args ++ ["admin", "user", "list", "maxiocompat"],
+        opts,
+        {:output_contains, [user_name, "enabled"]},
+        scenario: "admin_user_list",
+        assertion: "mc admin user list returns the active temporary IAM user"
+      ),
+      step(
         "admin_user_info",
         executable,
         base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
         opts,
-        {:output_contains, ["Status", "enabled"]},
+        {:output_contains, [user_name, "Status", "enabled"]},
         scenario: "admin_user_info",
         assertion: "mc admin user info returns the active temporary IAM user"
       ),

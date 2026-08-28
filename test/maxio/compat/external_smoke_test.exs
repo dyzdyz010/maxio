@@ -252,10 +252,16 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           ["policy", "info", "maxiocompat", policy_name] = command_args
           {"PolicyName: #{policy_name}", 0}
 
+        subcommand == "admin" and Enum.take(command_args, 3) == ["user", "list", "maxiocompat"] ->
+          ["user", "list", "maxiocompat"] = command_args
+          user_name = Process.get(:admin_fixture_user)
+          send(self(), {:admin_user_list, user_name})
+          {"#{user_name} enabled\nsuper-secret test-access", 0}
+
         subcommand == "admin" and Enum.take(command_args, 3) == ["user", "info", "maxiocompat"] ->
           ["user", "info", "maxiocompat", user_name] = command_args
           send(self(), {:admin_user_info, user_name})
-          {"Status: enabled\nsuper-secret test-access", 0}
+          {"AccessKey: #{user_name}\nStatus: enabled\nsuper-secret test-access", 0}
 
         subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
           payload_path = Enum.find(command_args, &File.regular?/1)
@@ -300,6 +306,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "admin_policy_create",
              "admin_policy_list",
              "admin_policy_info",
+             "admin_user_list",
              "admin_user_info",
              "admin_policy_remove",
              "delete_copied_object",
@@ -310,6 +317,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert entry["scenario_counts"]["object_copy"] == 3
     assert entry["scenario_counts"]["admin_policy_lifecycle"] == 4
+    assert entry["scenario_counts"]["admin_user_list"] == 1
     assert entry["scenario_counts"]["admin_user_info"] == 1
 
     encoded = Jason.encode!(entry)
@@ -322,7 +330,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert config_dir |> Path.dirname() |> Path.dirname() |> Path.expand() |> Path.split() ==
              tmp_root |> Path.expand() |> Path.split()
 
-    assert length(calls) == 15
+    assert length(calls) == 16
 
     Enum.each(calls, fn {command, args, opts} ->
       assert command == "mc.exe"
@@ -393,12 +401,22 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              ^config_dir,
              "admin",
              "user",
+             "list",
+             "maxiocompat"
+           ] = elem(Enum.at(calls, 10), 1)
+
+    assert [
+             "--config-dir",
+             ^config_dir,
+             "admin",
+             "user",
              "info",
              "maxiocompat",
              fixture_user
-           ] = elem(Enum.at(calls, 10), 1)
+           ] = elem(Enum.at(calls, 11), 1)
 
     assert_received {:admin_fixture_created, ^fixture_user}
+    assert_received {:admin_user_list, ^fixture_user}
     assert_received {:admin_user_info, ^fixture_user}
     assert_received {:admin_fixture_cleaned, ^fixture_user}
 
@@ -410,12 +428,13 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "rm",
              "maxiocompat",
              ^policy_name
-           ] = elem(Enum.at(calls, 11), 1)
+           ] = elem(Enum.at(calls, 12), 1)
 
     refute Enum.any?(calls, fn {_command, args, _opts} ->
              args_text = Enum.join(args, " ")
 
-             args_text =~ " admin user enable " or args_text =~ " admin user disable " or
+             args_text =~ " admin user add " or args_text =~ " admin user enable " or
+               args_text =~ " admin user disable " or
                args_text =~ " admin user remove "
            end)
 
@@ -453,8 +472,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "info"] ->
           {"PolicyName #{Process.get(:cleanup_policy_name)}", 0}
 
+        subcommand == "admin" and Enum.take(command_args, 2) == ["user", "list"] ->
+          {"#{Process.get(:admin_fixture_user)} enabled", 0}
+
         subcommand == "admin" and Enum.take(command_args, 2) == ["user", "info"] ->
-          {"Status: enabled", 0}
+          {"AccessKey: #{Process.get(:admin_fixture_user)}\nStatus: enabled", 0}
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "rm"] ->
           calls = Process.get(:policy_remove_calls) + 1
@@ -572,6 +594,85 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert [%{"reason" => "external_smoke_output_missing", "step" => "stat_object"}] =
              entry["blockers"]
+  end
+
+  test "mc user list command and decrypted-output assertions fail explicitly before info" do
+    for {list_result, reason, step_status} <- [
+          {{"user list failed", 17}, "external_smoke_step_failed", "blocked"},
+          {{"somebody-else disabled", 0}, "external_smoke_output_missing", "ok"}
+        ] do
+      [entry] =
+        @config
+        |> Map.put(:clients, ["minio_mc"])
+        |> ExternalSmoke.run(
+          executable_finder: fn "mc" -> "mc.exe" end,
+          command_runner: successful_mc_runner(admin_user_list: list_result),
+          tmp_root_fun: &tmp_root/0,
+          admin_user_fixture_opts: fixture_opts(self())
+        )
+
+      assert entry["status"] == "blocked"
+
+      assert Enum.any?(
+               entry["steps"],
+               &(&1["id"] == "admin_user_list" and &1["status"] == step_status)
+             )
+
+      refute Enum.any?(entry["steps"], &(&1["id"] == "admin_user_info"))
+      assert hd(entry["blockers"])["reason"] == reason
+      assert hd(entry["blockers"])["step"] == "admin_user_list"
+      assert List.last(entry["steps"])["id"] == "admin_user_fixture_cleanup"
+    end
+  end
+
+  test "mc prerequisites block before fixture setup or command execution" do
+    [entry] =
+      ExternalSmoke.run(%{clients: ["minio_mc"]},
+        executable_finder: fn _candidate -> raise "finder must not run" end,
+        command_runner: fn _, _, _ -> raise "runner must not run" end,
+        admin_user_fixture_opts: [create_user: fn _ -> raise "fixture must not run" end]
+      )
+
+    assert entry["status"] == "attention"
+    assert [%{"reason" => "external_smoke_not_configured"}] = entry["warnings"]
+    assert entry["steps"] == []
+  end
+
+  test "mc read smoke is repeatable and never constructs admin user add argv" do
+    owner = self()
+    successful = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      send(owner, {:repeatable_mc_argv, args})
+      successful.(command, args, opts)
+    end
+
+    entries =
+      for _iteration <- 1..2 do
+        [entry] =
+          @config
+          |> Map.put(:clients, ["minio_mc"])
+          |> ExternalSmoke.run(
+            executable_finder: fn "mc" -> "mc.exe" end,
+            command_runner: runner,
+            tmp_root_fun: &tmp_root/0,
+            admin_user_fixture_opts: fixture_opts(owner)
+          )
+
+        entry
+      end
+
+    assert Enum.all?(entries, &(&1["status"] == "ok"))
+
+    argv = receive_all_argv()
+    user_commands = Enum.filter(argv, &(Enum.slice(&1, 2, 2) == ["admin", "user"]))
+    assert Enum.count(user_commands, &(Enum.at(&1, 4) == "list")) == 2
+    assert Enum.count(user_commands, &(Enum.at(&1, 4) == "info")) == 2
+
+    refute Enum.any?(argv, fn args ->
+             Enum.chunk_every(args, 3, 1, :discard)
+             |> Enum.any?(&(&1 == ["admin", "user", "add"]))
+           end)
   end
 
   test "successful user info plus fixture cleanup failure keeps primary evidence and blocks" do
@@ -797,11 +898,20 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert host in String.split(upper, ",")
   end
 
+  defp receive_all_argv(acc \\ []) do
+    receive do
+      {:repeatable_mc_argv, args} -> receive_all_argv([args | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   defp fixture_opts(owner, cleanup_result \\ :ok) do
     [
       start_repo: fn -> :ok end,
       name: "maxio-compat-user-#{System.unique_integer([:positive])}",
       create_user: fn name ->
+        Process.put(:admin_fixture_user, name)
         send(owner, {:admin_fixture_created, name})
         {:ok, %{user_name: name, status: "active"}}
       end,
@@ -813,6 +923,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   end
 
   defp successful_mc_runner(opts \\ []) do
+    admin_user_list = Keyword.get(opts, :admin_user_list)
     admin_user_info = Keyword.get(opts, :admin_user_info, {"Status: enabled", 0})
 
     fn _command, args, _command_opts ->
@@ -841,8 +952,17 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "info"] ->
           {"PolicyName #{Process.get(:successful_mc_policy)}", 0}
 
+        subcommand == "admin" and Enum.take(command_args, 2) == ["user", "list"] ->
+          admin_user_list || {"#{Process.get(:admin_fixture_user)} enabled", 0}
+
         subcommand == "admin" and Enum.take(command_args, 2) == ["user", "info"] ->
-          admin_user_info
+          case admin_user_info do
+            {output, status} when status == 0 ->
+              {"AccessKey: #{Process.get(:admin_fixture_user)}\n#{output}", status}
+
+            failure ->
+              failure
+          end
 
         true ->
           {"ok", 0}

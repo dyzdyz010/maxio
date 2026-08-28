@@ -61,6 +61,8 @@ defmodule Maxio.S3.Log do
     :target_policy,
     :target_user,
     :user_count,
+    :enabled_count,
+    :disabled_count,
     :credential_bearing_count,
     :minio_view_partial_count,
     :omitted_non_root_path_policies,
