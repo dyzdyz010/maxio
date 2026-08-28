@@ -165,12 +165,7 @@ defmodule Maxio.Compat.AdminUserFixture do
     secret_key = Base.url_encode64(:crypto.strong_rand_bytes(30), padding: false)
 
     with {:ok, %{user: user}} <- IAM.create_minio_user_strict(name, secret_key, "active"),
-         :ok <-
-           IAM.put_user_policy_strict(
-             name,
-             "maxio-compat-list-buckets",
-             list_buckets_policy()
-           ) do
+         :ok <- maybe_put_list_buckets_policy(name, opts) do
       {:ok,
        %{
          user: user,
@@ -180,6 +175,14 @@ defmodule Maxio.Compat.AdminUserFixture do
       failure ->
         _cleanup = IAM.delete_user(name)
         failure
+    end
+  end
+
+  defp maybe_put_list_buckets_policy(name, opts) do
+    if Keyword.get(opts, :initial_list_buckets_policy, true) do
+      IAM.put_user_policy_strict(name, "maxio-compat-list-buckets", list_buckets_policy())
+    else
+      :ok
     end
   end
 

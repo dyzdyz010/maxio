@@ -81,13 +81,13 @@ the JSON fixtures; a moving branch is not an oracle for this batch.
   parity claim.
 - Maxio deliberately does not reproduce the upstream bad-envelope 500 or the
   disabled-group 500: the selected structured responses are recorded in the P6
-  fixture. Zero length uses the same bad-envelope 400 but should preferably reach
-  decrypt naturally.
+  fixture. A known operation with zero-length ciphertext reaches decrypt and is
+  returned as structured `400 ConfigBadJSON`.
 
-The only unresolved wire boundary in this evidence pack is malformed percent
-encoding in the raw P7 query string. It remains **VERIFY-AT-IMPL**. If Maxio
-chooses a structured 400 before compatible evidence is available, that behavior
-must be documented as a defense deviation. No other fixture field is provisional.
+Maxio rejects malformed percent encoding in the raw P7 query string with a
+structured 400 before projection. This is an explicit defense deviation pending
+strict live evidence, not a claim that upstream emits the same classification.
+No other fixture field is provisional.
 
 ## Canonical mc output
 

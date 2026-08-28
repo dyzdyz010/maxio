@@ -98,6 +98,18 @@ defmodule Maxio.Compat.AdminUserFixtureTest do
     assert :error = IAM.get_user(user_name)
   end
 
+  test "policy-association smoke can start without the bootstrap ListBuckets grant" do
+    assert {:ok, user_name, %{blockers: []}} =
+             AdminUserFixture.with_user([initial_list_buckets_policy: false], fn user, s3_probe ->
+               assert [] = IAM.list_principal_policies(user.user_arn)
+               assert is_function(s3_probe, 0)
+               user.user_name
+             end)
+
+    assert String.starts_with?(user_name, "maxio-compat-user-")
+    assert :error = IAM.get_user(user_name)
+  end
+
   defp fixture_opts(owner) do
     [
       start_repo: fn -> :ok end,

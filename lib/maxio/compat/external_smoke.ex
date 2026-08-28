@@ -251,7 +251,9 @@ defmodule Maxio.Compat.ExternalSmoke do
     env = mc_env(config)
 
     admin_user_fixture_opts =
-      Keyword.put_new(admin_user_fixture_opts, :endpoint, config.endpoint)
+      admin_user_fixture_opts
+      |> Keyword.put_new(:endpoint, config.endpoint)
+      |> Keyword.put_new(:initial_list_buckets_policy, false)
 
     human =
       run_mc_user_mode(
@@ -297,13 +299,22 @@ defmodule Maxio.Compat.ExternalSmoke do
          started
        ) do
     case AdminUserFixture.with_user(fixture_opts, fn user, s3_probe ->
+           mode_paths = independent_mc_paths(paths, mode)
+
            {steps, cleanup_steps} =
              case mode do
                :human ->
-                 mc_steps(executable, config, paths, env, user.user_name, s3_probe)
+                 mc_steps(executable, config, mode_paths, env, user.user_name, s3_probe)
 
                :json ->
-                 mc_json_user_steps(executable, config, paths, env, user.user_name, s3_probe)
+                 mc_json_user_steps(
+                   executable,
+                   config,
+                   mode_paths,
+                   env,
+                   user.user_name,
+                   s3_probe
+                 )
              end
 
            run_step_plan(
@@ -338,6 +349,22 @@ defmodule Maxio.Compat.ExternalSmoke do
       _other ->
         opts
     end
+  end
+
+  defp independent_mc_paths(paths, :human), do: paths
+
+  defp independent_mc_paths(paths, :json) do
+    suffix = "-json"
+    max_prefix = max(3, 128 - byte_size(suffix))
+
+    %{
+      paths
+      | policy_name:
+          binary_part(paths.policy_name, 0, min(byte_size(paths.policy_name), max_prefix)) <>
+            suffix,
+        mc_config_dir: paths.mc_config_dir <> suffix,
+        mc_alias: "maxiocompatjson"
+    }
   end
 
   defp tag_mc_mode(entry, mode) do
@@ -738,7 +765,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         assertion: "copied object body matches the source bytes"
       ),
       step(
-        "admin_policy_create",
+        "admin_policy_human_create",
         executable,
         base_args ++
           [
@@ -754,7 +781,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         assertion: "managed policy can be created through mc admin"
       ),
       step(
-        "admin_policy_list",
+        "admin_policy_human_list",
         executable,
         base_args ++ ["admin", "policy", "ls", "maxiocompat"],
         opts,
@@ -763,7 +790,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         assertion: "created managed policy is visible through mc admin policy ls"
       ),
       step(
-        "admin_policy_info",
+        "admin_policy_human_info",
         executable,
         base_args ++ ["admin", "policy", "info", "maxiocompat", paths.policy_name],
         opts,
@@ -790,11 +817,84 @@ defmodule Maxio.Compat.ExternalSmoke do
         assertion: "mc admin user info returns the active temporary IAM user"
       ),
       local_step(
-        "admin_user_human_s3_enabled",
+        "admin_policy_human_s3_baseline_denied",
+        s3_probe,
+        {:probe, :rejected},
+        "admin_policy_association_lifecycle",
+        "unprivileged temporary user cannot list buckets before attach"
+      ),
+      step(
+        "admin_policy_human_attach",
+        executable,
+        base_args ++
+          ["admin", "policy", "attach", "maxiocompat", paths.policy_name, "--user", user_name],
+        opts,
+        {:output_exact, association_human_output(:attach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "mc attaches the dedicated ListBuckets policy"
+      ),
+      local_step(
+        "admin_policy_human_s3_attached",
         s3_probe,
         {:probe, :success},
-        "admin_user_human_lifecycle",
-        "temporary user can list buckets before disable"
+        "admin_policy_association_lifecycle",
+        "attached managed policy enables ListBuckets"
+      ),
+      step(
+        "admin_policy_human_attach_no_effect",
+        executable,
+        base_args ++
+          [
+            "admin",
+            "policy",
+            "attach",
+            "maxiocompat",
+            paths.policy_name,
+            paths.policy_name,
+            "--user",
+            user_name
+          ],
+        opts,
+        {:output_exact,
+         association_human_output(:attach, [paths.policy_name, paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "pinned mc synthesizes no-effect success from original duplicate argv"
+      ),
+      step(
+        "admin_policy_human_entities",
+        executable,
+        base_args ++ policy_entities_args(paths.policy_name, user_name),
+        opts,
+        {:policy_entities_human, paths.policy_name, user_name},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "mc renders policy entities after independently repeated filters"
+      ),
+      step(
+        "admin_policy_human_detach",
+        executable,
+        base_args ++
+          ["admin", "policy", "detach", "maxiocompat", paths.policy_name, "--user", user_name],
+        opts,
+        {:output_exact, association_human_output(:detach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "mc detaches the dedicated policy"
+      ),
+      local_step(
+        "admin_policy_human_s3_detached",
+        s3_probe,
+        {:probe, :rejected},
+        "admin_policy_association_lifecycle",
+        "detaching the only grant restores S3 denial"
+      ),
+      step(
+        "admin_policy_human_reattach",
+        executable,
+        base_args ++
+          ["admin", "policy", "attach", "maxiocompat", paths.policy_name, "--user", user_name],
+        opts,
+        {:output_exact, association_human_output(:attach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "policy is reattached before the existing user-status lifecycle"
       ),
       step(
         "admin_user_human_disable",
@@ -847,6 +947,16 @@ defmodule Maxio.Compat.ExternalSmoke do
         "the same credential works after re-enable"
       ),
       step(
+        "admin_policy_human_cleanup_detach",
+        executable,
+        base_args ++
+          ["admin", "policy", "detach", "maxiocompat", paths.policy_name, "--user", user_name],
+        opts,
+        {:output_exact, association_human_output(:detach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "cleanup detaches policy before deleting user and managed policy"
+      ),
+      step(
         "admin_user_human_remove",
         executable,
         base_args ++ ["admin", "user", "remove", "maxiocompat", user_name],
@@ -883,7 +993,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         assertion: "root-signed admin request still succeeds after root removal is rejected"
       ),
       step(
-        "admin_policy_remove",
+        "admin_policy_human_remove",
         executable,
         base_args ++ ["admin", "policy", "rm", "maxiocompat", paths.policy_name],
         opts,
@@ -906,7 +1016,9 @@ defmodule Maxio.Compat.ExternalSmoke do
 
     cleanup_steps =
       select_cleanup_steps(steps, [
-        {"admin_policy_remove", "admin_policy_create"},
+        {"admin_policy_human_cleanup_detach", "admin_policy_human_create"},
+        {"admin_user_human_remove", "admin_policy_human_create"},
+        {"admin_policy_human_remove", "admin_policy_human_create"},
         {"delete_copied_object", "copy_object"},
         {"delete_object", "put_object"},
         {"delete_bucket", "make_bucket"}
@@ -918,8 +1030,20 @@ defmodule Maxio.Compat.ExternalSmoke do
   defp mc_json_user_steps(executable, config, paths, env, user_name, s3_probe) do
     opts = command_opts(config, [{"MC_CONFIG_DIR", paths.mc_config_dir} | env])
     base_args = ["--json"]
+    mc_alias = paths.mc_alias
 
     steps = [
+      step(
+        "admin_policy_json_create",
+        executable,
+        base_args ++
+          ["admin", "policy", "create", mc_alias, paths.policy_name, paths.policy_path],
+        opts,
+        {:json_object,
+         %{"status" => "success", "policy" => paths.policy_name, "isGroup" => false}},
+        scenario: "admin_policy_lifecycle",
+        assertion: "JSON mode independently creates its managed policy"
+      ),
       json_user_step(
         "admin_user_json_info_enabled",
         executable,
@@ -927,14 +1051,88 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "info",
         user_name,
+        mc_alias,
         %{"accessKey" => user_name, "status" => "success", "userStatus" => "enabled"}
       ),
       local_step(
-        "admin_user_json_s3_enabled",
+        "admin_policy_json_s3_baseline_denied",
+        s3_probe,
+        {:probe, :rejected},
+        "admin_policy_association_lifecycle",
+        "independent JSON fixture begins without ListBuckets permission"
+      ),
+      step(
+        "admin_policy_json_attach",
+        executable,
+        base_args ++
+          ["admin", "policy", "attach", mc_alias, paths.policy_name, "--user", user_name],
+        opts,
+        {:json_object, association_json(:attach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "JSON mc attaches the dedicated policy"
+      ),
+      local_step(
+        "admin_policy_json_s3_attached",
         s3_probe,
         {:probe, :success},
-        "admin_user_json_lifecycle",
-        "JSON fixture credential works before disable"
+        "admin_policy_association_lifecycle",
+        "JSON fixture can list buckets after attach"
+      ),
+      step(
+        "admin_policy_json_attach_no_effect",
+        executable,
+        base_args ++
+          [
+            "admin",
+            "policy",
+            "attach",
+            mc_alias,
+            paths.policy_name,
+            paths.policy_name,
+            "--user",
+            user_name
+          ],
+        opts,
+        {:json_object,
+         association_json(:attach, [paths.policy_name, paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "JSON no-effect synthesis preserves duplicate argv"
+      ),
+      step(
+        "admin_policy_json_entities",
+        executable,
+        base_args ++ policy_entities_args(paths.policy_name, user_name, mc_alias),
+        opts,
+        {:policy_entities_json, paths.policy_name, user_name},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "JSON entities output preserves omission, null, and sorting semantics"
+      ),
+      step(
+        "admin_policy_json_detach",
+        executable,
+        base_args ++
+          ["admin", "policy", "detach", mc_alias, paths.policy_name, "--user", user_name],
+        opts,
+        {:json_object, association_json(:detach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "JSON mc detaches the dedicated policy"
+      ),
+      local_step(
+        "admin_policy_json_s3_detached",
+        s3_probe,
+        {:probe, :rejected},
+        "admin_policy_association_lifecycle",
+        "JSON fixture is denied again after detach"
+      ),
+      step(
+        "admin_policy_json_reattach",
+        executable,
+        base_args ++
+          ["admin", "policy", "attach", mc_alias, paths.policy_name, "--user", user_name],
+        opts,
+        {:json_object, association_json(:attach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "JSON policy is reattached before user-status checks"
       ),
       json_user_step(
         "admin_user_json_disable",
@@ -943,6 +1141,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "disable",
         user_name,
+        mc_alias,
         %{"accessKey" => user_name, "status" => "success"}
       ),
       json_user_step(
@@ -952,6 +1151,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "info",
         user_name,
+        mc_alias,
         %{"accessKey" => user_name, "status" => "success", "userStatus" => "disabled"}
       ),
       local_step(
@@ -968,6 +1168,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "enable",
         user_name,
+        mc_alias,
         %{"accessKey" => user_name, "status" => "success"}
       ),
       json_user_step(
@@ -977,6 +1178,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "info",
         user_name,
+        mc_alias,
         %{"accessKey" => user_name, "status" => "success", "userStatus" => "enabled"}
       ),
       local_step(
@@ -986,6 +1188,16 @@ defmodule Maxio.Compat.ExternalSmoke do
         "admin_user_json_lifecycle",
         "JSON fixture credential works after re-enable"
       ),
+      step(
+        "admin_policy_json_cleanup_detach",
+        executable,
+        base_args ++
+          ["admin", "policy", "detach", mc_alias, paths.policy_name, "--user", user_name],
+        opts,
+        {:json_object, association_json(:detach, [paths.policy_name], user_name)},
+        scenario: "admin_policy_association_lifecycle",
+        assertion: "JSON cleanup detaches before deleting user and policy"
+      ),
       json_user_step(
         "admin_user_json_remove",
         executable,
@@ -993,18 +1205,71 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "remove",
         user_name,
+        mc_alias,
         %{"accessKey" => user_name, "status" => "success"}
+      ),
+      step(
+        "admin_policy_json_remove",
+        executable,
+        base_args ++ ["admin", "policy", "rm", mc_alias, paths.policy_name],
+        opts,
+        {:json_object,
+         %{"status" => "success", "policy" => paths.policy_name, "isGroup" => false}},
+        scenario: "admin_policy_lifecycle",
+        assertion: "JSON mode removes its independent policy after deleting the user"
       )
     ]
 
-    {steps, []}
+    cleanup_steps =
+      select_cleanup_steps(steps, [
+        {"admin_policy_json_cleanup_detach", "admin_policy_json_create"},
+        {"admin_user_json_remove", "admin_policy_json_create"},
+        {"admin_policy_json_remove", "admin_policy_json_create"}
+      ])
+
+    {steps, cleanup_steps}
   end
 
-  defp json_user_step(id, executable, base_args, opts, action, user_name, expected) do
+  defp association_human_output(:attach, policies, user_name) do
+    "Attached Policies: [#{Enum.join(policies, " ")}]\nTo User: #{user_name}\n"
+  end
+
+  defp association_human_output(:detach, policies, user_name) do
+    "Detached Policies: [#{Enum.join(policies, " ")}]\nFrom User: #{user_name}\n"
+  end
+
+  defp association_json(:attach, policies, user_name) do
+    %{"status" => "success", "policiesAttached" => policies, "user" => user_name}
+  end
+
+  defp association_json(:detach, policies, user_name) do
+    %{"status" => "success", "policiesDetached" => policies, "user" => user_name}
+  end
+
+  defp policy_entities_args(policy_name, user_name, mc_alias \\ "maxiocompat") do
+    missing_user = "missing-#{user_name}"
+
+    [
+      "admin",
+      "policy",
+      "entities",
+      mc_alias,
+      "--user",
+      missing_user,
+      "--user",
+      missing_user,
+      "--policy",
+      policy_name,
+      "--policy",
+      policy_name
+    ]
+  end
+
+  defp json_user_step(id, executable, base_args, opts, action, user_name, mc_alias, expected) do
     step(
       id,
       executable,
-      base_args ++ ["admin", "user", action, "maxiocompat", user_name],
+      base_args ++ ["admin", "user", action, mc_alias, user_name],
       opts,
       {:json_object, expected},
       scenario: "admin_user_json_lifecycle",
@@ -1213,6 +1478,44 @@ defmodule Maxio.Compat.ExternalSmoke do
     end
   end
 
+  defp verify_step({:policy_entities_human, policy_name, user_name}, output) do
+    with ["Query time: " <> timestamp, mappings] <- String.split(output, "\n", parts: 2),
+         {:ok, _instant, _offset} <- DateTime.from_iso8601(timestamp),
+         true <-
+           mc_output_exact?(
+             mappings,
+             "Policy -> Entity Mappings:\n" <>
+               "  Policy: #{policy_name}\n" <>
+               "    User Mappings:\n" <>
+               "      #{user_name}\n"
+           ) do
+      :ok
+    else
+      _other ->
+        {:error, "external_smoke_output_mismatch", "mc policy entities output did not match"}
+    end
+  end
+
+  defp verify_step({:policy_entities_json, policy_name, user_name}, output) do
+    with {:ok,
+          %{
+            "status" => "success",
+            "result" => %{
+              "timestamp" => timestamp,
+              "policyMappings" => [
+                %{"policy" => ^policy_name, "users" => [^user_name], "groups" => nil}
+              ]
+            }
+          } = decoded} <- Jason.decode(output),
+         {:ok, _instant, _offset} <- DateTime.from_iso8601(timestamp),
+         true <- map_size(decoded) == 2 and map_size(decoded["result"]) == 2 do
+      :ok
+    else
+      _other ->
+        {:error, "external_smoke_json_mismatch", "policy entities JSON did not match"}
+    end
+  end
+
   defp verify_step({:probe, expected}, output) do
     with {:ok, %{"status" => status, "code" => code, "message" => message}} <-
            Jason.decode(output) do
@@ -1396,8 +1699,8 @@ defmodule Maxio.Compat.ExternalSmoke do
         "Version" => "2012-10-17",
         "Statement" => %{
           "Effect" => "Allow",
-          "Action" => "s3:GetObject",
-          "Resource" => "arn:aws:s3:::maxio-compat-*/*"
+          "Action" => "s3:ListAllMyBuckets",
+          "Resource" => "*"
         }
       })
     )
@@ -1415,6 +1718,7 @@ defmodule Maxio.Compat.ExternalSmoke do
       range_download_path: range_download_path,
       copy_download_path: copy_download_path,
       mc_config_dir: mc_config_dir,
+      mc_alias: "maxiocompat",
       policy_name: policy_name,
       policy_path: policy_path,
       range_header: "bytes=0-#{byte_size(range_payload) - 1}",
@@ -1439,9 +1743,11 @@ defmodule Maxio.Compat.ExternalSmoke do
   end
 
   defp mc_env(config) do
+    host = endpoint_with_userinfo(config.endpoint, config.access_key, config.secret_key)
+
     [
-      {"MC_HOST_maxiocompat",
-       endpoint_with_userinfo(config.endpoint, config.access_key, config.secret_key)}
+      {"MC_HOST_maxiocompat", host},
+      {"MC_HOST_maxiocompatjson", host}
     ]
   end
 

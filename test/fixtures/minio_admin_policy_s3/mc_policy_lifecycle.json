@@ -134,16 +134,46 @@
     "stderr": "",
     "exit_code": 0
   },
-  "lifecycle_order": [
-    "create managed policy",
-    "create unprivileged user",
-    "baseline S3 list denied",
-    "attach policy",
-    "S3 list allowed",
-    "repeat attach and observe mc no-effect synthesis",
-    "query policy entities with repeated filters",
-    "detach policy",
-    "S3 list denied",
-    "cleanup user before policy"
-  ]
+  "external_smoke_contract": {
+    "policy_document": {
+      "Version": "2012-10-17",
+      "Statement": {
+        "Effect": "Allow",
+        "Action": "s3:ListAllMyBuckets",
+        "Resource": "*"
+      }
+    },
+    "independent_modes": [
+      "human",
+      "json"
+    ],
+    "independent_aliases": {
+      "human": "maxiocompat",
+      "json": "maxiocompatjson"
+    },
+    "per_mode_order": [
+      "create dedicated managed policy",
+      "create credential-bearing user without bootstrap ListBuckets policy",
+      "baseline S3 list denied",
+      "attach policy",
+      "S3 list allowed",
+      "repeat attach with duplicate positional policy argv and observe mc no-effect synthesis",
+      "query policy entities with repeated user and policy filters",
+      "detach policy",
+      "S3 list denied",
+      "reattach policy",
+      "disable user and observe S3 rejection",
+      "enable user and observe S3 recovery",
+      "detach policy",
+      "remove user",
+      "remove policy"
+    ],
+    "failure_cleanup_order": [
+      "detach policy when policy creation succeeded",
+      "remove user",
+      "remove managed policy"
+    ],
+    "json_position": "--json is the first mc argument and MC_CONFIG_DIR remains environment-only",
+    "evidence_note": "This is expected source-pinned contract data. Fake-runner automation is not strict native mc live evidence."
+  }
 }
