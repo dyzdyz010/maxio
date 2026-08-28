@@ -15,6 +15,7 @@ defmodule Maxio.IAM do
     AccountPasswordPolicy,
     AccessKey,
     AccessKeySecret,
+    AdminGroupLifecycle,
     CredentialInvalidation,
     CredentialNamespace,
     Group,
@@ -910,6 +911,18 @@ defmodule Maxio.IAM do
   @spec group_arn(String.t()) :: String.t()
   def group_arn(group_name), do: "arn:aws:iam:::group/#{group_name}"
 
+  @doc "Atomically applies the MinIO admin create/add/remove/delete-empty group contract."
+  @spec update_minio_group_members_strict(String.t(), [String.t()], boolean(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def update_minio_group_members_strict(group_name, members, remove?, group_status),
+    do: AdminGroupLifecycle.update_members(group_name, members, remove?, group_status)
+
+  @doc "Atomically updates a MinIO admin group status."
+  @spec update_minio_group_status_strict(String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def update_minio_group_status_strict(group_name, status),
+    do: AdminGroupLifecycle.set_status(group_name, status)
+
   @doc "Atomically creates a new MinIO admin user and its same-name long-term credential."
   @spec create_minio_user_strict(String.t(), String.t(), String.t()) ::
           {:ok, %{user: map(), access_key: map()}} | {:error, term()}
@@ -1559,26 +1572,7 @@ defmodule Maxio.IAM do
   @spec add_user_to_group(String.t(), String.t()) :: :ok | {:error, term()}
   def add_user_to_group(user_name_or_arn, group_name_or_arn)
       when is_binary(user_name_or_arn) and is_binary(group_name_or_arn) do
-    with {:ok, user} <- get_user(user_name_or_arn),
-         {:ok, group} <- get_group(group_name_or_arn) do
-      %GroupMembership{}
-      |> GroupMembership.changeset(%{user_arn: user.user_arn, group_arn: group.group_arn})
-      |> Repo.insert(on_conflict: :nothing, conflict_target: [:user_arn, :group_arn])
-      |> case do
-        {:ok, _membership} ->
-          Notify.broadcast({:principal_policy_changed, user.user_arn})
-          :ok
-
-        {:error, changeset} ->
-          {:error, changeset}
-      end
-    else
-      # `get_user/1` 与 `get_group/1` 的契约都是 `{:ok, map()} | :error`（见各自实现：
-      # `fetch_*_record/1` 返回 nil 时归一成裸 `:error`），从不返回 `{:error, _}`。
-      # 原来那条 `{:error, reason} -> {:error, reason}` 是恒等映射且恒不可达，删除后
-      # 唯一可达的失败仍然是结构化的 `{:error, :not_found}`。
-      :error -> {:error, :not_found}
-    end
+    AdminGroupLifecycle.add_member(user_name_or_arn, group_name_or_arn)
   end
 
   def add_user_to_group(_user_name_or_arn, _group_name_or_arn), do: {:error, :malformed}
@@ -1587,23 +1581,7 @@ defmodule Maxio.IAM do
   @spec add_user_to_group_strict(String.t(), String.t()) :: :ok | {:error, term()}
   def add_user_to_group_strict(user_name_or_arn, group_name_or_arn)
       when is_binary(user_name_or_arn) and is_binary(group_name_or_arn) do
-    with %User{} = user <- fetch_user_record(user_name_or_arn),
-         %Group{} = group <- fetch_group_record(group_name_or_arn) do
-      %GroupMembership{}
-      |> GroupMembership.changeset(%{user_arn: user.user_arn, group_arn: group.group_arn})
-      |> Repo.insert(on_conflict: :nothing, conflict_target: [:user_arn, :group_arn])
-      |> case do
-        {:ok, _membership} ->
-          Notify.broadcast({:principal_policy_changed, user.user_arn})
-          :ok
-
-        {:error, changeset} ->
-          {:error, changeset}
-      end
-    else
-      nil -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
-    end
+    AdminGroupLifecycle.add_member(user_name_or_arn, group_name_or_arn)
   end
 
   def add_user_to_group_strict(_user_name_or_arn, _group_name_or_arn),
@@ -1613,16 +1591,10 @@ defmodule Maxio.IAM do
   @spec remove_user_from_group(String.t(), String.t()) :: :ok
   def remove_user_from_group(user_name_or_arn, group_name_or_arn)
       when is_binary(user_name_or_arn) and is_binary(group_name_or_arn) do
-    user_arn = resolve_user_arn(user_name_or_arn)
-    group_arn = resolve_group_arn(group_name_or_arn)
-
-    Repo.delete_all(
-      from m in GroupMembership,
-        where: m.user_arn == ^user_arn and m.group_arn == ^group_arn
-    )
-
-    Notify.broadcast({:principal_policy_changed, user_arn})
-    :ok
+    case AdminGroupLifecycle.remove_member(user_name_or_arn, group_name_or_arn, false) do
+      :ok -> :ok
+      {:error, _reason} -> :ok
+    end
   end
 
   def remove_user_from_group(_user_name_or_arn, _group_name_or_arn), do: :ok
@@ -1631,16 +1603,7 @@ defmodule Maxio.IAM do
   @spec remove_user_from_group_strict(String.t(), String.t()) :: :ok | {:error, term()}
   def remove_user_from_group_strict(user_name_or_arn, group_name_or_arn)
       when is_binary(user_name_or_arn) and is_binary(group_name_or_arn) do
-    with %User{} = user <- fetch_user_record(user_name_or_arn),
-         %Group{} = group <- fetch_group_record(group_name_or_arn),
-         %GroupMembership{} = membership <-
-           Repo.get_by(GroupMembership, user_arn: user.user_arn, group_arn: group.group_arn) do
-      Repo.delete!(membership)
-      Notify.broadcast({:principal_policy_changed, user.user_arn})
-      :ok
-    else
-      nil -> {:error, :not_found}
-    end
+    AdminGroupLifecycle.remove_member(user_name_or_arn, group_name_or_arn, true)
   end
 
   def remove_user_from_group_strict(_user_name_or_arn, _group_name_or_arn),
@@ -4332,26 +4295,6 @@ defmodule Maxio.IAM do
     do: group_arn(group_name)
 
   defp default_group_arn(_group_name), do: nil
-
-  defp resolve_user_arn(value) do
-    value = normalize_iam_text(value)
-
-    if String.starts_with?(value, "arn:aws:iam:::user/") do
-      value
-    else
-      user_arn(value)
-    end
-  end
-
-  defp resolve_group_arn(value) do
-    value = normalize_iam_text(value)
-
-    if String.starts_with?(value, "arn:aws:iam:::group/") do
-      value
-    else
-      group_arn(value)
-    end
-  end
 
   defp access_keys_for_principal(principal_arn) do
     Repo.all(
