@@ -2,6 +2,180 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
   use ExUnit.Case, async: true
 
   @fixture_dir Path.expand("../../fixtures/minio_admin_config_kv_s5", __DIR__)
+  @ciphertext_hex "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f002021222324252627f68319b27606c7ea0e993fbbdbb3982b04"
+  @entity_matrix [
+    %{
+      "id" => "get_request",
+      "method" => "GET",
+      "status" => nil,
+      "content_length" => "absent",
+      "transfer_encoding" => "absent",
+      "content_type" => "absent",
+      "body_hex" => "",
+      "body_length" => 0
+    },
+    %{
+      "id" => "set_request",
+      "method" => "PUT",
+      "status" => nil,
+      "content_length" => "58",
+      "transfer_encoding" => "absent",
+      "content_type" => "absent",
+      "body_hex" => @ciphertext_hex,
+      "body_length" => 58
+    },
+    %{
+      "id" => "reset_request",
+      "method" => "DELETE",
+      "status" => nil,
+      "content_length" => "58",
+      "transfer_encoding" => "absent",
+      "content_type" => "absent",
+      "body_hex" => @ciphertext_hex,
+      "body_length" => 58
+    },
+    %{
+      "id" => "get_response",
+      "method" => "GET",
+      "status" => 200,
+      "content_length" => "58",
+      "transfer_encoding" => "absent",
+      "content_type" => "application/json",
+      "body_hex" => @ciphertext_hex,
+      "body_length" => 58
+    },
+    %{
+      "id" => "set_response",
+      "method" => "PUT",
+      "status" => 200,
+      "content_length" => "0",
+      "transfer_encoding" => "absent",
+      "content_type" => "absent",
+      "body_hex" => "",
+      "body_length" => 0
+    },
+    %{
+      "id" => "reset_response",
+      "method" => "DELETE",
+      "status" => 200,
+      "content_length" => "0",
+      "transfer_encoding" => "absent",
+      "content_type" => "absent",
+      "body_hex" => "",
+      "body_length" => 0
+    }
+  ]
+  @query_branches %{
+    "missing_key_authenticated" => %{
+      "matches_handler" => false,
+      "status" => 426,
+      "code" => "XMinioAdminVersionMismatch",
+      "description_template" => "This 'admin' API is not supported by server in '<mode>'"
+    },
+    "empty_key_authorized" => %{
+      "matches_handler" => true,
+      "status" => 400,
+      "code" => "XMinioConfigError",
+      "description" => "unknown subsystem: "
+    },
+    "unauthenticated_admin_surface" => %{
+      "status" => 403,
+      "code" => "AccessDenied",
+      "precedence" => "before_route_detail"
+    }
+  }
+  @errors %{
+    "generic" => %{
+      "status" => 400,
+      "code" => "XMinioConfigError",
+      "examples" => [
+        "unknown subsystem: ",
+        "unknown sub-system bad value",
+        "sub-system 's3' cannot have empty keys"
+      ]
+    },
+    "not_found" => %{
+      "status" => 404,
+      "code" => "XMinioConfigNotFoundError",
+      "description" => "key absent doesn't exist",
+      "only" => "reset of ordinary unknown key in exposed subsystem"
+    },
+    "bad_json" => %{
+      "status" => 400,
+      "code" => "XMinioAdminConfigBadJSON",
+      "description" => "JSON configuration provided is of incorrect format",
+      "causes" => [
+        "invalid SIO envelope",
+        "actual read length mismatch",
+        "typed validator failure"
+      ]
+    },
+    "too_large" => %{"status" => 400, "code" => "XMinioAdminConfigTooLarge"},
+    "payload_hash" => %{"status" => 400, "code" => "XAmzContentSHA256Mismatch"}
+  }
+  @human_stdout %{
+    "get" => %{
+      "utf8" => "s3 clock_skew_ms=900000 \n",
+      "utf8_length" => 25,
+      "hex" => "733320636c6f636b5f736b65775f6d733d393030303030200a"
+    },
+    "set_applied" => %{
+      "utf8" => "Successfully applied new settings.\n",
+      "utf8_length" => 35,
+      "hex" => "5375636365737366756c6c79206170706c696564206e65772073657474696e67732e0a"
+    },
+    "set_restart" => %{
+      "utf8" =>
+        "Successfully applied new settings.\nPlease restart your server 'mc admin service restart ALIAS'.\n",
+      "utf8_length" => 96,
+      "hex" =>
+        "5375636365737366756c6c79206170706c696564206e65772073657474696e67732e0a506c65617365207265737461727420796f75722073657276657220276d632061646d696e2073657276696365207265737461727420414c494153272e0a"
+    },
+    "reset_applied" => %{
+      "utf8" => "'s3 clock_skew_ms' is successfully reset.\n",
+      "utf8_length" => 42,
+      "hex" =>
+        "27733320636c6f636b5f736b65775f6d7327206973207375636365737366756c6c792072657365742e0a"
+    },
+    "reset_restart" => %{
+      "utf8" =>
+        "'s3 clock_skew_ms' is successfully reset.\nPlease restart your server with `mc admin service restart ALIAS`.\n",
+      "utf8_length" => 108,
+      "hex" =>
+        "27733320636c6f636b5f736b65775f6d7327206973207375636365737366756c6c792072657365742e0a506c65617365207265737461727420796f757220736572766572207769746820606d632061646d696e2073657276696365207265737461727420414c494153602e0a"
+    }
+  }
+  @json_stdout %{
+    "get" => %{
+      "utf8" =>
+        "{\"status\":\"success\",\"config\":[{\"subSystem\":\"s3\",\"kv\":[{\"key\":\"clock_skew_ms\",\"value\":\"900000\"}]}]}\n",
+      "utf8_length" => 99,
+      "hex" =>
+        "7b22737461747573223a2273756363657373222c22636f6e666967223a5b7b2273756253797374656d223a227333222c226b76223a5b7b226b6579223a22636c6f636b5f736b65775f6d73222c2276616c7565223a22393030303030227d5d7d5d7d0a"
+    },
+    "set" => %{
+      "utf8" => "{\"status\":\"success\"}\n",
+      "utf8_length" => 21,
+      "hex" => "7b22737461747573223a2273756363657373227d0a"
+    },
+    "reset" => %{
+      "utf8" => "{\"status\":\"success\"}\n",
+      "utf8_length" => 21,
+      "hex" => "7b22737461747573223a2273756363657373227d0a"
+    }
+  }
+  @unsupported_catalog_claims [
+    "help-config-kv",
+    "config_export_import",
+    "config_history",
+    "subsystem_target",
+    "api",
+    "site",
+    "notify_*",
+    "logger_*",
+    "identity_*",
+    "service_restart"
+  ]
 
   setup_all do
     fixtures =
@@ -40,10 +214,16 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
                "115e8d856da915da1a3539dc3932e3068c676dc95a1364de7a4aa4a5f86229ec",
              "mc_config_get_rendering" =>
                "48e2f3cad229a128306ba2dd0b0f2ed9edd06ebeabee7c69b4dfa8024f3f844f",
+             "mc_config_get_help_branch" =>
+               "a4797b0e56f8a74668fcd746bb34cf56de54eb9160998a06833fd3a13aaefba3",
              "mc_config_reset_rendering" =>
                "dd7590ee93ea4c1662462b6803dfeb1d4ea7adc307534491930405559fd94016",
+             "mc_config_reset_help_branch" =>
+               "1cec7998d65c252a6e100b46e8854b3d0460db8dbf5dc9143efc9e9665af72e6",
              "mc_config_set_rendering" =>
                "d4ded1439ba1303de5198c525123fdc8586e8546ac3a22558c40f6bd4bc6839c",
+             "mc_config_set_help_branch" =>
+               "a9e49de1465f0fef984c67c06a88b0e815136c63acea9b3809453da19a22ae03",
              "mc_print_non_tty_compaction" =>
                "96338ddfe75ded06aeeecaa0572d236edf5904480a72492f5619382f291f4aa3",
              "minio_del_config_kv_action_and_decrypt" =>
@@ -76,19 +256,7 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
              {"KV3", "DELETE", "/minio/admin/v3/del-config-kv", "admin:ConfigUpdate"}
            ]
 
-    assert routes["query_branches"]["missing_key_authenticated"] == %{
-             "code" => "XMinioAdminVersionMismatch",
-             "description_template" => "This 'admin' API is not supported by server in '<mode>'",
-             "matches_handler" => false,
-             "status" => 426
-           }
-
-    assert routes["query_branches"]["empty_key_authorized"] == %{
-             "code" => "XMinioConfigError",
-             "description" => "unknown subsystem: ",
-             "matches_handler" => true,
-             "status" => 400
-           }
+    assert routes["query_branches"] == @query_branches
 
     assert routes["error_precedence"] == [
              "authentication",
@@ -108,45 +276,16 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
   test "fixture separates generic not-found and BadJSON public errors", fixtures do
     errors = fixtures["minio_routes_and_errors"]["errors"]
 
-    assert errors["generic"]["code"] == "XMinioConfigError"
-    assert errors["generic"]["status"] == 400
-
-    assert errors["not_found"] == %{
-             "code" => "XMinioConfigNotFoundError",
-             "description" => "key absent doesn't exist",
-             "only" => "reset of ordinary unknown key in exposed subsystem",
-             "status" => 404
-           }
-
-    assert errors["bad_json"] == %{
-             "causes" => [
-               "invalid SIO envelope",
-               "actual read length mismatch",
-               "typed validator failure"
-             ],
-             "code" => "XMinioAdminConfigBadJSON",
-             "description" => "JSON configuration provided is of incorrect format",
-             "status" => 400
-           }
+    assert errors == @errors
   end
 
   test "fixture freezes entity framing and applied-header restart branches", fixtures do
     wire = fixtures["madmin_config_kv_wire"]
-    sample = Base.decode16!(wire["ciphertext_hex"], case: :lower)
+    sample = Base.decode16!(@ciphertext_hex, case: :lower)
 
-    assert byte_size(sample) == wire["ciphertext_utf8_length"]
-
-    assert Enum.map(wire["entity_matrix"], fn entity ->
-             {entity["id"], entity["content_length"], entity["transfer_encoding"],
-              entity["content_type"], entity["body_length"]}
-           end) == [
-             {"get_request", "absent", "absent", "absent", 0},
-             {"set_request", "58", "absent", "absent", 58},
-             {"reset_request", "58", "absent", "absent", 58},
-             {"get_response", "58", "absent", "application/json", 58},
-             {"set_response", "0", "absent", "absent", 0},
-             {"reset_response", "0", "absent", "absent", 0}
-           ]
+    assert wire["ciphertext_hex"] == @ciphertext_hex
+    assert byte_size(sample) == wire["ciphertext_byte_length"]
+    assert wire["entity_matrix"] == @entity_matrix
 
     assert wire["applied_header"] == %{
              "missing_branch" => %{"restart" => true, "value" => "absent"},
@@ -178,11 +317,7 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
              "maxio-runtime-audit-atomicity"
            ]
 
-    refute "target" in routes["unsupported_catalog_claims"]
-    assert "subsystem_target" in routes["unsupported_catalog_claims"]
-    assert "api" in routes["unsupported_catalog_claims"]
-    assert "site" in routes["unsupported_catalog_claims"]
-    assert "service_restart" in routes["unsupported_catalog_claims"]
+    assert routes["unsupported_catalog_claims"] == @unsupported_catalog_claims
   end
 
   test "fixture preserves every human stdout byte including trailing space and LF", fixtures do
@@ -195,7 +330,7 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
              "stdout" => "non_tty"
            }
 
-    assert human["stdout"]["get"]["utf8"] == "s3 clock_skew_ms=900000 \n"
+    assert human["stdout"] == @human_stdout
 
     for {_id, output} <- human["stdout"] do
       assert byte_size(output["utf8"]) == output["utf8_length"]
@@ -223,8 +358,7 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
              "trailing_lf_count" => 1
            }
 
-    assert json["stdout"]["get"]["utf8"] ==
-             "{\"status\":\"success\",\"config\":[{\"subSystem\":\"s3\",\"kv\":[{\"key\":\"clock_skew_ms\",\"value\":\"900000\"}]}]}\n"
+    assert json["stdout"] == @json_stdout
 
     for {_id, output} <- json["stdout"] do
       assert byte_size(output["utf8"]) == output["utf8_length"]
