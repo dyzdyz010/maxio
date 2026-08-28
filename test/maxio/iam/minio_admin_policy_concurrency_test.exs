@@ -49,12 +49,16 @@ defmodule Maxio.IAM.MinioAdminPolicyConcurrencyTest do
     assert_receive {:principal_quota_lock_wait, ^batch_pid}
     assert_receive {:principal_quota_locked, ^batch_pid}
 
+    owner = self()
+
     singular_task =
       Task.async(fn ->
+        send(owner, :singular_quota_case_started)
         unboxed(fn -> IAM.attach_user_policy_strict(user_name, Enum.at(policy_arns, 10)) end)
       end)
 
-    assert_receive {:observed_identity_lock_wait, singular_pid}
+    assert_receive :singular_quota_case_started
+    assert_receive {:observed_identity_lock_wait, singular_pid}, 1_000
     refute_receive {:principal_quota_lock_wait, ^singular_pid}, 100
 
     send(batch_pid, :release_principal_quota)
