@@ -503,10 +503,11 @@ defmodule Maxio.Config.Store do
     {:noreply, schedule_refresh(state)}
   end
 
-  # 广播只带"哪个键变了"，但重装的是**整张表**：广播是 best-effort，收到一条不等于没漏另一条。
-  # 只重装被点名的子系统，就会把"整表已核对"记进 meta 而实际没读过其余的行——一次丢广播 +
-  # 一次任意其它子系统的广播即可永久关掉兜底对账（见 moduledoc「为什么没有只重装一个子系统
-  # 的装载器」）。subsystem/key 只进 reason，供 `mix maxio.config.status` 取证。
+  # 新广播只带 subsystem；迁移期 legacy 广播还会带 key，但两者都重装**整张表**：广播是
+  # best-effort，收到一条不等于没漏另一条。只重装被点名的子系统，就会把"整表已核对"记进
+  # meta 而实际没读过其余的行——一次丢广播 + 一次任意其它子系统的广播即可永久关掉兜底对账
+  # （见 moduledoc「为什么没有只重装一个子系统的装载器」）。subsystem/key 只进 reason，供
+  # `mix maxio.config.status` 取证。
   @impl true
   def handle_info({:config_changed, subsystem}, state) when is_atom(subsystem) do
     state =

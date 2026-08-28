@@ -413,8 +413,7 @@ defmodule Maxio.Config.Coordinator do
 
   defp safe_reload(store, repo, reason) do
     case store.load_all!(repo: repo, reason: reason) do
-      :ok -> :ok
-      result when is_map(result) -> :ok
+      %{aggregate: _aggregate, orphan_config_keys: _orphans, subsystems: _subsystems} -> :ok
       _discarded -> {:error, :reload_failed}
     end
   rescue
