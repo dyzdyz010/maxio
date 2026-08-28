@@ -1,7 +1,9 @@
 defmodule Maxio.Cluster.NotifyTest do
   use ExUnit.Case, async: false
 
-  alias Maxio.Cluster.Notify
+  import ExUnit.CaptureLog
+
+  alias Maxio.Cluster.{CacheInvalidator, Notify}
 
   defmodule ProbeCredentialStore do
     @behaviour Maxio.Auth.CredentialStore
@@ -40,6 +42,43 @@ defmodule Maxio.Cluster.NotifyTest do
     assert :ok = Notify.broadcast(event)
 
     assert_receive ^event
+  end
+
+  test "checked broadcast publishes the two-tuple config batch event" do
+    # Catches the event type/facade rejecting the subsystem-level event while callers migrate away
+    # from the legacy per-key tuple.
+    :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Notify.topic())
+
+    event = {:config_changed, :listing}
+    assert :ok = Notify.broadcast_checked(event)
+    assert_receive ^event
+  end
+
+  test "cache invalidator recognizes both config event generations as owned no-ops" do
+    # Catches the two-tuple event being mislabeled as unknown operational noise while Store owns the
+    # actual reload. Legacy recognition remains frozen for the migration window.
+    previous_level = Logger.level()
+
+    log =
+      try do
+        Logger.configure(level: :debug)
+
+        capture_log([level: :debug], fn ->
+          assert {:noreply, %{}} =
+                   CacheInvalidator.handle_info({:config_changed, :listing}, %{})
+
+          assert {:noreply, %{}} =
+                   CacheInvalidator.handle_info(
+                     {:config_changed, :listing, :sql_hard_limit},
+                     %{}
+                   )
+        end)
+      after
+        Logger.configure(level: previous_level)
+      end
+
+    refute log =~ "ignored unknown metadata event"
+    refute log =~ "ignored cache invalidator message"
   end
 
   test "cache invalidator delegates IAM changes to the credential store" do

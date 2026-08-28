@@ -1,0 +1,338 @@
+defmodule Maxio.Config.CoordinatorPostcommitTest do
+  use Maxio.DataCase, async: false
+
+  import Ecto.Query
+  import ExUnit.CaptureLog
+
+  alias Maxio.Config
+  alias Maxio.Config.{RuntimeConfig, RuntimeConfigAudit, Store}
+
+  alias Maxio.Test.{
+    ConfigBatchFailureRepo,
+    ConfigPostcommitNotify,
+    ConfigPostcommitStore
+  }
+
+  @sensitive_terms [
+    "POSTCOMMIT-SUBMITTED-VALUE-7391",
+    "POSTCOMMIT-PLAINTEXT-S3CR3T",
+    "POSTCOMMIT-CIPHERTEXT-S3CR3T",
+    "POSTCOMMIT-CALLER-S3CR3T"
+  ]
+
+  setup do
+    ConfigBatchFailureRepo.clear!()
+    Store.reset_local!()
+    start_supervised!({ConfigPostcommitStore, owner: self()})
+    start_supervised!({ConfigPostcommitNotify, owner: self()})
+
+    on_exit(fn ->
+      ConfigBatchFailureRepo.clear!()
+      Store.reset_local!()
+    end)
+
+    :ok
+  end
+
+  test "changed batch commits before one full reload and one checked subsystem broadcast" do
+    # Catches callbacks inside the transaction, per-key reload/broadcast, legacy broadcast, and a
+    # postcommit retry that manufactures a second version/audit.
+    assert {:returned, {:ok, result}} = capture_outcome(fn -> mutate(1_001) end)
+
+    assert [
+             {:reload,
+              %{
+                transaction_open?: false,
+                runtime_count: 1,
+                audit_count: 1,
+                runtime_keys: [{"listing", "sql_hard_limit", 1}]
+              }, {:write, :listing, [:sql_hard_limit]}},
+             {:checked, {:config_changed, :listing}}
+           ] = dependency_events()
+
+    assert %{
+             committed?: true,
+             changed_count: 1,
+             local_reload: :ok,
+             broadcast: :ok,
+             attention?: false
+           } = result
+
+    assert ConfigPostcommitStore.observations().attention_calls == []
+    assert ConfigPostcommitStore.observations().reload_calls |> length() == 1
+    assert ConfigPostcommitNotify.observations().checked_calls == [{:config_changed, :listing}]
+    assert ConfigPostcommitNotify.observations().legacy_calls == []
+    assert Store.lookup(:listing, :sql_hard_limit) == {:ok, 1_001}
+    assert_committed_once(1_001)
+  end
+
+  for {label, reload_outcome} <- [
+        {"raise", {:raise, "private reload exception"}},
+        {"exit", {:exit, {:private_reload_exit, "discard-me"}}},
+        {"transport return", {:return, {:error, {:transport, "discard-me"}}}}
+      ] do
+    test "reload #{label} is a safe committed result and checked broadcast is still attempted" do
+      # Catches a postcommit reload failure escaping as a false rollback/5xx or short-circuiting the
+      # independent broadcast. All dependency details collapse to the fixed reload_failed atom.
+      ConfigPostcommitStore.configure(reload: unquote(Macro.escape(reload_outcome)))
+
+      outcome = capture_outcome(fn -> mutate(1_101) end)
+      events = dependency_events()
+
+      assert {:returned, {:ok, result}} = outcome
+
+      assert %{
+               committed?: true,
+               changed_count: 1,
+               local_reload: {:error, :reload_failed},
+               broadcast: :ok,
+               attention?: true
+             } = result
+
+      assert event_kinds(events) == [:reload, :checked, :attention]
+      assert ConfigPostcommitNotify.observations().checked_calls == [{:config_changed, :listing}]
+      assert ConfigPostcommitNotify.observations().legacy_calls == []
+
+      assert ConfigPostcommitStore.observations().attention_calls == [
+               %{
+                 subsystem: :listing,
+                 local_reload: {:error, :reload_failed},
+                 broadcast: :ok
+               }
+             ]
+
+      assert_committed_once(1_101)
+    end
+  end
+
+  for {label, broadcast_outcome} <- [
+        {"raise", {:raise, "private broadcast exception"}},
+        {"exit", {:exit, {:private_broadcast_exit, "discard-me"}}},
+        {"transport return", {:return, {:error, {:transport, "discard-me"}}}}
+      ] do
+    test "checked broadcast #{label} is safe and does not turn a hot commit into restart" do
+      # Catches checked transport failure escaping after commit, legacy broadcast swallowing it, or
+      # broadcast failure being misreported as a restart requirement despite a successful reload.
+      ConfigPostcommitNotify.configure(checked: unquote(Macro.escape(broadcast_outcome)))
+
+      assert {:returned, {:ok, result}} = capture_outcome(fn -> mutate(1_201) end)
+
+      assert %{
+               committed?: true,
+               changed_count: 1,
+               local_reload: :ok,
+               broadcast: {:error, :broadcast_failed},
+               attention?: true,
+               outcomes: %{sql_hard_limit: %{applied: :hot}}
+             } = result
+
+      assert event_kinds(dependency_events()) == [:reload, :checked, :attention]
+      assert ConfigPostcommitNotify.observations().checked_calls == [{:config_changed, :listing}]
+      assert ConfigPostcommitNotify.observations().legacy_calls == []
+
+      assert ConfigPostcommitStore.observations().attention_calls == [
+               %{
+                 subsystem: :listing,
+                 local_reload: :ok,
+                 broadcast: {:error, :broadcast_failed}
+               }
+             ]
+
+      assert Store.lookup(:listing, :sql_hard_limit) == {:ok, 1_201}
+      assert_committed_once(1_201)
+    end
+  end
+
+  test "successful no-op has no callbacks, needs no attention, and remains applied-eligible" do
+    # Catches unconditional postcommit work for changed_count=0 and a no-op being mistaken for a
+    # restart merely because there was no reload to report.
+    insert_runtime!(1_301)
+    ConfigPostcommitStore.reset_observations()
+    ConfigPostcommitNotify.reset_observations()
+
+    assert {:returned, {:ok, result}} = capture_outcome(fn -> mutate(1_301) end)
+
+    assert %{
+             committed?: true,
+             changed_count: 0,
+             local_reload: :not_needed,
+             broadcast: :not_needed,
+             attention?: false,
+             outcomes: %{
+               sql_hard_limit: %{changed?: false, applied: :hot, version: 1}
+             }
+           } = result
+
+    assert dependency_events() == []
+    assert ConfigPostcommitStore.observations().reload_calls == []
+    assert ConfigPostcommitStore.observations().attention_calls == []
+    assert ConfigPostcommitNotify.observations() == %{checked_calls: [], legacy_calls: []}
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+  end
+
+  for {label, trigger, recorder_outcome, expected_record} <- [
+        {"reload failure then recorder raise", :reload,
+         {:raise,
+          "POSTCOMMIT-SUBMITTED-VALUE-7391 POSTCOMMIT-PLAINTEXT-S3CR3T " <>
+            "POSTCOMMIT-CIPHERTEXT-S3CR3T POSTCOMMIT-CALLER-S3CR3T"}, :recorder_raised},
+        {"reload failure then recorder exit", :reload,
+         {:exit, {:private, "POSTCOMMIT-PLAINTEXT-S3CR3T"}}, :recorder_exited},
+        {"reload failure then recorder unavailable", :reload, {:return, {:error, :unavailable}},
+         :recorder_unavailable},
+        {"broadcast failure then recorder transport", :broadcast, {:return, {:error, :transport}},
+         :recorder_transport_failed},
+        {"broadcast failure then secret-bearing recorder transport", :broadcast,
+         {:return, {:error, {:transport, "POSTCOMMIT-CIPHERTEXT-S3CR3T"}}},
+         :recorder_transport_failed}
+      ] do
+    test "#{label} cannot replace or disclose the committed result" do
+      # Catches the attention recorder as a second point of failure: it is invoked only after a
+      # postcommit problem, but its own raise/exit/transport details may never escape or trigger a
+      # second mutation.
+      trigger = unquote(trigger)
+      recorder_outcome = unquote(Macro.escape(recorder_outcome))
+      expected_record = unquote(expected_record)
+
+      configure_attention_failure(trigger, recorder_outcome)
+
+      outcome_ref = make_ref()
+
+      log =
+        capture_log(fn ->
+          send(self(), {outcome_ref, capture_outcome(fn -> mutate(1_401, sensitive_opts()) end)})
+        end)
+
+      assert_receive {^outcome_ref, {:returned, {:ok, result}}}
+
+      expected_postcommit = expected_postcommit(trigger)
+
+      assert %{committed?: true, changed_count: 1, attention?: true} = result
+      assert Map.take(result, [:local_reload, :broadcast]) == expected_postcommit
+      refute Map.has_key?(result, :attention_record)
+      assert result.outcomes.sql_hard_limit.applied == :hot
+
+      assert event_kinds(dependency_events()) == [:reload, :checked, :attention]
+
+      assert ConfigPostcommitStore.observations().attention_calls == [
+               Map.put(expected_postcommit, :subsystem, :listing)
+             ]
+
+      assert_committed_once(1_401)
+
+      assert log =~ "config_attention_record=#{expected_record}"
+      assert log =~ "config_subsystem=listing"
+      assert log =~ "request_id=req-postcommit-recorder"
+
+      serialized = inspect(result, limit: :infinity, printable_limit: :infinity) <> log
+      Enum.each(@sensitive_terms, &refute(serialized =~ &1))
+    end
+  end
+
+  defp mutate(value, extra_opts \\ []) do
+    opts =
+      [
+        source: "admin_api",
+        principal_arn: "arn:aws:iam:::root",
+        access_key_id: "AKIA-POSTCOMMIT",
+        request_id: "req-postcommit",
+        repo: ConfigBatchFailureRepo,
+        store: ConfigPostcommitStore,
+        notify: ConfigPostcommitNotify
+      ]
+      |> Keyword.merge(extra_opts)
+
+    Config.mutate_subsystem(:listing, [{:set, :sql_hard_limit, value}], opts)
+  end
+
+  defp configure_attention_failure(:reload, recorder_outcome) do
+    ConfigPostcommitStore.configure(
+      reload: {:return, {:error, {:transport, "private reload detail"}}},
+      attention: recorder_outcome
+    )
+  end
+
+  defp configure_attention_failure(:broadcast, recorder_outcome) do
+    ConfigPostcommitStore.configure(attention: recorder_outcome)
+
+    ConfigPostcommitNotify.configure(
+      checked: {:return, {:error, {:transport, "private broadcast detail"}}}
+    )
+  end
+
+  defp expected_postcommit(:reload) do
+    %{local_reload: {:error, :reload_failed}, broadcast: :ok}
+  end
+
+  defp expected_postcommit(:broadcast) do
+    %{local_reload: :ok, broadcast: {:error, :broadcast_failed}}
+  end
+
+  defp sensitive_opts do
+    [
+      request_id: "req-postcommit-recorder",
+      submitted_value: "POSTCOMMIT-SUBMITTED-VALUE-7391",
+      plaintext: "POSTCOMMIT-PLAINTEXT-S3CR3T",
+      ciphertext: "POSTCOMMIT-CIPHERTEXT-S3CR3T",
+      caller_secret: "POSTCOMMIT-CALLER-S3CR3T"
+    ]
+  end
+
+  defp capture_outcome(fun) do
+    {:returned, fun.()}
+  rescue
+    error -> {:raised, error.__struct__}
+  catch
+    :exit, _reason -> {:exited, :dependency_exit}
+    _kind, _reason -> {:caught, :dependency_failure}
+  end
+
+  defp dependency_events(events \\ []) do
+    receive do
+      {:config_postcommit_dependency, :reload, evidence, reason} ->
+        dependency_events([{:reload, evidence, reason} | events])
+
+      {:config_postcommit_dependency, :attention, fields} ->
+        dependency_events([{:attention, fields} | events])
+
+      {:config_postcommit_dependency, kind, event} when kind in [:checked, :legacy] ->
+        dependency_events([{kind, event} | events])
+    after
+      0 -> Enum.reverse(events)
+    end
+  end
+
+  defp event_kinds(events), do: Enum.map(events, &elem(&1, 0))
+
+  defp insert_runtime!(value) do
+    %RuntimeConfig{}
+    |> RuntimeConfig.changeset(%{
+      subsystem: "listing",
+      key: "sql_hard_limit",
+      value: %{"v" => value},
+      version: 1,
+      apply_mode: "hot",
+      source: "cli"
+    })
+    |> Repo.insert!()
+  end
+
+  defp assert_committed_once(value) do
+    assert [row] =
+             Repo.all(
+               from row in RuntimeConfig,
+                 where: row.subsystem == "listing" and row.key == "sql_hard_limit"
+             )
+
+    assert row.value == %{"v" => value}
+    assert row.version == 1
+
+    assert [audit] =
+             Repo.all(
+               from audit in RuntimeConfigAudit,
+                 where: audit.subsystem == "listing" and audit.key == "sql_hard_limit"
+             )
+
+    assert audit.operation == "set"
+    assert audit.to_version == 1
+  end
+end

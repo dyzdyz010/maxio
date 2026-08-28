@@ -321,6 +321,7 @@ defmodule Maxio.ConfigTest do
       assert %{reloaded?: true} = Store.reconcile!()
       assert Config.get(:listing, :sql_hard_limit) == 999
       assert Store.drifted?() == false
+      assert Store.meta().last_reload_reason == :reconcile
     end
 
     test "从未装载过时的首次漂移日志仍带 config_local_digest（nil 必须落成显式占位串）" do
