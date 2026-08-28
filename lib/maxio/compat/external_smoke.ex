@@ -8,6 +8,8 @@ defmodule Maxio.Compat.ExternalSmoke do
   lifecycle, and cleanup through external clients.
   """
 
+  alias Maxio.Compat.AdminUserFixture
+
   @clients [
     %{
       id: "aws_cli",
@@ -57,9 +59,19 @@ defmodule Maxio.Compat.ExternalSmoke do
     executable_finder = Keyword.get(opts, :executable_finder, &System.find_executable/1)
     command_runner = Keyword.get(opts, :command_runner, &System.cmd/3)
     tmp_root_fun = Keyword.get(opts, :tmp_root_fun, &System.tmp_dir!/0)
+    admin_user_fixture_opts = Keyword.get(opts, :admin_user_fixture_opts, [])
 
     config.clients
-    |> Enum.map(&run_client(&1, config, executable_finder, command_runner, tmp_root_fun))
+    |> Enum.map(
+      &run_client(
+        &1,
+        config,
+        executable_finder,
+        command_runner,
+        tmp_root_fun,
+        admin_user_fixture_opts
+      )
+    )
   end
 
   defp normalize_config(config) do
@@ -87,7 +99,14 @@ defmodule Maxio.Compat.ExternalSmoke do
     |> Enum.uniq()
   end
 
-  defp run_client(client_id, config, executable_finder, command_runner, tmp_root_fun) do
+  defp run_client(
+         client_id,
+         config,
+         executable_finder,
+         command_runner,
+         tmp_root_fun,
+         admin_user_fixture_opts
+       ) do
     started = System.monotonic_time(:millisecond)
 
     try do
@@ -100,7 +119,15 @@ defmodule Maxio.Compat.ExternalSmoke do
         spec ->
           with :ok <- validate_required_config(config, client_id, spec.label),
                {:ok, executable} <- find_executable(spec, executable_finder) do
-            run_configured_client(spec, executable, config, command_runner, tmp_root_fun, started)
+            run_configured_client(
+              spec,
+              executable,
+              config,
+              command_runner,
+              tmp_root_fun,
+              admin_user_fixture_opts,
+              started
+            )
           else
             {:attention, warnings} ->
               attention_entry(client_id, spec.label, started, warnings)
@@ -114,14 +141,30 @@ defmodule Maxio.Compat.ExternalSmoke do
     end
   end
 
-  defp run_configured_client(spec, executable, config, command_runner, tmp_root_fun, started) do
+  defp run_configured_client(
+         spec,
+         executable,
+         config,
+         command_runner,
+         tmp_root_fun,
+         admin_user_fixture_opts,
+         started
+       ) do
     with_temp_paths(spec.id, tmp_root_fun, fn paths ->
       case spec.id do
         "aws_cli" ->
           run_aws_cli(spec, executable, config, paths, command_runner, started)
 
         "minio_mc" ->
-          run_minio_mc(spec, executable, config, paths, command_runner, started)
+          run_minio_mc(
+            spec,
+            executable,
+            config,
+            paths,
+            command_runner,
+            admin_user_fixture_opts,
+            started
+          )
 
         "python_boto3" ->
           run_python_boto3(spec, executable, config, paths, command_runner, started)
@@ -186,12 +229,40 @@ defmodule Maxio.Compat.ExternalSmoke do
     run_step_plan(spec, config, paths, steps, cleanup_steps, command_runner, redactions, started)
   end
 
-  defp run_minio_mc(spec, executable, config, paths, command_runner, started) do
+  defp run_minio_mc(
+         spec,
+         executable,
+         config,
+         paths,
+         command_runner,
+         admin_user_fixture_opts,
+         started
+       ) do
     redactions = redactions(config)
     env = mc_env(config)
 
-    {steps, cleanup_steps} = mc_steps(executable, config, paths, env)
-    run_step_plan(spec, config, paths, steps, cleanup_steps, command_runner, redactions, started)
+    case AdminUserFixture.with_user(admin_user_fixture_opts, fn user ->
+           {steps, cleanup_steps} = mc_steps(executable, config, paths, env, user.user_name)
+
+           run_step_plan(
+             spec,
+             config,
+             paths,
+             steps,
+             cleanup_steps,
+             command_runner,
+             redactions,
+             started
+           )
+         end) do
+      {:ok, entry, cleanup} ->
+        merge_cleanup(entry, cleanup, redactions)
+
+      {:error, blocker, cleanup} ->
+        spec
+        |> blocked_entry(config, paths, started, [], [redact_value(blocker, redactions)])
+        |> merge_cleanup(cleanup, redactions)
+    end
   end
 
   defp run_python_boto3(spec, executable, config, paths, command_runner, started) do
@@ -265,12 +336,18 @@ defmodule Maxio.Compat.ExternalSmoke do
         ok_entry(spec, config, paths, started, step_views)
 
       {:blocked, step_views, blocker} ->
-        run_cleanup_steps(cleanup_steps, command_runner)
-        blocked_entry(spec, config, paths, started, step_views, [blocker])
+        cleanup = run_cleanup_steps(cleanup_steps, command_runner, redactions)
+
+        spec
+        |> blocked_entry(config, paths, started, step_views, [blocker])
+        |> merge_cleanup(cleanup, redactions)
 
       {:error, step_views, blocker} ->
-        run_cleanup_steps(cleanup_steps, command_runner)
-        error_entry(spec.id, spec.label, started, step_views, [blocker], config, paths)
+        cleanup = run_cleanup_steps(cleanup_steps, command_runner, redactions)
+
+        spec.id
+        |> error_entry(spec.label, started, step_views, [blocker], config, paths)
+        |> merge_cleanup(cleanup, redactions)
     end
   end
 
@@ -467,7 +544,7 @@ defmodule Maxio.Compat.ExternalSmoke do
     {steps, cleanup_steps}
   end
 
-  defp mc_steps(executable, config, paths, env) do
+  defp mc_steps(executable, config, paths, env, user_name) do
     opts = command_opts(config, env)
     base_args = ["--config-dir", paths.mc_config_dir]
     object = "maxiocompat/#{paths.bucket}/#{paths.key}"
@@ -561,6 +638,15 @@ defmodule Maxio.Compat.ExternalSmoke do
         {:output_contains, ["PolicyName", paths.policy_name]},
         scenario: "admin_policy_lifecycle",
         assertion: "mc admin policy info returns the named PolicyInfo projection"
+      ),
+      step(
+        "admin_user_info",
+        executable,
+        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
+        opts,
+        {:output_contains, ["Status", "enabled"]},
+        scenario: "admin_user_info",
+        assertion: "mc admin user info returns the active temporary IAM user"
       ),
       step(
         "admin_policy_remove",
@@ -729,16 +815,56 @@ defmodule Maxio.Compat.ExternalSmoke do
 
   defp verify_step(_verify, _output), do: :ok
 
-  defp run_cleanup_steps([], _command_runner), do: :ok
+  defp run_cleanup_steps([], _command_runner, _redactions), do: %{steps: [], blockers: []}
 
-  defp run_cleanup_steps(steps, command_runner) do
-    Enum.each(steps, fn step ->
-      try do
-        command_runner.(step.command, step.args, step.opts)
-      rescue
-        _error -> :ok
+  defp run_cleanup_steps(steps, command_runner, redactions) do
+    Enum.reduce(steps, %{steps: [], blockers: []}, fn step, cleanup ->
+      case run_step(step, command_runner, redactions) do
+        {:ok, view} ->
+          %{cleanup | steps: cleanup.steps ++ [view]}
+
+        {:blocked, view, blocker} ->
+          cleanup_blocker =
+            blocker
+            |> Map.put("reason", "external_smoke_cleanup_failed")
+            |> Map.put("step", step.id)
+
+          %{
+            steps: cleanup.steps ++ [view],
+            blockers: cleanup.blockers ++ [cleanup_blocker]
+          }
+
+        {:error, view, blocker} ->
+          cleanup_blocker =
+            blocker
+            |> Map.put("reason", "external_smoke_cleanup_failed")
+            |> Map.put("step", step.id)
+
+          %{
+            steps: cleanup.steps ++ [view],
+            blockers: cleanup.blockers ++ [cleanup_blocker]
+          }
       end
     end)
+  end
+
+  defp merge_cleanup(entry, cleanup, redactions) do
+    cleanup = redact_value(cleanup, redactions)
+    steps = entry["steps"] ++ cleanup.steps
+    blockers = entry["blockers"] ++ cleanup.blockers
+
+    status =
+      if entry["status"] == "ok" and cleanup.blockers != [] do
+        "blocked"
+      else
+        entry["status"]
+      end
+
+    entry
+    |> Map.put("status", status)
+    |> Map.put("steps", steps)
+    |> Map.put("blockers", blockers)
+    |> Map.put("scenario_counts", scenario_counts(steps))
   end
 
   defp ok_entry(spec, config, paths, started, steps) do
@@ -1035,6 +1161,17 @@ defmodule Maxio.Compat.ExternalSmoke do
       String.replace(acc, redaction, "[REDACTED]")
     end)
   end
+
+  defp redact_value(%{} = value, redactions) do
+    Map.new(value, fn {key, item} -> {key, redact_value(item, redactions)} end)
+  end
+
+  defp redact_value(value, redactions) when is_list(value) do
+    Enum.map(value, &redact_value(&1, redactions))
+  end
+
+  defp redact_value(value, redactions) when is_binary(value), do: redact(value, redactions)
+  defp redact_value(value, _redactions), do: value
 
   defp output_snippet(output, redactions) when is_binary(output) do
     output

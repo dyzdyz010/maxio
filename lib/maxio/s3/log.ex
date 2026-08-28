@@ -59,7 +59,15 @@ defmodule Maxio.S3.Log do
     :admin_action,
     :admin_endpoint,
     :target_policy,
+    :target_user,
     :omitted_non_root_path_policies,
+    :credential_bearing,
+    :managed_policies,
+    :inline_policies,
+    :group_inherited,
+    :role_attached,
+    :minio_view_partial,
+    :omitted_reason,
     :surface,
     # 运行时配置面固定字段（设计 §6）。formatter 侧的 metadata 白名单必须同步放行，
     # 否则结构化字段被静默丢弃——ObjectMutation 已有前车之鉴。

@@ -26,7 +26,7 @@ Ready to run in production? Please [check our deployment guides](https://hexdocs
 - `AssumeRoleWithWebIdentity` now resolves active persisted IAM OIDC providers before static `MAXIO_WEB_IDENTITY_PROVIDERS` / `config :maxio, :web_identity_providers`; disabled persisted providers fail closed and do not fall back to static config. Static providers remain a fallback only when no DB provider exists for the issuer, or when direct callers explicitly pass `providers:`.
 - OIDC discovery and JWKS parsing happen at provider management time with bounded HTTP/JWK validation; persisted providers reject private/symmetric JWK material and public projections expose only public keys. Create/refresh now collect TLS certificate-chain thumbprints for both issuer discovery and JWKS endpoints, auto-fill omitted `ThumbprintList`, and use configured/stored thumbprints as a private/non-public CA TLS trust fallback before failing closed on mismatch while preserving the last known good JWKS. STS does not fetch network resources on the token path. DB-backed provider JWKS refresh is available through `mix maxio.iam.oidc.refresh_jwks` and a disabled-by-default `config :maxio, :iam_oidc_provider_jwks_refresh` scheduler; both are dry-run by default and keep the last known good JWKS on refresh failure. WebIdentity now consumes AWS JWT `source_identity` and session tag claims. Still deferred: OAuth `ProviderId` access-token path, `ProvidedContexts`, remaining AWS IAM Query/API surface beyond the implemented user/group/OIDC/MFA actions, and cross-account/multi-account IAM semantics.
 
-## MinIO Admin managed-policy status (2026-08-28)
+## MinIO Admin status (2026-08-28)
 
 The S3 endpoint now serves the S1 MinIO admin managed-policy slice through four exact, SigV4-authenticated v3 routes:
 
@@ -37,9 +37,13 @@ The S3 endpoint now serves the S1 MinIO admin managed-policy slice through four 
 
 Only managed policies with IAM `path=/` are visible through mc. `mix maxio.admin.policy.list [--json]` reports both visible policies and every non-root policy omitted from the compatibility view; `mix maxio.admin.policy.show NAME [--json]` recomputes the v2 `PolicyInfo` projection locally without HTTP or signing.
 
+The U3 read-only user-info route is also supported: `GET /minio/admin/v3/user-info?accessKey=NAME` (`mc admin user info`) returns plaintext JSON `200` after a full `admin:GetUser` identity-policy authorization. Its deliberately partial `UserInfo` contains `status`, and conditionally direct managed-policy `policyName`, sorted `memberOf`, and UTC `updatedAt`. It always omits `secretKey` and `userAuthInfo`; direct inline, group inline/managed, role-managed, and comma-ambiguous direct managed-policy sources are also omitted from the wire view. Use `mix maxio.admin.user.show NAME [--json]` or the IAM Query/CLI surfaces for security audits: both expose safe source names, ARNs, counts, and partial-view reasons without policy documents or credential material. Do not treat mc user-info output as a complete authorization inventory.
+
+V-B17 is deliberately stricter than MinIO's deny-only self-read relaxation: even a caller reading its own user name needs an explicit effective `admin:GetUser` allow. Implicit deny, explicit deny, STS session boundaries, and the rule that bucket policy cannot grant cluster-admin actions all remain fail-closed.
+
 Admin calls must use the path-style server-root endpoint. A virtual-host request whose object key happens to start with `/minio/admin/` remains S3 data-plane traffic. Claimed admin requests bypass S3 request metrics and access-log delivery, so they are not miscounted as activity for a bucket named `minio`.
 
-Policy attach/detach/entity endpoints, user/group admin endpoints, and encrypted madmin endpoints remain explicit `501 NotImplemented`; the `?bucket=` list-policy variant is also `501` rather than silently returning the global list.
+Policy attach/detach/entity endpoints, U1 add-user, both U2 list-users variants (including `?bucket=`), U4 remove-user, U5 set-user-status, other user/group admin endpoints, and encrypted madmin endpoints remain explicit `501 NotImplemented`; the `?bucket=` list-policy variant is also `501` rather than silently returning the global list. The next admin identity mutation batch is gated on the prior identity-lock and versioned-credential-invalidation design plus independent review.
 
 ## 高级特性（M4）
 

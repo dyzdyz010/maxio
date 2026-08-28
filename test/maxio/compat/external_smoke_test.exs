@@ -197,7 +197,15 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert [%{"reason" => "external_smoke_step_failed", "step" => "put_object"}] =
              entry["blockers"]
 
-    assert Enum.map(entry["steps"], & &1["id"]) == ["create_bucket", "head_bucket", "put_object"]
+    assert Enum.map(entry["steps"], & &1["id"]) == [
+             "create_bucket",
+             "head_bucket",
+             "put_object",
+             "delete_copied_object",
+             "delete_object",
+             "delete_bucket"
+           ]
+
     assert_received {:cmd, "aws.exe", ["--endpoint-url", "http://127.0.0.1:9900" | _], _opts}
   end
 
@@ -213,10 +221,12 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert entry["status"] == "error"
 
-    assert [%{"reason" => "external_smoke_command_failed", "message" => message}] =
+    assert [%{"reason" => "external_smoke_command_failed", "message" => message} | cleanup] =
              entry["blockers"]
 
     assert message =~ "boom"
+    assert length(cleanup) == 3
+    assert Enum.all?(cleanup, &(&1["reason"] == "external_smoke_cleanup_failed"))
     refute Jason.encode!(entry) =~ "super-secret"
   end
 
@@ -246,6 +256,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           ["policy", "info", "maxiocompat", policy_name] = command_args
           {"PolicyName: #{policy_name}", 0}
 
+        subcommand == "admin" and Enum.take(command_args, 3) == ["user", "info", "maxiocompat"] ->
+          ["user", "info", "maxiocompat", user_name] = command_args
+          send(self(), {:admin_user_info, user_name})
+          {"Status: enabled\nsuper-secret test-access", 0}
+
         subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
           payload_path = Enum.find(command_args, &File.regular?/1)
           Process.put(:payload, File.read!(payload_path))
@@ -272,7 +287,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       |> ExternalSmoke.run(
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: command_runner,
-        tmp_root_fun: fn -> tmp_root end
+        tmp_root_fun: fn -> tmp_root end,
+        admin_user_fixture_opts: fixture_opts(self())
       )
 
     assert entry["status"] == "ok"
@@ -288,14 +304,17 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "admin_policy_create",
              "admin_policy_list",
              "admin_policy_info",
+             "admin_user_info",
              "admin_policy_remove",
              "delete_copied_object",
              "delete_object",
-             "delete_bucket"
+             "delete_bucket",
+             "admin_user_fixture_cleanup"
            ]
 
     assert entry["scenario_counts"]["object_copy"] == 3
     assert entry["scenario_counts"]["admin_policy_lifecycle"] == 4
+    assert entry["scenario_counts"]["admin_user_info"] == 1
 
     encoded = Jason.encode!(entry)
     refute encoded =~ "super-secret"
@@ -307,7 +326,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert config_dir |> Path.dirname() |> Path.dirname() |> Path.expand() |> Path.split() ==
              tmp_root |> Path.expand() |> Path.split()
 
-    assert length(calls) == 14
+    assert length(calls) == 15
 
     Enum.each(calls, fn {command, args, opts} ->
       assert command == "mc.exe"
@@ -377,11 +396,32 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "--config-dir",
              ^config_dir,
              "admin",
+             "user",
+             "info",
+             "maxiocompat",
+             fixture_user
+           ] = elem(Enum.at(calls, 10), 1)
+
+    assert_received {:admin_fixture_created, ^fixture_user}
+    assert_received {:admin_user_info, ^fixture_user}
+    assert_received {:admin_fixture_cleaned, ^fixture_user}
+
+    assert [
+             "--config-dir",
+             ^config_dir,
+             "admin",
              "policy",
              "rm",
              "maxiocompat",
              ^policy_name
-           ] = elem(Enum.at(calls, 10), 1)
+           ] = elem(Enum.at(calls, 11), 1)
+
+    refute Enum.any?(calls, fn {_command, args, _opts} ->
+             args_text = Enum.join(args, " ")
+
+             args_text =~ " admin user enable " or args_text =~ " admin user disable " or
+               args_text =~ " admin user remove "
+           end)
 
     refute File.exists?(config_dir)
     refute File.exists?(Path.dirname(config_dir))
@@ -424,6 +464,9 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "info"] ->
             {"PolicyName #{Process.get(:cleanup_policy_name)}", 0}
 
+          subcommand == "admin" and Enum.take(command_args, 2) == ["user", "info"] ->
+            {"Status: enabled", 0}
+
           subcommand == "rm" ->
             Process.put(:mc_cleanup_failed, true)
             {"late cleanup failure", 9}
@@ -440,7 +483,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       |> ExternalSmoke.run(
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
-        tmp_root_fun: &tmp_root/0
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
       )
 
     assert entry["status"] == "blocked"
@@ -475,13 +519,62 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       |> ExternalSmoke.run(
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: command_runner,
-        tmp_root_fun: &tmp_root/0
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
       )
 
     assert entry["status"] == "blocked"
 
     assert [%{"reason" => "external_smoke_output_missing", "step" => "stat_object"}] =
              entry["blockers"]
+  end
+
+  test "successful user info plus fixture cleanup failure keeps primary evidence and blocks" do
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: successful_mc_runner(),
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self(), {:error, :cleanup_failed})
+      )
+
+    assert entry["status"] == "blocked"
+    assert Enum.any?(entry["steps"], &(&1["id"] == "admin_user_info" and &1["status"] == "ok"))
+    assert List.last(entry["steps"])["id"] == "admin_user_fixture_cleanup"
+    assert [%{"reason" => "external_smoke_cleanup_failed"}] = entry["blockers"]
+  end
+
+  test "blocked user info plus fixture cleanup failure retains both causes in order" do
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: successful_mc_runner(admin_user_info: {"user info failed", 17}),
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self(), {:error, :cleanup_failed})
+      )
+
+    assert entry["status"] == "blocked"
+
+    assert Enum.any?(
+             entry["steps"],
+             &(&1["id"] == "admin_user_info" and &1["status"] == "blocked")
+           )
+
+    assert List.last(entry["steps"])["id"] == "admin_user_fixture_cleanup"
+
+    assert [
+             %{"reason" => "external_smoke_step_failed", "step" => "admin_user_info"},
+             %{
+               "reason" => "external_smoke_cleanup_failed",
+               "step" => "admin_user_fixture_cleanup"
+             }
+           ] = entry["blockers"]
+
+    refute Enum.any?(entry["blockers"], &(&1["reason"] == "external_smoke_failed"))
   end
 
   test "python-boto3 smoke runs one self-verifying CRUD script" do
@@ -591,6 +684,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self()),
         system_env: %{
           "NO_PROXY" => "example.com,LOCALHOST",
           "no_proxy" => "EXAMPLE.com,service.internal"
@@ -636,6 +730,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self()),
         system_env: %{"NO_PROXY" => "existing.local", "no_proxy" => "legacy.local"}
       )
 
@@ -654,6 +749,59 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     {"no_proxy", lower} = Enum.find(env, &(elem(&1, 0) == "no_proxy"))
     assert upper == lower
     assert host in String.split(upper, ",")
+  end
+
+  defp fixture_opts(owner, cleanup_result \\ :ok) do
+    [
+      start_repo: fn -> :ok end,
+      name: "maxio-compat-user-#{System.unique_integer([:positive])}",
+      create_user: fn name ->
+        send(owner, {:admin_fixture_created, name})
+        {:ok, %{user_name: name, status: "active"}}
+      end,
+      cleanup_user: fn name ->
+        send(owner, {:admin_fixture_cleaned, name})
+        cleanup_result
+      end
+    ]
+  end
+
+  defp successful_mc_runner(opts \\ []) do
+    admin_user_info = Keyword.get(opts, :admin_user_info, {"Status: enabled", 0})
+
+    fn _command, args, _command_opts ->
+      ["--config-dir", _config_dir, subcommand | command_args] = args
+
+      cond do
+        subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
+          payload_path = Enum.find(command_args, &File.regular?/1)
+          Process.put(:successful_mc_payload, File.read!(payload_path))
+          {"copied", 0}
+
+        subcommand == "stat" ->
+          {"maxio-smoke: deep-matrix", 0}
+
+        subcommand == "cat" ->
+          {Process.get(:successful_mc_payload), 0}
+
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
+          ["policy", "create", "maxiocompat", policy_name, _policy_path] = command_args
+          Process.put(:successful_mc_policy, policy_name)
+          {"created", 0}
+
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "ls"] ->
+          {Process.get(:successful_mc_policy), 0}
+
+        subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "info"] ->
+          {"PolicyName #{Process.get(:successful_mc_policy)}", 0}
+
+        subcommand == "admin" and Enum.take(command_args, 2) == ["user", "info"] ->
+          admin_user_info
+
+        true ->
+          {"ok", 0}
+      end
+    end
   end
 
   defp tmp_root do

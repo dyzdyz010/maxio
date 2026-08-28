@@ -203,11 +203,43 @@ defmodule Maxio.Admin.Plug do
       [target_user: conn.query_params["accessKey"]],
       fn conn ->
         case UserAdapter.info(conn.query_params["accessKey"]) do
-          {:ok, result} -> send_json(conn, result.wire)
-          {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+          {:ok, result} ->
+            log_user_info_projection(conn, result.evidence)
+            send_json(conn, result.wire)
+
+          {:error, reason} ->
+            render_error(conn, ErrorMap.from_reason(reason))
         end
       end
     )
+  end
+
+  defp log_user_info_projection(conn, evidence) do
+    metadata =
+      user_info_log_metadata(conn, evidence)
+
+    Log.info("admin user info projected", metadata)
+
+    if evidence.direct_managed.omitted_names != [] do
+      Log.warn("ambiguous direct managed policy omitted from MinIO UserInfo", metadata)
+    end
+  end
+
+  defp user_info_log_metadata(conn, evidence) do
+    [
+      action: "admin_user_info",
+      admin_action: "admin_user_info",
+      target_user: conn.query_params["accessKey"],
+      credential_bearing: evidence.credential_bearing,
+      managed_policies: evidence.direct_managed.count,
+      inline_policies: evidence.direct_inline.count,
+      group_inherited: evidence.group_inline.count + evidence.group_managed.count,
+      role_attached: evidence.role_managed.count,
+      minio_view_partial: evidence.minio_view_partial,
+      omitted_reason: Enum.join(evidence.omitted_reason, ","),
+      request_id: request_id(conn),
+      surface: conn.assigns[:maxio_surface]
+    ]
   end
 
   defp authorize_and_run(conn, required_action, admin_action, callback) do

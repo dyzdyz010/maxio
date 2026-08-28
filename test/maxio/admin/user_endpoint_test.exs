@@ -1,6 +1,8 @@
 defmodule Maxio.Admin.UserEndpointTest do
   use Maxio.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Maxio.Auth.CredentialStore
   alias Maxio.IAM
   alias Maxio.Policy.{Statement, Store}
@@ -192,6 +194,82 @@ defmodule Maxio.Admin.UserEndpointTest do
     assert Jason.decode!(missing.resp_body)["Message"] == "The specified user does not exist."
   end
 
+  test "partial UserInfo logs only safe source counts and omission reasons" do
+    original_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: original_level) end)
+
+    owner = self()
+    user_name = unique_access_name("LOGUSER")
+    assert {:ok, user} = IAM.create_user(name: user_name)
+    secret = "endpoint-log-secret-long-enough"
+
+    assert {:ok, _key} =
+             IAM.create_access_key(
+               access_key_id: user_name,
+               secret_key: secret,
+               user_name: user_name
+             )
+
+    direct_name = unique_name("log-direct")
+    comma_name = unique_name("log-comma") <> ",omitted"
+    inline_name = unique_name("log-inline")
+    group_name = unique_name("log-group")
+    group_inline_name = unique_name("log-group-inline")
+    group_managed_name = unique_name("log-group-managed")
+    role_managed_name = unique_name("log-role-managed")
+
+    direct_arn = create_managed_policy!(direct_name)
+    comma_arn = create_managed_policy!(comma_name)
+    group_managed_arn = create_managed_policy!(group_managed_name)
+    role_managed_arn = create_managed_policy!(role_managed_name)
+
+    assert :ok = IAM.attach_user_policy(user_name, direct_arn)
+    assert :ok = IAM.attach_user_policy(user_name, comma_arn)
+    assert :ok = IAM.put_principal_policy(user.user_arn, inline_name, source_policy())
+    assert {:ok, _group} = IAM.create_group(name: group_name)
+    assert :ok = IAM.add_user_to_group(user_name, group_name)
+
+    assert :ok =
+             IAM.put_group_policy(group_name, group_inline_name, source_policy())
+
+    assert :ok = IAM.attach_group_policy(group_name, group_managed_arn)
+    assert {:ok, _role} = create_evidence_role(user.user_arn)
+    assert :ok = Store.attach_role_managed_policy(user.user_arn, role_managed_arn)
+
+    log =
+      capture_log([level: :info], fn ->
+        conn = signed(:get, @path, query: %{"accessKey" => user_name}, region: "")
+        send(owner, {:logged_user_info, conn})
+      end)
+
+    assert_receive {:logged_user_info, conn}
+    assert conn.status == 200
+    assert log =~ "admin user info projected"
+    assert log =~ "target_user=#{user_name}"
+    assert log =~ "credential_bearing=true"
+    assert log =~ "managed_policies=2"
+    assert log =~ "inline_policies=1"
+    assert log =~ "group_inherited=2"
+    assert log =~ "role_attached=1"
+    assert log =~ "minio_view_partial=true"
+
+    for reason <- [
+          "ambiguous_direct_managed_policy_name",
+          "direct_inline_policy",
+          "group_inline_policy",
+          "group_managed_policy",
+          "role_managed_policy"
+        ] do
+      assert log =~ reason
+    end
+
+    assert log =~ "ambiguous direct managed policy omitted from MinIO UserInfo"
+    refute log =~ secret
+    refute log =~ "Statement"
+    refute log =~ "s3:GetObject"
+  end
+
   test "anonymous U3 is denied before endpoint disclosure" do
     conn =
       :get
@@ -269,6 +347,45 @@ defmodule Maxio.Admin.UserEndpointTest do
     })
   end
 
+  defp create_managed_policy!(name) do
+    arn = IAM.managed_policy_arn(name, "/")
+
+    assert {:ok, %{policy_arn: ^arn}} =
+             IAM.create_managed_policy_strict(
+               name: name,
+               path: "/",
+               document: source_policy()
+             )
+
+    arn
+  end
+
+  defp create_evidence_role(role_arn) do
+    Maxio.Repo.insert(%Maxio.IAM.Role{
+      role_name: unique_name("evidence-role"),
+      role_arn: role_arn,
+      trust_policy: %{
+        "Version" => "2012-10-17",
+        "Statement" => %{
+          "Effect" => "Allow",
+          "Action" => "sts:AssumeRole",
+          "Principal" => %{"AWS" => IAM.root_principal_arn()}
+        }
+      }
+    })
+  end
+
+  defp source_policy do
+    Jason.encode!(%{
+      "Version" => "2012-10-17",
+      "Statement" => %{
+        "Effect" => "Allow",
+        "Action" => "s3:GetObject",
+        "Resource" => "arn:aws:s3:::admin-user-log/*"
+      }
+    })
+  end
+
   defp assert_admin_error(conn, status, code) do
     assert conn.status == status
     assert Jason.decode!(conn.resp_body)["Code"] == code
@@ -279,4 +396,9 @@ defmodule Maxio.Admin.UserEndpointTest do
   end
 
   defp unique_name(prefix), do: "#{prefix}-#{System.unique_integer([:positive, :monotonic])}"
+
+  defp unique_access_name(prefix) do
+    suffix = System.unique_integer([:positive, :monotonic])
+    String.pad_trailing("AKIA#{prefix}#{suffix}", 20, "X")
+  end
 end
