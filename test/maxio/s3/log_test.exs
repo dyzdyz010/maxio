@@ -67,7 +67,12 @@ defmodule Maxio.S3.LogTest do
         owner: false,
         authenticated: true,
         write_authority: ":sidecar",
-        matched_tasks: 1
+        matched_tasks: 1,
+        admin_action: "admin_policy_info",
+        admin_endpoint: "/minio/admin/v3/info-canned-policy",
+        target_policy: "read-only",
+        omitted_non_root_path_policies: 2,
+        surface: :admin
       )
 
     assert Keyword.get(md, :request_id) == "r"
@@ -88,5 +93,10 @@ defmodule Maxio.S3.LogTest do
     assert Keyword.get(md, :authenticated) == true
     assert Keyword.get(md, :write_authority) == ":sidecar"
     assert Keyword.get(md, :matched_tasks) == 1
+    assert Keyword.get(md, :admin_action) == "admin_policy_info"
+    assert Keyword.get(md, :admin_endpoint) == "/minio/admin/v3/info-canned-policy"
+    assert Keyword.get(md, :target_policy) == "read-only"
+    assert Keyword.get(md, :omitted_non_root_path_policies) == 2
+    assert Keyword.get(md, :surface) == :admin
   end
 end

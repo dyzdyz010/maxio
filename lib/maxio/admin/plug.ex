@@ -22,6 +22,10 @@ defmodule Maxio.Admin.Plug do
   | 路径 | 方法 | admin action | 响应 |
   |---|---|---|---|
   | `/minio/admin/v3/info` | GET | `admin:ServerInfo` | 200 明文 JSON `InfoMessage` |
+  | `/minio/admin/v3/add-canned-policy` | PUT | `admin:CreatePolicy` | 200 空 body |
+  | `/minio/admin/v3/list-canned-policies` | GET | `admin:ListUserPolicies` | 200 明文 JSON |
+  | `/minio/admin/v3/info-canned-policy` | GET | `admin:GetPolicy` | 200 明文 JSON |
+  | `/minio/admin/v3/remove-canned-policy` | DELETE | `admin:DeletePolicy` | 200 空 body |
 
   其余一切 `/minio/admin/*`（含 `/minio/admin/v4/*`）落 501 `NotImplemented`(JSON)；
   匿名请求一律 403 `AccessDenied`(JSON)。
@@ -40,7 +44,7 @@ defmodule Maxio.Admin.Plug do
 
   import Plug.Conn
 
-  alias Maxio.Admin.{Authz, ErrorView, ServerInfo}
+  alias Maxio.Admin.{Authz, ErrorMap, ErrorView, PolicyAdapter, PolicyRequest, ServerInfo}
   alias Maxio.S3.{Error, Log, PipelineOrderError, RawPath, ReservedNamespace}
 
   @behaviour Plug
@@ -94,6 +98,7 @@ defmodule Maxio.Admin.Plug do
 
   defp route(conn) do
     if authenticated?(conn) do
+      conn = fetch_query_params(conn)
       dispatch(conn, conn.method, RawPath.decoded_path(conn))
     else
       render_error(conn, Error.new(:access_denied))
@@ -103,7 +108,127 @@ defmodule Maxio.Admin.Plug do
   # madmin 的 ServerInfo 硬编码打 v3（实测 mc RELEASE.2025-08-13）。
   defp dispatch(conn, "GET", "/minio/admin/v3/info"), do: server_info(conn)
 
+  defp dispatch(conn, "PUT", "/minio/admin/v3/add-canned-policy"),
+    do: create_policy(conn)
+
+  defp dispatch(conn, "GET", "/minio/admin/v3/list-canned-policies"),
+    do: list_policies(conn)
+
+  defp dispatch(conn, "GET", "/minio/admin/v3/info-canned-policy"),
+    do: policy_info(conn)
+
+  defp dispatch(conn, "DELETE", "/minio/admin/v3/remove-canned-policy"),
+    do: remove_policy(conn)
+
   defp dispatch(conn, _method, path) do
+    render_not_implemented(conn, path)
+  end
+
+  defp create_policy(conn) do
+    authorize_and_run(conn, "admin:CreatePolicy", "admin_policy_create", fn conn ->
+      {conn, body} = PolicyRequest.read_add_body!(conn)
+
+      case PolicyAdapter.create(conn.query_params["name"], body) do
+        {:ok, _policy} -> send_empty_success(conn)
+        {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+      end
+    end)
+  end
+
+  defp list_policies(conn) do
+    authorize_and_run(conn, "admin:ListUserPolicies", "admin_policy_list", fn conn ->
+      if Map.has_key?(conn.query_params, "bucket") do
+        render_not_implemented(conn, RawPath.decoded_path(conn))
+      else
+        {:ok, %{policies: policies, omitted: omitted}} = PolicyAdapter.list()
+
+        if omitted != [] do
+          Log.info("non-root policies omitted from MinIO admin view",
+            action: "admin_policy_list",
+            admin_action: "admin_policy_list",
+            omitted_non_root_path_policies: length(omitted),
+            request_id: request_id(conn),
+            surface: conn.assigns[:maxio_surface]
+          )
+        end
+
+        send_json(conn, policies)
+      end
+    end)
+  end
+
+  defp policy_info(conn) do
+    authorize_and_run(conn, "admin:GetPolicy", "admin_policy_info", fn conn ->
+      case conn.query_params["v"] do
+        version when version in [nil, "", "2"] -> policy_info(conn, version)
+        _unsupported -> render_error(conn, Error.new(:admin_invalid_argument))
+      end
+    end)
+  end
+
+  defp policy_info(conn, version) do
+    case PolicyAdapter.info(conn.query_params["name"]) do
+      {:ok, info} when version == "2" -> send_json(conn, info)
+      {:ok, info} -> send_json(conn, info["Policy"])
+      {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+    end
+  end
+
+  defp remove_policy(conn) do
+    authorize_and_run(conn, "admin:DeletePolicy", "admin_policy_remove", fn conn ->
+      case PolicyAdapter.remove(conn.query_params["name"]) do
+        :ok -> send_empty_success(conn)
+        {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+      end
+    end)
+  end
+
+  defp authorize_and_run(conn, required_action, admin_action, callback) do
+    metadata =
+      policy_log_metadata(conn, required_action, admin_action)
+
+    case Authz.authorize(conn, conn.assigns[:principal], required_action) do
+      :ok ->
+        Log.info("admin policy request authorized", [{:decision, "allow"} | metadata])
+        callback.(conn)
+
+      {:error, reason} ->
+        Log.warn("admin policy request denied", [
+          {:decision, "deny"},
+          {:reason, to_string(reason)}
+          | metadata
+        ])
+
+        render_error(conn, Error.new(:access_denied))
+    end
+  end
+
+  defp policy_log_metadata(conn, required_action, admin_action) do
+    [
+      action: admin_action,
+      admin_action: admin_action,
+      admin_endpoint: RawPath.decoded_path(conn),
+      target_policy: conn.query_params["name"],
+      required_action: required_action,
+      method: conn.method,
+      resource: RawPath.decoded_path(conn),
+      request_id: request_id(conn),
+      auth_type: conn.assigns[:auth_type],
+      principal_arn: principal_arn(conn),
+      surface: conn.assigns[:maxio_surface]
+    ]
+  end
+
+  defp send_json(conn, body) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode_to_iodata!(body))
+    |> halt()
+  end
+
+  defp send_empty_success(conn), do: conn |> send_resp(200, "") |> halt()
+
+  defp render_not_implemented(conn, path) do
     render_error(
       conn,
       Error.new(:not_implemented,
@@ -141,8 +266,6 @@ defmodule Maxio.Admin.Plug do
   # 无论它发不发，服务端支持这个参数都是正确的：收到就绕过 usage / 盘容量的短 TTL 快照，
   # 这个参数存在的全部意义就是"我要最新的，别给我缓存的"。
   defp server_info_body(conn) do
-    conn = fetch_query_params(conn)
-
     ServerInfo.build(
       no_cache: no_cache?(conn),
       host: conn.host,

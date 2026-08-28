@@ -92,6 +92,13 @@ config :logger, :default_formatter,
     :configuration_id,
     :notification_event_id,
     :attempts,
+    # MinIO admin control-plane request fields. Never add policy documents or
+    # credentials to this formatter allowlist.
+    :admin_action,
+    :admin_endpoint,
+    :target_policy,
+    :omitted_non_root_path_policies,
+    :surface,
     # ObjectMutation 协议 §7 固定字段（B7 日志收口，B5 审查项 1）：Log 模块只放行白名单键，
     # formatter 侧必须同步放行，否则结构化字段被静默丢弃（action/request_id/bucket/key/
     # version_id/reason 已在上方白名单）。绝不放行对象 body / 密钥 / SSE envelope 类键。

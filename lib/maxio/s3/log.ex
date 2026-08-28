@@ -54,6 +54,13 @@ defmodule Maxio.S3.Log do
     :configuration_id,
     :notification_event_id,
     :attempts,
+    # MinIO admin control-plane request fields. Policy documents and credentials
+    # are intentionally absent from this allowlist.
+    :admin_action,
+    :admin_endpoint,
+    :target_policy,
+    :omitted_non_root_path_policies,
+    :surface,
     # 运行时配置面固定字段（设计 §6）。formatter 侧的 metadata 白名单必须同步放行，
     # 否则结构化字段被静默丢弃——ObjectMutation 已有前车之鉴。
     :config_subsystem,
