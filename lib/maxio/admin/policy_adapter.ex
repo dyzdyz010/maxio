@@ -125,6 +125,130 @@ defmodule Maxio.Admin.PolicyAdapter do
     end
   end
 
+  @spec update_associations(:attach | :detach, {:user | :group, String.t()}, [String.t()]) ::
+          {:ok, %{wire: map(), changed_count: non_neg_integer()}} | {:error, term()}
+  def update_associations(operation, principal, policy_names)
+      when operation in [:attach, :detach] and is_list(policy_names) do
+    with :ok <- validate_policy_names(policy_names),
+         {:ok, result} <-
+           IAM.update_managed_policy_associations_strict(operation, principal, policy_names) do
+      changed_names = Enum.map(result.changed_policy_arns, &root_policy_name!/1)
+      key = if operation == :attach, do: "policiesAttached", else: "policiesDetached"
+
+      {:ok,
+       %{
+         wire: %{key => changed_names, "updatedAt" => DateTime.to_iso8601(result.updated_at)},
+         changed_count: length(changed_names)
+       }}
+    end
+  end
+
+  def update_associations(_operation, _principal, _policy_names), do: {:error, :invalid_argument}
+
+  @spec entities(map()) :: {:ok, %{wire: map(), evidence: map()}} | {:error, term()}
+  def entities(%{
+        users: users,
+        groups: groups,
+        policies: policy_names,
+        requested: %MapSet{} = requested
+      }) do
+    with {:ok, policy_arns} <- root_policy_arns(policy_names),
+         {:ok, projection} <-
+           IAM.query_builtin_policy_entities(%{
+             users: users,
+             groups: groups,
+             policy_arns: policy_arns,
+             requested: requested
+           }) do
+      wire =
+        %{"timestamp" => DateTime.to_iso8601(projection.timestamp)}
+        |> maybe_put_mapping("userMappings", project_user_mappings(projection.user_mappings))
+        |> maybe_put_mapping("groupMappings", project_group_mappings(projection.group_mappings))
+        |> maybe_put_mapping(
+          "policyMappings",
+          project_policy_mappings(projection.policy_mappings)
+        )
+
+      {:ok,
+       %{
+         wire: wire,
+         evidence: %{
+           user_mappings: length(projection.user_mappings),
+           group_mappings: length(projection.group_mappings),
+           policy_mappings: length(projection.policy_mappings)
+         }
+       }}
+    end
+  end
+
+  def entities(_filters), do: {:error, :invalid_argument}
+
+  defp validate_policy_names(names) do
+    case root_policy_arns(names) do
+      {:ok, _arns} when names != [] -> :ok
+      {:ok, _arns} -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp root_policy_arns(names) when is_list(names) do
+    Enum.reduce_while(names, {:ok, []}, fn name, {:ok, arns} ->
+      case root_policy_target(name) do
+        {:ok, arn} -> {:cont, {:ok, [arn | arns]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, arns} -> {:ok, arns |> Enum.uniq() |> Enum.sort()}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp root_policy_arns(_names), do: {:error, :invalid_argument}
+
+  defp root_policy_name!("arn:aws:iam:::policy/" <> name), do: name
+
+  defp project_user_mappings(mappings) do
+    Enum.map(mappings, fn mapping ->
+      %{
+        "user" => mapping.user,
+        "policies" => nullable_policy_names(mapping.policy_arns)
+      }
+      |> maybe_put_mapping(
+        "memberOfMappings",
+        Enum.map(mapping.member_of_mappings, fn inherited ->
+          %{
+            "group" => inherited.group,
+            "policies" => nullable_policy_names(inherited.policy_arns)
+          }
+        end)
+      )
+    end)
+  end
+
+  defp project_group_mappings(mappings) do
+    Enum.map(mappings, fn mapping ->
+      %{"group" => mapping.group, "policies" => nullable_policy_names(mapping.policy_arns)}
+    end)
+  end
+
+  defp project_policy_mappings(mappings) do
+    Enum.map(mappings, fn mapping ->
+      %{
+        "policy" => root_policy_name!(mapping.policy_arn),
+        "users" => nullable_strings(mapping.users),
+        "groups" => nullable_strings(mapping.groups)
+      }
+    end)
+  end
+
+  defp nullable_policy_names([]), do: nil
+  defp nullable_policy_names(arns), do: Enum.map(arns, &root_policy_name!/1)
+  defp nullable_strings([]), do: nil
+  defp nullable_strings(values), do: values
+  defp maybe_put_mapping(map, _key, []), do: map
+  defp maybe_put_mapping(map, key, value), do: Map.put(map, key, value)
+
   defp root_policy_target(name) do
     with :ok <- validate_name(name),
          arn = IAM.managed_policy_arn(name, "/"),

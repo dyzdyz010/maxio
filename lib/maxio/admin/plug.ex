@@ -51,6 +51,8 @@ defmodule Maxio.Admin.Plug do
     Envelope,
     ErrorView,
     PolicyAdapter,
+    PolicyAssociationRequest,
+    PolicyEntitiesRequest,
     PolicyRequest,
     ServerInfo,
     UserAdapter,
@@ -111,8 +113,10 @@ defmodule Maxio.Admin.Plug do
 
   defp route(conn) do
     if authenticated?(conn) do
-      conn = fetch_query_params(conn)
-      dispatch(conn, conn.method, RawPath.decoded_path(conn))
+      path = RawPath.decoded_path(conn)
+      conn = assign(conn, :admin_raw_query_string, conn.query_string)
+      conn = if p7_route?(conn.method, path), do: conn, else: fetch_query_params(conn)
+      dispatch(conn, conn.method, path)
     else
       render_error(conn, Error.new(:access_denied))
     end
@@ -139,6 +143,12 @@ defmodule Maxio.Admin.Plug do
   defp dispatch(conn, "DELETE", "/minio/admin/v3/remove-user"), do: remove_user(conn)
   defp dispatch(conn, "PUT", "/minio/admin/v3/set-user-status"), do: set_user_status(conn)
 
+  defp dispatch(conn, "POST", "/minio/admin/v3/idp/builtin/policy/" <> operation),
+    do: policy_association(conn, operation)
+
+  defp dispatch(conn, "GET", "/minio/admin/v3/idp/builtin/policy-entities"),
+    do: policy_entities(conn)
+
   defp dispatch(conn, _method, path) do
     render_not_implemented(conn, path)
   end
@@ -152,6 +162,88 @@ defmodule Maxio.Admin.Plug do
         {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
       end
     end)
+  end
+
+  defp policy_association(conn, operation) do
+    authorize_any_and_run(
+      conn,
+      ["admin:UpdatePolicyAssociation", "admin:AttachUserOrGroupPolicy"],
+      "admin_policy_association_#{operation}",
+      fn conn, authorized_action ->
+        declared_length = PolicyAssociationRequest.validate_transport!(conn)
+
+        if operation in ["attach", "detach"] do
+          with {:ok, caller_secret} <- signing_secret(conn) do
+            {conn, request} =
+              PolicyAssociationRequest.read!(conn, caller_secret, declared_length)
+
+            case PolicyAdapter.update_associations(
+                   String.to_existing_atom(operation),
+                   request.principal,
+                   request.policies
+                 ) do
+              {:ok, result} ->
+                log_policy_association(
+                  conn,
+                  operation,
+                  authorized_action,
+                  request,
+                  result
+                )
+
+                encrypt_admin_success(conn, caller_secret, result.wire)
+
+              {:error, reason} ->
+                render_error(conn, ErrorMap.from_reason(reason))
+            end
+          else
+            {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+          end
+        else
+          render_error(conn, Error.new(:admin_invalid_argument))
+        end
+      end
+    )
+  end
+
+  defp policy_entities(conn) do
+    authorize_any_and_run(
+      conn,
+      ["admin:ListGroups", "admin:ListUsers", "admin:ListUserPolicies"],
+      "admin_policy_entities",
+      fn conn, authorized_action ->
+        with {:ok, caller_secret} <- signing_secret(conn),
+             parsed <- PolicyEntitiesRequest.parse!(conn.assigns.admin_raw_query_string),
+             {:ok, result} <-
+               PolicyAdapter.entities(%{
+                 users: parsed.users,
+                 groups: parsed.groups,
+                 policies: parsed.policies,
+                 requested: parsed.requested
+               }) do
+          Log.info("admin policy entities projected",
+            action: "admin_policy_entities",
+            admin_action: "admin_policy_entities",
+            authorized_action: authorized_action,
+            required_actions: "admin:ListGroups,admin:ListUsers,admin:ListUserPolicies",
+            requested_user_count: length(parsed.users),
+            requested_group_count: length(parsed.groups),
+            requested_policy_count: length(parsed.policies),
+            user_mapping_count: result.evidence.user_mappings,
+            group_mapping_count: result.evidence.group_mappings,
+            policy_mapping_count: result.evidence.policy_mappings,
+            request_id: request_id(conn),
+            principal_arn: principal_arn(conn),
+            auth_type: conn.assigns[:auth_type]
+          )
+
+          encrypt_admin_success(conn, caller_secret, result.wire)
+        else
+          {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+          {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+        end
+      end
+    )
   end
 
   defp list_policies(conn) do
@@ -453,6 +545,66 @@ defmodule Maxio.Admin.Plug do
     end
   end
 
+  defp authorize_any_and_run(conn, required_actions, admin_action, callback) do
+    metadata = [
+      action: admin_action,
+      admin_action: admin_action,
+      admin_endpoint: RawPath.decoded_path(conn),
+      required_actions: Enum.join(required_actions, ","),
+      method: conn.method,
+      resource: RawPath.decoded_path(conn),
+      request_id: request_id(conn),
+      auth_type: conn.assigns[:auth_type],
+      principal_arn: principal_arn(conn),
+      surface: conn.assigns[:maxio_surface]
+    ]
+
+    case Authz.authorize_any(conn, conn.assigns[:principal], required_actions) do
+      {:ok, authorized_action} ->
+        Log.info(
+          "admin request authorized",
+          [{:decision, "allow"}, {:authorized_action, authorized_action} | metadata]
+        )
+
+        callback.(conn, authorized_action)
+
+      {:error, reason} ->
+        Log.warn("admin request denied", [
+          {:decision, "deny"},
+          {:reason, to_string(reason)}
+          | metadata
+        ])
+
+        render_error(conn, Error.new(:access_denied))
+    end
+  end
+
+  defp encrypt_admin_success(conn, caller_secret, wire) do
+    with {:ok, encrypted} <- Envelope.encrypt(caller_secret, Jason.encode_to_iodata!(wire)) do
+      send_encrypted_json(conn, encrypted)
+    else
+      {:error, _reason} -> render_error(conn, Error.new(:internal_error))
+    end
+  end
+
+  defp log_policy_association(conn, operation, authorized_action, request, result) do
+    {principal_kind, _principal_name} = request.principal
+
+    Log.info("admin policy association committed",
+      action: "admin_policy_association_#{operation}",
+      admin_action: "admin_policy_association_#{operation}",
+      required_actions: "admin:UpdatePolicyAssociation,admin:AttachUserOrGroupPolicy",
+      authorized_action: authorized_action,
+      principal_kind: principal_kind,
+      operation: operation,
+      requested_policy_count: length(request.policies),
+      changed_policy_count: result.changed_count,
+      request_id: request_id(conn),
+      principal_arn: principal_arn(conn),
+      auth_type: conn.assigns[:auth_type]
+    )
+  end
+
   defp admin_log_metadata(conn, required_action, admin_action, target_metadata) do
     base = [
       action: admin_action,
@@ -544,6 +696,9 @@ defmodule Maxio.Admin.Plug do
       value -> String.downcase(to_string(value)) not in ["false", "0", ""]
     end
   end
+
+  defp p7_route?("GET", "/minio/admin/v3/idp/builtin/policy-entities"), do: true
+  defp p7_route?(_method, _path), do: false
 
   defp principal_arn(conn) do
     case conn.assigns[:principal] do

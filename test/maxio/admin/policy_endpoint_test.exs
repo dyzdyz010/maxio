@@ -1,7 +1,8 @@
 defmodule Maxio.Admin.PolicyEndpointTest do
   use Maxio.DataCase, async: false
 
-  alias Maxio.Admin.PolicyAdapter
+  alias Maxio.Admin.{Envelope, PolicyAdapter}
+  alias Maxio.Auth.SigningSecret
   alias Maxio.Auth.CredentialStore
   alias Maxio.IAM
   alias Maxio.Policy.Store, as: PolicyStore
@@ -276,6 +277,98 @@ defmodule Maxio.Admin.PolicyEndpointTest do
     refute_received :body_reader_called
   end
 
+  test "root attaches, queries and detaches builtin policies through encrypted P6/P7" do
+    user_name = unique_name("p6-user")
+    policy_name = unique_name("p6-policy")
+    assert {:ok, _} = IAM.create_user(name: user_name)
+    assert {:ok, _} = PolicyAdapter.create(policy_name, policy_json("s3:ListAllMyBuckets"))
+
+    attached =
+      signed_policy_association(:attach, %{"policies" => [policy_name], "user" => user_name})
+
+    assert attached.status == 200
+    assert %{"policiesAttached" => [^policy_name], "updatedAt" => _} = decrypt_admin(attached)
+
+    repeated =
+      signed_policy_association(:attach, %{"policies" => [policy_name], "user" => user_name})
+
+    assert_admin_error(repeated, 400, "XMinioAdminPolicyChangeAlreadyApplied")
+
+    entities =
+      signed(:get, "#{@base}/idp/builtin/policy-entities",
+        query: %{"user" => user_name, "policy" => policy_name},
+        region: ""
+      )
+
+    assert entities.status == 200
+    assert [%{"user" => ^user_name}] = decrypt_admin(entities)["userMappings"]
+
+    detached =
+      signed_policy_association(:detach, %{"policies" => [policy_name], "user" => user_name})
+
+    assert %{"policiesDetached" => [^policy_name]} = decrypt_admin(detached)
+  end
+
+  test "P6 unknown operation applies transport gates before operation rejection" do
+    invalid =
+      signed(:post, "#{@base}/idp/builtin/policy/unknown",
+        body: "x",
+        headers: [{"content-length", "1"}, {"content-type", "text/plain"}],
+        region: ""
+      )
+
+    assert_admin_error(invalid, 400, "XMinioAdminInvalidArgument")
+
+    valid_transport =
+      signed(:post, "#{@base}/idp/builtin/policy/unknown",
+        body: "x",
+        headers: [
+          {"content-length", "1"},
+          {"content-type", "application/octet-stream"}
+        ],
+        region: ""
+      )
+
+    assert_admin_error(valid_transport, 400, "XMinioAdminInvalidArgument")
+  end
+
+  test "P6 and P7 accept every frozen OR authorization alternative" do
+    for action <- ["admin:UpdatePolicyAssociation", "admin:AttachUserOrGroupPolicy"] do
+      user_name = unique_name("or-p6-user")
+      policy_name = unique_name("or-p6-policy")
+      assert {:ok, _} = IAM.create_user(name: user_name)
+      assert {:ok, _} = PolicyAdapter.create(policy_name, policy_json("s3:GetObject"))
+      {access_key, secret, _arn} = put_action_key(action)
+
+      response =
+        signed_policy_association(
+          :attach,
+          %{"policies" => [policy_name], "user" => user_name},
+          access_key,
+          secret
+        )
+
+      assert response.status == 200
+
+      assert %{"policiesAttached" => [^policy_name]} =
+               decrypt_admin(response, SigningSecret.new(secret))
+    end
+
+    for action <- ["admin:ListGroups", "admin:ListUsers", "admin:ListUserPolicies"] do
+      {access_key, secret, _arn} = put_action_key(action)
+
+      response =
+        signed(:get, "#{@base}/idp/builtin/policy-entities",
+          access_key: access_key,
+          secret: secret,
+          region: ""
+        )
+
+      assert response.status == 200
+      assert is_binary(decrypt_admin(response, SigningSecret.new(secret))["timestamp"])
+    end
+  end
+
   for {label, action, method, endpoint} <- [
         {"create", "admin:CreatePolicy", :put, "add-canned-policy"},
         {"list", "admin:ListUserPolicies", :get, "list-canned-policies"},
@@ -324,6 +417,50 @@ defmodule Maxio.Admin.PolicyEndpointTest do
     method
     |> SigV4Request.signed_conn(path, opts)
     |> Endpoint.call(Endpoint.init([]))
+  end
+
+  defp signed_policy_association(operation, plaintext) do
+    signed_policy_association(operation, plaintext, nil, nil)
+  end
+
+  defp signed_policy_association(operation, plaintext, access_key, secret) do
+    envelope_secret = if secret, do: SigningSecret.new(secret), else: root_signing_secret()
+    {:ok, body} = Envelope.encrypt(envelope_secret, Jason.encode!(plaintext))
+
+    credentials =
+      if access_key,
+        do: [access_key: access_key, secret: secret],
+        else: []
+
+    signed(
+      :post,
+      "#{@base}/idp/builtin/policy/#{operation}",
+      credentials ++
+        [
+          body: body,
+          headers: [
+            {"content-length", Integer.to_string(byte_size(body))},
+            {"content-type", "application/octet-stream"}
+          ],
+          region: ""
+        ]
+    )
+  end
+
+  defp decrypt_admin(conn) do
+    decrypt_admin(conn, root_signing_secret())
+  end
+
+  defp decrypt_admin(conn, signing_secret) do
+    assert [content_type] = Plug.Conn.get_resp_header(conn, "content-type")
+    assert content_type =~ "application/json"
+    assert {:ok, plaintext} = Envelope.decrypt(signing_secret, conn.resp_body)
+    Jason.decode!(plaintext)
+  end
+
+  defp root_signing_secret do
+    secret = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_password)
+    SigningSecret.new(secret)
   end
 
   defp action_request_opts("create", name, body, access_key, secret) do

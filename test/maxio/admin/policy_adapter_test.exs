@@ -193,6 +193,63 @@ defmodule Maxio.Admin.PolicyAdapterTest do
     assert {:ok, _policy} = IAM.get_managed_policy(arn)
   end
 
+  test "association adapter returns actual sorted policy names and exact timestamp wire key" do
+    user_name = unique_name("assoc-user")
+    policy_a = unique_name("assoc-a")
+    policy_z = unique_name("assoc-z")
+    assert {:ok, _} = IAM.create_user(name: user_name)
+    assert {:ok, _} = PolicyAdapter.create(policy_z, policy_json("s3:GetObject"))
+    assert {:ok, _} = PolicyAdapter.create(policy_a, policy_json("s3:GetObject"))
+
+    assert {:ok,
+            %{
+              wire: %{"policiesAttached" => [^policy_a, ^policy_z], "updatedAt" => updated_at},
+              changed_count: 2
+            }} =
+             PolicyAdapter.update_associations(:attach, {:user, user_name}, [policy_z, policy_a])
+
+    assert {:ok, _timestamp, 0} = DateTime.from_iso8601(updated_at)
+
+    assert {:error, :policy_change_already_applied} =
+             PolicyAdapter.update_associations(:attach, {:user, user_name}, [policy_a])
+  end
+
+  test "entities adapter applies exact madmin omission, null and stable field projection" do
+    user_name = unique_name("entities-user")
+    policy_name = unique_name("entities-policy")
+    assert {:ok, _} = IAM.create_user(name: user_name)
+    assert {:ok, _} = PolicyAdapter.create(policy_name, policy_json("s3:GetObject"))
+
+    assert {:ok, _} =
+             PolicyAdapter.update_associations(:attach, {:user, user_name}, [policy_name])
+
+    assert {:ok, %{wire: wire}} =
+             PolicyAdapter.entities(%{
+               users: [user_name],
+               groups: [],
+               policies: [policy_name],
+               requested: MapSet.new([:user, :policy])
+             })
+
+    assert [%{"user" => ^user_name, "policies" => [^policy_name]}] = wire["userMappings"]
+
+    assert [%{"policy" => ^policy_name, "users" => [^user_name], "groups" => nil}] =
+             wire["policyMappings"]
+
+    refute Map.has_key?(wire, "groupMappings")
+    assert is_binary(wire["timestamp"])
+
+    assert {:ok, %{wire: timestamp_only}} =
+             PolicyAdapter.entities(%{
+               users: ["missing"],
+               groups: [],
+               policies: [],
+               requested: MapSet.new([:user])
+             })
+
+    assert Map.keys(timestamp_only) == ["timestamp"]
+  end
+
   defp unique_name(prefix), do: "#{prefix}-#{System.unique_integer([:positive, :monotonic])}"
 
   defp policy_json(action) do
