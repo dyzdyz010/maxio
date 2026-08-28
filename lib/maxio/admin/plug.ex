@@ -207,18 +207,26 @@ defmodule Maxio.Admin.Plug do
       "admin_user_add",
       [target_user: conn.query_params["accessKey"]],
       fn conn ->
-        with {:ok, caller_secret} <- signing_secret(conn) do
-          {conn, request} = UserRequest.read_add_body!(conn, caller_secret)
-
-          case UserAdapter.add(conn.query_params["accessKey"], request) do
-            {:ok, _created} -> send_empty_success(conn)
-            {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
-          end
+        if Map.has_key?(conn.query_params, "bucket") do
+          render_not_implemented(conn, RawPath.decoded_path(conn))
         else
-          {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+          add_user_authorized(conn)
         end
       end
     )
+  end
+
+  defp add_user_authorized(conn) do
+    with {:ok, caller_secret} <- signing_secret(conn) do
+      {conn, request} = UserRequest.read_add_body!(conn, caller_secret)
+
+      case UserAdapter.add(conn.query_params["accessKey"], request) do
+        {:ok, _created} -> send_empty_success(conn)
+        {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+      end
+    else
+      {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+    end
   end
 
   defp list_users(conn) do

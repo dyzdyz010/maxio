@@ -879,6 +879,13 @@ defmodule Maxio.IAM do
         lock_minio_access_key!(access_key_id)
         {:ok, :locked}
       end)
+      |> Ecto.Multi.run(:credential_namespace, fn repo, _changes ->
+        if credential_access_key_exists?(repo, access_key_id) do
+          {:error, :user_already_exists}
+        else
+          {:ok, :available}
+        end
+      end)
       |> Ecto.Multi.run(:identity, fn _repo, _changes ->
         if fetch_user_by_case_insensitive_name(access_key_id) do
           {:error, :user_already_exists}
@@ -5423,6 +5430,12 @@ defmodule Maxio.IAM do
        do: {:error, :user_already_exists}
 
   defp minio_user_transaction_result(
+         {:error, :credential_namespace, :user_already_exists, _changes},
+         _access_key_id
+       ),
+       do: {:error, :user_already_exists}
+
+  defp minio_user_transaction_result(
          {:error, operation, %Ecto.Changeset{} = changeset, _changes},
          _access_key_id
        )
@@ -5479,6 +5492,11 @@ defmodule Maxio.IAM do
     )
 
     :ok
+  end
+
+  defp credential_access_key_exists?(repo, access_key_id) do
+    repo.exists?(from(a in AccessKey, where: a.access_key_id == ^access_key_id)) or
+      repo.exists?(from(s in STSSession, where: s.access_key_id == ^access_key_id))
   end
 
   defp lock_signing_certificate_principal!(principal_key) do

@@ -107,39 +107,43 @@ defmodule Maxio.Admin.EnvelopeTest do
              )
   end
 
-  test "a request-local derivation neither spawns nor sends the signing secret", %{
+  test "Argon2 and PBKDF2 request-local derivations do not escape process state", %{
     madmin: fixture
   } do
-    vector = Enum.find(fixture["vectors"], &(&1["name"] == "id2_len1"))
     sentinel = fixture["password_utf8"]
-    secret = SigningSecret.new(sentinel)
-    envelope = decode_hex!(vector["envelope_hex"])
-    before_dictionary = Process.info(self(), :dictionary)
 
-    assert 1 == :erlang.trace(self(), true, [:procs, :send])
+    for algorithm_id <- [0, 2] do
+      vector = Enum.find(fixture["vectors"], &(&1["name"] == "id#{algorithm_id}_len1"))
+      secret = SigningSecret.new(sentinel)
+      envelope = decode_hex!(vector["envelope_hex"])
+      before_dictionary = Process.info(self(), :dictionary)
 
-    result =
-      try do
-        Envelope.decrypt(secret, envelope)
-      after
-        :erlang.trace(self(), false, [:procs, :send])
-      end
+      assert 1 == :erlang.trace(self(), true, [:procs, :send])
 
-    assert {:ok, <<17>>} = result
-    refute inspect(result) =~ sentinel
-    assert Process.info(self(), :dictionary) == before_dictionary
-    refute_receive {:trace, _, :spawn, _, _}
-    refute_receive {:trace, _, :send, _, _}
-    refute state_contains_secret?(Application.get_all_env(:maxio), sentinel)
-    refute state_contains_secret?(:persistent_term.get(), sentinel)
-    refute ets_contains_secret?(sentinel)
+      result =
+        try do
+          Envelope.decrypt(secret, envelope)
+        after
+          :erlang.trace(self(), false, [:procs, :send])
+        end
 
-    log =
-      capture_log(fn ->
-        assert {:error, :not_authentic} = Envelope.decrypt(SigningSecret.new("wrong"), envelope)
-      end)
+      assert {:ok, <<17>>} = result
+      refute inspect(result) =~ sentinel
+      assert Process.info(self(), :dictionary) == before_dictionary
+      refute_receive {:trace, _, :spawn, _, _}
+      refute_receive {:trace, _, :send, _, _}
+      refute state_contains_secret?(Application.get_all_env(:maxio), sentinel)
+      refute state_contains_secret?(:persistent_term.get(), sentinel)
+      refute ets_contains_secret?(sentinel)
 
-    refute log =~ sentinel
+      log =
+        capture_log(fn ->
+          assert {:error, :not_authentic} =
+                   Envelope.decrypt(SigningSecret.new("wrong"), envelope)
+        end)
+
+      refute log =~ sentinel
+    end
   end
 
   defp decode_hex!(hex) do

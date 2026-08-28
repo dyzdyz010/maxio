@@ -25,14 +25,29 @@ defmodule Maxio.Admin.UserAdapterTest do
 
     refute log =~ secret
 
-    assert {:ok, _three_byte_boundary} =
-             UserAdapter.add("a1b", %{
-               secret_key: "12345678",
-               policy: "",
-               status: "enabled"
-             })
+    for valid <- [
+          "a1b",
+          String.duplicate("A", 20),
+          String.duplicate("B", 21),
+          String.duplicate("C", 64)
+        ] do
+      assert {:ok, _boundary_user} =
+               UserAdapter.add(valid, %{
+                 secret_key: "12345678",
+                 policy: "",
+                 status: "enabled"
+               })
+    end
 
-    for invalid <- [nil, "", "aa", "contains space", String.duplicate("A", 21)] do
+    for invalid <- [
+          nil,
+          "",
+          "aa",
+          "contains space",
+          "abc=def",
+          "abé",
+          String.duplicate("D", 65)
+        ] do
       assert {:error, :invalid_access_key} =
                UserAdapter.add(invalid, %{secret_key: "eight+++", policy: "", status: "enabled"})
     end

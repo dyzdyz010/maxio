@@ -10,6 +10,7 @@ defmodule Maxio.Admin.UserEndpointTest do
   alias Maxio.IAM
   alias Maxio.Policy.{Statement, Store}
   alias Maxio.S3.Endpoint
+  alias Maxio.STS
   alias Maxio.Test.SigV4Request
 
   @base "/minio/admin/v3"
@@ -72,6 +73,39 @@ defmodule Maxio.Admin.UserEndpointTest do
 
     assert {:error, :not_authentic} =
              Envelope.decrypt(SigningSecret.new("wrong-root-secret"), conn.resp_body)
+  end
+
+  test "a real STS signature binds the U2 envelope capability to the session secret" do
+    use_ecto_credentials!()
+    session_key = unique_access_name("LISTSTS")
+    session_secret = "sts-envelope-session-secret"
+    session_token = "sts-envelope-session-token"
+
+    assert {:ok, session} =
+             STS.issue_session(
+               issuer_access_key_id: @root_access_key,
+               session_access_key_id: session_key,
+               secret_key: session_secret,
+               session_token: session_token,
+               duration_seconds: 900
+             )
+
+    conn =
+      signed(:get, "#{@base}/list-users",
+        access_key: session.access_key_id,
+        secret: session_secret,
+        session_token: session_token,
+        region: ""
+      )
+
+    assert conn.status == 200
+    assert {:ok, "{}"} = Envelope.decrypt(SigningSecret.new(session_secret), conn.resp_body)
+
+    assert {:error, :not_authentic} =
+             Envelope.decrypt(SigningSecret.new(@root_secret), conn.resp_body)
+
+    assert {:error, :not_authentic} =
+             Envelope.decrypt(SigningSecret.new("unrelated-secret"), conn.resp_body)
   end
 
   test "U1 and U2 require their exact identity actions" do
@@ -488,6 +522,49 @@ defmodule Maxio.Admin.UserEndpointTest do
       |> Endpoint.call(Endpoint.init([]))
 
     assert_admin_error(conn, 403, "AccessDenied")
+  end
+
+  test "add-user bucket variants authorize before JSON 501 without decrypting or mutating IAM" do
+    for bucket <- ["", "bucket-a"] do
+      target = unique_access_name("BUCKETROOT")
+
+      root =
+        signed_body(:put, "#{@base}/add-user", <<0>>,
+          query: %{"accessKey" => target, "bucket" => bucket}
+        )
+
+      assert_admin_error(root, 501, "NotImplemented")
+      assert :error = IAM.get_user(target)
+      assert :error = EctoStore.get_secret(target)
+    end
+
+    {allowed_key, allowed_secret, _arn} = put_action_key("admin:CreateUser")
+    allowed_target = unique_access_name("BUCKETALLOW")
+
+    allowed =
+      signed_body(:put, "#{@base}/add-user", <<0>>,
+        query: %{"accessKey" => allowed_target, "bucket" => "bucket-b"},
+        access_key: allowed_key,
+        secret: allowed_secret
+      )
+
+    assert_admin_error(allowed, 501, "NotImplemented")
+    assert :error = IAM.get_user(allowed_target)
+    assert :error = EctoStore.get_secret(allowed_target)
+
+    {denied_key, denied_secret, _arn} = put_action_key(nil)
+    denied_target = unique_access_name("BUCKETDENY")
+
+    denied =
+      signed_body(:put, "#{@base}/add-user", <<0>>,
+        query: %{"accessKey" => denied_target, "bucket" => "bucket-c"},
+        access_key: denied_key,
+        secret: denied_secret
+      )
+
+    assert_admin_error(denied, 403, "AccessDenied")
+    assert :error = IAM.get_user(denied_target)
+    assert :error = EctoStore.get_secret(denied_target)
   end
 
   test "list bucket variant authorizes first while U4 U5 and wrong routes remain JSON 501" do

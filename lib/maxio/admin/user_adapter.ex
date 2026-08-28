@@ -10,7 +10,7 @@ defmodule Maxio.Admin.UserAdapter do
   alias Maxio.IAM
 
   @user_name_pattern ~r/\A[A-Za-z0-9+=.@_-]{1,64}\z/
-  @access_key_pattern ~r/\A[A-Za-z0-9+=.@_-]{3,20}\z/
+  @access_key_pattern ~r/\A[A-Za-z0-9+.@_-]{3,64}\z/
 
   @type reason :: :invalid_argument | :invalid_resource_name | :user_not_found | term()
 

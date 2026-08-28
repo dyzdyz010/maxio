@@ -4,7 +4,10 @@ defmodule Maxio.IAM.MinioAdminUserTest do
   alias Maxio.Auth.CredentialStore.EctoStore
   alias Maxio.Cluster.Notify
   alias Maxio.IAM
-  alias Maxio.IAM.{AccessKey, AccessKeySecret, User}
+  alias Maxio.IAM.{AccessKey, AccessKeySecret, STSSession, User}
+  alias Maxio.S3.Plugs.SigV4
+  alias Maxio.STS
+  alias Maxio.Test.SigV4Request
 
   setup do
     :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Notify.topic())
@@ -64,6 +67,78 @@ defmodule Maxio.IAM.MinioAdminUserTest do
     assert Repo.get_by!(AccessKey, access_key_id: colliding_key).id == old_row.id
     assert {:ok, %{secret_key: ^old_secret}} = EctoStore.get_secret(colliding_key)
     refute inspect(result) =~ new_secret
+    refute_receive {:iam_changed, _target}
+  end
+
+  test "an STS credential owns its exact id for its full persisted lifetime" do
+    issuer_key = unique_access_key("ISSUER")
+    session_key = unique_access_key("SESSION")
+    session_secret = "existing-session-secret"
+    session_token = "existing-session-token"
+
+    assert {:ok, issuer} =
+             IAM.create_access_key(
+               access_key_id: issuer_key,
+               secret_key: "session-issuer-secret"
+             )
+
+    assert {:ok, session} =
+             STS.issue_session(
+               issuer_access_key_id: issuer.access_key_id,
+               session_access_key_id: session_key,
+               secret_key: session_secret,
+               session_token: session_token,
+               duration_seconds: 900
+             )
+
+    flush_iam_events()
+    before_users = Repo.aggregate(User, :count)
+    before_keys = Repo.aggregate(AccessKey, :count)
+    before_sessions = Repo.aggregate(STSSession, :count)
+
+    assert {:error, :user_already_exists} =
+             IAM.create_minio_user_strict(session_key, "must-not-shadow-session", "active")
+
+    assert Repo.aggregate(User, :count) == before_users
+    assert Repo.aggregate(AccessKey, :count) == before_keys
+    assert Repo.aggregate(STSSession, :count) == before_sessions
+    assert :error = IAM.get_user(session_key)
+
+    assert {:ok, %{secret_key: ^session_secret}} =
+             EctoStore.get_secret(session_key,
+               session_token: session_token,
+               now: DateTime.add(session.issued_at, 1, :second)
+             )
+
+    previous_store = Application.fetch_env!(:maxio, :credential_store)
+    Application.put_env(:maxio, :credential_store, EctoStore)
+    on_exit(fn -> Application.put_env(:maxio, :credential_store, previous_store) end)
+
+    authenticated =
+      :get
+      |> SigV4Request.signed_conn("/sts-still-valid",
+        access_key: session_key,
+        secret: session_secret,
+        session_token: session_token
+      )
+      |> SigV4.call(SigV4.init([]))
+
+    refute authenticated.halted
+    assert authenticated.assigns.principal.credential_type == :session
+    assert authenticated.assigns.principal.session_access_key == session_key
+
+    refute_receive {:iam_changed, _target}
+
+    assert {:ok, _revoked} = STS.revoke_session(session_key)
+    flush_iam_events()
+
+    assert {:error, :user_already_exists} =
+             IAM.create_minio_user_strict(session_key, "must-not-reuse-revoked-id", "active")
+
+    assert Repo.aggregate(User, :count) == before_users
+    assert Repo.aggregate(AccessKey, :count) == before_keys
+    assert Repo.aggregate(STSSession, :count) == before_sessions
+    assert Repo.get_by!(STSSession, access_key_id: session_key).status == "revoked"
     refute_receive {:iam_changed, _target}
   end
 
