@@ -33,8 +33,7 @@ defmodule Maxio.Config do
 
   import Ecto.Query
 
-  alias Maxio.Config.{RuntimeConfig, RuntimeConfigAudit, Schema, Store}
-  alias Maxio.Cluster.Notify
+  alias Maxio.Config.{Coordinator, RuntimeConfig, RuntimeConfigAudit, Schema, Store}
   alias Maxio.S3.Log
 
   @no_default :"$maxio_config_no_default"
@@ -176,13 +175,7 @@ defmodule Maxio.Config do
   @spec set(subsystem(), key(), term(), keyword()) ::
           {:ok, map()} | {:error, write_error()}
   def set(subsystem, key, value, opts \\ []) do
-    with {:ok, entry} <- Schema.fetch(subsystem, key),
-         {:ok, casted} <- Schema.cast(subsystem, key, value),
-         {:ok, source} <- validate_source(opts) do
-      write(subsystem, key, {:set, casted}, entry, source, opts)
-    else
-      {:error, reason} -> log_write_rejection(subsystem, key, reason)
-    end
+    mutate_single(subsystem, key, {:set, key, value}, opts)
   end
 
   @doc """
@@ -193,12 +186,14 @@ defmodule Maxio.Config do
   """
   @spec reset(subsystem(), key(), keyword()) :: {:ok, map()} | {:error, write_error()}
   def reset(subsystem, key, opts \\ []) do
-    with {:ok, entry} <- Schema.fetch(subsystem, key),
-         {:ok, source} <- validate_source(opts) do
-      write(subsystem, key, :reset, entry, source, opts)
-    else
-      {:error, reason} -> log_write_rejection(subsystem, key, reason)
-    end
+    mutate_single(subsystem, key, {:reset, key}, opts)
+  end
+
+  @doc "Atomically mutate one subsystem through the shared advisory-lock coordinator."
+  @spec mutate_subsystem(subsystem(), [Coordinator.operation()], keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def mutate_subsystem(subsystem, operations, opts \\ []) do
+    Coordinator.mutate_subsystem(subsystem, operations, opts)
   end
 
   @doc "该键的变更审计流水，最近的在前。"
@@ -217,186 +212,27 @@ defmodule Maxio.Config do
     )
   end
 
-  # ── 内部：写事务 ───────────────────────────────────────────────────────────
+  # ── 内部：写适配 ───────────────────────────────────────────────────────────
 
-  defp write(subsystem, key, operation, entry, source, opts) do
-    repo = repo(opts)
-    apply_mode = Atom.to_string(entry.apply)
+  defp mutate_single(subsystem, key, operation, opts) do
+    coordinator_opts = translate_expected_version(opts, key)
 
-    result =
-      repo.transaction(fn ->
-        current = lock_current(repo, subsystem, key)
-
-        with :ok <- check_expected_version(current, opts) do
-          apply_operation(repo, subsystem, key, operation, current, apply_mode, source, opts)
-        else
-          {:error, reason} -> repo.rollback(reason)
-        end
-      end)
-
-    case result do
-      {:ok, outcome} -> finish_write(subsystem, key, entry, outcome, opts)
-      {:error, reason} -> {:error, reason}
+    case mutate_subsystem(subsystem, [operation], coordinator_opts) do
+      {:ok, %{outcomes: outcomes}} -> {:ok, Map.fetch!(outcomes, key)}
+      {:error, reason} -> log_write_rejection(subsystem, key, reason)
     end
   end
 
-  defp lock_current(repo, subsystem, key) do
-    subsystem_name = to_string(subsystem)
-    key_name = to_string(key)
-
-    repo.one(
-      from r in RuntimeConfig,
-        where: r.subsystem == ^subsystem_name and r.key == ^key_name,
-        lock: "FOR UPDATE"
-    )
-  end
-
-  defp check_expected_version(current, opts) do
+  defp translate_expected_version(opts, key) do
     case Keyword.fetch(opts, :expected_version) do
-      :error -> :ok
-      {:ok, expected} -> compare_version(current, expected)
-    end
-  end
+      :error ->
+        Keyword.delete(opts, :expected_versions)
 
-  defp compare_version(nil, nil), do: :ok
-  defp compare_version(%RuntimeConfig{version: version}, version), do: :ok
-  defp compare_version(_current, _expected), do: {:error, :config_version_conflict}
-
-  defp apply_operation(repo, subsystem, key, {:set, value}, current, apply_mode, source, opts) do
-    stored = Schema.encode_stored(value)
-    next_version = if current, do: current.version + 1, else: 1
-
-    attrs = %{
-      subsystem: to_string(subsystem),
-      key: to_string(key),
-      value: stored,
-      previous_value: current && current.value,
-      version: next_version,
-      apply_mode: apply_mode,
-      updated_by: Keyword.get(opts, :principal_arn),
-      source: source
-    }
-
-    # `FOR UPDATE` 只能锁**已存在**的行；两个进程同时首写同一个键时谁都锁不到东西，
-    # 于是双双走 insert，由 (subsystem, key) 唯一索引裁决。输方拿到的不是"内部错误"，
-    # 语义上就是一次版本冲突（它以为该键还没有覆盖值，事实上已经有了），因此归一成
-    # :config_version_conflict —— 调用方对这个错误已经有重试/重读的处置（见
-    # Maxio.Config.DeploymentId）。不能用 bang 版本：那会把一个**预期内**的并发结果
-    # 变成穿透事务的异常，写路径"失败一律结构化错误"的承诺就破了。
-    row =
-      case (current || %RuntimeConfig{})
-           |> RuntimeConfig.changeset(attrs)
-           |> repo.insert_or_update() do
-        {:ok, row} ->
-          row
-
-        {:error, %Ecto.Changeset{} = changeset} ->
-          if unique_key_conflict?(changeset) do
-            repo.rollback(:config_version_conflict)
-          else
-            # 其它 changeset 错误说明 Schema 校验与 DB 约束不一致（代码 bug），
-            # 绝不悄悄归一成并发冲突——那会让一个真 bug 长期伪装成"偶发冲突"。
-            raise Ecto.InvalidChangesetError, action: :insert_or_update, changeset: changeset
-          end
-      end
-
-    insert_audit!(repo, subsystem, key, "set", %{
-      old_value: current && current.value,
-      new_value: stored,
-      from_version: current && current.version,
-      to_version: next_version,
-      apply_mode: apply_mode,
-      source: source,
-      opts: opts
-    })
-
-    %{operation: :set, changed?: true, version: row.version, value: value}
-  end
-
-  defp apply_operation(_repo, _subsystem, _key, :reset, nil, _apply_mode, _source, _opts) do
-    %{operation: :reset, changed?: false, version: nil, value: nil}
-  end
-
-  defp apply_operation(repo, subsystem, key, :reset, current, apply_mode, source, opts) do
-    repo.delete!(current)
-
-    insert_audit!(repo, subsystem, key, "reset", %{
-      old_value: current.value,
-      new_value: nil,
-      from_version: current.version,
-      to_version: current.version + 1,
-      apply_mode: apply_mode,
-      source: source,
-      opts: opts
-    })
-
-    %{operation: :reset, changed?: true, version: nil, value: nil}
-  end
-
-  # 唯一索引冲突由 changeset 的 unique_constraint/3 转成 :subsystem 上的 :unique 错误
-  # （见 RuntimeConfig.changeset/2 的 name: :runtime_configs_subsystem_key_index）。
-  defp unique_key_conflict?(%Ecto.Changeset{errors: errors}) do
-    Enum.any?(errors, fn {_field, {_msg, meta}} ->
-      Keyword.get(meta, :constraint) == :unique
-    end)
-  end
-
-  defp insert_audit!(repo, subsystem, key, operation, fields) do
-    %RuntimeConfigAudit{}
-    |> RuntimeConfigAudit.changeset(%{
-      subsystem: to_string(subsystem),
-      key: to_string(key),
-      operation: operation,
-      old_value: fields.old_value,
-      new_value: fields.new_value,
-      from_version: fields.from_version,
-      to_version: fields.to_version,
-      apply_mode: fields.apply_mode,
-      principal_arn: Keyword.get(fields.opts, :principal_arn),
-      access_key_id: Keyword.get(fields.opts, :access_key_id),
-      request_id: Keyword.get(fields.opts, :request_id),
-      source: fields.source
-    })
-    |> repo.insert!()
-  end
-
-  # 提交之后才重装快照与广播：事务内重装会让一次回滚留下一份"生效了但没落库"的快照。
-  # 本节点走**同步**重装，正确性完全不依赖广播送达（广播是 best-effort，见 Store）。
-  defp finish_write(subsystem, key, entry, outcome, opts) do
-    if outcome.changed? do
-      # 整体重装，不是"只装刚写的那个子系统"：只装一个却记下整表指纹，会把别人刚提交、
-      # 本节点没读过的行记成"已核对"，从而抹掉丢广播的漂移证据（见 Store 的 moduledoc
-      # 「为什么没有只重装一个子系统的装载器」）。表行数上界 = 白名单键数，代价可忽略。
-      Store.load_all!(Keyword.take(opts, [:repo]) ++ [reason: {:write, subsystem, key}])
-      Notify.broadcast({:config_changed, subsystem, key})
-
-      Log.info("runtime config changed",
-        action: "config_#{outcome.operation}",
-        config_subsystem: to_string(subsystem),
-        config_key: to_string(key),
-        config_version: outcome.version,
-        config_apply_mode: to_string(entry.apply),
-        config_source: Keyword.get(opts, :source),
-        principal_arn: Keyword.get(opts, :principal_arn),
-        access_key_id: Keyword.get(opts, :access_key_id),
-        request_id: Keyword.get(opts, :request_id)
-      )
-    end
-
-    {:ok, Map.put(outcome, :applied, entry.apply)}
-  end
-
-  defp validate_source(opts) do
-    case Keyword.get(opts, :source) do
-      source when is_binary(source) ->
-        if source in RuntimeConfig.sources() do
-          {:ok, source}
-        else
-          {:error, {:invalid_config_source, source}}
-        end
-
-      other ->
-        {:error, {:invalid_config_source, inspect(other)}}
+      {:ok, expected} ->
+        opts
+        |> Keyword.delete(:expected_version)
+        |> Keyword.delete(:expected_versions)
+        |> Keyword.put(:expected_versions, %{key => expected})
     end
   end
 
