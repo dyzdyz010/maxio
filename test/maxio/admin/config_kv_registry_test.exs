@@ -91,13 +91,19 @@ defmodule Maxio.Admin.ConfigKV.RegistryTest do
     assert exposed_subsystem("cluster") == {:error, :unknown_subsystem}
   end
 
-  test "path classification keeps hidden and forbidden names ahead of generic unknowns" do
+  test "path classification keeps the hidden identity and every Schema forbidden declaration ahead of unknowns" do
     # Catches an exposure boundary that turns hidden identity into an exposed setting, or lets a
-    # secret/backend path masquerade as an ordinary unknown key.
+    # present or future Schema secret/backend declaration masquerade as an ordinary unknown key.
     assert classify_path("cluster", "deployment_id") == {:error, :wire_hidden}
-    assert classify_path("s3", "root_password") == {:error, :forbidden}
-    assert classify_path("kms", "master_key") == {:error, :forbidden}
-    assert classify_path("storage_backend", "implementation") == {:error, :forbidden}
+
+    for subsystem <- Schema.forbidden_subsystems() do
+      assert classify_path(to_string(subsystem), "unregistered_key") == {:error, :forbidden}
+    end
+
+    for {subsystem, key} <- Schema.forbidden_keys() do
+      assert classify_path(to_string(subsystem), to_string(key)) == {:error, :forbidden}
+    end
+
     assert classify_path("s3", "not_a_registered_key") == {:error, :unknown_key}
   end
 
@@ -105,10 +111,11 @@ defmodule Maxio.Admin.ConfigKV.RegistryTest do
     # Catches String.to_atom/1 (or equivalent) on a hostile wire name, which would permanently
     # exhaust the VM atom table under repeated admin requests.
     unique = "untrusted_" <> Integer.to_string(System.unique_integer([:positive]))
-    before_count = :erlang.system_info(:atom_count)
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unique) end
 
     assert classify_path(unique, unique) == {:error, :unknown_key}
 
-    assert :erlang.system_info(:atom_count) == before_count
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unique) end
   end
 end
