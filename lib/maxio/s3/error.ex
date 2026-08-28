@@ -170,6 +170,12 @@ defmodule Maxio.S3.Error do
       {"InvalidBucketState", 409,
        "The request is not valid with the current state of the bucket."},
     bucket_quota_exceeded: {"XMinioAdminBucketQuotaExceeded", 400, "Bucket quota exceeded."},
+    admin_no_such_policy: {"XMinioAdminNoSuchPolicy", 404, "The canned policy does not exist."},
+    admin_invalid_argument: {"XMinioAdminInvalidArgument", 400, "Invalid arguments specified."},
+    admin_resource_invalid_argument:
+      {"XMinioInvalidResource", 400,
+       "Policy, user or group names are not allowed to begin or end with space characters"},
+    malformed_policy_wire: {"MalformedPolicy", 400, "The policy document is malformed."},
     bad_digest:
       {"BadDigest", 400,
        "The Content-MD5 or checksum value that you specified did not match what the server received."},
