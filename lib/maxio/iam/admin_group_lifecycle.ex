@@ -109,7 +109,6 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
       when is_binary(group_name) and is_list(member_names) and is_boolean(remove?) and
              is_binary(group_status) do
     with :ok <- validate_member_types(member_names),
-         :ok <- validate_wire_member_names(member_names),
          :ok <- precheck_forbidden_members(member_names) do
       cond do
         remove? and group_name == "" ->
@@ -452,7 +451,7 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
 
   defp preflight_users(member_names) do
     Enum.reduce_while(member_names, {:ok, []}, fn member_name, {:ok, users} ->
-      case fetch_user(member_name) do
+      case fetch_wire_user(member_name) do
         %User{} = user ->
           {:cont, {:ok, users ++ [user]}}
 
@@ -485,12 +484,6 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
     if Enum.all?(member_names, &is_binary/1), do: :ok, else: {:error, :invalid_argument}
   end
 
-  defp validate_wire_member_names(member_names) do
-    if Enum.any?(member_names, &String.starts_with?(&1, "arn:aws:iam:::user/")),
-      do: {:error, :user_not_found},
-      else: :ok
-  end
-
   defp validate_new_group_name_if_missing(_group_name, {:existing, _id}), do: :ok
 
   defp validate_new_group_name_if_missing(group_name, :missing) do
@@ -512,6 +505,9 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
       nil -> false
     end
   end
+
+  defp fetch_wire_user("arn:aws:iam:::user/" <> _name), do: nil
+  defp fetch_wire_user(name), do: fetch_user(name)
 
   defp fetch_user("arn:aws:iam:::user/" <> name), do: fetch_user(name)
 

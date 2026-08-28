@@ -3,6 +3,7 @@ defmodule Maxio.Admin.GroupEndpointTest do
 
   alias Maxio.Auth.CredentialStore
   alias Maxio.IAM
+  alias Maxio.IAM.STSSession
   alias Maxio.Policy.Store
   alias Maxio.S3.Endpoint
   alias Maxio.Test.SigV4Request
@@ -198,6 +199,53 @@ defmodule Maxio.Admin.GroupEndpointTest do
              "The specified user does not exist. (Specified user does not exist)"
 
     assert :error = IAM.get_group(group_name)
+
+    assert {:ok, original_group} = IAM.create_group(name: group_name)
+
+    remove_body =
+      Jason.encode!(%{
+        "group" => group_name,
+        "members" => [IAM.user_arn(user_name)],
+        "isRemove" => true
+      })
+
+    remove_response = signed_body(:put, "#{@base}/update-group-members", remove_body)
+    assert_admin_error(remove_response, 404, "XMinioAdminNoSuchUser")
+    assert {:ok, same_group} = IAM.get_group(group_name)
+    assert same_group.id == original_group.id
+    assert IAM.list_users_in_group(group_name) == []
+  end
+
+  test "G3 ARN batches retain empty-group and forbidden-member precedence" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    root = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+    temp_access_key = create_temporary_session!()
+    user_name = "precedence-user-#{suffix}"
+    assert {:ok, _user} = IAM.create_user(name: user_name)
+    user_arn = IAM.user_arn(user_name)
+
+    empty_remove =
+      Jason.encode!(%{"group" => "", "members" => [user_arn], "isRemove" => true})
+
+    assert_admin_error(
+      signed_body(:put, "#{@base}/update-group-members", empty_remove),
+      400,
+      "XMinioAdminInvalidArgument"
+    )
+
+    for forbidden <- [root, temp_access_key],
+        {remove?, order} <- [
+          {false, [forbidden, user_arn]},
+          {false, [user_arn, forbidden]},
+          {true, [forbidden, user_arn]},
+          {true, [user_arn, forbidden]}
+        ] do
+      group_name = "precedence-#{remove?}-#{forbidden}-#{suffix}"
+      body = Jason.encode!(%{"group" => group_name, "members" => order, "isRemove" => remove?})
+      response = signed_body(:put, "#{@base}/update-group-members", body)
+      assert_admin_error(response, 403, "XMinioIAMActionNotAllowed")
+      assert :error = IAM.get_group(group_name)
+    end
   end
 
   test "a user delete-recreate generation race returns signed NoSuchUser" do
@@ -356,6 +404,28 @@ defmodule Maxio.Admin.GroupEndpointTest do
 
   defp content_length(conn) do
     conn |> Plug.Conn.get_resp_header("content-length") |> List.first() |> String.to_integer()
+  end
+
+  defp create_temporary_session! do
+    suffix = System.unique_integer([:positive, :monotonic])
+    access_key_id = "temp-group-precedence-#{suffix}"
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %STSSession{}
+    |> STSSession.changeset(%{
+      access_key_id: access_key_id,
+      secret_key: "encrypted-test-secret",
+      session_token_sha256: String.duplicate("0", 64),
+      issuer_access_key_id: Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user),
+      principal_arn: IAM.root_principal_arn(),
+      principal_type: "root",
+      session_name: "group-precedence-#{suffix}",
+      issued_at: now,
+      expires_at: DateTime.add(now, 3_600, :second)
+    })
+    |> Repo.insert!()
+
+    access_key_id
   end
 
   defp unboxed(fun), do: Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fun)

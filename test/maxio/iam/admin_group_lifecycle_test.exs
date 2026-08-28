@@ -4,7 +4,15 @@ defmodule Maxio.IAM.AdminGroupLifecycleTest do
   import Ecto.Query
 
   alias Maxio.IAM
-  alias Maxio.IAM.{AccessKey, Group, GroupManagedPolicyAttachment, GroupMembership}
+
+  alias Maxio.IAM.{
+    AccessKey,
+    Group,
+    GroupManagedPolicyAttachment,
+    GroupMembership,
+    STSSession
+  }
+
   alias Maxio.Policy.{ManagedPolicy, PrincipalPolicy}
 
   @document %{
@@ -142,6 +150,39 @@ defmodule Maxio.IAM.AdminGroupLifecycleTest do
     assert Repo.aggregate(GroupMembership, :count) == 0
   end
 
+  test "wire ARN rejection preserves global and branch-specific G3 precedence" do
+    root = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+    temp_access_key = create_temporary_session!()
+    user = create_user!("wire-user")
+    user_arn = user.user_arn
+
+    assert {:error, :invalid_argument} =
+             IAM.update_minio_group_members_strict("", [user_arn], true, "")
+
+    for forbidden <- [root, temp_access_key],
+        remove? <- [false, true],
+        members <- [[forbidden, user_arn], [user_arn, forbidden]] do
+      group_name = unique_name(if(remove?, do: "remove", else: "add"))
+
+      assert {:error, :minio_action_not_allowed} =
+               IAM.update_minio_group_members_strict(group_name, members, remove?, "")
+
+      refute Repo.get_by(Group, group_name: group_name)
+    end
+
+    assert {:error, :user_not_found} =
+             IAM.update_minio_group_members_strict("ordinary-add", [user_arn], false, "")
+
+    assert {:ok, original_group} = IAM.create_group(name: "ordinary-remove")
+
+    assert {:error, :user_not_found} =
+             IAM.update_minio_group_members_strict("ordinary-remove", [user_arn], true, "")
+
+    assert Repo.get_by(Group, id: original_group.id)
+    refute Repo.get_by(Group, group_name: "ordinary-add")
+    assert Repo.aggregate(GroupMembership, :count) == 0
+  end
+
   test "service-account and temporary credential ids cannot be group members" do
     parent = create_user!("parent")
     service_id = unique_name("service")
@@ -198,6 +239,27 @@ defmodule Maxio.IAM.AdminGroupLifecycleTest do
   defp create_policy!(name, path) do
     assert {:ok, policy} = IAM.create_managed_policy(name: name, path: path, document: @document)
     policy
+  end
+
+  defp create_temporary_session! do
+    access_key_id = unique_name("temp")
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %STSSession{}
+    |> STSSession.changeset(%{
+      access_key_id: access_key_id,
+      secret_key: "encrypted-test-secret",
+      session_token_sha256: String.duplicate("0", 64),
+      issuer_access_key_id: Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user),
+      principal_arn: IAM.root_principal_arn(),
+      principal_type: "root",
+      session_name: unique_name("session"),
+      issued_at: now,
+      expires_at: DateTime.add(now, 3_600, :second)
+    })
+    |> Repo.insert!()
+
+    access_key_id
   end
 
   defp group!(name), do: Repo.get_by!(Group, group_name: name)
