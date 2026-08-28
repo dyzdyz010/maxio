@@ -123,6 +123,36 @@ defmodule Maxio.Auth.SigV4.CanonicalTest do
     assert Canonical.canonical_request(req) == expected
   end
 
+  test "VECTOR E — duplicate names group case-insensitively and preserve value arrival order" do
+    # Catches repeated canonical header lines/names, case-sensitive grouping, value reordering,
+    # or joining raw whitespace instead of each value's Trimall projection.
+    headers = [
+      {"X-Amz-Meta-Trace", "  first   value "},
+      {"host", "examplebucket.s3.amazonaws.com"},
+      {"x-amz-meta-trace", "second"},
+      {"X-AMZ-META-TRACE", " third\tvalue "}
+    ]
+
+    assert Canonical.canonical_headers(headers) ==
+             "host:examplebucket.s3.amazonaws.com\n" <>
+               "x-amz-meta-trace:first value,second,third value\n"
+
+    assert Canonical.signed_headers(headers) == "host;x-amz-meta-trace"
+
+    assert Canonical.canonical_request(%{
+             method: "GET",
+             path: "/duplicate",
+             query: %{},
+             headers: headers,
+             payload_hash: @empty_hash
+           }) ==
+             "GET\n/duplicate\n\n" <>
+               "host:examplebucket.s3.amazonaws.com\n" <>
+               "x-amz-meta-trace:first value,second,third value\n\n" <>
+               "host;x-amz-meta-trace\n" <>
+               @empty_hash
+  end
+
   test "trimall/1 折叠内部连续空白并去首尾" do
     assert Canonical.trimall("  a   b  c ") == "a b c"
   end

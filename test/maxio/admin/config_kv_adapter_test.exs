@@ -131,6 +131,29 @@ defmodule Maxio.Admin.ConfigKV.AdapterTest do
       assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
     end
 
+    test "a later-line unknown reset key preserves its exact safe description and mutates nothing" do
+      # Catches reducing only the first reset line, returning an earlier valid key in the public
+      # description, or beginning a transaction before the complete subset is classified.
+      insert_runtime!("s3", "clock_skew_ms", 2_468, 7)
+
+      assert {:error, {:config_not_found, "key absent doesn't exist"}} =
+               Adapter.reset("s3 clock_skew_ms\ns3 absent", mutation_opts())
+
+      assert ConfigBatchFailureRepo.observations() == %{
+               transactions: 0,
+               query_calls: 0,
+               advisory_locks: 0
+             }
+
+      assert Repo.one(
+               from row in RuntimeConfig,
+                 where: row.subsystem == "s3" and row.key == "clock_skew_ms",
+                 select: {row.value, row.version}
+             ) == {%{"v" => 2_468}, 7}
+
+      assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+    end
+
     test "forbidden paths win before unknown and unknown-prefix classification" do
       # Catches Parser's generic/BadJSON result masking a known secret or backend path.
       assert {:error, :access_denied} =
@@ -170,6 +193,25 @@ defmodule Maxio.Admin.ConfigKV.AdapterTest do
 
       assert {:error, :config_bad_json} =
                Adapter.set("s3 absent=1 clock_skew_ms=1000", mutation_opts())
+
+      assert Repo.aggregate(RuntimeConfig, :count) == 0
+      assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+    end
+
+    test "cross-subsystem grammar wins before a forbidden token on the later line" do
+      # Catches a general exposure preflight scanning all tokens before Parser establishes that
+      # the plaintext cannot represent one subsystem mutation.
+      assert {:error, :config_bad_json} =
+               Adapter.set(
+                 "listing sql_hard_limit=100000\ns3 clock_skew_ms=1000 root_password=forbidden-value",
+                 mutation_opts()
+               )
+
+      assert ConfigBatchFailureRepo.observations() == %{
+               transactions: 0,
+               query_calls: 0,
+               advisory_locks: 0
+             }
 
       assert Repo.aggregate(RuntimeConfig, :count) == 0
       assert Repo.aggregate(RuntimeConfigAudit, :count) == 0

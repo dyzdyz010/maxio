@@ -196,6 +196,25 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     )
 
     {access_key, secret, _arn} = put_action_key(nil)
+    no_policy_missing_id = "req-config-missing-no-policy"
+
+    no_policy_missing =
+      signed(:get, @get_path,
+        access_key: access_key,
+        secret: secret,
+        headers: [{"x-request-id", no_policy_missing_id}],
+        region: ""
+      )
+
+    assert_admin_error(
+      no_policy_missing,
+      426,
+      "XMinioAdminVersionMismatch",
+      "This 'admin' API is not supported by server in 'maxio'",
+      @get_path,
+      no_policy_missing_id
+    )
+
     denied_id = "req-config-empty-denied"
 
     denied =
@@ -390,6 +409,36 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     end
   end
 
+  test "a raw duplicate Content-Length request authenticates before Admin rejects its framing" do
+    # Catches either the signing helper collapsing raw duplicates or SigV4 canonicalization
+    # producing different client/server material before Admin can classify ambiguous framing.
+    ciphertext = encrypted!(@root_secret, "listing sql_hard_limit=515159")
+    length = Integer.to_string(byte_size(ciphertext))
+    request_id = "req-config-framing-raw-duplicate"
+
+    {request, response} =
+      signed_pair(:put, @set_path,
+        body: ciphertext,
+        headers: [
+          {"content-length", length},
+          {"content-length", length},
+          {"x-request-id", request_id}
+        ],
+        region: ""
+      )
+
+    assert get_req_header(request, "content-length") == [length, length]
+
+    assert_admin_error(
+      response,
+      400,
+      "XMinioAdminConfigTooLarge",
+      @too_large,
+      @set_path,
+      request_id
+    )
+  end
+
   test "actual length, payload hash, decrypt and parser failures retain their fixed priority" do
     # Catches a lower stage overwriting a more causal error when the same signed request contains
     # multiple independent faults.
@@ -539,6 +588,81 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
   end
 
+  test "cross-subsystem grammar precedes a forbidden token on a later line" do
+    # Catches a plaintext-wide exposure scan that returns AccessDenied before Parser rejects a
+    # command that cannot represent one atomic subsystem mutation.
+    request_id = "req-config-priority-cross-subsystem"
+
+    response =
+      mutation(
+        :put,
+        @set_path,
+        "listing sql_hard_limit=100000\ns3 clock_skew_ms=1000 root_password=forbidden-value",
+        request_id: request_id,
+        config_kv_test_opts: [repo: ConfigBatchFailureRepo]
+      )
+
+    assert_admin_error(
+      response,
+      400,
+      "XMinioAdminConfigBadJSON",
+      @bad_json,
+      @set_path,
+      request_id
+    )
+
+    assert ConfigBatchFailureRepo.observations() == %{
+             transactions: 0,
+             query_calls: 0,
+             advisory_locks: 0
+           }
+
+    assert Repo.aggregate(RuntimeConfig, :count) == 0
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+  end
+
+  test "multi-line reset reports its later unknown key without mutating an earlier valid key" do
+    # Catches Plug reconstructing reset grammar from only the first line, or Adapter opening a
+    # transaction for the valid prefix before discovering the later unknown key.
+    assert {:ok, _result} =
+             Maxio.Config.set(:s3, :clock_skew_ms, 2_468,
+               source: "admin_api",
+               request_id: "req-config-reset-seed"
+             )
+
+    Repo.delete_all(RuntimeConfigAudit)
+    request_id = "req-config-reset-later-unknown"
+
+    response =
+      mutation(:delete, @reset_path, "s3 clock_skew_ms\ns3 absent",
+        request_id: request_id,
+        config_kv_test_opts: [repo: ConfigBatchFailureRepo]
+      )
+
+    assert_admin_error(
+      response,
+      404,
+      "XMinioConfigNotFoundError",
+      "key absent doesn't exist",
+      @reset_path,
+      request_id
+    )
+
+    assert ConfigBatchFailureRepo.observations() == %{
+             transactions: 0,
+             query_calls: 0,
+             advisory_locks: 0
+           }
+
+    assert Repo.one(
+             from row in RuntimeConfig,
+               where: row.subsystem == "s3" and row.key == "clock_skew_ms",
+               select: {row.value, row.version}
+           ) == {%{"v" => 2_468}, 1}
+
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+  end
+
   test "generic, not-found, hidden, forbidden and target errors keep distinct public contracts" do
     # Catches flattening all Config errors into BadJSON or leaking hidden/forbidden schema details.
     cases = [
@@ -603,6 +727,88 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
       )
 
     assert_mutation_success(restart, false)
+  end
+
+  test "a full-subsystem reset retry is an exact success without new audit version or postcommit" do
+    # Catches an HTTP retry being rejected, reporting a different entity/applied header, or
+    # manufacturing a second reset audit/version/invalidation after the first request committed.
+    start_supervised!({ConfigPostcommitStore, owner: self()})
+    start_supervised!({ConfigPostcommitNotify, owner: self()})
+
+    test_opts = [store: ConfigPostcommitStore, notify: ConfigPostcommitNotify]
+
+    seeded =
+      mutation(:put, @set_path, "s3 clock_skew_ms=1357",
+        request_id: "req-config-full-reset-seed",
+        config_kv_test_opts: test_opts
+      )
+
+    assert_mutation_success(seeded, true)
+    ConfigPostcommitStore.reset_observations()
+    ConfigPostcommitNotify.reset_observations()
+
+    first =
+      mutation(:delete, @reset_path, "s3",
+        request_id: "req-config-full-reset-first",
+        config_kv_test_opts: test_opts
+      )
+
+    assert_mutation_success(first, true)
+
+    audit_after_first =
+      Repo.all(
+        from audit in RuntimeConfigAudit,
+          where: audit.subsystem == "s3" and audit.key == "clock_skew_ms",
+          order_by: [asc: audit.to_version],
+          select: {
+            audit.operation,
+            audit.from_version,
+            audit.to_version,
+            audit.request_id
+          }
+      )
+
+    assert audit_after_first == [
+             {"set", nil, 1, "req-config-full-reset-seed"},
+             {"reset", 1, 2, "req-config-full-reset-first"}
+           ]
+
+    assert length(ConfigPostcommitStore.observations().reload_calls) == 1
+    assert length(ConfigPostcommitNotify.observations().checked_calls) == 1
+
+    ConfigPostcommitStore.reset_observations()
+    ConfigPostcommitNotify.reset_observations()
+
+    retry =
+      mutation(:delete, @reset_path, "s3",
+        request_id: "req-config-full-reset-retry",
+        config_kv_test_opts: test_opts
+      )
+
+    assert_mutation_success(retry, true)
+
+    assert Repo.all(
+             from audit in RuntimeConfigAudit,
+               where: audit.subsystem == "s3" and audit.key == "clock_skew_ms",
+               order_by: [asc: audit.to_version],
+               select: {
+                 audit.operation,
+                 audit.from_version,
+                 audit.to_version,
+                 audit.request_id
+               }
+           ) == audit_after_first
+
+    assert Repo.aggregate(
+             from(row in RuntimeConfig,
+               where: row.subsystem == "s3" and row.key == "clock_skew_ms"
+             ),
+             :count
+           ) == 0
+
+    assert ConfigPostcommitStore.observations().reload_calls == []
+    assert ConfigPostcommitStore.observations().attention_calls == []
+    assert ConfigPostcommitNotify.observations() == %{checked_calls: [], legacy_calls: []}
   end
 
   test "reload failure omits applied while broadcast failure keeps it after commit" do
@@ -776,6 +982,46 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert failure_log =~ "auth_type=header"
     refute failure_log =~ "not-a-number"
     refute failure_log =~ @root_secret
+  end
+
+  test "malformed UTF-8 is BadJSON and no plaintext rendering reaches logs" do
+    # Catches String operations raising on decrypted bytes and the top-level rescue logging the
+    # exception message, which can contain caller-controlled printable plaintext.
+    sentinel = "CONFIG-KV-MALFORMED-UTF8-SENTINEL"
+    plaintext = sentinel <> <<0xFF>> <> "-tail"
+    body = encrypted!(@root_secret, plaintext)
+    request_id = "req-config-malformed-utf8"
+    owner = self()
+
+    log =
+      capture_log(fn ->
+        response =
+          signed(:put, @set_path,
+            body: body,
+            headers: [
+              {"content-length", Integer.to_string(byte_size(body))},
+              {"x-request-id", request_id}
+            ],
+            region: ""
+          )
+
+        send(owner, {:malformed_utf8_response, response})
+      end)
+
+    assert_receive {:malformed_utf8_response, response}
+
+    assert_admin_error(
+      response,
+      400,
+      "XMinioAdminConfigBadJSON",
+      @bad_json,
+      @set_path,
+      request_id
+    )
+
+    refute log =~ sentinel
+    refute log =~ inspect(plaintext)
+    refute log =~ Base.encode16(plaintext, case: :lower)
   end
 
   defp signed(method, path, opts) do

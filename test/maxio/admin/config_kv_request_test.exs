@@ -257,6 +257,43 @@ defmodule Maxio.Admin.ConfigKV.RequestTest do
     refute log =~ Base.encode16(ciphertext, case: :lower)
   end
 
+  test "decrypted malformed UTF-8 becomes BadJSON without logging caller-controlled bytes" do
+    # Catches Request returning an invalid String to Parser/Plug, where a later String exception
+    # can include the printable portion of the decrypted plaintext in a warning.
+    sentinel = "CONFIG-KV-REQUEST-INVALID-UTF8-SENTINEL"
+    plaintext = sentinel <> <<0xFF>> <> "-tail"
+    caller_secret = SigningSecret.new(@oracle_secret)
+
+    {:ok, ciphertext} =
+      Envelope.encrypt(caller_secret, plaintext,
+        algorithm_id: 2,
+        salt: :binary.copy(<<11>>, 32),
+        nonce: :binary.copy(<<13>>, 8)
+      )
+
+    ciphertext_sha256 = :crypto.hash(:sha256, ciphertext) |> Base.encode16(case: :lower)
+
+    conn =
+      mutation_conn(ciphertext,
+        content_length: Integer.to_string(byte_size(ciphertext)),
+        signed_payload_sha256: ciphertext_sha256
+      )
+
+    log =
+      capture_log(fn ->
+        error =
+          assert_raise Error, fn ->
+            Request.read_mutation!(conn, caller_secret, byte_size(ciphertext))
+          end
+
+        assert_admin_error(error, "XMinioAdminConfigBadJSON", @bad_json_message)
+      end)
+
+    refute log =~ sentinel
+    refute log =~ inspect(plaintext)
+    refute log =~ Base.encode16(plaintext, case: :lower)
+  end
+
   defp mutation_conn(body, opts) do
     content_length = Keyword.fetch!(opts, :content_length)
 
