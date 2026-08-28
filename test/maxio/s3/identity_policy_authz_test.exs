@@ -189,6 +189,102 @@ defmodule Maxio.S3.IdentityPolicyAuthzTest do
     assert allowed.resp_body =~ "<Name>idplist</Name>"
   end
 
+  test "Admin G3/G4 drives managed group policy authorization deny allow disable enable remove delete" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    group_name = "admin-authz-#{suffix}"
+    policy_name = "admin-list-#{suffix}"
+
+    denied = alice(:get, "/") |> call()
+    assert denied.status == 403
+
+    add_body =
+      Jason.encode!(%{
+        "group" => group_name,
+        "members" => [@alice_ak],
+        "groupStatus" => "",
+        "isRemove" => false
+      })
+
+    assert admin_group_body("/minio/admin/v3/update-group-members", add_body).status == 200
+
+    document = %{
+      "Version" => "2012-10-17",
+      "Statement" => %{
+        "Effect" => "Allow",
+        "Action" => "s3:ListAllMyBuckets",
+        "Resource" => "*"
+      }
+    }
+
+    assert {:ok, policy} =
+             IAM.create_managed_policy(name: policy_name, path: "/", document: document)
+
+    assert :ok = IAM.attach_group_policy_strict(group_name, policy.policy_arn)
+
+    allowed = alice(:get, "/") |> call()
+    assert allowed.status == 200
+    assert allowed.resp_body =~ "<ListAllMyBucketsResult"
+
+    disabled =
+      :put
+      |> SigV4Request.signed_conn("/minio/admin/v3/set-group-status",
+        query: %{"group" => group_name, "status" => "disabled"},
+        region: ""
+      )
+      |> call()
+
+    assert disabled.status == 200
+    assert (alice(:get, "/") |> call()).status == 403
+
+    disabled_info =
+      :get
+      |> SigV4Request.signed_conn("/minio/admin/v3/group",
+        query: %{"group" => group_name},
+        region: ""
+      )
+      |> call()
+
+    assert %{"status" => "disabled", "policy" => ^policy_name} =
+             Jason.decode!(disabled_info.resp_body)
+
+    enabled =
+      :put
+      |> SigV4Request.signed_conn("/minio/admin/v3/set-group-status",
+        query: %{"group" => group_name, "status" => "enabled"},
+        region: ""
+      )
+      |> call()
+
+    assert enabled.status == 200
+    assert (alice(:get, "/") |> call()).status == 200
+
+    remove_body =
+      Jason.encode!(%{
+        "group" => group_name,
+        "members" => [@alice_ak],
+        "groupStatus" => "",
+        "isRemove" => true
+      })
+
+    assert admin_group_body("/minio/admin/v3/update-group-members", remove_body).status == 200
+    assert (alice(:get, "/") |> call()).status == 403
+
+    assert :ok = IAM.detach_group_policy_strict(group_name, policy.policy_arn)
+
+    delete_body =
+      Jason.encode!(%{
+        "group" => group_name,
+        "members" => [],
+        "groupStatus" => "",
+        "isRemove" => true
+      })
+
+    assert admin_group_body("/minio/admin/v3/update-group-members", delete_body).status == 200
+    assert :error = IAM.get_group(group_name)
+    assert {:ok, _policy_definition} = IAM.get_managed_policy(policy.policy_arn)
+    assert {:ok, %{user_name: @alice_ak}} = IAM.get_user(@alice_ak)
+  end
+
   test "identity policy explicit deny overrides bucket policy allow" do
     SigV4Request.signed_conn(:put, "/idpb2") |> call()
     SigV4Request.signed_conn(:put, "/idpb2/secret.txt", body: "secret") |> call()
@@ -211,6 +307,16 @@ defmodule Maxio.S3.IdentityPolicyAuthzTest do
     denied = alice(:get, "/idpb2/secret.txt") |> call()
     assert denied.status == 403
     assert denied.resp_body =~ "AccessDenied"
+  end
+
+  defp admin_group_body(path, body) do
+    :put
+    |> SigV4Request.signed_conn(path,
+      body: body,
+      headers: [{"content-length", Integer.to_string(byte_size(body))}],
+      region: ""
+    )
+    |> call()
   end
 
   test "IAM group policy is inherited by explicit user access keys" do

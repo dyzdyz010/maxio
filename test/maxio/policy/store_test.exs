@@ -72,6 +72,48 @@ defmodule Maxio.Policy.StoreTest do
     assert [] = Store.principal_policies(%{type: :iam_user, arn: principal_arn})
   end
 
+  test "group managed policy statements are inherited only while the group is active" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    user_name = "store-group-user-#{suffix}"
+    group_name = "store-group-#{suffix}"
+    policy_name = "store-group-policy-#{suffix}"
+
+    assert {:ok, user} = Maxio.IAM.create_user(name: user_name)
+    assert {:ok, _} = Maxio.IAM.create_group(name: group_name)
+    assert :ok = Maxio.IAM.add_user_to_group(user_name, group_name)
+
+    document = %{
+      "Version" => "2012-10-17",
+      "Statement" => %{
+        "Effect" => "Allow",
+        "Action" => "s3:ListAllMyBuckets",
+        "Resource" => "*"
+      }
+    }
+
+    assert {:ok, policy} =
+             Maxio.IAM.create_managed_policy(
+               name: policy_name,
+               path: "/",
+               document: document
+             )
+
+    assert :ok = Maxio.IAM.attach_group_policy(group_name, policy.policy_arn)
+
+    principal = %{type: :iam_user, arn: user.user_arn}
+
+    assert [%Maxio.Policy.Statement{actions: ["s3:ListAllMyBuckets"]}] =
+             Store.principal_policies(principal)
+
+    assert {:ok, _} = Maxio.IAM.update_minio_group_status_strict(group_name, "inactive")
+    assert [] = Store.principal_policies(principal)
+
+    assert {:ok, _} = Maxio.IAM.update_minio_group_status_strict(group_name, "active")
+
+    assert [%Maxio.Policy.Statement{actions: ["s3:ListAllMyBuckets"]}] =
+             Store.principal_policies(principal)
+  end
+
   test "managed session policy registry create, put, list, get, and delete" do
     policy_arn = "arn:aws:iam:::policy/session-read"
 

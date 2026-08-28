@@ -16,6 +16,7 @@ defmodule Maxio.Admin.GroupAdapterTest do
     zeta = "adapter-zeta-#{suffix}"
     a_policy = "adapter-a-#{suffix}"
     z_policy = "adapter-z-#{suffix}"
+    nested_policy = "adapter-hidden-#{suffix}"
 
     assert {:ok, _} = IAM.create_user(name: zeta)
     assert {:ok, _} = IAM.create_user(name: alpha)
@@ -29,6 +30,15 @@ defmodule Maxio.Admin.GroupAdapterTest do
 
       assert :ok = IAM.attach_group_policy(group_name, policy.policy_arn)
     end
+
+    assert {:ok, nested} =
+             IAM.create_managed_policy(
+               name: nested_policy,
+               path: "/team/",
+               document: @document
+             )
+
+    assert :ok = IAM.attach_group_policy(group_name, nested.policy_arn)
 
     assert :ok = IAM.put_group_policy(group_name, "hidden-inline", Jason.encode!(@document))
 
@@ -50,8 +60,9 @@ defmodule Maxio.Admin.GroupAdapterTest do
     assert evidence.snapshot == "single statement"
     assert evidence.member_order == "maxio-sorted-unique-members"
     assert evidence.inline_policy_names == ["hidden-inline"]
-    assert evidence.non_root_managed_policy_names == []
+    assert evidence.non_root_managed_policy_names == ["team/#{nested_policy}"]
     refute Jason.encode!(wire) =~ "hidden-inline"
+    refute Jason.encode!(wire) =~ nested_policy
     refute inspect(evidence) =~ Jason.encode!(@document)
   end
 
