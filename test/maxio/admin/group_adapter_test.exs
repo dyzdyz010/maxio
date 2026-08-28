@@ -109,7 +109,7 @@ defmodule Maxio.Admin.GroupAdapterTest do
   test "name compatibility and typed failures remain in the IAM domain" do
     assert {:error, :invalid_argument} = GroupAdapter.info(nil)
     assert {:error, :invalid_argument} = GroupAdapter.info("")
-    assert {:error, :group_not_found} = GroupAdapter.info("missing/group,utf8-é")
+    assert {:error, :minio_group_not_found} = GroupAdapter.info("missing/group,utf8-é")
 
     assert {:error, :invalid_resource_name} =
              GroupAdapter.update_members(%{

@@ -44,7 +44,7 @@ defmodule Mix.Tasks.Maxio.Admin.Group.Status do
         )
       end
     else
-      {:error, :group_not_found} -> Mix.raise("admin group not found")
+      {:error, :minio_group_not_found} -> Mix.raise("admin group not found")
       {:error, _reason} -> Mix.raise("admin group status change failed")
     end
   end

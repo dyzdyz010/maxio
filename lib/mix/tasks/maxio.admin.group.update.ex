@@ -81,9 +81,9 @@ defmodule Mix.Tasks.Maxio.Admin.Group.Update do
   defp operation(true, false), do: "remove"
   defp operation(false, false), do: "add"
 
-  defp public_failure(:group_not_found), do: "admin group not found"
-  defp public_failure(:user_not_found), do: "admin group member not found"
-  defp public_failure(:group_not_empty), do: "admin group is not empty"
+  defp public_failure(:minio_group_not_found), do: "admin group not found"
+  defp public_failure(:minio_user_not_found), do: "admin group member not found"
+  defp public_failure(:minio_group_not_empty), do: "admin group is not empty"
   defp public_failure(:invalid_resource_name), do: "invalid admin group name"
   defp public_failure(:invalid_group_name), do: "invalid admin group name"
   defp public_failure(:minio_action_not_allowed), do: "admin group member action is not allowed"

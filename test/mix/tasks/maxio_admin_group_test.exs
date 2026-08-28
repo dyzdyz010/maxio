@@ -76,7 +76,7 @@ defmodule Mix.Tasks.Maxio.Admin.GroupTest do
     Mix.Task.reenable(@update)
     Mix.Task.run(@update, [group, "--delete-empty"])
     assert shell_output() =~ "operation=delete_empty"
-    assert {:error, :group_not_found} = GroupAdapter.info(group)
+    assert {:error, :minio_group_not_found} = GroupAdapter.info(group)
   end
 
   test "duplicate add absent remove and same status expose fresh persisted timestamps" do

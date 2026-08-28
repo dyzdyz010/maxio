@@ -17,7 +17,7 @@ defmodule Mix.Tasks.Maxio.Admin.Group.Show do
     with :ok <- CLI.boot(), {:ok, result} <- GroupAdapter.info(name) do
       print(result, opts[:json])
     else
-      {:error, :group_not_found} ->
+      {:error, :minio_group_not_found} ->
         Mix.raise("admin group not found: #{name}")
 
       {:error, reason} when reason in [:invalid_argument, :invalid_resource_name] ->

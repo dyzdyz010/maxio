@@ -193,15 +193,23 @@ defmodule Maxio.Admin.GroupProtocolFixtureTest do
 
     assert errors["XMinioAdminNoSuchUser"] == %{
              "code" => "XMinioAdminNoSuchUser",
-             "message" => "The specified user does not exist.",
+             "message" => "The specified user does not exist. (Specified user does not exist)",
              "status" => 404
            }
 
     assert errors["XMinioAdminNoSuchGroup"]["status"] == 404
+
+    assert errors["XMinioAdminNoSuchGroup"]["message"] ==
+             "The specified group does not exist. (Specified group does not exist)"
+
     assert errors["XMinioAdminGroupNotEmpty"]["status"] == 400
 
     assert errors["XMinioAdminGroupNotEmpty"]["message"] ==
-             "The specified group is not empty - cannot remove it."
+             "The specified group is not empty - cannot remove it. " <>
+               "(Specified group is not empty - cannot remove it)"
+
+    assert errors["XMinioAdminInvalidArgument"]["message"] ==
+             "Invalid arguments specified. (Invalid arguments specified)"
 
     assert routes["error_response_shape"]["fields_in_source_order"] == [
              "Code",

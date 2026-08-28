@@ -17,13 +17,13 @@ defmodule Maxio.Admin.GroupAdapter do
         {:ok, %{wire: names, evidence: %{group_count: length(names), group_names: names}}}
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, wire_reason(reason)}
     end
   end
 
   @spec info(term()) :: {:ok, %{wire: map(), evidence: map()}} | {:error, reason()}
   def info(name) when is_binary(name) and name != "" do
-    with {:ok, description} <- IAM.get_minio_group_description_strict(name),
+    with {:ok, description} <- map_group_result(IAM.get_minio_group_description_strict(name)),
          {:ok, status} <- wire_status(description.status) do
       wire =
         %{
@@ -70,7 +70,7 @@ defmodule Maxio.Admin.GroupAdapter do
          })}
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, wire_reason(reason)}
     end
   end
 
@@ -80,6 +80,7 @@ defmodule Maxio.Admin.GroupAdapter do
   def status(group_name, status) when is_binary(group_name) and group_name != "" do
     with {:ok, internal_status} <- mutation_status(status) do
       IAM.update_minio_group_status_strict(group_name, internal_status)
+      |> map_group_result()
     end
   end
 
@@ -101,4 +102,14 @@ defmodule Maxio.Admin.GroupAdapter do
 
   defp put_updated_at(wire, %DateTime{} = updated_at),
     do: Map.put(wire, "updatedAt", DateTime.to_iso8601(updated_at))
+
+  defp map_group_result({:error, reason}), do: {:error, wire_reason(reason)}
+  defp map_group_result(result), do: result
+
+  defp wire_reason(:user_not_found), do: :minio_user_not_found
+  defp wire_reason(:group_not_found), do: :minio_group_not_found
+  defp wire_reason(:identity_changed), do: :minio_group_not_found
+  defp wire_reason(:group_not_empty), do: :minio_group_not_empty
+  defp wire_reason(:invalid_argument), do: :minio_invalid_argument
+  defp wire_reason(reason), do: reason
 end

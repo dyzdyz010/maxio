@@ -93,6 +93,11 @@ this batch.
   missing-user plus missing-group is NoSuchUser, while empty-group plus a
   missing ordinary user is InvalidArgument. Invalid G4 status precedes missing
   group.
+- Group handler failures call pinned `toAdminAPIErr`, whose fallback uses
+  `ToAPIErrWithErr`; therefore translated no-user, no-group, group-not-empty,
+  and invalid-argument messages append the concrete IAM cause in parentheses.
+  The fixture freezes those handler-level bytes rather than copying only the
+  static `api-errors.go` catalog description.
 - G1 group names are sorted. Policy names are stored/projected in stable order.
   Upstream member order has the deliberate split recorded below.
 - All group request and success payloads are plaintext at the Admin API

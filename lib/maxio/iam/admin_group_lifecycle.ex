@@ -428,7 +428,7 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
         {:error, :user_not_found}
 
       {:error, :identity_changed} ->
-        {:error, :identity_changed}
+        {:error, :user_not_found}
     end
   end
 
@@ -505,8 +505,6 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
       nil -> false
     end
   end
-
-  defp fetch_user("arn:aws:iam:::user/" <> name), do: fetch_user(name)
 
   defp fetch_user(name) do
     Repo.one(

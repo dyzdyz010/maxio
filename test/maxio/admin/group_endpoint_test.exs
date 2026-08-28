@@ -20,7 +20,7 @@ defmodule Maxio.Admin.GroupEndpointTest do
 
     list = signed(:get, "#{@base}/groups", region: "")
     assert list.status == 200
-    assert content_type(list) =~ "application/json"
+    assert content_type(list) == "application/json"
     assert content_length(list) == byte_size(list.resp_body)
     assert group_name in Jason.decode!(list.resp_body)
 
@@ -30,7 +30,7 @@ defmodule Maxio.Admin.GroupEndpointTest do
       ~s({"name":"#{group_name}","status":"enabled","members":["#{user_name}"],"policy":"","updatedAt":"#{DateTime.to_iso8601(created.updated_at)}"})
 
     assert info.status == 200
-    assert content_type(info) =~ "application/json"
+    assert content_type(info) == "application/json"
     assert content_length(info) == byte_size(expected)
     assert info.resp_body == expected
   end
@@ -157,6 +157,88 @@ defmodule Maxio.Admin.GroupEndpointTest do
     assert_admin_error(missing, 400, "XMinioAdminInvalidArgument")
   end
 
+  test "authorization denial does not read any G3 body bytes" do
+    {key, secret} = put_action_key(nil)
+    body = ~s({"group":"never-read","members":[],"isRemove":false})
+
+    conn =
+      SigV4Request.signed_conn(:put, "#{@base}/update-group-members",
+        body: body,
+        headers: [{"content-length", Integer.to_string(byte_size(body))}],
+        access_key: key,
+        secret: secret,
+        region: ""
+      )
+
+    {_adapter, state} = conn.adapter
+    conn = %{conn | adapter: {Maxio.Test.BodyReadProbeAdapter, {self(), state}}}
+    conn = Endpoint.call(conn, Endpoint.init([]))
+
+    assert_admin_error(conn, 403, "AccessDenied")
+    refute_received :body_reader_called
+  end
+
+  test "G3 treats a user ARN as an absent MinIO username without mutation" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    group_name = "arn-member-#{suffix}"
+    user_name = "arn-user-#{suffix}"
+    assert {:ok, _user} = IAM.create_user(name: user_name)
+
+    body =
+      Jason.encode!(%{
+        "group" => group_name,
+        "members" => [IAM.user_arn(user_name)],
+        "isRemove" => false
+      })
+
+    response = signed_body(:put, "#{@base}/update-group-members", body)
+    assert_admin_error(response, 404, "XMinioAdminNoSuchUser")
+
+    assert Jason.decode!(response.resp_body)["Message"] ==
+             "The specified user does not exist. (Specified user does not exist)"
+
+    assert :error = IAM.get_group(group_name)
+  end
+
+  test "a user delete-recreate generation race returns signed NoSuchUser" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    group_name = "endpoint-user-generation-group-#{suffix}"
+    user_name = "endpoint-user-generation-user-#{suffix}"
+
+    unboxed(fn ->
+      assert {:ok, _group} = IAM.create_group(name: group_name)
+      assert {:ok, _user} = IAM.create_user(name: user_name)
+    end)
+
+    body =
+      Jason.encode!(%{"group" => group_name, "members" => [user_name], "isRemove" => false})
+
+    barrier = Maxio.Test.IAMIdentityBarrier.attach(:user, user_name)
+
+    task =
+      Task.async(fn ->
+        unboxed(fn -> signed_body(:put, "#{@base}/update-group-members", body) end)
+      end)
+
+    assert_receive {:iam_identity_wait, ^barrier, task_pid}, 5_000
+    Maxio.Test.IAMIdentityBarrier.detach(barrier)
+
+    unboxed(fn ->
+      assert {:ok, _deleted} = IAM.delete_user_strict(user_name)
+      assert {:ok, _replacement} = IAM.create_user(name: user_name)
+    end)
+
+    send(task_pid, {:release_iam_identity, barrier})
+    response = Task.await(task, 10_000)
+
+    assert_admin_error(response, 404, "XMinioAdminNoSuchUser")
+
+    assert Jason.decode!(response.resp_body)["Message"] ==
+             "The specified user does not exist. (Specified user does not exist)"
+
+    assert unboxed(fn -> IAM.list_users_in_group(group_name) end) == []
+  end
+
   test "frozen group errors preserve status code message and precedence" do
     suffix = System.unique_integer([:positive, :monotonic])
     group_name = "nonempty#{suffix}"
@@ -169,7 +251,8 @@ defmodule Maxio.Admin.GroupEndpointTest do
     assert_admin_error(response, 400, "XMinioAdminGroupNotEmpty")
 
     assert Jason.decode!(response.resp_body)["Message"] ==
-             "The specified group is not empty - cannot remove it."
+             "The specified group is not empty - cannot remove it. " <>
+               "(Specified group is not empty - cannot remove it)"
 
     invalid_status =
       signed(:put, "#{@base}/set-group-status",
@@ -191,6 +274,14 @@ defmodule Maxio.Admin.GroupEndpointTest do
       404,
       "XMinioAdminNoSuchUser"
     )
+
+    missing_group =
+      signed(:get, "#{@base}/group", query: %{"group" => "missing#{suffix}"}, region: "")
+
+    assert_admin_error(missing_group, 404, "XMinioAdminNoSuchGroup")
+
+    assert Jason.decode!(missing_group.resp_body)["Message"] ==
+             "The specified group does not exist. (Specified group does not exist)"
   end
 
   test "wrong methods versions and adjacent paths remain authenticated JSON 501" do
@@ -259,4 +350,6 @@ defmodule Maxio.Admin.GroupEndpointTest do
   defp content_length(conn) do
     conn |> Plug.Conn.get_resp_header("content-length") |> List.first() |> String.to_integer()
   end
+
+  defp unboxed(fun), do: Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fun)
 end

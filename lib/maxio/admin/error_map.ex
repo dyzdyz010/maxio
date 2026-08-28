@@ -30,6 +30,26 @@ defmodule Maxio.Admin.ErrorMap do
     )
   end
 
+  def from_reason(:minio_group_not_found) do
+    Error.new(:admin_no_such_group,
+      message: "The specified group does not exist. (Specified group does not exist)"
+    )
+  end
+
+  def from_reason(:minio_group_not_empty) do
+    Error.new(:admin_group_not_empty,
+      message:
+        "The specified group is not empty - cannot remove it. " <>
+          "(Specified group is not empty - cannot remove it)"
+    )
+  end
+
+  def from_reason(:minio_invalid_argument) do
+    Error.new(:admin_invalid_argument,
+      message: "Invalid arguments specified. (Invalid arguments specified)"
+    )
+  end
+
   def from_reason(:minio_action_not_allowed), do: Error.new(:admin_iam_action_not_allowed)
 
   def from_reason(reason)

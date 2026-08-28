@@ -22,6 +22,34 @@ defmodule Maxio.Admin.ErrorMapTest do
            } = ErrorMap.from_reason(:invalid_group_name)
   end
 
+  test "maps MinIO group handler causes instead of static catalog messages" do
+    assert %{
+             code: "XMinioAdminNoSuchUser",
+             http_status: 404,
+             message: "The specified user does not exist. (Specified user does not exist)"
+           } = ErrorMap.from_reason(:minio_user_not_found)
+
+    assert %{
+             code: "XMinioAdminNoSuchGroup",
+             http_status: 404,
+             message: "The specified group does not exist. (Specified group does not exist)"
+           } = ErrorMap.from_reason(:minio_group_not_found)
+
+    assert %{
+             code: "XMinioAdminGroupNotEmpty",
+             http_status: 400,
+             message:
+               "The specified group is not empty - cannot remove it. " <>
+                 "(Specified group is not empty - cannot remove it)"
+           } = ErrorMap.from_reason(:minio_group_not_empty)
+
+    assert %{
+             code: "XMinioAdminInvalidArgument",
+             http_status: 400,
+             message: "Invalid arguments specified. (Invalid arguments specified)"
+           } = ErrorMap.from_reason(:minio_invalid_argument)
+  end
+
   test "maps every S2b input error to its exact public code, status, and message" do
     assert_error(
       :config_too_large,

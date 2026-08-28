@@ -764,7 +764,7 @@ defmodule Maxio.Admin.Plug do
     encoded = Jason.encode_to_iodata!(body)
 
     conn
-    |> put_resp_content_type("application/json")
+    |> put_resp_header("content-type", "application/json")
     |> put_resp_header("content-length", encoded |> IO.iodata_length() |> Integer.to_string())
     |> send_resp(200, encoded)
     |> halt()
