@@ -2,6 +2,7 @@ defmodule Maxio.Auth.CredentialStore.MemoryStoreTest do
   use ExUnit.Case, async: false
 
   alias Maxio.Auth.CredentialStore.MemoryStore
+  alias Maxio.IAM.CredentialInvalidation
 
   setup do
     MemoryStore.invalidate(:all)
@@ -34,6 +35,32 @@ defmodule Maxio.Auth.CredentialStore.MemoryStoreTest do
     assert :ok = MemoryStore.invalidate({:access_key, "AKINVALIDATE"})
 
     assert :error = MemoryStore.get_secret("AKINVALIDATE")
+  end
+
+  test "post-commit exact-id invalidation removes long-term and session entries" do
+    previous_store = Application.fetch_env!(:maxio, :credential_store)
+    Application.put_env(:maxio, :credential_store, MemoryStore)
+    on_exit(fn -> Application.put_env(:maxio, :credential_store, previous_store) end)
+
+    now = DateTime.utc_now()
+
+    assert :ok =
+             MemoryStore.put_access_key(%{access_key: "AKBATCHLONG", secret_key: "long-secret"})
+
+    assert :ok =
+             MemoryStore.put_access_key(%{
+               access_key: "ASIABATCHSESSION",
+               secret_key: "session-secret",
+               session_token: "session-token",
+               expires_at: DateTime.add(now, 900, :second)
+             })
+
+    result = CredentialInvalidation.after_commit(["AKBATCHLONG", "ASIABATCHSESSION"])
+
+    assert result.attempted.local_ids == 2
+    assert result.failures == []
+    assert :error = MemoryStore.get_secret("AKBATCHLONG")
+    assert :error = MemoryStore.get_secret("ASIABATCHSESSION", session_token: "session-token")
   end
 
   test "long-term access key rejects stale session token" do

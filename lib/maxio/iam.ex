@@ -6,6 +6,7 @@ defmodule Maxio.IAM do
     iam_user → %{type: :iam_user, access_key: ak, arn: "arn:aws:iam:::user/<ak>"}
   """
   import Ecto.Query
+  require Logger
   alias Maxio.Repo
   alias Maxio.Cluster.Notify
 
@@ -14,6 +15,7 @@ defmodule Maxio.IAM do
     AccountPasswordPolicy,
     AccessKey,
     AccessKeySecret,
+    CredentialInvalidation,
     CredentialNamespace,
     Group,
     GroupManagedPolicyAttachment,
@@ -955,6 +957,63 @@ defmodule Maxio.IAM do
   end
 
   def create_minio_user_strict(_access_key_id, _secret_key, _status),
+    do: {:error, :invalid_argument}
+
+  @doc "Atomically changes a MinIO regular user's reversible enabled state."
+  @spec update_minio_user_status_strict(String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def update_minio_user_status_strict(user_name, status, actor_access_key_id)
+      when is_binary(user_name) and status in ["active", "inactive"] and
+             is_binary(actor_access_key_id) do
+    with :ok <- classify_static_minio_status_target(user_name, actor_access_key_id) do
+      snapshot = UserIdentity.snapshot(Repo, user_name)
+
+      Repo.transaction(fn ->
+        with {:ok, %User{} = user} <-
+               lock_minio_status_target(Repo, user_name, snapshot),
+             credential_ids = UserIdentity.descendant_credential_ids(Repo, user),
+             {:ok, updated} <-
+               user
+               |> Ecto.Changeset.change()
+               |> Ecto.Changeset.force_change(:status, status)
+               |> Repo.update() do
+          {updated, credential_ids.long_term ++ credential_ids.sessions}
+        else
+          {:error, reason} -> Repo.rollback({:error, reason})
+        end
+      end)
+      |> case do
+        {:ok, {%User{} = user, credential_ids}} ->
+          invalidation =
+            invalidate_minio_credentials_after_commit(credential_ids, [
+              {:principal_policy_changed, user.user_arn}
+            ])
+
+          {:ok,
+           %{
+             user: public_user(user),
+             affected: %{credentials: length(Enum.uniq(credential_ids))},
+             invalidation: invalidation
+           }}
+
+        {:error, {:error, :user_not_found}} ->
+          {:error, :minio_user_not_found}
+
+        {:error, {:error, :identity_changed}} ->
+          {:error, :minio_user_not_found}
+
+        {:error, {:error, reason}} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def update_minio_user_status_strict(_user_name, _status, _actor_access_key_id),
     do: {:error, :invalid_argument}
 
   @doc "Creates an explicit IAM user. Access keys may later bind to this user ARN."
@@ -5595,6 +5654,62 @@ defmodule Maxio.IAM do
 
   defp minio_user_transaction_result({:error, _operation, reason, _changes}, _access_key_id),
     do: {:error, reason}
+
+  defp classify_static_minio_status_target(user_name, actor_access_key_id) do
+    root_access_key_id =
+      Application.fetch_env!(:maxio, :s3)
+      |> Keyword.fetch!(:root_user)
+
+    cond do
+      user_name == actor_access_key_id ->
+        {:error, :invalid_status_self_target}
+
+      user_name == root_access_key_id ->
+        {:error, :minio_user_not_found}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp lock_minio_status_target(repo, user_name, snapshot) do
+    with {:ok, identity} <- UserIdentity.lock_snapshot(repo, user_name, snapshot),
+         :ok <- CredentialNamespace.lock_exact(repo, user_name) do
+      expected_user_arn = user_arn(user_name)
+
+      cond do
+        repo.exists?(from(s in STSSession, where: s.access_key_id == ^user_name)) ->
+          {:error, :minio_user_not_found}
+
+        match?(
+          %AccessKey{principal_arn: principal_arn} when principal_arn != expected_user_arn,
+          repo.get_by(AccessKey, access_key_id: user_name)
+        ) ->
+          {:error, :minio_action_not_allowed}
+
+        match?(%User{}, identity) ->
+          {:ok, identity}
+
+        true ->
+          {:error, :minio_user_not_found}
+      end
+    end
+  end
+
+  defp invalidate_minio_credentials_after_commit(credential_ids, legacy_events) do
+    result = CredentialInvalidation.after_commit(credential_ids, legacy_events)
+
+    if result.failures != [] do
+      Logger.warning("admin_user_invalidation_partial",
+        local_attempts: result.attempted.local_ids,
+        typed_attempts: result.attempted.typed_batches,
+        legacy_attempts: result.attempted.legacy_events,
+        failure_count: length(result.failures)
+      )
+    end
+
+    result
+  end
 
   defp unique_constraint_error?(%Ecto.Changeset{} = changeset) do
     Enum.any?(changeset.errors, fn {_field, {_message, metadata}} ->

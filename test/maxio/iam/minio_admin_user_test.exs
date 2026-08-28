@@ -279,6 +279,135 @@ defmodule Maxio.IAM.MinioAdminUserTest do
     refute_receive {:iam_changed, _other}
   end
 
+  test "U5 disable and enable are reversible for long-term and descendant STS credentials" do
+    access_key = unique_access_key("STATUS")
+    secret = "status-user-secret"
+    session_key = unique_access_key("STATUSSESSION")
+    session_secret = "status-session-secret"
+    session_token = "status-session-token"
+
+    assert {:ok, %{user: user}} =
+             IAM.create_minio_user_strict(access_key, secret, "active")
+
+    assert {:ok, session} =
+             STS.issue_session(
+               issuer_access_key_id: access_key,
+               session_access_key_id: session_key,
+               secret_key: session_secret,
+               session_token: session_token,
+               duration_seconds: 900
+             )
+
+    before_key = Repo.get_by!(AccessKey, access_key_id: access_key)
+    before_session = Repo.get_by!(STSSession, access_key_id: session_key)
+    now = DateTime.add(session.issued_at, 1, :second)
+    assert {:ok, %{secret_key: ^secret}} = EctoStore.get_secret(access_key)
+
+    assert {:ok, %{secret_key: ^session_secret}} =
+             EctoStore.get_secret(session_key, session_token: session_token, now: now)
+
+    assert {:ok, disabled} =
+             IAM.update_minio_user_status_strict(user.user_name, "inactive", session_key)
+
+    assert disabled.user.status == "inactive"
+    assert disabled.affected.credentials == 2
+
+    after_key = Repo.get_by!(AccessKey, access_key_id: access_key)
+    after_session = Repo.get_by!(STSSession, access_key_id: session_key)
+
+    assert Map.take(after_key, [:id, :secret_key, :status]) ==
+             Map.take(before_key, [:id, :secret_key, :status])
+
+    assert Map.take(after_session, [
+             :id,
+             :secret_key,
+             :status,
+             :expires_at,
+             :revoked_at
+           ]) ==
+             Map.take(before_session, [
+               :id,
+               :secret_key,
+               :status,
+               :expires_at,
+               :revoked_at
+             ])
+
+    assert :error = EctoStore.get_secret(access_key)
+
+    assert {:error, :invalid_token} =
+             EctoStore.get_secret(session_key, session_token: session_token, now: now)
+
+    root_actor = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+
+    assert {:ok, enabled} =
+             IAM.update_minio_user_status_strict(user.user_name, "active", root_actor)
+
+    assert enabled.user.status == "active"
+    assert {:ok, %{secret_key: ^secret}} = EctoStore.get_secret(access_key)
+
+    assert {:ok, %{secret_key: ^session_secret}} =
+             EctoStore.get_secret(session_key, session_token: session_token, now: now)
+  end
+
+  test "U5 classifies root, session, and subordinate-key targets before mutation" do
+    access_key = unique_access_key("STATUSCLASS")
+    secret = "status-class-secret"
+    session_key = unique_access_key("STATUSCLASSSESSION")
+
+    assert {:ok, %{user: user}} =
+             IAM.create_minio_user_strict(access_key, secret, "active")
+
+    assert {:ok, subordinate_key} = IAM.create_access_key_strict(user.user_name)
+
+    assert {:ok, _session} =
+             STS.issue_session(
+               issuer_access_key_id: access_key,
+               session_access_key_id: session_key,
+               secret_key: "status-class-session-secret",
+               session_token: "status-class-session-token",
+               duration_seconds: 900
+             )
+
+    root_actor = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+
+    assert {:error, :invalid_status_self_target} =
+             IAM.update_minio_user_status_strict(root_actor, "inactive", root_actor)
+
+    assert {:error, :minio_user_not_found} =
+             IAM.update_minio_user_status_strict(root_actor, "inactive", access_key)
+
+    assert {:error, :minio_user_not_found} =
+             IAM.update_minio_user_status_strict(session_key, "inactive", root_actor)
+
+    assert {:error, :minio_action_not_allowed} =
+             IAM.update_minio_user_status_strict(
+               subordinate_key.access_key_id,
+               "inactive",
+               root_actor
+             )
+
+    assert Repo.get_by!(User, user_name: user.user_name).status == "active"
+  end
+
+  test "U5 exact signer self target is rejected and same-status writes advance updated_at" do
+    access_key = unique_access_key("STATUSSELF")
+    secret = "status-self-secret"
+    assert {:ok, %{user: user}} = IAM.create_minio_user_strict(access_key, secret, "active")
+
+    assert {:error, :invalid_status_self_target} =
+             IAM.update_minio_user_status_strict(user.user_name, "inactive", access_key)
+
+    before = Repo.get_by!(User, user_name: user.user_name)
+    actor = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+
+    assert {:ok, %{user: %{status: "active"}}} =
+             IAM.update_minio_user_status_strict(user.user_name, "active", actor)
+
+    after_write = Repo.get_by!(User, user_name: user.user_name)
+    assert DateTime.compare(after_write.updated_at, before.updated_at) == :gt
+  end
+
   test "two concurrent same-name creates commit exactly one pair and one notification" do
     access_key = unique_access_key("RACE")
     parent = self()

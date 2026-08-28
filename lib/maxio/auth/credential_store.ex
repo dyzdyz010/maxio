@@ -11,7 +11,7 @@ defmodule Maxio.Auth.CredentialStore do
               | {:error, :missing_session_token | :invalid_token | :expired_token}
   @callback put_access_key(map()) :: :ok | {:error, term()}
   @callback list_keys() :: [map()]
-  @callback invalidate(scope :: term()) :: :ok
+  @callback invalidate(scope :: term()) :: :ok | {:error, term()}
 
   @optional_callbacks invalidate: 1, get_secret: 2
 
@@ -44,7 +44,7 @@ defmodule Maxio.Auth.CredentialStore do
   @spec list_keys() :: [map()]
   def list_keys, do: impl().list_keys()
 
-  @spec invalidate(term()) :: :ok
+  @spec invalidate(term()) :: :ok | {:error, term()}
   def invalidate(scope) do
     backend = impl()
 

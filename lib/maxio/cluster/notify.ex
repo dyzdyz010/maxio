@@ -10,6 +10,7 @@ defmodule Maxio.Cluster.Notify do
 
   @type event ::
           {:iam_changed, String.t()}
+          | {:iam_credentials_changed, [String.t()]}
           | {:principal_policy_changed, String.t()}
           | {:bucket_config_changed, String.t(), atom()}
           | {:bucket_policy_changed, String.t()}
@@ -32,12 +33,25 @@ defmodule Maxio.Cluster.Notify do
   """
   @spec broadcast(event()) :: :ok
   def broadcast(event) do
-    if Process.whereis(Maxio.PubSub) do
-      Phoenix.PubSub.broadcast(Maxio.PubSub, @topic, event)
-    end
-
+    _result = broadcast_checked(event)
     :ok
-  catch
-    :exit, _ -> :ok
   end
+
+  @doc "Broadcasts an event and makes transport failure observable to mutation coordinators."
+  @spec broadcast_checked(event()) ::
+          :ok | {:error, :pubsub_unavailable | {:transport_exit, term()} | term()}
+  def broadcast_checked(event) do
+    if Process.whereis(Maxio.PubSub) do
+      transport().broadcast(Maxio.PubSub, @topic, event)
+    else
+      {:error, :pubsub_unavailable}
+    end
+  rescue
+    error -> {:error, {:transport_error, error.__struct__}}
+  catch
+    :exit, reason -> {:error, {:transport_exit, reason}}
+  end
+
+  defp transport,
+    do: Application.get_env(:maxio, :cluster_notify_transport, Phoenix.PubSub)
 end

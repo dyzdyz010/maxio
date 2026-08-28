@@ -27,7 +27,13 @@ defmodule Maxio.Cluster.CacheInvalidator do
 
   @impl true
   def handle_info({:iam_changed, access_key_id}, state) when is_binary(access_key_id) do
-    :ok = CredentialStore.invalidate({:access_key, access_key_id})
+    invalidate_ids([access_key_id])
+    {:noreply, state}
+  end
+
+  def handle_info({:iam_credentials_changed, access_key_ids}, state)
+      when is_list(access_key_ids) do
+    invalidate_ids(access_key_ids)
     {:noreply, state}
   end
 
@@ -67,4 +73,36 @@ defmodule Maxio.Cluster.CacheInvalidator do
   catch
     :exit, _ -> :ok
   end
+
+  defp invalidate_ids(access_key_ids) do
+    access_key_ids
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.uniq()
+    |> Enum.each(fn access_key_id ->
+      try do
+        case CredentialStore.invalidate({:access_key, access_key_id}) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("credential cache invalidation failed",
+              stage: :cluster_event,
+              reason: safe_reason(reason)
+            )
+        end
+      rescue
+        error ->
+          Logger.warning("credential cache invalidation raised",
+            stage: :cluster_event,
+            reason: error.__struct__
+          )
+      catch
+        :exit, _reason ->
+          Logger.warning("credential cache invalidation exited", stage: :cluster_event)
+      end
+    end)
+  end
+
+  defp safe_reason(reason) when is_atom(reason), do: reason
+  defp safe_reason(_reason), do: :backend_error
 end
