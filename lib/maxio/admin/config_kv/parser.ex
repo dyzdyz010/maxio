@@ -8,20 +8,23 @@ defmodule Maxio.Admin.ConfigKV.Parser do
           {:ok, %{wire_subsystem: String.t(), patches: [patch()]}} | {:error, atom()}
   def parse_set(plaintext, entries) when is_binary(plaintext) and is_list(entries) do
     plaintext
+    |> parse_set_detailed(entries)
+    |> normalize_detailed_error()
+  end
+
+  @doc false
+  @spec parse_set_detailed(String.t(), [entry()]) ::
+          {:ok, %{wire_subsystem: String.t(), patches: [patch()]}} | {:error, atom()}
+  def parse_set_detailed(plaintext, entries) when is_binary(plaintext) and is_list(entries) do
+    plaintext
     |> String.split("\n")
     |> Enum.reduce_while({:ok, nil, []}, fn line, {:ok, subsystem, patches} ->
-      case parse_set_line(line, entries) do
+      case parse_set_line(line, entries, subsystem) do
         :skip ->
           {:cont, {:ok, subsystem, patches}}
 
-        {:ok, line_subsystem, line_patches} when is_nil(subsystem) ->
-          {:cont, {:ok, line_subsystem, patches ++ line_patches}}
-
-        {:ok, ^subsystem, line_patches} ->
-          {:cont, {:ok, subsystem, patches ++ line_patches}}
-
-        {:ok, _other_subsystem, _line_patches} ->
-          {:halt, {:error, :bad_json}}
+        {:ok, line_subsystem, line_patches} ->
+          {:cont, {:ok, subsystem || line_subsystem, patches ++ line_patches}}
 
         {:error, reason} ->
           {:halt, {:error, reason}}
@@ -34,20 +37,23 @@ defmodule Maxio.Admin.ConfigKV.Parser do
           {:ok, %{wire_subsystem: String.t(), reset: :all | [String.t()]}} | {:error, atom()}
   def parse_reset(plaintext) when is_binary(plaintext) do
     plaintext
+    |> parse_reset_detailed()
+    |> normalize_detailed_error()
+  end
+
+  @doc false
+  @spec parse_reset_detailed(String.t()) ::
+          {:ok, %{wire_subsystem: String.t(), reset: :all | [String.t()]}} | {:error, atom()}
+  def parse_reset_detailed(plaintext) when is_binary(plaintext) do
+    plaintext
     |> String.split("\n")
     |> Enum.reduce_while({:ok, nil, :unset}, fn line, {:ok, subsystem, reset} ->
-      case parse_reset_line(line) do
+      case parse_reset_line(line, subsystem) do
         :skip ->
           {:cont, {:ok, subsystem, reset}}
 
-        {:ok, line_subsystem, line_reset} when is_nil(subsystem) ->
-          {:cont, {:ok, line_subsystem, merge_reset(reset, line_reset)}}
-
-        {:ok, ^subsystem, line_reset} ->
-          {:cont, {:ok, subsystem, merge_reset(reset, line_reset)}}
-
-        {:ok, _other_subsystem, _line_reset} ->
-          {:halt, {:error, :bad_json}}
+        {:ok, line_subsystem, line_reset} ->
+          {:cont, {:ok, subsystem || line_subsystem, merge_reset(reset, line_reset)}}
 
         {:error, reason} ->
           {:halt, {:error, reason}}
@@ -61,7 +67,7 @@ defmodule Maxio.Admin.ConfigKV.Parser do
     [subsystem, " ", Enum.map(kvs, fn {key, value} -> [key, "=", encode(value), " "] end), "\n"]
   end
 
-  defp parse_set_line(line, entries) do
+  defp parse_set_line(line, entries, expected_subsystem) do
     trimmed = String.trim(line)
 
     if blank_or_comment?(trimmed) do
@@ -69,6 +75,7 @@ defmodule Maxio.Admin.ConfigKV.Parser do
     else
       with {:ok, subsystem, fields} <- split_subsystem(trimmed),
            :ok <- reject_target(subsystem),
+           :ok <- require_same_subsystem(expected_subsystem, subsystem),
            {:ok, patches} <- parse_registered_fields(subsystem, fields, entries) do
         {:ok, subsystem, patches}
       end
@@ -118,7 +125,7 @@ defmodule Maxio.Admin.ConfigKV.Parser do
     end)
   end
 
-  defp parse_reset_line(line) do
+  defp parse_reset_line(line, expected_subsystem) do
     trimmed = String.trim(line)
 
     if blank_or_comment?(trimmed) do
@@ -129,7 +136,8 @@ defmodule Maxio.Admin.ConfigKV.Parser do
           :skip
 
         [subsystem | keys] ->
-          with :ok <- reject_target(subsystem) do
+          with :ok <- reject_target(subsystem),
+               :ok <- require_same_subsystem(expected_subsystem, subsystem) do
             reset = if keys == [], do: :all, else: keys
             {:ok, subsystem, reset}
           end
@@ -147,6 +155,10 @@ defmodule Maxio.Admin.ConfigKV.Parser do
   defp reject_target(subsystem) do
     if String.contains?(subsystem, ":"), do: {:error, :invalid_argument}, else: :ok
   end
+
+  defp require_same_subsystem(nil, _line_subsystem), do: :ok
+  defp require_same_subsystem(subsystem, subsystem), do: :ok
+  defp require_same_subsystem(_subsystem, _line_subsystem), do: {:error, :cross_subsystem}
 
   defp blank_or_comment?(trimmed), do: trimmed == "" or String.starts_with?(trimmed, "#")
 
@@ -177,6 +189,9 @@ defmodule Maxio.Admin.ConfigKV.Parser do
     do: {:ok, %{wire_subsystem: subsystem, reset: reset}}
 
   defp finish_reset({:error, reason}), do: {:error, reason}
+
+  defp normalize_detailed_error({:error, :cross_subsystem}), do: {:error, :bad_json}
+  defp normalize_detailed_error(result), do: result
 
   defp encode(value) when is_binary(value) do
     if String.match?(value, ~r/\s/u), do: ["\"", value, "\""], else: value

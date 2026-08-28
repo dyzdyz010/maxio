@@ -40,7 +40,7 @@ defmodule Maxio.Admin.ConfigKV.Request do
       )
 
     case Envelope.decrypt(caller_secret, ciphertext) do
-      {:ok, plaintext} -> {conn, plaintext}
+      {:ok, plaintext} -> validate_plaintext!(conn, plaintext)
       {:error, _discarded_reason} -> raise(Error.new(:admin_config_bad_json))
     end
   end
@@ -75,4 +75,14 @@ defmodule Maxio.Admin.ConfigKV.Request do
        do: hash
 
   defp authenticated_payload_hash!(_conn), do: raise(Error.new(:internal_error))
+
+  defp validate_plaintext!(conn, plaintext) when is_binary(plaintext) do
+    if String.valid?(plaintext) do
+      {conn, plaintext}
+    else
+      raise(Error.new(:admin_config_bad_json))
+    end
+  end
+
+  defp validate_plaintext!(_conn, _plaintext), do: raise(Error.new(:admin_config_bad_json))
 end
