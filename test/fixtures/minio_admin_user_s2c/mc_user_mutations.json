@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "fixture_id": "mc-admin-user-mutations",
+  "operations": [
+    "enable",
+    "disable",
+    "remove"
+  ],
+  "evidence_class": "pinned-source-derived-not-live",
+  "execution_claim": {
+    "mc_live_run_performed": false,
+    "reason": "This pack records deterministic source contracts only; future Maxio smoke must provide separate live evidence.",
+    "verify_at_impl": true
+  },
+  "provenance": {
+    "source_hash_byte_form": "canonical UTF-8/LF upstream text",
+    "mc": {
+      "commit": "77f82e18b5401a65958f1619df6ebb994634bd88"
+    },
+    "madmin_pin": {
+      "pseudo_version_commit": "4b504b82db633e978a57d49443b2be75824244c3"
+    },
+    "console_dependency": {
+      "module": "github.com/minio/pkg/v3",
+      "version": "v3.1.0",
+      "commit": "e97de32cd9d798d53115b831f4f7c0ad245c7fb2",
+      "module_sum": "h1:RoR1TMXV5y4LvKPkaB1WoeuM6CO7A+I55xYb1tzrvLQ=",
+      "go_mod_sum": "h1:8vhmdRv9EQnY6a+/gL9mKeIlzkhBsmhYGEmWKHW0uc4="
+    },
+    "sources": [
+      {
+        "path": "mc/cmd/admin-user-add.go",
+        "sha256": "f9042ad23d58bfeb2ba71df7fa04876d9098fc91e36068c6e29337fad98da12b",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-user-add.go"
+      },
+      {
+        "path": "mc/cmd/admin-user-disable.go",
+        "sha256": "e84adb276cafd3e69cf62665ce78411b62432e379b3a9c2e4be1dc86e0d73497",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-user-disable.go"
+      },
+      {
+        "path": "mc/cmd/admin-user-enable.go",
+        "sha256": "1aef37ca6c3bd835c4730440db8827e951b0336517113cdeb40aa22d5faa25cc",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-user-enable.go"
+      },
+      {
+        "path": "mc/cmd/admin-user-remove.go",
+        "sha256": "7f124bfe7ad0d308c104432f4a5bef54b1d8e261f5e8929c2d0d7c8833477894",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-user-remove.go"
+      },
+      {
+        "path": "mc/cmd/error.go",
+        "sha256": "3edf2559c4dbe5153ec1268726a85e8dca8d610369374e119e0f6429ac03e5a7",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/error.go#L48-L119"
+      },
+      {
+        "path": "mc/cmd/print.go",
+        "sha256": "2797d5a0be76b4f5e06421f09069421df36883f7feee425bbb7c93d46bb2cccb",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go#L35-L50"
+      },
+      {
+        "path": "mc/go.mod",
+        "sha256": "8794dc9370eca3a8d415c007568c3db9b88af3b08f1d8c4442c555aef8a8ed2d",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/go.mod"
+      },
+      {
+        "path": "pkg/v3/console/console.go",
+        "sha256": "a9624e0d70891e23338de464c32b6682ad36c129e6e774be6f65bff2c17bbaa4",
+        "url": "https://github.com/minio/pkg/blob/e97de32cd9d798d53115b831f4f7c0ad245c7fb2/console/console.go#L264-L301"
+      }
+    ]
+  },
+  "argv_contract": {
+    "required_positional_args": 2,
+    "target_form": "TARGET USERNAME",
+    "commands": [
+      "mc admin user disable TARGET USERNAME",
+      "mc admin user enable TARGET USERNAME",
+      "mc admin user remove TARGET USERNAME"
+    ],
+    "json_commands": [
+      "mc --json admin user disable TARGET USERNAME",
+      "mc --json admin user enable TARGET USERNAME",
+      "mc --json admin user remove TARGET USERNAME"
+    ],
+    "json_mode": "ordinary --json producing one pretty multiline JSON document",
+    "remove_alias": "rm",
+    "wrong_arg_count": {
+      "behavior": "show command help",
+      "exit_code": 1
+    }
+  },
+  "success_contract": {
+    "exit_code": 0,
+    "stderr": "",
+    "human_stdout": {
+      "disable": "Disabled user `NAME` successfully.",
+      "enable": "Enabled user `NAME` successfully.",
+      "remove": "Removed user `NAME` successfully."
+    },
+    "human_capture_note": "These are non-TTY captured text values; an interactive terminal may add ANSI color sequences.",
+    "json_stdout_object": {
+      "status": "success",
+      "accessKey": "NAME"
+    },
+    "json_stdout_contract": {
+      "document_count": 1,
+      "pretty_multiline": true,
+      "stdout_text_lf_with_trailing_lf": "{\n \"status\": \"success\",\n \"accessKey\": \"NAME\"\n}\n",
+      "stdout_sha256_lf": "75c879997665206ee45ec6432f590ea0ed5e3aa27b55a0268455336f29f2b3fd"
+    },
+    "secret_fields_emitted": false
+  },
+  "error_contract": {
+    "exit_code": 1,
+    "human_mode": {
+      "stdout": "",
+      "stderr_prefix": "mc: <ERROR> ",
+      "operation_templates": {
+        "disable": "Unable to disable user",
+        "enable": "Unable to enable user",
+        "remove": "Unable to remove"
+      },
+      "sequential_second_remove_source_derived_example": "mc: <ERROR> Unable to remove NAME. The specified user does not exist. (Specified user does not exist).",
+      "exact_terminal_rendering_verify_at_impl": true
+    },
+    "json_mode": {
+      "document_count": 1,
+      "pretty_multiline": true,
+      "stdout": "one pretty multiline JSON error document through console.Println",
+      "stderr": "empty for the normal fatal JSON path",
+      "document_structure": {
+        "status": "error",
+        "error": {
+          "message": "operation template from the command source",
+          "cause": {
+            "message": "dynamic server or transport error text",
+            "error": "dynamic JSON representation of the Go error"
+          },
+          "type": "fatal",
+          "trace_and_sysinfo": "omitted unless debug is enabled"
+        }
+      },
+      "note": "transport/runtime diagnostics outside the normal fatal formatter can still use stderr",
+      "exact_live_document_verify_at_impl": true
+    }
+  },
+  "safe_future_smoke": {
+    "preconditions": [
+      "use a disposable non-root user name",
+      "keep all real credential material outside captured argv/stdout/stderr",
+      "capture streams and exit code separately",
+      "run enable, disable, remove, then sequential second remove in human mode",
+      "repeat with the exact mc --json argv recorded above and capture the single pretty JSON document"
+    ],
+    "must_not_capture": [
+      "secret key values",
+      "session token values",
+      "signed request headers"
+    ]
+  },
+  "redaction": {
+    "real_credentials_present": false,
+    "placeholder": "NAME"
+  }
+}

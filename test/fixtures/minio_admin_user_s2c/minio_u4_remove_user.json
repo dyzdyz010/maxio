@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "fixture_id": "minio-admin-v3-u4-remove-user",
+  "operation": "remove-user",
+  "evidence_class": "pinned-upstream-source-plus-temporary-server-suite",
+  "provenance": {
+    "source_hash_byte_form": "canonical UTF-8/LF upstream text",
+    "minio": {
+      "commit": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+      "go_selected": "go1.24.8"
+    },
+    "madmin_go": {
+      "tag": "v3.0.109",
+      "commit": "6897865311e2be91d814ea0ef4814a730d87d1cd",
+      "wire_capture_go": "go1.24.2"
+    },
+    "sources": [
+      {
+        "path": "minio/cmd/admin-router.go",
+        "sha256": "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go#L271-L272"
+      },
+      {
+        "path": "minio/cmd/admin-handlers-users.go",
+        "sha256": "ddcad4a547cb1588baebbec45516cbbbcce9391c3a84bbea7215d9f2d549fdcb",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-users.go#L48-L101"
+      },
+      {
+        "path": "minio/cmd/iam.go",
+        "sha256": "6275bdc45fc5c1b76f984ee7e5a4c99df83a437a580c2a758d1e5a4bef98f217",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/iam.go#L942-L962"
+      },
+      {
+        "path": "minio/cmd/iam-store.go",
+        "sha256": "e60b87f2155c6e9ba990c57d01533008d6dbe0ecdf1f4319a7e2521bfd0b7fb5",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/iam-store.go#L1925-L1989"
+      },
+      {
+        "path": "minio/cmd/admin-handler-utils.go",
+        "sha256": "a1423bd1af26d0838280fffa5b87597344a94f6b01c6a512a8b0f14e5d7eb49f",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handler-utils.go"
+      },
+      {
+        "path": "minio/cmd/api-errors.go",
+        "sha256": "12e69a17696a8bacaf10cfa52806ea9b6d44aefebad4530a17f6b16d74625081",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/api-errors.go"
+      },
+      {
+        "path": "minio/cmd/auth-handler.go",
+        "sha256": "d79e454532b17d89e3dd5e0216c91b1e3d2741c3aff3aa7b291f84497692c27b",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/auth-handler.go#L159-L207"
+      },
+      {
+        "path": "minio/cmd/signature-v4-parser.go",
+        "sha256": "a08569a7db8f3b68a9c049c4e53ba12621cf99c428cb65eb377c37e8634763c1",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/signature-v4-parser.go#L52-L66"
+      },
+      {
+        "path": "minio/cmd/signature-v4-utils.go",
+        "sha256": "d1e6c50ef73fe56ba06cf6df72c13bce952ca55c2658df31c111b2fee4968b10",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/signature-v4-utils.go#L148-L181"
+      },
+      {
+        "path": "minio/internal/auth/credentials.go",
+        "sha256": "eba58c2bd7bbe65117662b30e0856843377f4289184c0d8d633abde46a87c54d",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/auth/credentials.go#L110-L121"
+      },
+      {
+        "path": "minio/cmd/typed-errors.go",
+        "sha256": "15f0462937c1477435ae1817dcc595a42da3cfae1bb6d1d50449dc5802f57eae",
+        "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/typed-errors.go#L109"
+      },
+      {
+        "path": "madmin-go/user-commands.go",
+        "sha256": "cce048000582de809eb9b119cef85e1c32b1b752e1110922a01f40f58f968019",
+        "url": "https://github.com/minio/madmin-go/blob/6897865311e2be91d814ea0ef4814a730d87d1cd/user-commands.go#L160-L182"
+      }
+    ]
+  },
+  "wire": {
+    "method": "DELETE",
+    "path": "/minio/admin/v3/remove-user",
+    "query": {
+      "accessKey": "NAME"
+    },
+    "request_body": {
+      "plaintext_length": 0,
+      "encrypted": false,
+      "schema": "empty"
+    },
+    "request_headers": {
+      "content_type": null,
+      "content_length": 0,
+      "transfer_encoding": []
+    },
+    "madmin_wire_capture": "remove method=DELETE requestURI=/minio/admin/v3/remove-user?accessKey=fixture-user contentLength=0 transferEncoding=[] contentType=\"\" bodyLen=0",
+    "madmin_combined_wire_transcript_lines_lf": [
+      "status method=PUT requestURI=/minio/admin/v3/set-user-status?accessKey=fixture-user&status=disabled contentLength=-1 transferEncoding=[\"chunked\"] contentType=\"\" bodyLen=0",
+      "remove method=DELETE requestURI=/minio/admin/v3/remove-user?accessKey=fixture-user contentLength=0 transferEncoding=[] contentType=\"\" bodyLen=0"
+    ],
+    "madmin_combined_wire_transcript_sha256_lf": "a9e91230d177db46e99e431b8ca9c83596b00578b05ca6710b4acbaaa198ed16",
+    "success": {
+      "http_status": 200,
+      "body_length": 0,
+      "content_type": null,
+      "json": false,
+      "client_rule": "madmin accepts only HTTP 200"
+    },
+    "error_representation": {
+      "content_type": "application/json",
+      "fields": [
+        "Code",
+        "Message",
+        "Resource",
+        "RequestId",
+        "HostId",
+        "Region"
+      ]
+    }
+  },
+  "authorization": {
+    "required_action": "admin:DeleteUser",
+    "ordinary_self_target": {
+      "http_status": 403,
+      "code": "XMinioIAMActionNotAllowed",
+      "message": "Specified IAM action is not allowed",
+      "reachability": "reachable after IsTempUser succeeds for a stored regular user"
+    },
+    "configured_root_target": {
+      "root_caller_self_target": {
+        "http_status": 404,
+        "code": "XMinioAdminNoSuchUser",
+        "message": "The specified user does not exist. (Specified user does not exist)"
+      },
+      "non_root_admin_caller": {
+        "http_status": 404,
+        "code": "XMinioAdminNoSuchUser",
+        "message": "The specified user does not exist. (Specified user does not exist)"
+      },
+      "source_order": [
+        "handler calls IsTempUser(target) before root/self checks",
+        "configured root is absent from iamUsersMap and iamSTSAccountsMap",
+        "IsTempUser returns errNoSuchUser",
+        "handler writes 404 and returns",
+        "the later explicit root/self XMinioIAMActionNotAllowed branch is unreachable for configured root"
+      ],
+      "plan_amendment_history": "Research found the draft plan's root 403 assumption differed from both fixed-server caller-mode oracles. The approved amendment now selects MinIO-compatible root 404; no implementation choice remains open."
+    },
+    "temporary_sts_target": {
+      "http_status": 403,
+      "code": "XMinioIAMActionNotAllowed",
+      "message": "Specified IAM action is not allowed",
+      "reason": "IsTempUser succeeds with isTemp=true, then handler rejects"
+    },
+    "service_account_target": {
+      "http_status": 403,
+      "code": "XMinioIAMActionNotAllowed",
+      "message": "Specified IAM action is not allowed",
+      "reason": "IsServiceAccount succeeds with true, then handler rejects"
+    },
+    "authorization_denied": {
+      "http_status": 403,
+      "code": "AccessDenied",
+      "message": "Access Denied."
+    }
+  },
+  "authenticated_principal_provenance": {
+    "evidence_kind": "fixed-source-derived-not-live",
+    "flow": [
+      "getReqAccessKeyV4 parses the SigV4 Credential access key and passes it to checkKeyValid",
+      "checkKeyValid resolves that exact key to auth.Credentials, preserving distinct AccessKey and ParentUser fields and validating any session token",
+      "validateAdminSignature returns the resolved signer credential",
+      "checkAdminRequestAuth authorizes admin:DeleteUser with AccountName equal to signer cred.AccessKey",
+      "validateAdminReq returns the same signer credential to RemoveUser",
+      "RemoveUser compares target accessKey with global root AccessKey and signer cred.AccessKey; it does not compare target with cred.ParentUser"
+    ],
+    "handler_self_comparison": "accessKey == globalActiveCred.AccessKey || accessKey == cred.AccessKey",
+    "derived_parent_consequence": {
+      "statement": "An STS signer access key differs from its ParentUser, so an STS signer that is granted admin:DeleteUser can target its parent without being classified as self.",
+      "authorization_required": true,
+      "live_oracle_executed": false,
+      "verify_at_impl": true
+    }
+  },
+  "existence_and_idempotency": {
+    "missing_or_sequential_second_remove": {
+      "http_status": 404,
+      "code": "XMinioAdminNoSuchUser",
+      "message": "The specified user does not exist. (Specified user does not exist)"
+    },
+    "sequential_idempotent": false,
+    "explanation": "The store-level deletion tolerates errNoSuchUser, but the handler's earlier IsTempUser precheck intercepts a later sequential request.",
+    "concurrent_double_remove": {
+      "status": "ambiguous",
+      "possible_results": [
+        "200 and 200 if both requests pass the unlocked handler prechecks before deletion",
+        "200 and 404 if the second precheck observes the completed deletion"
+      ],
+      "verify_at_impl": true
+    }
+  },
+  "effects": {
+    "fixed_delete_user_source_range": "cmd/iam-store.go:1925-1989",
+    "cascade_order": [
+      "remove regular user from all persistent group memberships",
+      "scan iamUsersMap for credentials whose ParentUser equals the target",
+      "delete derived service accounts found by that scan; an STS switch branch is present but ordinary STS storage uses iamSTSAccountsMap",
+      "delete the target's mapped policy and evict iamUserPolicyMap",
+      "delete the target identity, tolerating errNoSuchUser at this internal layer",
+      "evict target caches and update cache.updatedAt"
+    ],
+    "regular_user": "deleted from persistent identity storage and local cache",
+    "mapped_user_policy": "the user-to-policy mapping is deleted; canned policy documents remain",
+    "groups": "the user is removed from group memberships; group records and group policy mappings remain",
+    "service_accounts": "DeleteUser scans derived service accounts and attempts deletion; per-service-account deletion errors are ignored",
+    "sts_sessions": {
+      "upstream_comment": "the function header says it is not used for STS, while an inner comment and switch branch attempt derived STS deletion",
+      "observed_source_conflict": "ordinary STS identities are stored in iamSTSAccountsMap by SetTempUser/updateUserWithClaims, but DeleteUser lines 1951-1970 scan iamUsersMap; the endpoint does not call RevokeTokens",
+      "conclusion": "ordinary STS persistence/revocation is not proven by this path",
+      "verify_at_impl": true
+    },
+    "tombstone": "no local permanent-user tombstone is created",
+    "peer_and_cache": "local mutation occurs under the IAM store lock; peer notification/cache convergence may be eventual and notification failures are logged rather than rolling back the local result",
+    "in_flight_requests": "requests already authorized are not synchronously canceled",
+    "group_cleanup_failure": "a persistent group-membership cleanup error can fail the operation"
+  },
+  "executed_oracles": [
+    {
+      "name": "sequential-second-remove-and-nonself-root-status",
+      "scope_for_this_fixture": "sequential second remove only",
+      "command": "go test ./cmd -run '^TestS2C(RepeatRemoveHTTP|NonSelfRootSetStatusHTTP)$' -count=1 -v",
+      "temporary_source_committed": false,
+      "result": "PASS",
+      "transcript_lines_lf": [
+        "=== RUN   TestS2CNonSelfRootSetStatusHTTP",
+        "--- PASS: TestS2CNonSelfRootSetStatusHTTP (0.20s)",
+        "=== RUN   TestS2CRepeatRemoveHTTP",
+        "--- PASS: TestS2CRepeatRemoveHTTP (0.16s)",
+        "PASS",
+        "ok   github.com/minio/minio/cmd  1.133s"
+      ],
+      "transcript_sha256_lf_with_trailing_lf": "d62bee7220a87ddeafb509bca4dad328b7c071a602071accdeee2e57039eb175"
+    },
+    {
+      "name": "configured-root-remove-caller-modes",
+      "command": "go test ./cmd -run '^TestS2C(RootSelfRemove|NonRootAdminRemoveRoot)HTTP$' -count=1 -v",
+      "temporary_source_committed": false,
+      "result": "PASS",
+      "assertions": [
+        "root caller removing configured root: 404/XMinioAdminNoSuchUser/dynamic no-such-user message",
+        "different ordinary admin removing configured root: 404/XMinioAdminNoSuchUser/dynamic no-such-user message"
+      ],
+      "transcript_lines_lf": [
+        "=== RUN   TestS2CNonRootAdminRemoveRootHTTP",
+        "--- PASS: TestS2CNonRootAdminRemoveRootHTTP (0.18s)",
+        "=== RUN   TestS2CRootSelfRemoveHTTP",
+        "--- PASS: TestS2CRootSelfRemoveHTTP (0.10s)",
+        "PASS",
+        "ok   github.com/minio/minio/cmd  1.059s"
+      ],
+      "transcript_sha256_lf_with_trailing_lf": "7f27a1501e2f6b9546547eda989bf9952f2da1260dd324e5aede47cb43d5e7d4"
+    }
+  ],
+  "review_correction": {
+    "rejected_citation": "cmd/admin-handlers-users.go#L2271",
+    "fixed_commit_line_2271": "adminLogIf(ctx, err)",
+    "actual_remove_handler_lines": "48-101"
+  },
+  "redaction": {
+    "real_credentials_present": false,
+    "placeholder": "NAME"
+  }
+}
