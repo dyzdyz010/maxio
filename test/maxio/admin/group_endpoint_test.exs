@@ -201,9 +201,16 @@ defmodule Maxio.Admin.GroupEndpointTest do
   end
 
   test "a user delete-recreate generation race returns signed NoSuchUser" do
-    suffix = System.unique_integer([:positive, :monotonic])
+    suffix = Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
     group_name = "endpoint-user-generation-group-#{suffix}"
     user_name = "endpoint-user-generation-user-#{suffix}"
+
+    on_exit(fn ->
+      unboxed(fn ->
+        :ok = IAM.delete_group(group_name)
+        :ok = IAM.delete_user(user_name)
+      end)
+    end)
 
     unboxed(fn ->
       assert {:ok, _group} = IAM.create_group(name: group_name)

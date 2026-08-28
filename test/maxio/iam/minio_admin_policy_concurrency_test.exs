@@ -529,6 +529,179 @@ defmodule Maxio.IAM.MinioAdminPolicyConcurrencyTest do
     assert [] = Store.list_principal_policies(renamed.group_arn)
   end
 
+  test "generic group policy put serializes before delete-empty and leaves no orphan" do
+    suffix = random_suffix()
+    group_name = "generic-put-delete-#{suffix}"
+    policy_name = "generic-put-delete-policy-#{suffix}"
+    policy_json = Jason.encode!(@document)
+    group = unboxed(fn -> elem(IAM.create_group(name: group_name), 1) end)
+
+    on_exit(fn ->
+      cleanup_group_fixture(group_name, [])
+      Store.delete_principal_policy(group.group_arn, policy_name)
+    end)
+
+    attach_pre_quota_order_barrier(:group, group_name, group.group_arn)
+    :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Maxio.Cluster.Notify.topic())
+
+    put_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.put_principal_policy(group.group_arn, policy_name, policy_json) end)
+      end)
+
+    assert_receive {:ordered_identity_wait, put_pid}
+    assert_receive {:ordered_quota_wait, ^put_pid}
+    refute_received {:principal_policy_changed, _principal_arn}
+
+    delete_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.update_minio_group_members_strict(group_name, [], true, "") end)
+      end)
+
+    assert_receive {:ordered_identity_wait, delete_pid}
+    refute delete_pid == put_pid
+    send(put_pid, {:release_ordered_quota, put_pid})
+
+    assert :ok = Task.await(put_task)
+    assert_receive {:principal_policy_changed, canonical_group_arn}
+    assert canonical_group_arn == group.group_arn
+    assert {:ok, %{operation: :delete_empty}} = Task.await(delete_task)
+    assert :error = unboxed(fn -> IAM.get_group(group_name) end)
+    assert [] = Store.list_principal_policies(group.group_arn)
+  end
+
+  test "generic group policy put serializes before rename and follows the canonical ARN" do
+    suffix = random_suffix()
+    group_name = "generic-put-rename-#{suffix}"
+    renamed_name = "generic-put-rename-target-#{suffix}"
+    policy_name = "generic-put-rename-policy-#{suffix}"
+    policy_json = Jason.encode!(@document)
+    group = unboxed(fn -> elem(IAM.create_group(name: group_name), 1) end)
+
+    on_exit(fn ->
+      cleanup_group_fixture(group_name, [])
+      cleanup_group_fixture(renamed_name, [])
+      Store.delete_principal_policy(group.group_arn, policy_name)
+      Store.delete_principal_policy(IAM.group_arn(renamed_name), policy_name)
+    end)
+
+    attach_pre_quota_order_barrier(:group, group_name, group.group_arn)
+
+    put_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.put_principal_policy(group.group_arn, policy_name, policy_json) end)
+      end)
+
+    assert_receive {:ordered_identity_wait, put_pid}
+    assert_receive {:ordered_quota_wait, ^put_pid}
+
+    rename_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.update_group_name_strict(group_name, renamed_name) end)
+      end)
+
+    assert_receive {:ordered_identity_wait, rename_pid}
+    refute rename_pid == put_pid
+    send(put_pid, {:release_ordered_quota, put_pid})
+
+    assert :ok = Task.await(put_task)
+    assert {:ok, renamed} = Task.await(rename_task)
+    assert [] = Store.list_principal_policies(group.group_arn)
+    assert [%{policy_name: ^policy_name}] = Store.list_principal_policies(renamed.group_arn)
+  end
+
+  test "generic group policy delete serializes before delete-empty" do
+    suffix = random_suffix()
+    group_name = "generic-delete-empty-#{suffix}"
+    policy_name = "generic-delete-empty-policy-#{suffix}"
+    policy_json = Jason.encode!(@document)
+
+    group =
+      unboxed(fn ->
+        group = elem(IAM.create_group(name: group_name), 1)
+        :ok = IAM.put_group_policy(group_name, policy_name, policy_json)
+        group
+      end)
+
+    on_exit(fn ->
+      cleanup_group_fixture(group_name, [])
+      Store.delete_principal_policy(group.group_arn, policy_name)
+    end)
+
+    attach_pre_quota_order_barrier(:group, group_name, group.group_arn)
+    :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Maxio.Cluster.Notify.topic())
+
+    policy_delete_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.delete_principal_policy(group.group_arn, policy_name) end)
+      end)
+
+    assert_receive {:ordered_identity_wait, delete_pid}
+    assert_receive {:ordered_quota_wait, ^delete_pid}
+    refute_received {:principal_policy_changed, _principal_arn}
+
+    group_delete_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.update_minio_group_members_strict(group_name, [], true, "") end)
+      end)
+
+    assert_receive {:ordered_identity_wait, group_delete_pid}
+    refute group_delete_pid == delete_pid
+    send(delete_pid, {:release_ordered_quota, delete_pid})
+
+    assert :ok = Task.await(policy_delete_task)
+    assert_receive {:principal_policy_changed, canonical_group_arn}
+    assert canonical_group_arn == group.group_arn
+    assert {:ok, %{operation: :delete_empty}} = Task.await(group_delete_task)
+    assert [] = Store.list_principal_policies(group.group_arn)
+  end
+
+  test "generic group policy delete serializes before rename" do
+    suffix = random_suffix()
+    group_name = "generic-delete-rename-#{suffix}"
+    renamed_name = "generic-delete-rename-target-#{suffix}"
+    policy_name = "generic-delete-rename-policy-#{suffix}"
+    policy_json = Jason.encode!(@document)
+
+    group =
+      unboxed(fn ->
+        group = elem(IAM.create_group(name: group_name), 1)
+        :ok = IAM.put_group_policy(group_name, policy_name, policy_json)
+        group
+      end)
+
+    on_exit(fn ->
+      cleanup_group_fixture(group_name, [])
+      cleanup_group_fixture(renamed_name, [])
+      Store.delete_principal_policy(group.group_arn, policy_name)
+      Store.delete_principal_policy(IAM.group_arn(renamed_name), policy_name)
+    end)
+
+    attach_pre_quota_order_barrier(:group, group_name, group.group_arn)
+
+    policy_delete_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.delete_principal_policy(group.group_arn, policy_name) end)
+      end)
+
+    assert_receive {:ordered_identity_wait, delete_pid}
+    assert_receive {:ordered_quota_wait, ^delete_pid}
+
+    rename_task =
+      Task.async(fn ->
+        unboxed(fn -> IAM.update_group_name_strict(group_name, renamed_name) end)
+      end)
+
+    assert_receive {:ordered_identity_wait, rename_pid}
+    refute rename_pid == delete_pid
+    send(delete_pid, {:release_ordered_quota, delete_pid})
+
+    assert :ok = Task.await(policy_delete_task)
+    assert {:ok, renamed} = Task.await(rename_task)
+    assert [] = Store.list_principal_policies(group.group_arn)
+    assert [] = Store.list_principal_policies(renamed.group_arn)
+  end
+
   test "a unique conflict from a legacy writer becomes a typed no-effect result" do
     suffix = random_suffix()
     user_name = "unique-conflict-user-#{suffix}"

@@ -47,6 +47,7 @@ defmodule Maxio.IAM do
   alias Maxio.Tags
 
   @root_principal_arn "arn:aws:iam:::root"
+  @local_group_arn_prefix "arn:aws:iam:::group/"
   @default_mfa_device_name "root-account-mfa-device"
   @managed_policy_name_pattern ~r/\A[A-Za-z0-9+=,.@_-]+\z/
   @managed_policy_path_segment_pattern ~r/\A[A-Za-z0-9.,+@=_-]+\z/
@@ -1850,6 +1851,19 @@ defmodule Maxio.IAM do
   identity policy 不允许显式 Principal；principal 由绑定的 principal ARN 隐式提供。
   """
   @spec put_principal_policy(String.t(), String.t(), binary()) :: :ok | {:error, term()}
+  def put_principal_policy(@local_group_arn_prefix <> _group_name = principal_arn, name, json)
+      when is_binary(name) and is_binary(json) do
+    case fetch_group_record(principal_arn) do
+      %Group{} = group ->
+        run_group_inline_policy_mutation(group, fn canonical_group_arn ->
+          Store.put_principal_policy_without_notify(canonical_group_arn, name, json)
+        end)
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
   def put_principal_policy(principal_arn, name, json)
       when is_binary(principal_arn) and is_binary(name) and is_binary(json),
       do: Store.put_principal_policy(principal_arn, name, json)
@@ -1865,6 +1879,22 @@ defmodule Maxio.IAM do
 
   @doc "删除某 principal 的一个 identity policy（幂等）。"
   @spec delete_principal_policy(String.t(), String.t()) :: :ok
+  def delete_principal_policy(@local_group_arn_prefix <> _group_name = principal_arn, name)
+      when is_binary(name) do
+    case fetch_group_record(principal_arn) do
+      %Group{} = group ->
+        case run_group_inline_policy_mutation(group, fn canonical_group_arn ->
+               Store.delete_principal_policy_without_notify(canonical_group_arn, name)
+             end) do
+          :ok -> :ok
+          {:error, :identity_changed} -> :ok
+        end
+
+      nil ->
+        :ok
+    end
+  end
+
   def delete_principal_policy(principal_arn, name)
       when is_binary(principal_arn) and is_binary(name),
       do: Store.delete_principal_policy(principal_arn, name)
