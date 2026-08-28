@@ -8,6 +8,14 @@
 
 用 Elixir/Phoenix 完整复刻 MinIO 的全功能、Amazon S3 兼容对象存储系统（aws-cli/boto3/mc/SDK 直连）。工程约束参考姊妹项目寰析（huanxi）。
 
+## Latest Batch Update (2026-08-28 Admin Policy S1 closeout)
+
+- Admin Policy S1 已落地 MinIO admin v3 的四条本地 managed-policy 路由：`PUT /minio/admin/v3/add-canned-policy`（`admin:CreatePolicy`）、`GET /minio/admin/v3/list-canned-policies`（`admin:ListUserPolicies`）、`GET /minio/admin/v3/info-canned-policy`（`admin:GetPolicy`）与 `DELETE /minio/admin/v3/remove-canned-policy`（`admin:DeletePolicy`）；四者成功状态严格为 200，create/remove 是空 body。AddCannedPolicy 接受无 `Content-Type` 的 raw policy JSON，只接受唯一、正值、纯 ASCII 十进制 `Content-Length`，拒绝 chunked，并精确允许 20,480 bytes、在 20,481 bytes 时于解析前拒绝。`info?v=2` 精确输出 `PolicyName/Policy/CreateDate/UpdateDate` 四个 key，无 `v`/空 `v` 返回 raw policy document，未知 `v` 返回 400；认证后的 `list-canned-policies?bucket=` 仍显式返回 501，绝不静默退化为全局列表。
+- `Maxio.Admin.PolicyAdapter` 只经 `Maxio.IAM` 边界访问托管策略，只向 madmin 暴露严格 `path=/` 的 root-path policy，嵌套 path 不可经构造名称读写；同名 create 保留历史并创建新的 default version，五版本配额显式报错。remove 对 attachment 与 non-default versions 均 fail-closed，返回可行动 blocker 且不级联 detach/delete-version。独立审查发现 `:policy_limit_exceeded`（账户配额或合法文档超过 IAM 6,144-character quota）曾落入 500 fallback；提交 `24315f8` 已将其修复为 400 `XMinioAdminInvalidArgument`，消息与 five-version `:policy_version_limit_exceeded` 明确区分，并以低于 20,480-byte wire limit 的合法超额 JSON 证明失败不持久化；最终独立 review 结论为 `APPROVED`。
+- Admin path-style surface 在 S3 request observers 之前分类为 control plane，不注册 S3 request-metric ledger，也不投递 bucket server access log；普通 path-style S3 与 vhost 下同名 `/minio/admin/...` object path 保持原观察行为。新增只读 CLI `mix maxio.admin.policy.list [--json]` 与 `mix maxio.admin.policy.show NAME [--json]`，并把 `mc admin policy create/ls/info/rm` 生命周期接入 external-smoke harness；这只代表 CLI 与 smoke wiring 已完成，不代表本机 live smoke 已通过。
+- 本批收口证据：Admin S1 focused gate 为 `99 passed`；`mix compile --warnings-as-errors`、`mix format --check-formatted`、`git diff --check` 均 exit 0；协调者只执行一次完整 `mix precommit`，exit 0，结果 `4425 passed, 5 excluded`，耗时 `485.7 seconds`。真实 `mc` / external smoke 明确为 **BLOCKED（不是 passed）**：当前环境缺少可执行 `mc`，且未提供 `MAXIO_ROOT_USER`、`MAXIO_ROOT_PASSWORD`、`MAXIO_COMPAT_ENDPOINT`、`MAXIO_COMPAT_ACCESS_KEY`、`MAXIO_COMPAT_SECRET_KEY`；因此没有启动 server、没有创建 mc alias，也没有创建 live policy。
+- 本批范围严格止于 Admin Policy S1。Admin S2/S3、加密 envelope、user/group 与其余尚未实现的 admin endpoints 继续显式返回 501；不得据此声明完整 MinIO Admin API、live mc 兼容或 production readiness。
+
 ## Latest Batch Update (2026-08-28 dirty-worktree review findings closure)
 
 - `MemoryStore` 的 ETS 生命周期根因已从 owner 层收口：配置该后端时仍由 `Maxio.Application` 纳入监督树；无应用的 `mix run --no-start` 首触不再让一次性调用方持表，而是启动独立临时 owner。受监督 GenServer 收到 ETS `give_away/3` 的 `ETS-TRANSFER` 后还必须重新读取并证明 `table_owner() == self()` 才完成启动（该消息只是可伪造的普通 mailbox term）；旧 owner 在移交前恰好退出时使用启动快照重建，未知 owner 不配合、伪造 transfer 或实际 owner 不符均显式失败，绝不再出现“GenServer 存活但表归临时进程、临时进程退出后凭据静默消失”。回归用例真实终止应用监督子进程，覆盖预启动凭据无损移交及恶意 owner 伪造完全匹配 transfer tuple 两条路径。
