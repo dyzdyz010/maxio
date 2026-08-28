@@ -131,13 +131,36 @@ defmodule Maxio.Admin.ConfigKV.AdapterTest do
       assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
     end
 
-    test "a later-line unknown reset key preserves its exact safe description and mutates nothing" do
-      # Catches reducing only the first reset line, returning an earlier valid key in the public
-      # description, or beginning a transaction before the complete subset is classified.
+    test "a later-line unknown reset keeps the atom contract and exposes detail only on request" do
+      # Catches leaking HTTP-only description tuples to ordinary Adapter callers, losing the safe
+      # evidence needed by Plug, or beginning a transaction before the subset is classified.
       insert_runtime!("s3", "clock_skew_ms", 2_468, 7)
+      command = "s3 clock_skew_ms\ns3 absent"
+      opts = mutation_opts()
 
-      assert {:error, {:config_not_found, "key absent doesn't exist"}} =
-               Adapter.reset("s3 clock_skew_ms\ns3 absent", mutation_opts())
+      assert {:error, :config_not_found} = Adapter.reset(command, opts)
+
+      assert ConfigBatchFailureRepo.observations() == %{
+               transactions: 0,
+               query_calls: 0,
+               advisory_locks: 0
+             }
+
+      assert Repo.one(
+               from row in RuntimeConfig,
+                 where: row.subsystem == "s3" and row.key == "clock_skew_ms",
+                 select: {row.value, row.version}
+             ) == {%{"v" => 2_468}, 7}
+
+      assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+
+      assert {:error,
+              %{
+                reason: {:config_not_found, "key absent doesn't exist"},
+                subsystem: "s3",
+                key_count: 2,
+                stage: :exposure
+              }} = Adapter.reset(command, Keyword.put(opts, :return_error_evidence, true))
 
       assert ConfigBatchFailureRepo.observations() == %{
                transactions: 0,
