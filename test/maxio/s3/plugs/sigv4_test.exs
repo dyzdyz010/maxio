@@ -3,7 +3,10 @@ defmodule Maxio.S3.Plugs.SigV4Test do
   import Plug.Test
   import Plug.Conn
 
+  alias Maxio.Auth.CredentialStore.MemoryStore
+  alias Maxio.Auth.SigningSecret
   alias Maxio.S3.Plugs.SigV4
+  alias Maxio.Test.SigV4Request
 
   @empty_hash "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -33,6 +36,9 @@ defmodule Maxio.S3.Plugs.SigV4Test do
     assert conn.assigns.principal.type == :root
     assert conn.assigns.auth_type == :header
     assert conn.assigns.payload_mode == :single
+    assert %SigningSecret{} = conn.assigns.sigv4_context.caller_secret
+    assert conn.assigns.sigv4_context.signed_payload_sha256 == @empty_hash
+    refute inspect(conn) =~ "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
   end
 
   test "错误签名 halt + 403 SignatureDoesNotMatch XML" do
@@ -44,6 +50,34 @@ defmodule Maxio.S3.Plugs.SigV4Test do
     assert conn.status == 403
     assert conn.resp_body =~ "<Code>SignatureDoesNotMatch</Code>"
     assert get_resp_header(conn, "content-type") |> List.first() =~ "application/xml"
+    refute Map.has_key?(conn.assigns, :sigv4_context)
+  end
+
+  test "session authentication keeps only its own redacted signing secret" do
+    access_key = "ASIACALLERSECRET#{System.unique_integer([:positive])}"
+    session_secret = "session-signing-secret-#{System.unique_integer([:positive])}"
+    session_token = "session-token-#{System.unique_integer([:positive])}"
+
+    assert :ok =
+             MemoryStore.put_access_key(%{
+               access_key: access_key,
+               secret_key: session_secret,
+               session_token: session_token,
+               expires_at: DateTime.add(DateTime.utc_now(), 300, :second),
+               principal: %{type: :root, arn: "arn:aws:iam:::root", tags: %{}}
+             })
+
+    conn =
+      SigV4Request.signed_conn(:get, "/session-secret",
+        access_key: access_key,
+        secret: session_secret,
+        session_token: session_token
+      )
+      |> SigV4.call(SigV4.init([]))
+
+    refute conn.halted
+    assert %SigningSecret{} = conn.assigns.sigv4_context.caller_secret
+    refute inspect(conn.assigns.sigv4_context) =~ session_secret
   end
 
   test "完全无凭据（无 Authorization 且无 presigned 参数）→ 匿名 principal，不 halt（裁决下沉 Authz）" do

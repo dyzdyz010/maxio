@@ -71,6 +71,8 @@ defmodule Maxio.MixProject do
       {:eqrcode, "~> 0.2.1"},
       # STS AssumeRoleWithWebIdentity OIDC JWT/JWK signature verification.
       {:jose, "~> 1.11"},
+      # MinIO Admin v3 madmin-go envelope Argon2id KDF (64 MiB, t=1, p=4).
+      {:argon2_elixir, "~> 4.1"},
       # 纠删码 Rust NIF（reed-solomon-simd + blake3）；use Rustler 宏在 mix compile 期驱动 cargo
       {:rustler, "~> 0.36"},
       # M7 多节点：libcluster 节点发现（dev gossip / prod epmd env host list）

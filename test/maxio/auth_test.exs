@@ -2,6 +2,7 @@ defmodule Maxio.AuthTest do
   use ExUnit.Case, async: false
 
   alias Maxio.Auth
+  alias Maxio.Auth.SigningSecret
   alias Maxio.Auth.SigV4.SignedRequest
   alias Maxio.S3.Error
 
@@ -40,16 +41,22 @@ defmodule Maxio.AuthTest do
     material =
       vector_a_material("f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 
-    assert {:ok, principal, _ctx} = Auth.authenticate(material)
+    assert {:ok, principal, context} = Auth.authenticate(material)
     assert principal.type == :root
     assert principal.access_key == "AKIAIOSFODNN7EXAMPLE"
+    assert %SigningSecret{} = context.caller_secret
+    assert inspect(context.caller_secret) == "#Maxio.Auth.SigningSecret<redacted>"
+    assert context.signed_payload_sha256 == @empty_hash
+    refute inspect(context) =~ "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
   end
 
   test "错误签名 → SignatureDoesNotMatch 403" do
     material = vector_a_material("deadbeef" <> String.duplicate("0", 56))
 
-    assert {:error, %Error{code: "SignatureDoesNotMatch", http_status: 403}} =
-             Auth.authenticate(material)
+    result = Auth.authenticate(material)
+
+    assert {:error, %Error{code: "SignatureDoesNotMatch", http_status: 403}} = result
+    refute inspect(result) =~ "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
   end
 
   test "未知 access key → InvalidAccessKeyId 403" do

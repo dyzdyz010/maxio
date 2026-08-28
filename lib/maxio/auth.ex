@@ -18,6 +18,7 @@ defmodule Maxio.Auth do
   """
   alias Maxio.Auth.SigV4.{Canonical, Signer}
   alias Maxio.Auth.CredentialStore
+  alias Maxio.Auth.SigningSecret
   alias Maxio.S3.{Error, Log}
 
   @algorithm "AWS4-HMAC-SHA256"
@@ -182,10 +183,12 @@ defmodule Maxio.Auth do
       # 要复用的材料——避免重查 secret / 重推 kSigning（铁律 2：不重复劳动）。
       {:ok,
        %{
+         caller_secret: SigningSecret.new(secret),
          k_signing: key,
          scope: scope,
          seed_signature: sr.signature,
-         amz_date: sr.amz_date
+         amz_date: sr.amz_date,
+         signed_payload_sha256: material.payload_hash
        }}
     else
       Log.warn("signature mismatch", auth_type: sr.auth_type, reason: :signature_does_not_match)
