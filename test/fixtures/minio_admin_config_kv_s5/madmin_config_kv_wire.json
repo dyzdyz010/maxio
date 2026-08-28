@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "fixture_id": "madmin-go-config-kv-wire-s5-v1",
+  "evidence_class": "source-pinned-derived-not-live-observed",
+  "pins": {"madmin_go": "4b504b82db633e978a57d49443b2be75824244c3", "minio": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f"},
+  "ciphertext_sample_note": "Exact opaque bytes are a deterministic fixture sentinel for entity framing only, not a live packet or a promise that random SIO encryption is stable.",
+  "ciphertext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f002021222324252627f68319b27606c7ea0e993fbbdbb3982b04",
+  "ciphertext_utf8_length": 58,
+  "entity_matrix": [
+    {"id": "get_request", "method": "GET", "content_length": "absent", "transfer_encoding": "absent", "content_type": "absent", "body_hex": "", "body_length": 0},
+    {"id": "set_request", "method": "PUT", "content_length": "58", "transfer_encoding": "absent", "content_type": "absent", "body_hex_ref": "ciphertext_hex", "body_length": 58},
+    {"id": "reset_request", "method": "DELETE", "content_length": "58", "transfer_encoding": "absent", "content_type": "absent", "body_hex_ref": "ciphertext_hex", "body_length": 58},
+    {"id": "get_response", "method": "GET", "status": 200, "content_length": "58", "transfer_encoding": "absent", "content_type": "application/json", "body_hex_ref": "ciphertext_hex", "body_length": 58},
+    {"id": "set_response", "method": "PUT", "status": 200, "content_length": "0", "transfer_encoding": "absent", "content_type": "absent", "body_hex": "", "body_length": 0},
+    {"id": "reset_response", "method": "DELETE", "status": 200, "content_length": "0", "transfer_encoding": "absent", "content_type": "absent", "body_hex": "", "body_length": 0}
+  ],
+  "applied_header": {"name": "x-minio-config-applied", "true_branch": {"value": "true", "restart": false}, "missing_branch": {"value": "absent", "restart": true}, "other_value_branch": {"value": "not_true", "restart": true}},
+  "request_builder": {"EncryptData": true, "DecryptData": true, "automatic_content_type": false, "positive_content_length": "exact_ciphertext_byte_length", "zero_length_content_length": "absent"}
+}

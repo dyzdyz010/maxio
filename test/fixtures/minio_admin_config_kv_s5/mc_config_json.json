@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "fixture_id": "mc-config-kv-json-s5-v1",
+  "evidence_class": "source-pinned-derived-not-live-observed",
+  "pin": "77f82e18b5401a65958f1619df6ebb994634bd88",
+  "mode": {"stdout": "non_tty", "argv_requires": "--json", "encoding": "compact_json", "pretty_output_forbidden": true, "trailing_lf_count": 1},
+  "argv": {"get": ["mc", "--json", "admin", "config", "get", "ALIAS", "s3"], "set": ["mc", "--json", "admin", "config", "set", "ALIAS", "s3", "clock_skew_ms=900000"], "reset": ["mc", "--json", "admin", "config", "reset", "ALIAS", "s3", "clock_skew_ms"]},
+  "stdout": {
+    "get": {"utf8": "{\"status\":\"success\",\"config\":[{\"subSystem\":\"s3\",\"kv\":[{\"key\":\"clock_skew_ms\",\"value\":\"900000\"}]}]}\n", "utf8_length": 99, "hex": "7b22737461747573223a2273756363657373222c22636f6e666967223a5b7b2273756253797374656d223a227333222c226b76223a5b7b226b6579223a22636c6f636b5f736b65775f6d73222c2276616c7565223a22393030303030227d5d7d5d7d0a"},
+    "set": {"utf8": "{\"status\":\"success\"}\n", "utf8_length": 21, "hex": "7b22737461747573223a2273756363657373227d0a"},
+    "reset": {"utf8": "{\"status\":\"success\"}\n", "utf8_length": 21, "hex": "7b22737461747573223a2273756363657373227d0a"}
+  }
+}

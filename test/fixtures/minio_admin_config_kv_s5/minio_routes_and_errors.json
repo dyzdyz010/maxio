@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "fixture_id": "minio-admin-config-kv-s5-routes-errors-v1",
+  "evidence_class": "source-pinned-derived-not-live-observed",
+  "pins": {
+    "minio": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+    "madmin_go": "4b504b82db633e978a57d49443b2be75824244c3",
+    "mc": "77f82e18b5401a65958f1619df6ebb994634bd88"
+  },
+  "source_excerpts": {
+    "minio_router_config_kv_routes": {"file": "cmd/admin-router.go", "lines": "202-204", "symbol": "adminRouter", "raw_file_sha256": "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9", "excerpt_sha256": "cd7845d7e2019e47e63f5a5906c465bb160f4a9903211f0a219a705833117050"},
+    "minio_del_config_kv_action_and_decrypt": {"file": "cmd/admin-handlers-config-kv.go", "lines": "43-69", "symbol": "DelConfigKVHandler", "raw_file_sha256": "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0", "excerpt_sha256": "7c7fd960f0e2f88fad3809b1e4900d101ec139c0e9595ea36821dea3add20307"},
+    "minio_set_config_kv_action_and_decrypt": {"file": "cmd/admin-handlers-config-kv.go", "lines": "147-176", "symbol": "SetConfigKVHandler", "raw_file_sha256": "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0", "excerpt_sha256": "80f8af1c1a2e2dc3518e86249a9a439e546f995479be29c9f2e4d1566617acb1"},
+    "minio_get_config_kv_action": {"file": "cmd/admin-handlers-config-kv.go", "lines": "233-247", "symbol": "GetConfigKVHandler", "raw_file_sha256": "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0", "excerpt_sha256": "c4183540d0a0395e62932d2dac4e8276790149e4c04b4775cd0eda422cd81fc3"},
+    "madmin_del_config_kv_wire": {"file": "config-kv-commands.go", "lines": "28-60", "symbol": "DelConfigKV", "raw_file_sha256": "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0", "excerpt_sha256": "e5eeb324cd5281b797e0925644f4abbdec8a0153daf6750a58cf96c492afb02d"},
+    "madmin_set_config_kv_wire": {"file": "config-kv-commands.go", "lines": "63-88", "symbol": "SetConfigKV", "raw_file_sha256": "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0", "excerpt_sha256": "115e8d856da915da1a3539dc3932e3068c676dc95a1364de7a4aa4a5f86229ec"},
+    "madmin_get_config_kv_wire": {"file": "config-kv-commands.go", "lines": "90-112", "symbol": "GetConfigKV", "raw_file_sha256": "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0", "excerpt_sha256": "53d5df7f4c3a488e8df181a576c70756a64f07c6cdcb2d1fd2a2fc6f31ca1c11"},
+    "madmin_new_request_entity_headers": {"file": "api.go", "lines": "495-544", "symbol": "newRequest", "raw_file_sha256": "932edaeb340bfdc9343db8f31124ea749cfc4836ab86b7196c5b2a876a9bea4e", "excerpt_sha256": "004ac16858b362fd7705774d5881af72e2d0e4a9ed9fb7f9462b34a3eff071e0"},
+    "minio_subsys_info_write_to": {"file": "internal/config/config.go", "lines": "1447-1477", "symbol": "(*SubsysInfo).WriteTo", "raw_file_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3", "excerpt_sha256": "3e0c076b97d4150a5d40d17279b35c8f7e18fe0e65f7915d29f7b09c9f9cf04b"},
+    "mc_print_non_tty_compaction": {"file": "cmd/print.go", "lines": "34-51", "symbol": "printMsg", "raw_file_sha256": "2797d5a0be76b4f5e06421f09069421df36883f7feee425bbb7c93d46bb2cccb", "excerpt_sha256": "96338ddfe75ded06aeeecaa0572d236edf5904480a72492f5619382f291f4aa3"},
+    "mc_config_get_rendering": {"file": "cmd/admin-config-get.go", "lines": "74-108", "symbol": "configGetMessage", "raw_file_sha256": "651d9d79f8546e55ab6fe4cad7b6113c8469bf70ba08aa766815e1d80dea51a3", "excerpt_sha256": "48e2f3cad229a128306ba2dd0b0f2ed9edd06ebeabee7c69b4dfa8024f3f844f"},
+    "mc_config_set_rendering": {"file": "cmd/admin-config-set.go", "lines": "67-85", "symbol": "configSetMessage", "raw_file_sha256": "babb2a3b100dac1f65ab9eba809a4f5d582618ce9d1afa8453335b5280df0201", "excerpt_sha256": "d4ded1439ba1303de5198c525123fdc8586e8546ac3a22558c40f6bd4bc6839c"},
+    "mc_config_reset_rendering": {"file": "cmd/admin-config-reset.go", "lines": "72-90", "symbol": "configResetMessage", "raw_file_sha256": "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9", "excerpt_sha256": "dd7590ee93ea4c1662462b6803dfeb1d4ea7adc307534491930405559fd94016"}
+  },
+  "provenance": [
+    {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go", "meaning": "three exact v3 routes and GET key matcher"},
+    {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-config-kv.go", "meaning": "ConfigUpdate action, envelope decrypt, error split"},
+    {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go", "meaning": "trailing SP then LF formatter"},
+    {"url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/config-kv-commands.go", "meaning": "encrypted client methods and applied header interpretation"},
+    {"url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/api.go", "meaning": "entity request Content-Length and absent automatic Content-Type"},
+    {"url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go", "meaning": "non-TTY compact JSON and one trailing LF"}
+  ],
+  "routes": [
+    {"id": "KV1", "operation": "get", "method": "GET", "path": "/minio/admin/v3/get-config-kv", "required_query": {"key": "subsystem"}, "action": "admin:ConfigUpdate", "plaintext_request": "none", "plaintext_success": "one KVS line"},
+    {"id": "KV2", "operation": "set", "method": "PUT", "path": "/minio/admin/v3/set-config-kv", "required_query": {}, "action": "admin:ConfigUpdate", "plaintext_request": "subsystem key=value ...", "plaintext_success": "empty"},
+    {"id": "KV3", "operation": "reset", "method": "DELETE", "path": "/minio/admin/v3/del-config-kv", "required_query": {}, "action": "admin:ConfigUpdate", "plaintext_request": "subsystem [key ...]", "plaintext_success": "empty"}
+  ],
+  "query_branches": {
+    "missing_key_authenticated": {"matches_handler": false, "status": 426, "code": "XMinioAdminVersionMismatch", "description_template": "This 'admin' API is not supported by server in '<mode>'"},
+    "empty_key_authorized": {"matches_handler": true, "status": 400, "code": "XMinioConfigError", "description": "unknown subsystem: "},
+    "unauthenticated_admin_surface": {"status": 403, "code": "AccessDenied", "precedence": "before_route_detail"}
+  },
+  "error_precedence": ["authentication", "route_and_admin_ConfigUpdate_authorization", "query_or_mutation_framing", "actual_read_length", "SigV4_payload_hash", "SIO_decrypt", "KVS_syntax", "exposure_boundary", "scalar_validation", "transactional_apply", "postcommit"],
+  "errors": {
+    "generic": {"status": 400, "code": "XMinioConfigError", "examples": ["unknown subsystem: ", "unknown sub-system bad value", "sub-system 's3' cannot have empty keys"]},
+    "not_found": {"status": 404, "code": "XMinioConfigNotFoundError", "description": "key absent doesn't exist", "only": "reset of ordinary unknown key in exposed subsystem"},
+    "bad_json": {"status": 400, "code": "XMinioAdminConfigBadJSON", "description": "JSON configuration provided is of incorrect format", "causes": ["invalid SIO envelope", "actual read length mismatch", "typed validator failure"]},
+    "too_large": {"status": 400, "code": "XMinioAdminConfigTooLarge"},
+    "payload_hash": {"status": 400, "code": "XAmzContentSHA256Mismatch"}
+  },
+  "same_body_reset": {"body_utf8": "s3\ns3\n", "upstream": {"status": 400}, "maxio": {"status": 200, "meaning": "full_subsystem_reset_once"}, "independent_retry": {"normally_status": 200, "meaning": "successful_noop_zero_version_zero_audit_zero_postcommit"}},
+  "deliberate_deviations": [
+    {"id": "maxio-unauthenticated-admin-route-concealment", "status": 403},
+    {"id": "maxio-exact-content-length-framing", "status": 400, "code": "XMinioAdminConfigTooLarge"},
+    {"id": "maxio-hidden-reset-generic-error", "path": "cluster.deployment_id", "status": 400, "code": "XMinioConfigError"},
+    {"id": "maxio-duplicate-full-reset-noop", "upstream_status": 400, "maxio_status": 200},
+    {"id": "maxio-runtime-audit-atomicity", "upstream": "separate_config_and_history_writes", "maxio": "single_database_transaction"}
+  ],
+  "unsupported_catalog_claims": ["help-config-kv", "config_export_import", "config_history", "subsystem_target", "api", "site", "notify_*", "logger_*", "identity_*", "service_restart"]
+}

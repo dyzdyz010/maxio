@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "fixture_id": "mc-config-kv-human-s5-v1",
+  "evidence_class": "source-pinned-derived-not-live-observed",
+  "pin": "77f82e18b5401a65958f1619df6ebb994634bd88",
+  "capture": {"stdout": "non_tty", "color": "disabled", "encoding": "utf-8", "MC_CONFIG_DIR": "isolated"},
+  "argv": {"get": ["mc", "--no-color", "admin", "config", "get", "ALIAS", "s3"], "set": ["mc", "--no-color", "admin", "config", "set", "ALIAS", "s3", "clock_skew_ms=900000"], "reset": ["mc", "--no-color", "admin", "config", "reset", "ALIAS", "s3", "clock_skew_ms"]},
+  "stdout": {
+    "get": {"utf8": "s3 clock_skew_ms=900000 \n", "utf8_length": 25, "hex": "733320636c6f636b5f736b65775f6d733d393030303030200a"},
+    "set_applied": {"utf8": "Successfully applied new settings.\n", "utf8_length": 35, "hex": "5375636365737366756c6c79206170706c696564206e65772073657474696e67732e0a"},
+    "set_restart": {"utf8": "Successfully applied new settings.\nPlease restart your server 'mc admin service restart ALIAS'.\n", "utf8_length": 96, "hex": "5375636365737366756c6c79206170706c696564206e65772073657474696e67732e0a506c65617365207265737461727420796f75722073657276657220276d632061646d696e2073657276696365207265737461727420414c494153272e0a"},
+    "reset_applied": {"utf8": "'s3 clock_skew_ms' is successfully reset.\n", "utf8_length": 42, "hex": "27733320636c6f636b5f736b65775f6d7327206973207375636365737366756c6c792072657365742e0a"},
+    "reset_restart": {"utf8": "'s3 clock_skew_ms' is successfully reset.\nPlease restart your server with `mc admin service restart ALIAS`.\n", "utf8_length": 108, "hex": "27733320636c6f636b5f736b65775f6d7327206973207375636365737366756c6c792072657365742e0a506c65617365207265737461727420796f757220736572766572207769746820606d632061646d696e2073657276696365207265737461727420414c494153602e0a"}
+  },
+  "local_help_or_rejection": {"get_alias_only": "help-config-kv_no_get_http", "set_without_equals": "help-config-kv_no_set_http", "reset_alias_only": "help-config-kv_no_delete_http", "reset_tail_contains_equals": "local_error_no_http"}
+}
