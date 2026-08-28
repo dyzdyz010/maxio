@@ -90,6 +90,119 @@ defmodule Mix.Tasks.MaxioAdminConfigTest do
     Enum.each(request_ids, &refute(quoted_output =~ &1 or split_output =~ &1))
   end
 
+  test "mutation formatter emits unique apply modes in deterministic order" do
+    # Catches map-enumeration order leaking into operator-visible output or duplicate apply modes
+    # being printed once per changed key instead of once per mode.
+    result = %{
+      committed?: true,
+      subsystem: :formatter_fixture,
+      changed_count: 4,
+      changed_keys: [:restart_key, :hot_key, :next_cycle_key, :second_hot_key],
+      outcomes: %{
+        restart_key: full_outcome(:set, true, 1, :restart),
+        hot_key: full_outcome(:set, true, 1, :hot),
+        next_cycle_key: full_outcome(:reset, true, nil, :next_cycle),
+        second_hot_key: full_outcome(:set, true, 1, :hot),
+        unchanged_key: full_outcome(:set, false, 9, :restart)
+      },
+      local_reload: :ok,
+      broadcast: :ok,
+      attention?: false
+    }
+
+    assert AdminSet.format_result(result) ==
+             "committed=true changed_count=4 apply_modes=hot,next_cycle,restart " <>
+               "local_reload=ok broadcast=ok attention=false"
+  end
+
+  test "mutation formatter exposes only closed postcommit failure enums" do
+    # Catches collapsing the two independently actionable postcommit failures into a generic
+    # value, dropping attention=true, or leaking an internal reason into the safe CLI line.
+    result = %{
+      committed?: true,
+      subsystem: :s3,
+      changed_count: 1,
+      changed_keys: [:clock_skew_ms],
+      outcomes: %{
+        clock_skew_ms: full_outcome(:set, true, 2, :hot)
+      },
+      local_reload: {:error, :reload_failed},
+      broadcast: {:error, :broadcast_failed},
+      attention?: true
+    }
+
+    assert AdminSet.format_result(result) ==
+             "committed=true changed_count=1 apply_modes=hot " <>
+               "local_reload=reload_failed broadcast=broadcast_failed attention=true"
+  end
+
+  test "mutation formatter rejects contradictory and unknown result shapes with one safe error" do
+    # Catches malformed coordinator/Adapter results being rendered as committed truth with
+    # apply_modes=unknown, local_reload=failed, a false changed count, or contradictory attention.
+    valid_changed = %{
+      committed?: true,
+      subsystem: :s3,
+      changed_count: 1,
+      changed_keys: [:clock_skew_ms],
+      outcomes: %{
+        clock_skew_ms: full_outcome(:set, true, 2, :hot)
+      },
+      local_reload: :ok,
+      broadcast: :ok,
+      attention?: false
+    }
+
+    valid_no_op = %{
+      committed?: true,
+      subsystem: :s3,
+      changed_count: 0,
+      changed_keys: [],
+      outcomes: %{
+        clock_skew_ms: full_outcome(:set, false, 2, :hot)
+      },
+      local_reload: :not_needed,
+      broadcast: :not_needed,
+      attention?: false
+    }
+
+    invalid_results = [
+      {"changed_count exceeds changed outcomes", Map.put(valid_changed, :changed_count, 2)},
+      {"changed_count hides a changed outcome", Map.put(valid_changed, :changed_count, 0)},
+      {"unknown applied mode",
+       put_in(valid_changed, [:outcomes, :clock_skew_ms, :applied], :eventually)},
+      {"malformed changed outcome",
+       put_in(valid_changed, [:outcomes, :clock_skew_ms], %{changed?: true})},
+      {"non-map outcome", put_in(valid_changed, [:outcomes, :clock_skew_ms], :invalid)},
+      {"unknown reload result",
+       Map.put(valid_changed, :local_reload, {:error, {:internal, "TOP-SECRET"}})},
+      {"unknown broadcast result",
+       Map.put(valid_changed, :broadcast, {:error, {:transport, "TOP-SECRET"}})},
+      {"invalid attention", Map.put(valid_changed, :attention?, :yes)},
+      {"uncommitted result", Map.put(valid_changed, :committed?, false)},
+      {"failed postcommit without attention",
+       Map.put(valid_changed, :local_reload, {:error, :reload_failed})},
+      {"attention without postcommit failure", Map.put(valid_changed, :attention?, true)},
+      {"changed result claims postcommit was unnecessary",
+       valid_changed
+       |> Map.put(:local_reload, :not_needed)
+       |> Map.put(:broadcast, :not_needed)},
+      {"no-op claims postcommit ran",
+       valid_no_op
+       |> Map.put(:local_reload, :ok)
+       |> Map.put(:broadcast, :ok)}
+    ]
+
+    for {label, result} <- invalid_results do
+      error =
+        assert_raise Mix.Error, "configuration operation returned an invalid result", fn ->
+          AdminSet.format_result(result)
+        end
+
+      assert error.message == "configuration operation returned an invalid result", label
+      refute error.message =~ "TOP-SECRET"
+    end
+  end
+
   test "RESET subset joins quoted and split argv and changes only the exposed key" do
     # Catches a reset task with its own whitespace grammar or a direct delete that bypasses the
     # Adapter's exposed-key projection.
@@ -387,12 +500,12 @@ defmodule Mix.Tasks.MaxioAdminConfigTest do
     observed = List.first(rows)
 
     cond do
-      match?(["Lock", _wait_event, _state], observed) ->
+      match?(["Lock", "advisory", _state], observed) ->
         :ok
 
       System.monotonic_time(:millisecond) >= deadline ->
         flunk(
-          "backend #{backend_pid} did not wait on the config subsystem lock; " <>
+          "backend #{backend_pid} did not wait on the config subsystem advisory lock; " <>
             "observed=#{inspect(observed || last_observed)}"
         )
 
@@ -405,6 +518,16 @@ defmodule Mix.Tasks.MaxioAdminConfigTest do
   defp backend_pid! do
     %{rows: [[backend_pid]]} = Ecto.Adapters.SQL.query!(Repo, "SELECT pg_backend_pid()")
     backend_pid
+  end
+
+  defp full_outcome(operation, changed?, version, applied) do
+    %{
+      operation: operation,
+      changed?: changed?,
+      version: version,
+      value: if(operation == :reset, do: nil, else: :fixture_value),
+      applied: applied
+    }
   end
 
   defp cleanup_unboxed! do
