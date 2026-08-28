@@ -240,18 +240,22 @@ madmin 总是发送一个 concrete Content-Length。Maxio 在两者交集上再�
 | envelope 解密失败、实读长度不符 | 400 `XMinioAdminConfigBadJSON` | 默认 message：`JSON configuration provided is of incorrect format` |
 | payload hash 不符 | 400 `XAmzContentSHA256Mismatch` | 复用现有错误表 |
 | 明确请求 target | 400 `XMinioAdminInvalidArgument` | 本批不支持 target 的显式偏差 |
-| set/get 的 unknown subsystem、set unknown-only/语法 generic error | 400 `XMinioConfigError` | Description 逐字使用 `config.ErrConfigGeneric.Error()`；固定 `toAdminAPIErr` 映射 |
+| get/set/reset 的 unknown subsystem、set unknown-only/语法 generic error | 400 `XMinioConfigError` | Description 逐字使用 `config.ErrConfigGeneric.Error()`；固定 `toAdminAPIErr` 映射 |
 | set 最终 typed/cross-key validator 失败 | 400 `XMinioAdminConfigBadJSON` | handler 的 `badConfigErr` 分支；Description 使用安全 validator message |
 | Maxio cross-subsystem / unknown-prefix safety deviation | 400 `XMinioAdminConfigBadJSON` | §4.2/§4.4 明确列举的本地防静默验证；不能泛化成 duplicate/unknown gate |
-| reset 不存在的 key/target | 404 `XMinioConfigNotFoundError` | Description 逐字使用 `config.ErrConfigNotFound.Error()` |
-| wire registry 未暴露（含 `cluster.deployment_id`） | 400 `XMinioConfigError` | 对 Admin Config KVS 表现为 unknown，不泄露内部可写 schema |
+| reset 已暴露 subsystem 下的普通 unknown key | 404 `XMinioConfigNotFoundError` | Description 逐字使用 `config.ErrConfigNotFound.Error()`；这是 reset 独有的 key-not-found 分支 |
+| get/set 请求 wire-hidden path（含 `cluster.deployment_id`） | 400 `XMinioConfigError` | exposure registry 在进入 core 前把它投影为不可用，不泄露内部可写 schema |
+| reset 请求 wire-hidden path（含 `cluster.deployment_id`） | 400 `XMinioConfigError` | **deliberate exposure deviation**：不同于已暴露 subsystem 下普通 unknown key reset 的 404；只用于阻断已知 hidden core path，绝不映射为 `XMinioAdminConfigBadJSON` |
 | 命中 Maxio secret/backend 禁止清单 | 403 `AccessDenied` | 禁止判定先于 unknown，避免把根信任材料伪装成普通 typo |
 | commit 前 Repo/事务不可用 | 500 `InternalError` | 详细原因只进结构化日志 |
 | commit 后 reload/broadcast 异常 | 200 committed | 不回滚、不诱导盲重试；见 §8 |
 
 这些映射已由固定源码冻结，不再列 VERIFY：`config.ErrConfigGeneric` → 400 `XMinioConfigError`，
 `config.ErrConfigNotFound` → 404 `XMinioConfigNotFoundError`，只有 handler 包装的 `badConfigErr` →
-400 `XMinioAdminConfigBadJSON`。unknown token 的位置敏感例外仍按 §4.4，不能用本表抹平；不得把
+400 `XMinioAdminConfigBadJSON`。其中已暴露 subsystem 下普通 unknown key 的 reset 必须保留 404；
+unknown subsystem 的 reset 仍随 `config.ErrConfigGeneric` 返回 400。已知 wire-hidden path
+的 reset 由 Maxio exposure registry 有意改成 400 `XMinioConfigError`，是本地暴露边界偏差，不能
+反推为 upstream 通用映射。unknown token 的位置敏感例外仍按 §4.4，不能用本表抹平；不得把
 所有 parser/validator 错误笼统改写成 ConfigBadJSON，也不得新增猜测的 `XMaxio*` code。
 
 固定源码中可直接确定的 Description 也进入 fixture，不再等待活体猜测：
@@ -259,8 +263,7 @@ madmin 总是发送一个 concrete Content-Length。Maxio 在两者交集上再�
 - GET unknown：`unknown subsystem: <subsystem>`；空 `key` 即 `unknown subsystem: `；
 - set/reset unknown subsystem：`unknown sub-system <完整明文输入>`；
 - set 没有任何 registered marker：`sub-system '<subsystem>' cannot have empty keys`；
-- reset 不存在的单键：`key <key> doesn't exist`；
-- reset 已不存在的整个默认 target：`sub-system <subsystem>:_ already deleted or does not exist`。
+- reset 不存在的单键：`key <key> doesn't exist`。
 
 错误 JSON 可以回显调用者自己提交的非敏感输入，但 forbidden secret/backend 分支必须在此之前
 截断为 AccessDenied，不能把 secret value 拼进 Description 或日志。
@@ -376,22 +379,30 @@ listing sql_hard_limit
   env 状态。no-op 不造审计行、不造版本，但命令整体仍返回 200。
 - reset 以 whitespace fields 读取 key；同一 key 重复出现时第一次已恢复 fallback，后续重复是
   同一候选配置上的幂等操作，不创造 duplicate 错误。
-- unknown 或仅 core 可见但 wire hidden 的 key 返回 `XMinioConfigError`；命中 secret/backend 禁止清单
-  返回 AccessDenied。任一失败都不能在同批里先 reset 其他合法键。
+- 已暴露 subsystem 下的普通 wire-unknown key 返回 404 `XMinioConfigNotFoundError`；这是 `DelKVS` 的
+  `config.ErrConfigNotFound` 分支。精确命中 exposure registry 已知但 wire-hidden 的 core key（首批只有
+  `cluster.deployment_id`）则在进入 core reset 前返回 400 `XMinioConfigError`。后者是 deliberate
+  exposure deviation，绝不改写成 `XMinioAdminConfigBadJSON`。命中 secret/backend 禁止清单返回
+  AccessDenied。任一失败都不能在同批里先 reset 其他合法键。
 
 固定 MinIO 的 `DelKVS` 是“恢复 registered default 或删除目标”，Maxio 删除 runtime override 后
 回到 env/application fallback，与其运维语义同构。
 
-**完整 subsystem 重复 reset 是 deliberate idempotency deviation。** 固定 MinIO 对已删除的整个
-target/subsystem 可返回 `config.ErrConfigNotFound`；Maxio 的 per-key override 模型没有“已删除的
-default target”状态，故以下两种重试一律成功 no-op：
+**完整 subsystem reset 采用更强的幂等契约，但不能建立在错误的 upstream 404 前提上。** 固定
+MinIO handler 在 `DelFrom`/`DelKVS` 前先对**整个 plaintext body**调用一次
+`GetSubSys(string(kvBytes))`。因此同一 envelope 明文 `s3\ns3\n` 不会被解释成两次合法 reset；整个
+字符串被当作 subsystem，命中 `config.ErrConfigGeneric`，固定结果是 400 `XMinioConfigError`，不会
+到达“第二次删除”的 not-found 分支。Maxio 的 batch parser 会逐行处理同 subsystem reset，并把第二行
+定义为 no-op；因此对该 exact body 返回 200 是明确的 parser/idempotency deviation，fixture 必须锁住
+upstream 400 与 Maxio 200，而不是虚构 upstream 404。
 
-- 同一 envelope 明文重复两行 `s3\ns3\n`；
-- 第一次 `DELETE` 成功后，以相同 `s3` 明文再次发送完整 HTTP retry。
-
-第二次/重复行不增 version、不写 audit、不 reload、不 broadcast，返回 200、
-`x-minio-config-applied: true`、`Content-Length: 0`、无 Content-Type、空 body。protocol fixture 必须
-锁住“固定 MinIO 可报 404，而 Maxio 200 no-op”的两边证据，防止以后把安全重试退化成错误。
+独立 HTTP retry 会重新读取 authoritative config；固定 MinIO 的 merge/default 构造通常恢复 default
+target，所以再次发送 `s3` 通常仍返回 200。目前没有已取证的输入既通过 whole-body `GetSubSys` 又在
+后续重复删除中稳定得到 upstream 404，故本批不建立此类 upstream fixture。Maxio 则作出更强且稳定的
+本地保证：完整 subsystem reset 及其独立 retry 一律成功；若没有 runtime override，就是 200 no-op，
+不增 version、不写 audit、不 reload、不 broadcast，并返回 `x-minio-config-applied: true`、
+`Content-Length: 0`、无 Content-Type、空 body。独立 retry fixture 只锁 Maxio 的 200 与零副作用；
+不得声称固定 MinIO 在该场景返回 404。
 
 ### 4.6 get
 
@@ -450,8 +461,10 @@ Maxio 绝不保存 unknown key；在固定 tokenizer 把 unknown 后缀归入 va
 ### 5.2 明确隐藏
 
 - `{:cluster, :deployment_id}` 即使当前属于 runtime schema，也不投影。它是部署稳定身份；允许
-  `mc admin config set` 修改会使审计、复制和 ServerInfo 身份发生语义漂移；经本端点请求它时按
-  wire unknown 返回 ConfigBadJSON，不透露 core schema 的存在。
+  `mc admin config set` 修改会使审计、复制和 ServerInfo 身份发生语义漂移。get/set 请求固定返回
+  400 `XMinioConfigError`；reset 请求也固定返回 400 `XMinioConfigError`，这是相对已暴露 subsystem
+  下普通 unknown key reset 返回 404 `XMinioConfigNotFoundError` 的 deliberate exposure deviation。该规则只识别 registry 中
+  已知的 wire-hidden key，不扫描或猜测其他 unknown 名称，且绝不返回 `XMinioAdminConfigBadJSON`。
 - `Maxio.Config.Schema.forbidden_keys/0` 与 `forbidden_subsystems/0` 的全部 key 都隐藏且不可写。
 - root user/password、access-key secret、SSE/KMS/MFA key、storage/credential/policy backend、
   Repo、topology/authoritative-source 等绝不进入 registry。
@@ -845,7 +858,9 @@ non-TTY 输出。测试应证明：
 - GET ciphertext 200 response 为 exact CL，mutation 200 response 为 CL0/no CT/empty body；
 - applied header 的 true/缺失分支；
 - 固定源码的 `XMinioConfigError` / `XMinioConfigNotFoundError` /
-  `XMinioAdminConfigBadJSON` 分流；
+  `XMinioAdminConfigBadJSON` 分流；尤其锁住 unknown subsystem reset 的 400、已暴露 subsystem 下普通
+  unknown key reset 的 404、wire-hidden reset 的 deliberate 400 exposure deviation，以及后者绝不落到
+  BadJSON；
 - get human 的 `<SP><LF>`、compact JSON，以及 set/reset compact
   `{"status":"success"}<LF>` stdout 与 exit status。
 
@@ -854,8 +869,11 @@ non-TTY 输出。测试应证明：
 覆盖合法空白/quote、单行 duplicate 被 value 吸收后由 validator 决定、同 subsystem 多行重复后写覆盖、
 首行非法 raw value 被后行合法值覆盖后只验证最终值、
 unknown-only/unknown-suffix 的固定行为、unknown-prefix deliberate deviation、合法 reset no-op、reset
-subset/full subsystem、full-subsystem repeated reset/HTTP retry 的 200 no-op deviation、跨 subsystem
-deliberate deviation、target 显式拒绝、稳定顺序、尾 `<SP><LF>`、
+subset/full subsystem、unknown subsystem reset 的 400、已暴露 subsystem 下普通 unknown key reset 的
+404、wire-hidden reset 的 deliberate 400 exposure deviation、
+同一 body `s3\ns3\n` 的 upstream 400/Maxio 200 parser deviation、独立 full-subsystem retry 的 Maxio
+200/零 version/零 audit/零 postcommit 保证（不设 upstream 404 fixture）、跨 subsystem deliberate
+deviation、target 显式拒绝、稳定顺序、尾 `<SP><LF>`、
 boolean/integer 格式、redaction 静态断言。
 
 ### 12.3 核心事务与并发
