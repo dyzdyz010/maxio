@@ -70,6 +70,32 @@ defmodule Maxio.Admin.ErrorMapTest do
              ErrorMap.from_reason(:not_found)
   end
 
+  test "maps U4 and U5 target errors to exact dynamic MinIO admin contracts" do
+    for reason <- [:minio_user_not_found] do
+      assert %{
+               code: "XMinioAdminNoSuchUser",
+               http_status: 404,
+               message: "The specified user does not exist. (Specified user does not exist)"
+             } = ErrorMap.from_reason(reason)
+    end
+
+    assert %{
+             code: "XMinioIAMActionNotAllowed",
+             http_status: 403,
+             message: "Specified IAM action is not allowed"
+           } = ErrorMap.from_reason(:minio_action_not_allowed)
+
+    for reason <- [:invalid_status_self_target, :invalid_status_argument] do
+      assert %{
+               code: "XMinioAdminInvalidArgument",
+               http_status: 400,
+               message: "Invalid arguments specified. (Invalid arguments specified)"
+             } = ErrorMap.from_reason(reason)
+    end
+
+    assert ErrorMap.from_reason(:invalid_argument).message == "Invalid arguments specified."
+  end
+
   test "delete blockers are actionable without embedding entity maps" do
     attached =
       ErrorMap.from_reason(

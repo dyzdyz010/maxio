@@ -392,7 +392,7 @@ defmodule Maxio.Admin.UserEndpointTest do
 
   test "self-read still needs a full identity allow under V-B17" do
     {access_key, secret, arn} = put_action_key(nil)
-    assert {:ok, _user} = IAM.create_user(name: access_key)
+    assert {:ok, _user} = IAM.get_user(access_key)
 
     denied =
       signed(:get, @path,
@@ -567,11 +567,251 @@ defmodule Maxio.Admin.UserEndpointTest do
     assert :error = EctoStore.get_secret(denied_target)
   end
 
-  test "list bucket variant authorizes first while U4 U5 and wrong routes remain JSON 501" do
+  test "U4 remove and U5 status use exact actions, ignore bodies, and return empty 200" do
+    owner = self()
+    original_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: original_level) end)
+    status_target = unique_access_name("STATUSHTTP")
+    remove_target = unique_access_name("REMOVEHTTP")
+
+    assert {:ok, _created} =
+             IAM.create_minio_user_strict(status_target, "status-http-secret", "active")
+
+    assert {:ok, _created} =
+             IAM.create_minio_user_strict(remove_target, "remove-http-secret", "active")
+
+    log =
+      capture_log([level: :info], fn ->
+        disabled =
+          signed_body(:put, "#{@base}/set-user-status", <<0>>,
+            query: %{"accessKey" => status_target, "status" => "disabled"}
+          )
+
+        send(owner, {:disabled_user, disabled})
+      end)
+
+    assert_receive {:disabled_user, disabled}
+
+    assert disabled.status == 200
+    assert disabled.resp_body == ""
+    assert {:ok, %{status: "inactive"}} = IAM.get_user(status_target)
+    assert log =~ "admin user mutation committed"
+    assert log =~ "required_action=admin:EnableUser"
+    assert log =~ "target_user=#{status_target}"
+    assert log =~ "requested_status=disabled"
+
+    for field <- [
+          "affected_credentials",
+          "access_keys_deleted",
+          "sessions_revoked",
+          "principal_policies_deleted",
+          "memberships_deleted",
+          "managed_policy_attachments_deleted",
+          "mfa_devices_deleted",
+          "signing_certificates_deleted",
+          "ssh_public_keys_deleted",
+          "invalidation_failure_count"
+        ] do
+      assert log =~ "#{field}="
+    end
+
+    enabled =
+      signed(:put, "#{@base}/set-user-status",
+        query: %{"accessKey" => status_target, "status" => "enabled"},
+        region: ""
+      )
+
+    assert enabled.status == 200
+    assert enabled.resp_body == ""
+    assert {:ok, %{status: "active"}} = IAM.get_user(status_target)
+
+    removed =
+      signed(:delete, "#{@base}/remove-user",
+        query: %{"accessKey" => remove_target},
+        region: ""
+      )
+
+    assert removed.status == 200
+    assert removed.resp_body == ""
+    assert :error = IAM.get_user(remove_target)
+
+    assert_admin_error(
+      signed(:delete, "#{@base}/remove-user",
+        query: %{"accessKey" => remove_target},
+        region: ""
+      ),
+      404,
+      "XMinioAdminNoSuchUser"
+    )
+  end
+
+  test "U4 and U5 bucket variants authorize before JSON 501 and never mutate" do
+    status_target = unique_access_name("STATUSBUCKET")
+    remove_target = unique_access_name("REMOVEBUCKET")
+
+    assert {:ok, _created} =
+             IAM.create_minio_user_strict(status_target, "status-bucket-secret", "active")
+
+    assert {:ok, _created} =
+             IAM.create_minio_user_strict(remove_target, "remove-bucket-secret", "active")
+
+    status_conn =
+      signed(:put, "#{@base}/set-user-status",
+        query: %{
+          "accessKey" => status_target,
+          "status" => "disabled",
+          "bucket" => "bucket-a"
+        },
+        region: ""
+      )
+
+    remove_conn =
+      signed(:delete, "#{@base}/remove-user",
+        query: %{"accessKey" => remove_target, "bucket" => "bucket-a"},
+        region: ""
+      )
+
+    assert_admin_error(status_conn, 501, "NotImplemented")
+    assert_admin_error(remove_conn, 501, "NotImplemented")
+    assert {:ok, %{status: "active"}} = IAM.get_user(status_target)
+    assert {:ok, %{status: "active"}} = IAM.get_user(remove_target)
+
+    {denied_key, denied_secret, _arn} = put_action_key(nil)
+
+    denied =
+      signed(:delete, "#{@base}/remove-user",
+        query: %{"accessKey" => remove_target, "bucket" => "bucket-a"},
+        access_key: denied_key,
+        secret: denied_secret,
+        region: ""
+      )
+
+    assert_admin_error(denied, 403, "AccessDenied")
+    assert {:ok, %{status: "active"}} = IAM.get_user(remove_target)
+  end
+
+  test "U4 and U5 preserve dynamic target errors and authorize before classification" do
+    root_status =
+      signed(:put, "#{@base}/set-user-status",
+        query: %{"accessKey" => @root_access_key, "status" => "disabled"},
+        region: ""
+      )
+
+    assert_admin_error(root_status, 400, "XMinioAdminInvalidArgument")
+
+    assert Jason.decode!(root_status.resp_body)["Message"] ==
+             "Invalid arguments specified. (Invalid arguments specified)"
+
+    root_remove =
+      signed(:delete, "#{@base}/remove-user",
+        query: %{"accessKey" => @root_access_key},
+        region: ""
+      )
+
+    assert_admin_error(root_remove, 404, "XMinioAdminNoSuchUser")
+
+    assert Jason.decode!(root_remove.resp_body)["Message"] ==
+             "The specified user does not exist. (Specified user does not exist)"
+
+    unknown_status =
+      signed(:put, "#{@base}/set-user-status",
+        query: %{"accessKey" => unique_access_name("UNKNOWN"), "status" => "paused"},
+        region: ""
+      )
+
+    assert_admin_error(unknown_status, 400, "XMinioAdminInvalidArgument")
+
+    assert Jason.decode!(unknown_status.resp_body)["Message"] ==
+             "Invalid arguments specified. (Invalid arguments specified)"
+
+    missing_status =
+      signed(:put, "#{@base}/set-user-status",
+        query: %{"accessKey" => unique_access_name("MISSING")},
+        region: ""
+      )
+
+    assert_admin_error(missing_status, 400, "XMinioAdminInvalidArgument")
+    assert Jason.decode!(missing_status.resp_body)["Message"] == "Invalid arguments specified."
+
+    {denied_key, denied_secret, _arn} = put_action_key(nil)
+
+    denied =
+      signed(:delete, "#{@base}/remove-user",
+        query: %{"accessKey" => @root_access_key},
+        access_key: denied_key,
+        secret: denied_secret,
+        region: ""
+      )
+
+    assert_admin_error(denied, 403, "AccessDenied")
+  end
+
+  test "a real signed STS actor can status and remove its parent by exact session key" do
+    use_ecto_credentials!()
+    parent_key = unique_access_name("STSPARENT")
+    session_key = unique_access_name("STSMUTATE")
+    session_secret = "sts-mutation-session-secret"
+    session_token = "sts-mutation-session-token"
+
+    assert {:ok, %{user: user}} =
+             IAM.create_minio_user_strict(parent_key, "sts-parent-secret", "active")
+
+    :ok =
+      Store.put_principal_policy(
+        user.user_arn,
+        unique_name("sts-admin-user-mutation"),
+        Jason.encode!(%{
+          "Version" => "2012-10-17",
+          "Statement" => %{
+            "Effect" => "Allow",
+            "Action" => ["admin:EnableUser", "admin:DeleteUser"]
+          }
+        })
+      )
+
+    assert {:ok, session} =
+             STS.issue_session(
+               issuer_access_key_id: parent_key,
+               session_access_key_id: session_key,
+               secret_key: session_secret,
+               session_token: session_token,
+               duration_seconds: 900
+             )
+
+    disabled =
+      signed(:put, "#{@base}/set-user-status",
+        query: %{"accessKey" => parent_key, "status" => "disabled"},
+        access_key: session.access_key_id,
+        secret: session_secret,
+        session_token: session_token,
+        region: ""
+      )
+
+    assert disabled.status == 200
+    assert {:ok, %{status: "inactive"}} = IAM.get_user(parent_key)
+
+    assert signed(:put, "#{@base}/set-user-status",
+             query: %{"accessKey" => parent_key, "status" => "enabled"},
+             region: ""
+           ).status == 200
+
+    removed =
+      signed(:delete, "#{@base}/remove-user",
+        query: %{"accessKey" => parent_key},
+        access_key: session.access_key_id,
+        secret: session_secret,
+        session_token: session_token,
+        region: ""
+      )
+
+    assert removed.status == 200
+    assert :error = IAM.get_user(parent_key)
+  end
+
+  test "list bucket variant authorizes first while wrong routes remain JSON 501" do
     for {method, path, query} <- [
           {:get, "#{@base}/list-users", %{"bucket" => ""}},
-          {:delete, "#{@base}/remove-user", %{"accessKey" => "alice"}},
-          {:put, "#{@base}/set-user-status", %{"accessKey" => "alice", "status" => "enabled"}},
           {:post, "#{@base}/add-user", %{"accessKey" => "alice"}},
           {:get, "#{@base}/unknown-user-route", %{}}
         ] do
@@ -663,6 +903,8 @@ defmodule Maxio.Admin.UserEndpointTest do
 
     principal =
       Map.merge(%{type: :iam_user, access_key: access_key, arn: arn}, principal_extra)
+
+    assert {:ok, %{user_name: ^access_key}} = IAM.create_user(name: access_key)
 
     :ok =
       CredentialStore.put_access_key(%{

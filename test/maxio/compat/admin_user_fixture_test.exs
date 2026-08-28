@@ -76,11 +76,21 @@ defmodule Maxio.Compat.AdminUserFixtureTest do
     assert step == "admin_user_fixture_cleanup"
   end
 
-  test "default fixture creates only an active user and removes it through IAM" do
+  test "default fixture creates a credential-bearing user and exposes the secret only as probe capability" do
     assert {:ok, user_name, %{blockers: []}} =
-             AdminUserFixture.with_user([], fn user ->
+             AdminUserFixture.with_user([], fn user, s3_probe ->
                assert user.status == "active"
-               assert {:ok, []} = IAM.list_access_keys_strict(user.user_name)
+
+               assert {:ok, [%{access_key_id: access_key_id}]} =
+                        IAM.list_access_keys_strict(user.user_name)
+
+               assert access_key_id == user.user_name
+               assert is_function(s3_probe, 0)
+               refute inspect(s3_probe) =~ "secret_key"
+
+               assert [%{policy_name: "maxio-compat-list-buckets"}] =
+                        IAM.list_principal_policies(user.user_arn)
+
                user.user_name
              end)
 

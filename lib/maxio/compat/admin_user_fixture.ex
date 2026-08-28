@@ -1,31 +1,34 @@
 defmodule Maxio.Compat.AdminUserFixture do
   @moduledoc """
-  Creates one short-lived IAM user for the external MinIO admin user-info smoke.
+  Creates one short-lived credential-bearing IAM user for external admin smoke.
 
-  Setup and cleanup use the public IAM facade. The callback receives only the
-  public user projection; no access key or secret is created. Cleanup evidence
-  uses the same step/blocker shape as `Maxio.Compat.ExternalSmoke`.
+  Setup and cleanup use public IAM facades. The plaintext secret exists only in
+  the closure environment of a zero-argument S3 probe capability; it is never
+  returned in fixture maps, argv, logs, or artifact evidence.
   """
 
   alias Maxio.Config.CLI
   alias Maxio.IAM
+  alias Maxio.S3.AWSClient
 
   @cleanup_step "admin_user_fixture_cleanup"
 
   @type cleanup_component :: %{steps: [map()], blockers: [map()]}
 
-  @spec with_user(keyword(), (map() -> term())) ::
+  @spec with_user(keyword(), function()) ::
           {:ok, term(), cleanup_component()}
           | {:error, map(), cleanup_component()}
-  def with_user(opts, callback) when is_list(opts) and is_function(callback, 1) do
+  def with_user(opts, callback)
+      when is_list(opts) and (is_function(callback, 1) or is_function(callback, 2)) do
     start_repo = Keyword.get(opts, :start_repo, &CLI.start_repo/0)
-    create_user = Keyword.get(opts, :create_user, &default_create_user/1)
+    create_user = Keyword.get(opts, :create_user, fn name -> default_create_user(name, opts) end)
     cleanup_user = Keyword.get(opts, :cleanup_user, &IAM.delete_user/1)
     name = Keyword.get(opts, :name, unique_name())
+    injected_probe = Keyword.get(opts, :s3_probe, &unconfigured_probe/0)
 
-    case setup_user(start_repo, create_user, name) do
-      {:ok, user} ->
-        primary = invoke_callback(callback, user)
+    case setup_user(start_repo, create_user, name, injected_probe) do
+      {:ok, user, s3_probe} ->
+        primary = invoke_callback(callback, user, s3_probe)
         cleanup = cleanup_user(cleanup_user, user.user_name)
 
         case primary do
@@ -38,10 +41,11 @@ defmodule Maxio.Compat.AdminUserFixture do
     end
   end
 
-  defp setup_user(start_repo, create_user, name) do
+  defp setup_user(start_repo, create_user, name, injected_probe) do
     with :ok <- start_repo.(),
-         {:ok, %{user_name: user_name} = user} when is_binary(user_name) <- create_user.(name) do
-      {:ok, user}
+         {:ok, created} <- create_user.(name),
+         {:ok, user, s3_probe} <- normalize_created(created, injected_probe) do
+      {:ok, user, s3_probe}
     else
       failure -> {:error, setup_blocker(failure)}
     end
@@ -51,8 +55,21 @@ defmodule Maxio.Compat.AdminUserFixture do
     kind, reason -> {:error, setup_catch_blocker(kind, reason)}
   end
 
-  defp invoke_callback(callback, user) do
-    {:ok, callback.(user)}
+  defp normalize_created(%{user: %{user_name: user_name} = user, s3_probe: s3_probe}, _injected)
+       when is_binary(user_name) and is_function(s3_probe, 0),
+       do: {:ok, user, s3_probe}
+
+  defp normalize_created(%{user_name: user_name} = user, injected_probe)
+       when is_binary(user_name) and is_function(injected_probe, 0),
+       do: {:ok, user, injected_probe}
+
+  defp normalize_created(_created, _injected_probe), do: {:error, :invalid_fixture_user}
+
+  defp invoke_callback(callback, user, s3_probe) do
+    result =
+      if is_function(callback, 2), do: callback.(user, s3_probe), else: callback.(user)
+
+    {:ok, result}
   rescue
     error ->
       {:error,
@@ -144,7 +161,78 @@ defmodule Maxio.Compat.AdminUserFixture do
     }
   end
 
-  defp default_create_user(name), do: IAM.create_user(name: name, status: "active")
+  defp default_create_user(name, opts) do
+    secret_key = Base.url_encode64(:crypto.strong_rand_bytes(30), padding: false)
+
+    with {:ok, %{user: user}} <- IAM.create_minio_user_strict(name, secret_key, "active"),
+         :ok <-
+           IAM.put_user_policy_strict(
+             name,
+             "maxio-compat-list-buckets",
+             list_buckets_policy()
+           ) do
+      {:ok,
+       %{
+         user: user,
+         s3_probe: s3_probe(name, secret_key, Keyword.get(opts, :endpoint))
+       }}
+    else
+      failure ->
+        _cleanup = IAM.delete_user(name)
+        failure
+    end
+  end
+
+  defp s3_probe(access_key_id, secret_key, configured_endpoint) do
+    endpoint = configured_endpoint || System.get_env("MAXIO_COMPAT_ENDPOINT")
+
+    fn ->
+      if is_binary(endpoint) and endpoint != "" do
+        url = String.trim_trailing(endpoint, "/") <> "/"
+
+        with {:ok, request} <-
+               AWSClient.signed_request(:get, url, "s3", "", %{}, "",
+                 access_key_id: access_key_id,
+                 secret_access_key: secret_key
+               ),
+             {:ok, response} <-
+               Req.request(
+                 method: request.method,
+                 url: request.url,
+                 headers: request.headers,
+                 body: request.body
+               ) do
+          %{status: response.status, code: response_code(response.body)}
+        else
+          {:error, _reason} -> %{status: nil, code: "probe_failed"}
+        end
+      else
+        %{status: nil, code: "probe_not_configured"}
+      end
+    end
+  end
+
+  defp response_code(body) when is_binary(body) do
+    case Regex.run(~r/<Code>([^<]+)<\/Code>/, body, capture: :all_but_first) do
+      [code] -> code
+      _other -> nil
+    end
+  end
+
+  defp response_code(_body), do: nil
+
+  defp unconfigured_probe, do: %{status: nil, code: "probe_not_configured"}
+
+  defp list_buckets_policy do
+    Jason.encode!(%{
+      "Version" => "2012-10-17",
+      "Statement" => %{
+        "Effect" => "Allow",
+        "Action" => "s3:ListAllMyBuckets",
+        "Resource" => "*"
+      }
+    })
+  end
 
   defp safe_reason({:exception, message}), do: message
   defp safe_reason(reason), do: inspect(reason)

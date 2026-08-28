@@ -171,6 +171,8 @@ defmodule Maxio.S3.Error do
        "The request is not valid with the current state of the bucket."},
     bucket_quota_exceeded: {"XMinioAdminBucketQuotaExceeded", 400, "Bucket quota exceeded."},
     admin_no_such_user: {"XMinioAdminNoSuchUser", 404, "The specified user does not exist."},
+    admin_iam_action_not_allowed:
+      {"XMinioIAMActionNotAllowed", 403, "Specified IAM action is not allowed"},
     admin_user_already_exists:
       {"XMaxioAdminUserAlreadyExists", 400, "The specified user already exists."},
     admin_no_such_policy: {"XMinioAdminNoSuchPolicy", 404, "The canned policy does not exist."},

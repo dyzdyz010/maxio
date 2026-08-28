@@ -197,6 +197,50 @@ defmodule Maxio.Admin.UserAdapterTest do
     assert :ok = UserAdapter.validate_name("Alice_01+=.@-")
   end
 
+  test "mutation names preserve the exact S2b access-key domain" do
+    for name <- [
+          "a1b",
+          "a b",
+          "a!b",
+          "a#b",
+          "a:b",
+          String.duplicate("A", 64)
+        ] do
+      assert :ok = UserAdapter.validate_mutation_name(name)
+    end
+
+    for name <- [nil, "", "aa", "abc=def", "a/b", "a\\b", "ab茅", String.duplicate("A", 65)] do
+      assert {:error, :invalid_argument} = UserAdapter.validate_mutation_name(name)
+    end
+
+    for name <- [" abc", "abc ", "\u00A0abc", "abc\u3000", "a,b"] do
+      assert {:error, :invalid_resource_name} = UserAdapter.validate_mutation_name(name)
+    end
+  end
+
+  test "status and remove delegate exact actors to reversible and permanent IAM facades" do
+    access_key = unique_access_name("MUTATE")
+    actor = Application.fetch_env!(:maxio, :s3) |> Keyword.fetch!(:root_user)
+
+    assert {:ok, %{user: user}} =
+             IAM.create_minio_user_strict(access_key, "mutation-secret", "active")
+
+    assert {:ok, %{user: %{status: "inactive"}}} =
+             UserAdapter.status(user.user_name, "disabled", actor)
+
+    assert {:ok, %{user: %{status: "active"}}} =
+             UserAdapter.status(user.user_name, "enabled", actor)
+
+    assert {:error, :invalid_status_argument} =
+             UserAdapter.status(user.user_name, "paused", actor)
+
+    assert {:ok, %{user: %{user_name: user_name}}} =
+             UserAdapter.remove(user.user_name, actor)
+
+    assert user_name == user.user_name
+    assert {:error, :minio_user_not_found} = UserAdapter.remove(user.user_name, actor)
+  end
+
   test "reports a valid absent user without conflating policy absence" do
     assert {:error, :user_not_found} = UserAdapter.info(unique_name("missing-user"))
   end

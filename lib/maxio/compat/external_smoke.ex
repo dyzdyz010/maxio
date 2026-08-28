@@ -57,7 +57,7 @@ defmodule Maxio.Compat.ExternalSmoke do
     system_env = Keyword.get(opts, :system_env, System.get_env())
     config = Map.put(config, :proxy_bypass_env, proxy_bypass_env(config.endpoint, system_env))
     executable_finder = Keyword.get(opts, :executable_finder, &System.find_executable/1)
-    command_runner = Keyword.get(opts, :command_runner, &System.cmd/3)
+    command_runner = Keyword.get(opts, :command_runner, &run_command/3)
     tmp_root_fun = Keyword.get(opts, :tmp_root_fun, &System.tmp_dir!/0)
     admin_user_fixture_opts = Keyword.get(opts, :admin_user_fixture_opts, [])
 
@@ -241,8 +241,61 @@ defmodule Maxio.Compat.ExternalSmoke do
     redactions = redactions(config)
     env = mc_env(config)
 
-    case AdminUserFixture.with_user(admin_user_fixture_opts, fn user ->
-           {steps, cleanup_steps} = mc_steps(executable, config, paths, env, user.user_name)
+    admin_user_fixture_opts =
+      Keyword.put_new(admin_user_fixture_opts, :endpoint, config.endpoint)
+
+    human =
+      run_mc_user_mode(
+        :human,
+        spec,
+        executable,
+        config,
+        paths,
+        env,
+        command_runner,
+        admin_user_fixture_opts,
+        redactions,
+        started
+      )
+
+    json =
+      run_mc_user_mode(
+        :json,
+        spec,
+        executable,
+        config,
+        paths,
+        env,
+        command_runner,
+        independent_fixture_opts(admin_user_fixture_opts, :json),
+        redactions,
+        started
+      )
+
+    combine_mc_mode_entries(human, json)
+  end
+
+  defp run_mc_user_mode(
+         mode,
+         spec,
+         executable,
+         config,
+         paths,
+         env,
+         command_runner,
+         fixture_opts,
+         redactions,
+         started
+       ) do
+    case AdminUserFixture.with_user(fixture_opts, fn user, s3_probe ->
+           {steps, cleanup_steps} =
+             case mode do
+               :human ->
+                 mc_steps(executable, config, paths, env, user.user_name, s3_probe)
+
+               :json ->
+                 mc_json_user_steps(executable, config, paths, env, user.user_name, s3_probe)
+             end
 
            run_step_plan(
              spec,
@@ -256,14 +309,74 @@ defmodule Maxio.Compat.ExternalSmoke do
            )
          end) do
       {:ok, entry, cleanup} ->
-        merge_cleanup(entry, cleanup, redactions)
+        entry |> merge_cleanup(cleanup, redactions) |> tag_mc_mode(mode)
 
       {:error, blocker, cleanup} ->
         spec
         |> blocked_entry(config, paths, started, [], [redact_value(blocker, redactions)])
         |> merge_cleanup(cleanup, redactions)
+        |> tag_mc_mode(mode)
     end
   end
+
+  defp independent_fixture_opts(opts, :json) do
+    case Keyword.fetch(opts, :name) do
+      {:ok, name} when is_binary(name) ->
+        suffix = "-json"
+        max_prefix = max(3, 64 - byte_size(suffix))
+        Keyword.put(opts, :name, binary_part(name, 0, min(byte_size(name), max_prefix)) <> suffix)
+
+      _other ->
+        opts
+    end
+  end
+
+  defp tag_mc_mode(entry, mode) do
+    suffix = Atom.to_string(mode)
+
+    steps =
+      Enum.map(entry["steps"], fn
+        %{"id" => "admin_user_fixture_cleanup"} = step ->
+          Map.put(step, "id", "admin_user_fixture_cleanup_#{suffix}")
+
+        step ->
+          step
+      end)
+
+    blockers =
+      Enum.map(entry["blockers"], fn
+        %{"step" => "admin_user_fixture_cleanup"} = blocker ->
+          Map.put(blocker, "step", "admin_user_fixture_cleanup_#{suffix}")
+
+        blocker ->
+          blocker
+      end)
+
+    entry
+    |> Map.put("steps", steps)
+    |> Map.put("blockers", blockers)
+    |> Map.put("scenario_counts", scenario_counts(steps))
+  end
+
+  defp combine_mc_mode_entries(human, json) do
+    steps = human["steps"] ++ json["steps"]
+
+    human
+    |> Map.put("status", combined_status(human["status"], json["status"]))
+    |> Map.put("steps", steps)
+    |> Map.put("blockers", human["blockers"] ++ json["blockers"])
+    |> Map.put("warnings", human["warnings"] ++ json["warnings"])
+    |> Map.put("scenario_counts", scenario_counts(steps))
+  end
+
+  defp combined_status(left, right) do
+    Enum.max_by([left, right], &status_rank/1)
+  end
+
+  defp status_rank("error"), do: 3
+  defp status_rank("blocked"), do: 2
+  defp status_rank("attention"), do: 1
+  defp status_rank(_status), do: 0
 
   defp run_python_boto3(spec, executable, config, paths, command_runner, started) do
     redactions = redactions(config)
@@ -554,7 +667,7 @@ defmodule Maxio.Compat.ExternalSmoke do
     {steps, cleanup_steps}
   end
 
-  defp mc_steps(executable, config, paths, env, user_name) do
+  defp mc_steps(executable, config, paths, env, user_name, s3_probe) do
     opts = command_opts(config, env)
     base_args = ["--config-dir", paths.mc_config_dir]
     object = "maxiocompat/#{paths.bucket}/#{paths.key}"
@@ -658,6 +771,13 @@ defmodule Maxio.Compat.ExternalSmoke do
         scenario: "admin_user_list",
         assertion: "mc admin user list returns the active temporary IAM user"
       ),
+      local_step(
+        "admin_user_human_s3_enabled",
+        s3_probe,
+        {:probe, :success},
+        "admin_user_human_lifecycle",
+        "temporary user can list buckets before disable"
+      ),
       step(
         "admin_user_info",
         executable,
@@ -666,6 +786,102 @@ defmodule Maxio.Compat.ExternalSmoke do
         {:output_contains, [user_name, "Status", "enabled"]},
         scenario: "admin_user_info",
         assertion: "mc admin user info returns the active temporary IAM user"
+      ),
+      step(
+        "admin_user_human_disable",
+        executable,
+        base_args ++ ["admin", "user", "disable", "maxiocompat", user_name],
+        opts,
+        {:output_equals, "Disabled user `#{user_name}` successfully."},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "mc disables the temporary user"
+      ),
+      local_step(
+        "admin_user_human_s3_disabled",
+        s3_probe,
+        {:probe, :rejected},
+        "admin_user_human_lifecycle",
+        "disabled user is rejected by S3"
+      ),
+      step(
+        "admin_user_human_info_disabled",
+        executable,
+        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
+        opts,
+        {:output_contains, [user_name, "Status", "disabled"]},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "mc reports disabled status"
+      ),
+      step(
+        "admin_user_human_enable",
+        executable,
+        base_args ++ ["admin", "user", "enable", "maxiocompat", user_name],
+        opts,
+        {:output_equals, "Enabled user `#{user_name}` successfully."},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "mc re-enables the temporary user"
+      ),
+      local_step(
+        "admin_user_human_s3_reenabled",
+        s3_probe,
+        {:probe, :success},
+        "admin_user_human_lifecycle",
+        "the same credential works after re-enable"
+      ),
+      step(
+        "admin_user_human_info_reenabled",
+        executable,
+        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
+        opts,
+        {:output_contains, [user_name, "Status", "enabled"]},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "mc reports re-enabled status"
+      ),
+      step(
+        "admin_user_human_remove",
+        executable,
+        base_args ++ ["admin", "user", "remove", "maxiocompat", user_name],
+        opts,
+        {:output_equals, "Removed user `#{user_name}` successfully."},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "mc removes the temporary user"
+      ),
+      step(
+        "admin_user_human_remove_again",
+        executable,
+        base_args ++ ["admin", "user", "remove", "maxiocompat", user_name],
+        opts,
+        {:expected_failure, 1,
+         [
+           "Unable to remove #{user_name}",
+           "The specified user does not exist.",
+           "(Specified user does not exist)."
+         ]},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "a sequential second remove returns the exact dynamic no-such-user error"
+      ),
+      step(
+        "admin_user_human_remove_root",
+        executable,
+        base_args ++ ["admin", "user", "remove", "maxiocompat", config.access_key],
+        opts,
+        {:expected_failure, 1,
+         [
+           "Unable to remove #{config.access_key}",
+           "The specified user does not exist.",
+           "(Specified user does not exist)."
+         ]},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "configured-root remove returns the exact dynamic no-such-user error"
+      ),
+      step(
+        "admin_user_human_root_probe_after_remove_rejected",
+        executable,
+        base_args ++ ["admin", "user", "list", "maxiocompat"],
+        opts,
+        :none,
+        scenario: "admin_user_human_lifecycle",
+        assertion: "root-signed admin request still succeeds after root removal is rejected"
       ),
       step(
         "admin_policy_remove",
@@ -700,6 +916,103 @@ defmodule Maxio.Compat.ExternalSmoke do
     {steps, cleanup_steps}
   end
 
+  defp mc_json_user_steps(executable, config, paths, env, user_name, s3_probe) do
+    opts = command_opts(config, env)
+    base_args = ["--config-dir", paths.mc_config_dir, "--json"]
+
+    steps = [
+      local_step(
+        "admin_user_json_s3_enabled",
+        s3_probe,
+        {:probe, :success},
+        "admin_user_json_lifecycle",
+        "JSON fixture credential works before disable"
+      ),
+      json_user_step(
+        "admin_user_json_info_enabled",
+        executable,
+        base_args,
+        opts,
+        "info",
+        user_name,
+        %{"accessKey" => user_name, "status" => "enabled"}
+      ),
+      json_user_step(
+        "admin_user_json_disable",
+        executable,
+        base_args,
+        opts,
+        "disable",
+        user_name,
+        %{"accessKey" => user_name, "status" => "success"}
+      ),
+      local_step(
+        "admin_user_json_s3_disabled",
+        s3_probe,
+        {:probe, :rejected},
+        "admin_user_json_lifecycle",
+        "JSON fixture credential is rejected while disabled"
+      ),
+      json_user_step(
+        "admin_user_json_info_disabled",
+        executable,
+        base_args,
+        opts,
+        "info",
+        user_name,
+        %{"accessKey" => user_name, "status" => "disabled"}
+      ),
+      json_user_step(
+        "admin_user_json_enable",
+        executable,
+        base_args,
+        opts,
+        "enable",
+        user_name,
+        %{"accessKey" => user_name, "status" => "success"}
+      ),
+      local_step(
+        "admin_user_json_s3_reenabled",
+        s3_probe,
+        {:probe, :success},
+        "admin_user_json_lifecycle",
+        "JSON fixture credential works after re-enable"
+      ),
+      json_user_step(
+        "admin_user_json_info_reenabled",
+        executable,
+        base_args,
+        opts,
+        "info",
+        user_name,
+        %{"accessKey" => user_name, "status" => "enabled"}
+      ),
+      json_user_step(
+        "admin_user_json_remove",
+        executable,
+        base_args,
+        opts,
+        "remove",
+        user_name,
+        %{"accessKey" => user_name, "status" => "success"}
+      )
+    ]
+
+    {steps, []}
+  end
+
+  defp json_user_step(id, executable, base_args, opts, action, user_name, expected) do
+    step(
+      id,
+      executable,
+      base_args ++ ["admin", "user", action, "maxiocompat", user_name],
+      opts,
+      {:json_object, expected},
+      scenario: "admin_user_json_lifecycle",
+      assertion: "mc --json admin user #{action} returns one exact JSON object"
+    )
+  end
+
   defp select_cleanup_steps(steps, cleanup_pairs) do
     steps_by_id = Map.new(steps, &{&1.id, &1})
 
@@ -723,6 +1036,19 @@ defmodule Maxio.Compat.ExternalSmoke do
       verify: verify,
       scenario: Keyword.get(metadata, :scenario, "unspecified"),
       assertion: Keyword.get(metadata, :assertion)
+    }
+  end
+
+  defp local_step(id, fun, verify, scenario, assertion) when is_function(fun, 0) do
+    %{
+      id: id,
+      command: "s3_probe_capability",
+      args: [],
+      opts: [],
+      verify: verify,
+      scenario: scenario,
+      assertion: assertion,
+      local_fun: fun
     }
   end
 
@@ -761,24 +1087,35 @@ defmodule Maxio.Compat.ExternalSmoke do
     started = System.monotonic_time(:millisecond)
 
     try do
-      {output, exit_status} = command_runner.(step.command, step.args, step.opts)
+      {output, stderr, exit_status} = invoke_step(step, command_runner)
       duration_ms = System.monotonic_time(:millisecond) - started
-      view = step_view(step, exit_status, output, duration_ms, redactions)
+      view = step_view(step, exit_status, output, stderr, duration_ms, redactions)
+
+      expected_exit = expected_exit_status(step.verify)
 
       cond do
-        exit_status != 0 ->
+        exit_status != expected_exit ->
           {:blocked, view,
            %{
              "reason" => "external_smoke_step_failed",
              "step" => step.id,
              "exit_status" => exit_status,
-             "output_snippet" => view["output_snippet"]
+             "output_snippet" => view["output_snippet"],
+             "stderr_snippet" => view["stderr_snippet"]
+           }}
+
+        expected_exit == 0 and stderr != "" ->
+          {:blocked, Map.put(view, "status", "blocked"),
+           %{
+             "reason" => "external_smoke_stderr_not_empty",
+             "step" => step.id,
+             "stderr_snippet" => view["stderr_snippet"]
            }}
 
         true ->
-          case verify_step(step.verify, output) do
+          case verify_step(step.verify, output, stderr) do
             :ok ->
-              {:ok, view}
+              {:ok, Map.put(view, "status", "ok")}
 
             {:error, reason, detail} ->
               {:blocked, view, %{"reason" => reason, "step" => step.id, "detail" => detail}}
@@ -789,7 +1126,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         duration_ms = System.monotonic_time(:millisecond) - started
 
         view =
-          step_view(step, nil, Exception.message(error), duration_ms, redactions)
+          step_view(step, nil, Exception.message(error), "", duration_ms, redactions)
           |> Map.put("status", "error")
 
         {:error, view,
@@ -801,7 +1138,25 @@ defmodule Maxio.Compat.ExternalSmoke do
     end
   end
 
-  defp step_view(step, exit_status, output, duration_ms, redactions) do
+  defp invoke_step(%{local_fun: fun}, _command_runner) do
+    {Jason.encode!(fun.()), "", 0}
+  end
+
+  defp invoke_step(step, command_runner) do
+    case command_runner.(step.command, step.args, step.opts) do
+      {stdout, stderr, exit_status}
+      when is_binary(stdout) and is_binary(stderr) and is_integer(exit_status) ->
+        {stdout, stderr, exit_status}
+
+      {output, exit_status} when is_binary(output) and is_integer(exit_status) ->
+        {output, "", exit_status}
+
+      other ->
+        raise "invalid external smoke command result: #{inspect(other)}"
+    end
+  end
+
+  defp step_view(step, exit_status, output, stderr, duration_ms, redactions) do
     %{
       "id" => step.id,
       "scenario" => step.scenario,
@@ -809,12 +1164,57 @@ defmodule Maxio.Compat.ExternalSmoke do
       "exit_status" => exit_status,
       "duration_ms" => duration_ms,
       "status" => if(exit_status == 0, do: "ok", else: "blocked"),
-      "output_snippet" => output_snippet(output, redactions)
+      "output_snippet" => output_snippet(output, redactions),
+      "stderr_snippet" => output_snippet(stderr, redactions)
     }
     |> maybe_put("assertion", step.assertion)
   end
 
+  defp verify_step(verify, output, stderr) do
+    case verify do
+      {:expected_failure, _exit_status, expected_stderr_values} ->
+        verify_step({:output_contains, expected_stderr_values}, stderr)
+
+      other ->
+        verify_step(other, output)
+    end
+  end
+
+  defp expected_exit_status({:expected_failure, exit_status, _expected_stderr_values}),
+    do: exit_status
+
+  defp expected_exit_status(_verify), do: 0
+
   defp verify_step(:none, _output), do: :ok
+
+  defp verify_step({:json_object, expected}, output) do
+    case Jason.decode(output) do
+      {:ok, decoded} when is_map(decoded) ->
+        if Enum.all?(expected, fn {key, value} -> Map.get(decoded, key) == value end) do
+          :ok
+        else
+          {:error, "external_smoke_json_mismatch", "decoded object fields did not match"}
+        end
+
+      {:ok, _other} ->
+        {:error, "external_smoke_json_not_object", "mc JSON output was not one object"}
+
+      {:error, _reason} ->
+        {:error, "external_smoke_json_invalid", "mc output was not one JSON document"}
+    end
+  end
+
+  defp verify_step({:probe, expected}, output) do
+    with {:ok, %{"status" => status}} <- Jason.decode(output) do
+      case expected do
+        :success when status in 200..299 -> :ok
+        :rejected when is_integer(status) and status not in 200..299 -> :ok
+        _other -> {:error, "external_smoke_s3_probe_failed", "unexpected S3 probe status"}
+      end
+    else
+      _other -> {:error, "external_smoke_s3_probe_failed", "invalid S3 probe evidence"}
+    end
+  end
 
   defp verify_step({:file_equals, path, expected}, _output) do
     case File.read(path) do
@@ -1033,7 +1433,155 @@ defmodule Maxio.Compat.ExternalSmoke do
   end
 
   defp command_opts(config, client_env) do
-    [stderr_to_stdout: true, env: client_env ++ config.proxy_bypass_env]
+    [env: client_env ++ config.proxy_bypass_env]
+  end
+
+  defp run_command(command, args, opts) do
+    stderr_path =
+      Path.join(
+        System.tmp_dir!(),
+        "maxio_external_smoke_stderr_#{System.unique_integer([:positive])}.log"
+      )
+
+    try do
+      {stdout, exit_status} =
+        if match?({:win32, _name}, :os.type()) do
+          powershell = System.find_executable("pwsh") || System.find_executable("powershell")
+
+          unless powershell do
+            raise "PowerShell executable is required to capture external smoke stderr"
+          end
+
+          script = """
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $stderrPath = $env:MAXIO_EXTERNAL_SMOKE_STDERR_PATH
+
+          function ConvertTo-NativeArgument([string]$value) {
+            $builder = New-Object System.Text.StringBuilder
+            [void]$builder.Append('"')
+            $slashes = 0
+
+            foreach ($character in $value.ToCharArray()) {
+              if ($character -eq '\') {
+                $slashes++
+              } elseif ($character -eq '"') {
+                [void]$builder.Append(('\' * (2 * $slashes + 1)))
+                [void]$builder.Append('"')
+                $slashes = 0
+              } else {
+                [void]$builder.Append(('\' * $slashes))
+                [void]$builder.Append($character)
+                $slashes = 0
+              }
+            }
+
+            [void]$builder.Append(('\' * (2 * $slashes)))
+            [void]$builder.Append('"')
+            return $builder.ToString()
+          }
+
+          try {
+            $commandArgs = @(ConvertFrom-Json $env:MAXIO_EXTERNAL_SMOKE_ARGS_JSON)
+            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $startInfo.FileName = $env:MAXIO_EXTERNAL_SMOKE_EXECUTABLE
+            $startInfo.Arguments = (($commandArgs | ForEach-Object {
+              ConvertTo-NativeArgument ([string]$_)
+            }) -join ' ')
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+            $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $startInfo
+            [void]$process.Start()
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            $process.WaitForExit()
+            $stdout = $stdoutTask.Result
+            $stderr = $stderrTask.Result
+            [Console]::Out.Write($stdout)
+            [IO.File]::WriteAllText(
+              $stderrPath,
+              $stderr,
+              (New-Object System.Text.UTF8Encoding($false))
+            )
+            exit $process.ExitCode
+          } catch {
+            [IO.File]::WriteAllText(
+              $stderrPath,
+              $_.Exception.ToString(),
+              (New-Object System.Text.UTF8Encoding($false))
+            )
+            exit 255
+          }
+          """
+
+          encoded_script =
+            script
+            |> :unicode.characters_to_binary(:utf8, {:utf16, :little})
+            |> Base.encode64()
+
+          powershell_opts =
+            command_env(
+              opts,
+              [
+                {"MAXIO_EXTERNAL_SMOKE_STDERR_PATH", stderr_path},
+                {"MAXIO_EXTERNAL_SMOKE_EXECUTABLE", command},
+                {"MAXIO_EXTERNAL_SMOKE_ARGS_JSON", Jason.encode!(args)}
+              ]
+            )
+
+          System.cmd(
+            powershell,
+            [
+              "-NoLogo",
+              "-NoProfile",
+              "-NonInteractive",
+              "-EncodedCommand",
+              encoded_script
+            ],
+            powershell_opts
+          )
+        else
+          System.cmd(
+            "sh",
+            [
+              "-c",
+              ~S(stderr_path=$1; shift; "$@" 2>"$stderr_path"),
+              "maxio-external-smoke",
+              stderr_path,
+              command | args
+            ],
+            opts
+          )
+        end
+
+      stderr =
+        case File.read(stderr_path) do
+          {:ok, bytes} -> bytes
+          {:error, :enoent} -> ""
+          {:error, reason} -> raise "cannot read external smoke stderr: #{inspect(reason)}"
+        end
+
+      {stdout, stderr, exit_status}
+    after
+      File.rm(stderr_path)
+    end
+  end
+
+  defp command_env(opts, injected) do
+    injected_names = MapSet.new(injected, &elem(&1, 0))
+
+    existing =
+      opts
+      |> Keyword.get(:env, [])
+      |> Enum.reject(fn {name, _value} -> MapSet.member?(injected_names, name) end)
+
+    Keyword.put(opts, :env, existing ++ injected)
   end
 
   defp proxy_bypass_env(endpoint, system_env) do

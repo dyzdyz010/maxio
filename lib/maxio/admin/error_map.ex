@@ -10,6 +10,22 @@ defmodule Maxio.Admin.ErrorMap do
 
   @spec from_reason(term()) :: Error.t()
   def from_reason(:user_not_found), do: Error.new(:admin_no_such_user)
+
+  def from_reason(:minio_user_not_found) do
+    Error.new(:admin_no_such_user,
+      message: "The specified user does not exist. (Specified user does not exist)"
+    )
+  end
+
+  def from_reason(:minio_action_not_allowed), do: Error.new(:admin_iam_action_not_allowed)
+
+  def from_reason(reason)
+      when reason in [:invalid_status_self_target, :invalid_status_argument] do
+    Error.new(:admin_invalid_argument,
+      message: "Invalid arguments specified. (Invalid arguments specified)"
+    )
+  end
+
   def from_reason(:user_already_exists), do: Error.new(:admin_user_already_exists)
   def from_reason(:config_too_large), do: Error.new(:admin_config_too_large)
   def from_reason(:config_bad_json), do: Error.new(:admin_config_bad_json)

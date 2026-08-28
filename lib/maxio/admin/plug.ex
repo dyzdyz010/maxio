@@ -136,6 +136,8 @@ defmodule Maxio.Admin.Plug do
   defp dispatch(conn, "PUT", "/minio/admin/v3/add-user"), do: add_user(conn)
   defp dispatch(conn, "GET", "/minio/admin/v3/list-users"), do: list_users(conn)
   defp dispatch(conn, "GET", "/minio/admin/v3/user-info"), do: user_info(conn)
+  defp dispatch(conn, "DELETE", "/minio/admin/v3/remove-user"), do: remove_user(conn)
+  defp dispatch(conn, "PUT", "/minio/admin/v3/set-user-status"), do: set_user_status(conn)
 
   defp dispatch(conn, _method, path) do
     render_not_implemented(conn, path)
@@ -297,6 +299,107 @@ defmodule Maxio.Admin.Plug do
       end
     )
   end
+
+  defp remove_user(conn) do
+    authorize_and_run(
+      conn,
+      "admin:DeleteUser",
+      "admin_user_remove",
+      [target_user: conn.query_params["accessKey"]],
+      fn conn ->
+        if Map.has_key?(conn.query_params, "bucket") do
+          render_not_implemented(conn, RawPath.decoded_path(conn))
+        else
+          with {:ok, actor_access_key_id} <- exact_actor_access_key_id(conn),
+               {:ok, result} <-
+                 UserAdapter.remove(conn.query_params["accessKey"], actor_access_key_id) do
+            log_user_mutation(conn, "admin_user_remove", result)
+            send_empty_success(conn)
+          else
+            {:error, :missing_actor_access_key} ->
+              render_error(conn, Error.new(:internal_error))
+
+            {:error, reason} ->
+              render_error(conn, ErrorMap.from_reason(reason))
+          end
+        end
+      end
+    )
+  end
+
+  defp set_user_status(conn) do
+    authorize_and_run(
+      conn,
+      "admin:EnableUser",
+      "admin_user_status",
+      [
+        target_user: conn.query_params["accessKey"],
+        requested_status: conn.query_params["status"]
+      ],
+      fn conn ->
+        if Map.has_key?(conn.query_params, "bucket") do
+          render_not_implemented(conn, RawPath.decoded_path(conn))
+        else
+          with {:ok, actor_access_key_id} <- exact_actor_access_key_id(conn),
+               {:ok, result} <-
+                 UserAdapter.status(
+                   conn.query_params["accessKey"],
+                   conn.query_params["status"],
+                   actor_access_key_id
+                 ) do
+            log_user_mutation(conn, "admin_user_status", result)
+            send_empty_success(conn)
+          else
+            {:error, :missing_actor_access_key} ->
+              render_error(conn, Error.new(:internal_error))
+
+            {:error, reason} ->
+              render_error(conn, ErrorMap.from_reason(reason))
+          end
+        end
+      end
+    )
+  end
+
+  defp exact_actor_access_key_id(%{
+         assigns: %{sigv4_signed_request: %{access_key: access_key_id}}
+       })
+       when is_binary(access_key_id) and access_key_id != "",
+       do: {:ok, access_key_id}
+
+  defp exact_actor_access_key_id(_conn), do: {:error, :missing_actor_access_key}
+
+  defp log_user_mutation(conn, admin_action, result) do
+    affected = Map.get(result, :affected, %{})
+    invalidation = Map.get(result, :invalidation, %{failures: []})
+
+    Log.info("admin user mutation committed",
+      action: admin_action,
+      admin_action: admin_action,
+      required_action: mutation_required_action(admin_action),
+      target_user: conn.query_params["accessKey"],
+      requested_status: conn.query_params["status"],
+      affected_credentials: Map.get(affected, :credentials, 0),
+      access_keys_deleted: Map.get(affected, :access_keys_deleted, 0),
+      sessions_revoked: Map.get(affected, :sessions_revoked, 0),
+      principal_policies_deleted: Map.get(affected, :principal_policies_deleted, 0),
+      memberships_deleted: Map.get(affected, :memberships_deleted, 0),
+      managed_policy_attachments_deleted:
+        Map.get(affected, :managed_policy_attachments_deleted, 0),
+      mfa_devices_deleted: Map.get(affected, :mfa_devices_deleted, 0),
+      signing_certificates_deleted: Map.get(affected, :signing_certificates_deleted, 0),
+      ssh_public_keys_deleted: Map.get(affected, :ssh_public_keys_deleted, 0),
+      invalidation_failure_count: invalidation |> Map.get(:failures, []) |> length(),
+      decision: "committed",
+      principal_arn: principal_arn(conn),
+      auth_type: conn.assigns[:auth_type],
+      request_id: request_id(conn),
+      surface: conn.assigns[:maxio_surface]
+    )
+  end
+
+  defp mutation_required_action("admin_user_remove"), do: "admin:DeleteUser"
+  defp mutation_required_action("admin_user_status"), do: "admin:EnableUser"
 
   defp log_user_info_projection(conn, evidence) do
     metadata =

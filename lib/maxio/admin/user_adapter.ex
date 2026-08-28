@@ -32,6 +32,27 @@ defmodule Maxio.Admin.UserAdapter do
 
   def validate_name(_name), do: {:error, :invalid_argument}
 
+  @doc "Validates U4/U5 target names against the completed MinIO access-key domain."
+  @spec validate_mutation_name(term()) ::
+          :ok | {:error, :invalid_argument | :invalid_resource_name}
+  def validate_mutation_name(name) when is_binary(name) do
+    cond do
+      name == "" ->
+        {:error, :invalid_argument}
+
+      String.trim(name) != name or String.contains?(name, ",") ->
+        {:error, :invalid_resource_name}
+
+      IAM.validate_minio_access_key(name) == :ok ->
+        :ok
+
+      true ->
+        {:error, :invalid_argument}
+    end
+  end
+
+  def validate_mutation_name(_name), do: {:error, :invalid_argument}
+
   @spec add(term(), map()) :: {:ok, map()} | {:error, reason()}
   def add(access_key, request) do
     with :ok <- validate_access_key(access_key),
@@ -72,6 +93,23 @@ defmodule Maxio.Admin.UserAdapter do
     with :ok <- validate_name(name),
          {:ok, user} <- fetch_user(name) do
       project_fetched_user(user)
+    end
+  end
+
+  @spec status(term(), term(), term()) :: {:ok, map()} | {:error, reason()}
+  def status(name, status, actor_access_key_id) do
+    with :ok <- validate_mutation_name(name),
+         {:ok, internal_status} <- mutation_status(status),
+         :ok <- validate_actor_access_key(actor_access_key_id) do
+      IAM.update_minio_user_status_strict(name, internal_status, actor_access_key_id)
+    end
+  end
+
+  @spec remove(term(), term()) :: {:ok, map()} | {:error, reason()}
+  def remove(name, actor_access_key_id) do
+    with :ok <- validate_mutation_name(name),
+         :ok <- validate_actor_access_key(actor_access_key_id) do
+      IAM.delete_minio_user_strict(name, actor_access_key_id)
     end
   end
 
@@ -145,6 +183,20 @@ defmodule Maxio.Admin.UserAdapter do
   end
 
   defp validate_access_key(_access_key), do: {:error, :invalid_access_key}
+
+  defp mutation_status("enabled"), do: {:ok, "active"}
+  defp mutation_status("disabled"), do: {:ok, "inactive"}
+
+  defp mutation_status(status) when is_binary(status) and status != "",
+    do: {:error, :invalid_status_argument}
+
+  defp mutation_status(_status), do: {:error, :invalid_argument}
+
+  defp validate_actor_access_key(actor_access_key_id)
+       when is_binary(actor_access_key_id) and actor_access_key_id != "",
+       do: :ok
+
+  defp validate_actor_access_key(_actor_access_key_id), do: {:error, :invalid_argument}
 
   defp validate_add_request(%{secret_key: secret_key, policy: "", status: "enabled"})
        when is_binary(secret_key) do
