@@ -93,6 +93,8 @@ defmodule Maxio.DataCase do
         tags: Keyword.get(opts, :access_key_tags, %{})
       )
 
+    _ = :sys.get_state(Maxio.Cluster.CacheInvalidator)
+
     %{
       user: user,
       user_arn: user.user_arn,
