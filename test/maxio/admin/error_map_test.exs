@@ -139,6 +139,12 @@ defmodule Maxio.Admin.ErrorMapTest do
     refute document_quota.message == version_quota.message
     refute document_quota.message =~ "DeletePolicyVersion"
 
+    attachment_quota = ErrorMap.from_reason(:managed_policy_attachment_limit_exceeded)
+    assert attachment_quota.code == "XMinioAdminInvalidArgument"
+    assert attachment_quota.http_status == 400
+    assert attachment_quota.message =~ "10 managed policies"
+    refute attachment_quota.message =~ "6,144"
+
     unknown = ErrorMap.from_reason({:unexpected, "credential=do-not-leak"})
     assert unknown.code == "InternalError"
     assert unknown.http_status == 500

@@ -3,6 +3,7 @@ defmodule Maxio.Admin.PolicyAdapterTest do
 
   alias Maxio.Admin.PolicyAdapter
   alias Maxio.IAM
+  alias Maxio.IAM.UserManagedPolicyAttachment
 
   test "rejects empty, Unicode-edge-whitespace, comma, slash, backslash, and dot path segments" do
     assert {:error, :invalid_argument} = PolicyAdapter.validate_name("")
@@ -214,6 +215,33 @@ defmodule Maxio.Admin.PolicyAdapterTest do
              PolicyAdapter.update_associations(:attach, {:user, user_name}, [policy_a])
   end
 
+  test "association target classification precedes policy addressability and uses canonical identity ARN" do
+    user_name = unique_name("CaseUser")
+    policy_name = unique_name("assoc-case")
+    assert {:ok, user} = IAM.create_user(name: user_name)
+    assert {:ok, _} = PolicyAdapter.create(policy_name, policy_json("s3:GetObject"))
+
+    assert {:error, :user_not_found} =
+             PolicyAdapter.update_associations(:attach, {:user, "missing-user"}, ["team/bad"])
+
+    assert {:error, :policy_change_already_applied} =
+             PolicyAdapter.update_associations(:detach, {:user, user_name}, ["team/bad"])
+
+    assert {:ok, %{changed_count: 1}} =
+             PolicyAdapter.update_associations(
+               :attach,
+               {:user, String.downcase(user_name)},
+               [policy_name]
+             )
+
+    assert %UserManagedPolicyAttachment{user_arn: canonical_arn} =
+             Repo.get_by(UserManagedPolicyAttachment,
+               policy_arn: IAM.managed_policy_arn(policy_name, "/")
+             )
+
+    assert canonical_arn == user.user_arn
+  end
+
   test "entities adapter applies exact madmin omission, null and stable field projection" do
     user_name = unique_name("entities-user")
     policy_name = unique_name("entities-policy")
@@ -248,6 +276,18 @@ defmodule Maxio.Admin.PolicyAdapterTest do
              })
 
     assert Map.keys(timestamp_only) == ["timestamp"]
+
+    for policy_filter <- ["", "team/read", "team\\read", "unknown"] do
+      assert {:ok, %{wire: safe_omission}} =
+               PolicyAdapter.entities(%{
+                 users: [],
+                 groups: [],
+                 policies: [policy_filter],
+                 requested: MapSet.new([:policy])
+               })
+
+      assert Map.keys(safe_omission) == ["timestamp"]
+    end
   end
 
   defp unique_name(prefix), do: "#{prefix}-#{System.unique_integer([:positive, :monotonic])}"

@@ -735,11 +735,16 @@ defmodule Maxio.Policy.Store.EctoStore do
     snapshot = builtin_principal_snapshot(kind, principal_arn)
 
     Repo.transaction(fn ->
-      with {:ok, _principal} <- lock_builtin_principal(kind, principal_arn, snapshot),
-           :ok <- lock_builtin_principal_quota(principal_arn),
+      with {:ok, principal} <- lock_builtin_principal(kind, principal_arn, snapshot),
+           canonical_arn = builtin_principal_arn!(kind, principal),
+           :ok <- lock_builtin_principal_quota(canonical_arn),
            {:ok, changed} <-
-             mutate_builtin_policy_associations(kind, principal_arn, operation, policy_arns) do
-        %{changed_policy_arns: changed, updated_at: database_timestamp!()}
+             mutate_builtin_policy_associations(kind, canonical_arn, operation, policy_arns) do
+        %{
+          principal_arn: canonical_arn,
+          changed_policy_arns: changed,
+          updated_at: database_timestamp!()
+        }
       else
         {:error, reason} -> Repo.rollback(reason)
       end
@@ -762,50 +767,84 @@ defmodule Maxio.Policy.Store.EctoStore do
       })
       when is_list(requested_users) and is_list(requested_groups) and
              is_list(requested_policy_arns) do
-    Repo.transaction(
-      fn ->
-        users = Repo.all(from u in User, select: {u.user_arn, u.user_name})
-        groups = Repo.all(from g in Group, select: {g.group_arn, g.group_name})
-
-        user_attachments =
-          Repo.all(
-            from a in UserManagedPolicyAttachment,
-              select: {a.user_arn, a.policy_arn}
-          )
-          |> Enum.filter(fn {_user_arn, policy_arn} -> root_builtin_policy_arn?(policy_arn) end)
-
-        group_attachments =
-          Repo.all(
-            from a in GroupManagedPolicyAttachment,
-              select: {a.group_arn, a.policy_arn}
-          )
-          |> Enum.filter(fn {_group_arn, policy_arn} -> root_builtin_policy_arn?(policy_arn) end)
-
-        memberships =
-          Repo.all(from m in GroupMembership, select: {m.user_arn, m.group_arn})
-
-        build_builtin_policy_entities(%{
-          timestamp: database_timestamp!(),
-          users: users,
-          groups: groups,
-          user_attachments: user_attachments,
-          group_attachments: group_attachments,
-          memberships: memberships,
-          requested_users: requested_users,
-          requested_groups: requested_groups,
-          requested_policy_arns: requested_policy_arns,
-          requested_dimensions: requested_dimensions
-        })
-      end,
-      isolation: :repeatable_read
+    :telemetry.execute(
+      [:maxio, :policy, :entities, :snapshot],
+      %{system_time: System.system_time()},
+      %{isolation: "single statement", phase: :before_read}
     )
-    |> case do
-      {:ok, projection} -> {:ok, projection}
-      {:error, reason} -> {:error, reason}
-    end
+
+    # All five relation snapshots and the response timestamp are deliberately read by one
+    # PostgreSQL statement. PostgreSQL gives every statement one MVCC snapshot, including when
+    # this callback is invoked inside a caller-owned transaction (such as SQL Sandbox). Keeping
+    # this as one statement avoids a phase-drift window without relying on transaction options
+    # that Ecto/Postgrex do not translate into SET TRANSACTION.
+    %{rows: [[timestamp, users, groups, user_attachments, group_attachments, memberships]]} =
+      Ecto.Adapters.SQL.query!(Repo, builtin_policy_entities_snapshot_sql(), [])
+
+    :telemetry.execute(
+      [:maxio, :policy, :entities, :snapshot],
+      %{system_time: System.system_time()},
+      %{isolation: "single statement", phase: :after_read}
+    )
+
+    projection =
+      build_builtin_policy_entities(%{
+        timestamp: timestamp,
+        users: tuple_pairs(users),
+        groups: tuple_pairs(groups),
+        user_attachments:
+          user_attachments
+          |> tuple_pairs()
+          |> Enum.filter(fn {_user_arn, policy_arn} -> root_builtin_policy_arn?(policy_arn) end),
+        group_attachments:
+          group_attachments
+          |> tuple_pairs()
+          |> Enum.filter(fn {_group_arn, policy_arn} -> root_builtin_policy_arn?(policy_arn) end),
+        memberships: tuple_pairs(memberships),
+        requested_users: requested_users,
+        requested_groups: requested_groups,
+        requested_policy_arns: requested_policy_arns,
+        requested_dimensions: requested_dimensions
+      })
+
+    {:ok, projection}
   end
 
   def query_builtin_managed_policy_entities(_filters), do: {:error, :malformed}
+
+  defp builtin_policy_entities_snapshot_sql do
+    """
+    SELECT
+      CURRENT_TIMESTAMP,
+      COALESCE(
+        (SELECT jsonb_agg(jsonb_build_array(user_arn, user_name) ORDER BY user_arn)
+           FROM iam_users),
+        '[]'::jsonb
+      ),
+      COALESCE(
+        (SELECT jsonb_agg(jsonb_build_array(group_arn, group_name) ORDER BY group_arn)
+           FROM iam_groups),
+        '[]'::jsonb
+      ),
+      COALESCE(
+        (SELECT jsonb_agg(jsonb_build_array(user_arn, policy_arn) ORDER BY user_arn, policy_arn)
+           FROM iam_user_managed_policy_attachments),
+        '[]'::jsonb
+      ),
+      COALESCE(
+        (SELECT jsonb_agg(jsonb_build_array(group_arn, policy_arn) ORDER BY group_arn, policy_arn)
+           FROM iam_group_managed_policy_attachments),
+        '[]'::jsonb
+      ),
+      COALESCE(
+        (SELECT jsonb_agg(jsonb_build_array(user_arn, group_arn) ORDER BY user_arn, group_arn)
+           FROM iam_group_memberships),
+        '[]'::jsonb
+      )
+    """
+  end
+
+  defp tuple_pairs(rows), do: Enum.map(rows, fn [left, right] -> {left, right} end)
 
   defp build_builtin_policy_entities(data) do
     user_names = Map.new(data.users)
@@ -1016,7 +1055,7 @@ defmodule Maxio.Policy.Store.EctoStore do
           {:error, :policy_change_already_applied}
 
         length(Enum.uniq(current ++ changed)) > 10 ->
-          {:error, :policy_limit_exceeded}
+          {:error, :managed_policy_attachment_limit_exceeded}
 
         true ->
           insert_builtin_attachments(kind, principal_arn, changed)
@@ -1026,6 +1065,7 @@ defmodule Maxio.Policy.Store.EctoStore do
   end
 
   defp mutate_builtin_policy_associations(kind, principal_arn, :detach, requested) do
+    requested = Enum.filter(requested, &root_builtin_policy_arn?/1)
     changed = lock_matching_attachment_arns(kind, principal_arn, requested)
 
     if changed == [] do
@@ -1131,6 +1171,9 @@ defmodule Maxio.Policy.Store.EctoStore do
 
     :ok
   end
+
+  defp builtin_principal_arn!(:user, %User{user_arn: user_arn}), do: user_arn
+  defp builtin_principal_arn!(:group, %Group{group_arn: group_arn}), do: group_arn
 
   defp lock_group_name!(group_name) do
     Ecto.Adapters.SQL.query!(

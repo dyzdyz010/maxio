@@ -129,7 +129,7 @@ defmodule Maxio.Admin.PolicyAdapter do
           {:ok, %{wire: map(), changed_count: non_neg_integer()}} | {:error, term()}
   def update_associations(operation, principal, policy_names)
       when operation in [:attach, :detach] and is_list(policy_names) do
-    with :ok <- validate_policy_names(policy_names),
+    with true <- policy_names != [] and Enum.all?(policy_names, &is_binary/1),
          {:ok, result} <-
            IAM.update_managed_policy_associations_strict(operation, principal, policy_names) do
       changed_names = Enum.map(result.changed_policy_arns, &root_policy_name!/1)
@@ -140,6 +140,9 @@ defmodule Maxio.Admin.PolicyAdapter do
          wire: %{key => changed_names, "updatedAt" => DateTime.to_iso8601(result.updated_at)},
          changed_count: length(changed_names)
        }}
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -152,7 +155,8 @@ defmodule Maxio.Admin.PolicyAdapter do
         policies: policy_names,
         requested: %MapSet{} = requested
       }) do
-    with {:ok, policy_arns} <- root_policy_arns(policy_names),
+    with true <- Enum.all?(policy_names, &is_binary/1),
+         policy_arns <- Enum.map(policy_names, &("arn:aws:iam:::policy/" <> &1)),
          {:ok, projection} <-
            IAM.query_builtin_policy_entities(%{
              users: users,
@@ -178,33 +182,13 @@ defmodule Maxio.Admin.PolicyAdapter do
            policy_mappings: length(projection.policy_mappings)
          }
        }}
+    else
+      false -> {:error, :invalid_argument}
+      {:error, reason} -> {:error, reason}
     end
   end
 
   def entities(_filters), do: {:error, :invalid_argument}
-
-  defp validate_policy_names(names) do
-    case root_policy_arns(names) do
-      {:ok, _arns} when names != [] -> :ok
-      {:ok, _arns} -> {:error, :invalid_argument}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp root_policy_arns(names) when is_list(names) do
-    Enum.reduce_while(names, {:ok, []}, fn name, {:ok, arns} ->
-      case root_policy_target(name) do
-        {:ok, arn} -> {:cont, {:ok, [arn | arns]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, arns} -> {:ok, arns |> Enum.uniq() |> Enum.sort()}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp root_policy_arns(_names), do: {:error, :invalid_argument}
 
   defp root_policy_name!("arn:aws:iam:::policy/" <> name), do: name
 

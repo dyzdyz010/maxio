@@ -63,6 +63,12 @@ defmodule Maxio.Admin.ErrorMap do
     )
   end
 
+  def from_reason(:managed_policy_attachment_limit_exceeded) do
+    Error.new(:admin_invalid_argument,
+      message: "The principal already has the maximum of 10 managed policies attached."
+    )
+  end
+
   def from_reason(:policy_version_limit_exceeded) do
     Error.new(:admin_invalid_argument,
       message:

@@ -2198,7 +2198,10 @@ defmodule Maxio.IAM do
              operation,
              policy_arns
            ) do
-      Notify.broadcast({:principal_policy_changed, principal_arn})
+      Notify.broadcast(
+        {:principal_policy_changed, Map.get(result, :principal_arn, principal_arn)}
+      )
+
       {:ok, result}
     else
       false -> {:error, :malformed}
@@ -2240,9 +2243,12 @@ defmodule Maxio.IAM do
   def query_builtin_policy_entities(_filters), do: {:error, :malformed}
 
   defp builtin_policy_arns(policy_names) do
-    if policy_names != [] and
-         Enum.all?(policy_names, &(is_binary(&1) and &1 != "" and not String.contains?(&1, "/"))) do
-      {:ok, policy_names |> Enum.uniq() |> Enum.map(&managed_policy_arn(&1, "/")) |> Enum.sort()}
+    if policy_names != [] and Enum.all?(policy_names, &is_binary/1) do
+      {:ok,
+       policy_names
+       |> Enum.uniq()
+       |> Enum.map(&("arn:aws:iam:::policy/" <> &1))
+       |> Enum.sort()}
     else
       {:error, :malformed}
     end
