@@ -3,6 +3,25 @@ defmodule Maxio.Admin.ErrorMapTest do
 
   alias Maxio.Admin.ErrorMap
 
+  test "maps frozen group lifecycle errors exactly" do
+    assert %{code: "XMinioAdminNoSuchGroup", http_status: 404, message: message} =
+             ErrorMap.from_reason(:group_not_found)
+
+    assert message == "The specified group does not exist."
+
+    assert %{
+             code: "XMinioAdminGroupNotEmpty",
+             http_status: 400,
+             message: "The specified group is not empty - cannot remove it."
+           } = ErrorMap.from_reason(:group_not_empty)
+
+    assert %{
+             code: "XMinioInvalidGroupName",
+             http_status: 400,
+             message: "The group name is invalid."
+           } = ErrorMap.from_reason(:invalid_group_name)
+  end
+
   test "maps every S2b input error to its exact public code, status, and message" do
     assert_error(
       :config_too_large,

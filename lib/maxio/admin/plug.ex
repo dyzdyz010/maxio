@@ -50,6 +50,8 @@ defmodule Maxio.Admin.Plug do
     ErrorMap,
     Envelope,
     ErrorView,
+    GroupAdapter,
+    GroupRequest,
     PolicyAdapter,
     PolicyAssociationRequest,
     PolicyEntitiesRequest,
@@ -142,6 +144,15 @@ defmodule Maxio.Admin.Plug do
   defp dispatch(conn, "GET", "/minio/admin/v3/user-info"), do: user_info(conn)
   defp dispatch(conn, "DELETE", "/minio/admin/v3/remove-user"), do: remove_user(conn)
   defp dispatch(conn, "PUT", "/minio/admin/v3/set-user-status"), do: set_user_status(conn)
+
+  defp dispatch(conn, "GET", "/minio/admin/v3/groups"), do: list_groups(conn)
+  defp dispatch(conn, "GET", "/minio/admin/v3/group"), do: group_info(conn)
+
+  defp dispatch(conn, "PUT", "/minio/admin/v3/update-group-members"),
+    do: update_group_members(conn)
+
+  defp dispatch(conn, "PUT", "/minio/admin/v3/set-group-status"),
+    do: set_group_status(conn)
 
   defp dispatch(conn, "POST", "/minio/admin/v3/idp/builtin/policy/" <> operation),
     do: policy_association(conn, operation)
@@ -453,6 +464,126 @@ defmodule Maxio.Admin.Plug do
     )
   end
 
+  defp list_groups(conn) do
+    authorize_and_run(conn, "admin:ListGroups", "admin_group_list", fn conn ->
+      case GroupAdapter.list() do
+        {:ok, result} ->
+          Log.info("admin groups projected",
+            action: "admin_group_list",
+            admin_action: "admin_group_list",
+            group_count: result.evidence.group_count,
+            request_id: request_id(conn),
+            surface: conn.assigns[:maxio_surface]
+          )
+
+          send_json(conn, result.wire)
+
+        {:error, reason} ->
+          render_error(conn, ErrorMap.from_reason(reason))
+      end
+    end)
+  end
+
+  defp group_info(conn) do
+    authorize_and_run(
+      conn,
+      "admin:GetGroup",
+      "admin_group_info",
+      [target_group: conn.query_params["group"]],
+      fn conn ->
+        case GroupAdapter.info(conn.query_params["group"]) do
+          {:ok, result} ->
+            Log.info("admin group projected",
+              action: "admin_group_info",
+              admin_action: "admin_group_info",
+              target_group: result.wire["name"],
+              affected_member_count: length(result.wire["members"]),
+              request_id: request_id(conn),
+              surface: conn.assigns[:maxio_surface]
+            )
+
+            send_group_json(conn, result.wire)
+
+          {:error, reason} ->
+            render_error(conn, ErrorMap.from_reason(reason))
+        end
+      end
+    )
+  end
+
+  defp update_group_members(conn) do
+    authorize_and_run(conn, "admin:AddUserToGroup", "admin_group_members", fn conn ->
+      {conn, request} = GroupRequest.read_update_body!(conn)
+
+      case GroupAdapter.update_members(request) do
+        {:ok, result} ->
+          invalidation = Map.get(result, :invalidation, %{failures: []})
+
+          Log.info("admin group membership mutation committed",
+            action: "admin_group_members",
+            admin_action: "admin_group_members",
+            required_action: "admin:AddUserToGroup",
+            target_group: request.group,
+            requested_member_count: length(request.members),
+            changed_member_count: length(Map.get(result, :changed_member_arns, [])),
+            affected_member_count: length(Map.get(result, :affected_member_arns, [])),
+            group_status_ignored: result.evidence.group_status_ignored,
+            cleanup_count:
+              result
+              |> Map.get(:affected, %{})
+              |> Map.values()
+              |> Enum.sum(),
+            invalidation_failure_count: length(invalidation.failures),
+            request_id: request_id(conn),
+            principal_arn: principal_arn(conn),
+            auth_type: conn.assigns[:auth_type]
+          )
+
+          send_empty_success(conn)
+
+        {:error, reason} ->
+          render_error(conn, ErrorMap.from_reason(reason))
+      end
+    end)
+  end
+
+  defp set_group_status(conn) do
+    authorize_and_run(
+      conn,
+      "admin:EnableGroup",
+      "admin_group_status",
+      [
+        target_group: conn.query_params["group"],
+        requested_group_status: conn.query_params["status"]
+      ],
+      fn conn ->
+        case GroupAdapter.status(conn.query_params["group"], conn.query_params["status"]) do
+          {:ok, result} ->
+            invalidation = Map.get(result, :invalidation, %{failures: []})
+
+            Log.info("admin group status mutation committed",
+              action: "admin_group_status",
+              admin_action: "admin_group_status",
+              required_action: "admin:EnableGroup",
+              target_group: result.group.group_name,
+              requested_group_status: conn.query_params["status"],
+              actual_group_status: result.group.status,
+              affected_member_count: length(Map.get(result, :affected_member_arns, [])),
+              invalidation_failure_count: length(invalidation.failures),
+              request_id: request_id(conn),
+              principal_arn: principal_arn(conn),
+              auth_type: conn.assigns[:auth_type]
+            )
+
+            send_empty_success(conn)
+
+          {:error, reason} ->
+            render_error(conn, ErrorMap.from_reason(reason))
+        end
+      end
+    )
+  end
+
   defp exact_actor_access_key_id(%{
          assigns: %{sigv4_signed_request: %{access_key: access_key_id}}
        })
@@ -630,10 +761,24 @@ defmodule Maxio.Admin.Plug do
   end
 
   defp send_json(conn, body) do
+    encoded = Jason.encode_to_iodata!(body)
+
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode_to_iodata!(body))
+    |> put_resp_header("content-length", encoded |> IO.iodata_length() |> Integer.to_string())
+    |> send_resp(200, encoded)
     |> halt()
+  end
+
+  defp send_group_json(conn, wire) do
+    ordered =
+      Jason.OrderedObject.new(
+        Enum.flat_map(["name", "status", "members", "policy", "updatedAt"], fn key ->
+          if Map.has_key?(wire, key), do: [{key, Map.fetch!(wire, key)}], else: []
+        end)
+      )
+
+    send_json(conn, ordered)
   end
 
   defp send_encrypted_json(conn, body) do

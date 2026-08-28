@@ -172,6 +172,9 @@ defmodule Maxio.S3.Error do
     bucket_quota_exceeded: {"XMinioAdminBucketQuotaExceeded", 400, "Bucket quota exceeded."},
     admin_no_such_user: {"XMinioAdminNoSuchUser", 404, "The specified user does not exist."},
     admin_no_such_group: {"XMinioAdminNoSuchGroup", 404, "The specified group does not exist."},
+    admin_group_not_empty:
+      {"XMinioAdminGroupNotEmpty", 400, "The specified group is not empty - cannot remove it."},
+    admin_invalid_group_name: {"XMinioInvalidGroupName", 400, "The group name is invalid."},
     admin_iam_action_not_allowed:
       {"XMinioIAMActionNotAllowed", 403, "Specified IAM action is not allowed"},
     admin_user_already_exists:

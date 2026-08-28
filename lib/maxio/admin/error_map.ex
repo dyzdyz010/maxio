@@ -11,6 +11,9 @@ defmodule Maxio.Admin.ErrorMap do
   @spec from_reason(term()) :: Error.t()
   def from_reason(:user_not_found), do: Error.new(:admin_no_such_user)
   def from_reason(:group_not_found), do: Error.new(:admin_no_such_group)
+  def from_reason(:identity_changed), do: Error.new(:admin_no_such_group)
+  def from_reason(:group_not_empty), do: Error.new(:admin_group_not_empty)
+  def from_reason(:invalid_group_name), do: Error.new(:admin_invalid_group_name)
 
   def from_reason(:group_disabled) do
     Error.new(:admin_invalid_argument,
