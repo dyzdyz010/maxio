@@ -82,6 +82,62 @@ defmodule Maxio.ConfigTest do
     end
   end
 
+  describe "Admin 权威读门面" do
+    test "authoritative_effective/3 同步对账后按请求顺序返回真实 effective maps" do
+      # Catches a facade that reads the stale snapshot before reconcile, returns a hand-merged
+      # projection, or loses the caller's stable key order.
+      assert {:ok, _result} =
+               Config.set(:listing, :sql_hard_limit, 111, source: "admin_api")
+
+      {1, nil} =
+        Repo.update_all(
+          from(row in RuntimeConfig,
+            where: row.subsystem == "listing" and row.key == "sql_hard_limit"
+          ),
+          set: [value: %{"v" => 999}]
+        )
+
+      assert Config.get(:listing, :sql_hard_limit) == 111
+      assert Store.drifted?() == true
+
+      assert {:ok,
+              [
+                %{
+                  subsystem: :listing,
+                  key: :sql_hard_limit,
+                  value: 999,
+                  source: :runtime,
+                  runtime_value: 999,
+                  version: 1
+                } = effective
+              ]} = Config.authoritative_effective(:listing, [:sql_hard_limit])
+
+      assert effective.apply == :hot
+      assert Config.get(:listing, :sql_hard_limit) == 999
+      assert Store.meta().last_reload_reason == :reconcile
+      assert Store.drifted?() == false
+    end
+
+    test "authoritative_effective/3 turns Repo or Store failure into a safe atom without cache fallback" do
+      # Catches the ordinary effective/3 fail-open behavior being reused for Admin GET, or a raw
+      # exception/reason carrying cached values across the public boundary.
+      assert {:ok, _result} =
+               Config.set(:listing, :sql_hard_limit, 111, source: "admin_api")
+
+      assert Config.get(:listing, :sql_hard_limit) == 111
+
+      assert {:error, {:config_store_unavailable, safe_reason}} =
+               Config.authoritative_effective(
+                 :listing,
+                 [:sql_hard_limit],
+                 repo: Maxio.Test.ConfigMissingQueryRepo
+               )
+
+      assert is_atom(safe_reason)
+      refute Atom.to_string(safe_reason) =~ "111"
+    end
+  end
+
   describe "白名单与禁止清单（D3 / §4）" do
     test "未知键写入返回 {:unknown_config_key, ...} 且绝不落库" do
       assert {:error, {:unknown_config_key, :listing, :nope}} =
