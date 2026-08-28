@@ -27,6 +27,81 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
   alias Maxio.Repo
 
   @membership_event [:maxio, :iam, :group_membership, :before_mutation]
+  @projection_event [:maxio, :iam, :admin_group_projection, :phase]
+  @policy_prefix "arn:aws:iam:::policy/"
+
+  @spec list_names() :: {:ok, [String.t()]} | {:error, term()}
+  def list_names do
+    sql = """
+    /* maxio_admin_group_names */
+    SELECT group_name
+    FROM iam_groups
+    ORDER BY group_name COLLATE "C"
+    """
+
+    case Ecto.Adapters.SQL.query(Repo, sql, []) do
+      {:ok, %{rows: rows}} -> {:ok, Enum.map(rows, &hd/1)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec describe(String.t()) :: {:ok, map()} | {:error, term()}
+  def describe(name_or_arn) when is_binary(name_or_arn) do
+    group_name = identity_group_name(name_or_arn)
+
+    :telemetry.execute(
+      @projection_event,
+      %{system_time: System.system_time()},
+      %{isolation: "single statement", phase: :before_read, group_name: group_name}
+    )
+
+    result = Ecto.Adapters.SQL.query(Repo, description_sql(), [String.downcase(group_name)])
+
+    :telemetry.execute(
+      @projection_event,
+      %{system_time: System.system_time()},
+      %{isolation: "single statement", phase: :after_read, group_name: group_name}
+    )
+
+    case result do
+      {:ok,
+       %{
+         rows: [
+           [
+             canonical_name,
+             status,
+             updated_at,
+             member_names,
+             managed_policy_names,
+             inline_policy_names,
+             non_root_managed_policy_names
+           ]
+         ]
+       }} ->
+        {:ok,
+         %{
+           group_name: canonical_name,
+           status: status,
+           updated_at: normalize_utc_datetime(updated_at),
+           member_names: member_names || [],
+           managed_policy_names: managed_policy_names || [],
+           inline_policy_names: inline_policy_names || [],
+           non_root_managed_policy_names: non_root_managed_policy_names || [],
+           evidence: %{
+             snapshot: "single statement",
+             member_order: "maxio-sorted-unique-members"
+           }
+         }}
+
+      {:ok, %{rows: []}} ->
+        {:error, :group_not_found}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def describe(_name_or_arn), do: {:error, :invalid_argument}
 
   @spec update_members(String.t(), [String.t()], boolean(), String.t()) ::
           {:ok, map()} | {:error, term()}
@@ -541,4 +616,67 @@ defmodule Maxio.IAM.AdminGroupLifecycle do
 
   defp group_arn(group_name), do: "arn:aws:iam:::group/#{group_name}"
   defp user_arn(user_name), do: "arn:aws:iam:::user/#{user_name}"
+
+  defp identity_group_name("arn:aws:iam:::group/" <> name), do: name
+  defp identity_group_name(name), do: name
+
+  defp normalize_utc_datetime(%DateTime{} = value), do: value
+
+  defp normalize_utc_datetime(%NaiveDateTime{} = value),
+    do: DateTime.from_naive!(value, "Etc/UTC")
+
+  defp description_sql do
+    """
+    /* maxio_admin_group_description */
+    WITH target AS (
+      SELECT group_name, group_arn, status, updated_at
+      FROM iam_groups
+      WHERE lower(group_name) = $1
+      ORDER BY inserted_at
+      LIMIT 1
+    )
+    SELECT
+      target.group_name,
+      target.status,
+      target.updated_at,
+      COALESCE((
+        SELECT jsonb_agg(member_name ORDER BY member_name COLLATE "C")
+        FROM (
+          SELECT DISTINCT users.user_name AS member_name
+          FROM iam_group_memberships AS memberships
+          JOIN iam_users AS users ON users.user_arn = memberships.user_arn
+          WHERE memberships.group_arn = target.group_arn
+        ) AS members
+      ), '[]'::jsonb) AS member_names,
+      COALESCE((
+        SELECT jsonb_agg(policy_name ORDER BY policy_name COLLATE "C")
+        FROM (
+          SELECT DISTINCT substring(attachments.policy_arn FROM char_length('#{@policy_prefix}') + 1) AS policy_name
+          FROM iam_group_managed_policy_attachments AS attachments
+          WHERE attachments.group_arn = target.group_arn
+            AND attachments.policy_arn LIKE '#{@policy_prefix}%'
+            AND substring(attachments.policy_arn FROM char_length('#{@policy_prefix}') + 1) NOT LIKE '%/%'
+        ) AS root_policies
+      ), '[]'::jsonb) AS managed_policy_names,
+      COALESCE((
+        SELECT jsonb_agg(policy_name ORDER BY policy_name COLLATE "C")
+        FROM (
+          SELECT DISTINCT policies.policy_name
+          FROM principal_policies AS policies
+          WHERE policies.principal_arn = target.group_arn
+        ) AS inline_policies
+      ), '[]'::jsonb) AS inline_policy_names,
+      COALESCE((
+        SELECT jsonb_agg(policy_name ORDER BY policy_name COLLATE "C")
+        FROM (
+          SELECT DISTINCT substring(attachments.policy_arn FROM char_length('#{@policy_prefix}') + 1) AS policy_name
+          FROM iam_group_managed_policy_attachments AS attachments
+          WHERE attachments.group_arn = target.group_arn
+            AND attachments.policy_arn LIKE '#{@policy_prefix}%'
+            AND substring(attachments.policy_arn FROM char_length('#{@policy_prefix}') + 1) LIKE '%/%'
+        ) AS non_root_policies
+      ), '[]'::jsonb) AS non_root_managed_policy_names
+    FROM target
+    """
+  end
 end

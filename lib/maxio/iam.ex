@@ -923,6 +923,15 @@ defmodule Maxio.IAM do
   def update_minio_group_status_strict(group_name, status),
     do: AdminGroupLifecycle.set_status(group_name, status)
 
+  @doc "Lists canonical local group names for the MinIO admin group surface."
+  @spec list_minio_group_names() :: {:ok, [String.t()]} | {:error, term()}
+  def list_minio_group_names, do: AdminGroupLifecycle.list_names()
+
+  @doc "Projects one MinIO admin group description from a single database statement."
+  @spec get_minio_group_description_strict(String.t()) :: {:ok, map()} | {:error, term()}
+  def get_minio_group_description_strict(group_name),
+    do: AdminGroupLifecycle.describe(group_name)
+
   @doc "Atomically creates a new MinIO admin user and its same-name long-term credential."
   @spec create_minio_user_strict(String.t(), String.t(), String.t()) ::
           {:ok, %{user: map(), access_key: map()}} | {:error, term()}
