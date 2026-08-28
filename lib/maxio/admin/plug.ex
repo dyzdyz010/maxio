@@ -62,9 +62,14 @@ defmodule Maxio.Admin.Plug do
   }
 
   alias Maxio.Auth.SigningSecret
+  alias Maxio.Admin.ConfigKV.{Adapter, Registry, Request}
   alias Maxio.S3.{Error, Log, PipelineOrderError, RawPath, ReservedNamespace}
 
   @behaviour Plug
+  @config_update_action "admin:ConfigUpdate"
+  @config_kv_test_build Mix.env() == :test
+  @safe_config_label ~r/\A[a-z][a-z0-9_]{0,63}\z/
+  @sensitive_config_label ~r/(?:secret|password|token|credential|access[_-]?key|private|cipher|plaintext|root[_-]?user)/i
 
   @impl true
   def init(opts), do: opts
@@ -117,7 +122,7 @@ defmodule Maxio.Admin.Plug do
     if authenticated?(conn) do
       path = RawPath.decoded_path(conn)
       conn = assign(conn, :admin_raw_query_string, conn.query_string)
-      conn = if p7_route?(conn.method, path), do: conn, else: fetch_query_params(conn)
+      conn = if raw_query_route?(conn.method, path), do: conn, else: fetch_query_params(conn)
       dispatch(conn, conn.method, path)
     else
       render_error(conn, Error.new(:access_denied))
@@ -126,6 +131,10 @@ defmodule Maxio.Admin.Plug do
 
   # madmin 的 ServerInfo 硬编码打 v3（实测 mc RELEASE.2025-08-13）。
   defp dispatch(conn, "GET", "/minio/admin/v3/info"), do: server_info(conn)
+
+  defp dispatch(conn, "GET", "/minio/admin/v3/get-config-kv"), do: get_config_kv(conn)
+  defp dispatch(conn, "PUT", "/minio/admin/v3/set-config-kv"), do: set_config_kv(conn)
+  defp dispatch(conn, "DELETE", "/minio/admin/v3/del-config-kv"), do: reset_config_kv(conn)
 
   defp dispatch(conn, "PUT", "/minio/admin/v3/add-canned-policy"),
     do: create_policy(conn)
@@ -162,6 +171,94 @@ defmodule Maxio.Admin.Plug do
 
   defp dispatch(conn, _method, path) do
     render_not_implemented(conn, path)
+  end
+
+  defp get_config_kv(conn) do
+    authorize_and_run(conn, @config_update_action, "admin_config_get", fn conn ->
+      conn = fetch_query_params(conn)
+
+      if Map.has_key?(conn.query_params, "key") do
+        get_config_kv_authorized(conn, conn.query_params["key"])
+      else
+        render_error(conn, ErrorMap.from_reason(:admin_version_mismatch))
+      end
+    end)
+  end
+
+  defp get_config_kv_authorized(conn, subsystem) do
+    with {:ok, caller_secret} <- signing_secret(conn),
+         {:ok, access_key_id} <- exact_actor_access_key_id(conn),
+         {:ok, result} <- Adapter.get(subsystem, config_kv_options(conn, access_key_id)) do
+      ciphertext = Request.encrypt_get!(caller_secret, result.plaintext)
+
+      Log.info("admin config projected",
+        action: "admin_config_get",
+        admin_action: "admin_config_get",
+        required_action: @config_update_action,
+        config_subsystem: Atom.to_string(result.subsystem),
+        config_key_count: length(result.keys),
+        config_changed_count: 0,
+        request_id: request_id(conn),
+        principal_arn: principal_arn(conn),
+        access_key_id: access_key_id,
+        auth_type: conn.assigns[:auth_type]
+      )
+
+      send_config_ciphertext(conn, ciphertext)
+    else
+      {:error, :missing_signing_secret} ->
+        render_error(conn, Error.new(:internal_error))
+
+      {:error, :missing_actor_access_key} ->
+        render_error(conn, Error.new(:internal_error))
+
+      {:error, reason} ->
+        render_config_adapter_error(conn, :get, subsystem, reason)
+    end
+  end
+
+  defp set_config_kv(conn), do: mutate_config_kv(conn, :set)
+  defp reset_config_kv(conn), do: mutate_config_kv(conn, :reset)
+
+  defp mutate_config_kv(conn, operation) do
+    action = config_action(operation)
+
+    authorize_and_run(conn, @config_update_action, action, fn conn ->
+      mutate_config_kv_authorized(conn, operation, action)
+    end)
+  end
+
+  defp mutate_config_kv_authorized(conn, operation, action) do
+    with {:ok, caller_secret} <- signing_secret(conn),
+         {:ok, access_key_id} <- exact_actor_access_key_id(conn) do
+      try do
+        declared_length = Request.declared_mutation_length!(conn)
+        {conn, plaintext} = Request.read_mutation!(conn, caller_secret, declared_length)
+        opts = config_kv_options(conn, access_key_id)
+
+        result =
+          case operation do
+            :set -> Adapter.set(plaintext, opts)
+            :reset -> Adapter.reset(plaintext, opts)
+          end
+
+        case result do
+          {:ok, mutation} ->
+            log_config_mutation(conn, action, access_key_id, mutation)
+            mutation_success(conn, mutation)
+
+          {:error, reason} ->
+            render_config_adapter_error(conn, operation, plaintext, reason)
+        end
+      rescue
+        err in Error ->
+          log_config_transport_failure(conn, action, err)
+          render_error(conn, err)
+      end
+    else
+      {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+      {:error, :missing_actor_access_key} -> render_error(conn, Error.new(:internal_error))
+    end
   end
 
   defp create_policy(conn) do
@@ -592,6 +689,284 @@ defmodule Maxio.Admin.Plug do
 
   defp exact_actor_access_key_id(_conn), do: {:error, :missing_actor_access_key}
 
+  defp config_kv_options(conn, access_key_id) do
+    audit = [
+      source: "admin_api",
+      principal_arn: principal_arn(conn),
+      access_key_id: access_key_id,
+      request_id: request_id(conn),
+      auth_type: conn.assigns[:auth_type]
+    ]
+
+    Keyword.merge(config_kv_test_options(conn), audit)
+  end
+
+  if @config_kv_test_build do
+    defp config_kv_test_options(conn) do
+      case conn.private[:maxio_config_kv_test_opts] do
+        opts when is_list(opts) -> if Keyword.keyword?(opts), do: opts, else: []
+        _other -> []
+      end
+    end
+  else
+    defp config_kv_test_options(_conn), do: []
+  end
+
+  defp render_config_adapter_error(conn, operation, input, reason) do
+    err = config_adapter_error(reason, operation, input)
+
+    Log.warn("admin config request failed",
+      action: config_action(operation),
+      admin_action: config_action(operation),
+      required_action: @config_update_action,
+      config_subsystem: config_subsystem(operation, input),
+      config_key_count: requested_config_key_count(operation, input),
+      config_failure_stage: config_failure_stage(reason, operation, input),
+      code: err.code,
+      status: err.http_status,
+      request_id: request_id(conn),
+      principal_arn: principal_arn(conn),
+      auth_type: conn.assigns[:auth_type]
+    )
+
+    render_error(conn, err)
+  end
+
+  defp config_adapter_error(:access_denied, _operation, _input),
+    do: config_access_denied_error()
+
+  defp config_adapter_error(reason, operation, input) do
+    reason
+    |> config_public_reason(operation, input)
+    |> ErrorMap.from_reason()
+  end
+
+  defp config_public_reason(:config_generic, :get, subsystem) when is_binary(subsystem),
+    do: {:config_generic, "unknown subsystem: #{subsystem}"}
+
+  defp config_public_reason(:config_generic, operation, plaintext)
+       when operation in [:set, :reset] and is_binary(plaintext) do
+    trimmed = String.trim(plaintext)
+    subsystem = config_subsystem(operation, plaintext)
+
+    description =
+      case {operation, Registry.exposed_subsystem(subsystem)} do
+        {:set, {:ok, _entries}} -> "sub-system '#{subsystem}' cannot have empty keys"
+        {_operation, _not_exposed} -> "unknown sub-system #{trimmed}"
+      end
+
+    {:config_generic, description}
+  end
+
+  defp config_public_reason(:config_not_found, :reset, plaintext) when is_binary(plaintext) do
+    case reset_unknown_key(plaintext) do
+      nil -> :config_not_found
+      key -> {:config_not_found, "key #{key} doesn't exist"}
+    end
+  end
+
+  defp config_public_reason(reason, _operation, _input), do: reason
+
+  defp reset_unknown_key(plaintext) do
+    case mutation_tokens(plaintext) do
+      [subsystem | keys] ->
+        Enum.find(keys, fn key ->
+          Registry.classify_path(subsystem, key) == {:error, :unknown_key}
+        end)
+
+      [] ->
+        nil
+    end
+  end
+
+  defp log_config_transport_failure(conn, action, err) do
+    Log.warn("admin config transport failed",
+      action: action,
+      admin_action: action,
+      required_action: @config_update_action,
+      config_subsystem: "unknown",
+      config_key_count: 0,
+      config_failure_stage: config_transport_failure_stage(err),
+      code: err.code,
+      status: err.http_status,
+      request_id: request_id(conn),
+      principal_arn: principal_arn(conn),
+      auth_type: conn.assigns[:auth_type]
+    )
+  end
+
+  defp config_transport_failure_stage(%Error{code: "XMinioAdminConfigTooLarge"}), do: :framing
+  defp config_transport_failure_stage(%Error{code: "XAmzContentSHA256Mismatch"}), do: :hash
+  defp config_transport_failure_stage(%Error{code: "XMinioAdminConfigBadJSON"}), do: :transport
+  defp config_transport_failure_stage(_err), do: :transport
+
+  defp config_failure_stage({:config_store_unavailable, _reason}, _operation, _input),
+    do: :database
+
+  defp config_failure_stage(:config_bad_json, :set, plaintext) do
+    if typed_set_candidate?(plaintext), do: :type, else: :parser
+  end
+
+  defp config_failure_stage(:config_bad_json, _operation, _input), do: :parser
+  defp config_failure_stage(:invalid_argument, _operation, _input), do: :parser
+  defp config_failure_stage(:access_denied, _operation, _input), do: :exposure
+  defp config_failure_stage(:config_generic, _operation, _input), do: :exposure
+  defp config_failure_stage(:config_not_found, _operation, _input), do: :exposure
+  defp config_failure_stage(_reason, _operation, _input), do: :database
+
+  defp typed_set_candidate?(plaintext) when is_binary(plaintext) do
+    lines = mutation_lines(plaintext)
+
+    case lines do
+      [] ->
+        false
+
+      _lines ->
+        subsystems = Enum.map(lines, &config_subsystem(:set, &1))
+        subsystem = hd(subsystems)
+
+        Enum.uniq(subsystems) == [subsystem] and
+          Enum.all?(lines, &line_starts_with_registered_key?(&1, subsystem))
+    end
+  end
+
+  defp typed_set_candidate?(_plaintext), do: false
+
+  defp line_starts_with_registered_key?(line, subsystem) do
+    fields =
+      case String.split(String.trim(line), ~r/\s+/u, parts: 2) do
+        [_subsystem, fields] -> String.trim_leading(fields)
+        _other -> ""
+      end
+
+    case Registry.exposed_subsystem(subsystem) do
+      {:ok, entries} -> Enum.any?(entries, &String.starts_with?(fields, &1.wire_key <> "="))
+      {:error, :unknown_subsystem} -> false
+    end
+  end
+
+  defp log_config_mutation(conn, action, access_key_id, mutation) do
+    Log.info("admin config mutation committed",
+      action: action,
+      admin_action: action,
+      required_action: @config_update_action,
+      config_subsystem: mutation.subsystem,
+      config_key_count: map_size(mutation.outcomes),
+      config_changed_count: mutation.changed_count,
+      config_apply_modes: mutation_apply_modes_text(mutation),
+      config_local_reload: config_local_reload_metadata(mutation.local_reload),
+      config_broadcast: config_broadcast_metadata(mutation.broadcast),
+      config_attention: to_string(mutation.attention?),
+      request_id: request_id(conn),
+      principal_arn: principal_arn(conn),
+      access_key_id: access_key_id,
+      auth_type: conn.assigns[:auth_type]
+    )
+  end
+
+  defp mutation_apply_modes_text(mutation) do
+    case mutation_apply_modes(mutation) do
+      [] -> "none"
+      modes -> Enum.map_join(modes, ",", &Atom.to_string/1)
+    end
+  end
+
+  defp mutation_apply_modes(%{outcomes: outcomes}) when is_map(outcomes) do
+    outcomes
+    |> Map.values()
+    |> Enum.filter(&Map.get(&1, :changed?, false))
+    |> Enum.map(&Map.get(&1, :applied))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp mutation_apply_modes(_mutation), do: [:unknown]
+
+  defp config_local_reload_metadata(:ok), do: :ok
+  defp config_local_reload_metadata(:not_needed), do: :not_needed
+  defp config_local_reload_metadata({:error, :reload_failed}), do: :reload_failed
+  defp config_local_reload_metadata(_result), do: :failed
+
+  defp config_broadcast_metadata(:ok), do: :ok
+  defp config_broadcast_metadata(:not_needed), do: :not_needed
+  defp config_broadcast_metadata({:error, :broadcast_failed}), do: :broadcast_failed
+  defp config_broadcast_metadata(_result), do: :failed
+
+  defp requested_config_key_count(:get, subsystem) when is_binary(subsystem) do
+    case Registry.exposed_subsystem(subsystem) do
+      {:ok, entries} -> length(entries)
+      {:error, :unknown_subsystem} -> 0
+    end
+  end
+
+  defp requested_config_key_count(:set, plaintext) when is_binary(plaintext) do
+    subsystem = config_subsystem(:set, plaintext)
+
+    case Registry.exposed_subsystem(subsystem) do
+      {:ok, entries} -> Enum.count(entries, &String.contains?(plaintext, &1.wire_key <> "="))
+      {:error, :unknown_subsystem} -> 0
+    end
+  end
+
+  defp requested_config_key_count(:reset, plaintext) when is_binary(plaintext) do
+    case mutation_tokens(plaintext) do
+      [subsystem] ->
+        case Registry.exposed_subsystem(subsystem) do
+          {:ok, entries} -> length(entries)
+          {:error, :unknown_subsystem} -> 0
+        end
+
+      [_subsystem | keys] ->
+        keys |> MapSet.new() |> MapSet.size()
+
+      [] ->
+        0
+    end
+  end
+
+  defp requested_config_key_count(_operation, _input), do: 0
+
+  defp config_subsystem(:get, subsystem), do: safe_config_label(subsystem)
+
+  defp config_subsystem(operation, plaintext)
+       when operation in [:set, :reset] and is_binary(plaintext) do
+    case mutation_tokens(plaintext) do
+      [subsystem | _rest] -> safe_config_label(subsystem)
+      [] -> "unknown"
+    end
+  end
+
+  defp config_subsystem(_operation, _input), do: "unknown"
+
+  defp safe_config_label(value) when is_binary(value) do
+    if Regex.match?(@safe_config_label, value) and
+         not Regex.match?(@sensitive_config_label, value) do
+      value
+    else
+      "unknown"
+    end
+  end
+
+  defp safe_config_label(_value), do: "unknown"
+
+  defp mutation_tokens(plaintext) do
+    case mutation_lines(plaintext) do
+      [line | _rest] -> String.split(line, ~r/\s+/u)
+      [] -> []
+    end
+  end
+
+  defp mutation_lines(plaintext) do
+    plaintext
+    |> String.split("\n")
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
+  end
+
+  defp config_action(:get), do: "admin_config_get"
+  defp config_action(:set), do: "admin_config_set"
+  defp config_action(:reset), do: "admin_config_reset"
+
   defp log_user_mutation(conn, admin_action, result) do
     affected = Map.get(result, :affected, %{})
     invalidation = Map.get(result, :invalidation, %{failures: []})
@@ -672,9 +1047,22 @@ defmodule Maxio.Admin.Plug do
           | metadata
         ])
 
-        render_error(conn, Error.new(:access_denied))
+        render_error(conn, access_denied_error(admin_action))
     end
   end
+
+  defp access_denied_error(admin_action)
+       when admin_action in [
+              "admin_config_get",
+              "admin_config_set",
+              "admin_config_reset"
+            ],
+       do: config_access_denied_error()
+
+  defp access_denied_error(_admin_action), do: Error.new(:access_denied)
+
+  defp config_access_denied_error,
+    do: Error.new(:access_denied, message: "Access Denied.")
 
   defp authorize_any_and_run(conn, required_actions, admin_action, callback) do
     metadata = [
@@ -788,6 +1176,38 @@ defmodule Maxio.Admin.Plug do
     |> halt()
   end
 
+  defp send_config_ciphertext(conn, body) do
+    conn
+    |> delete_resp_header("transfer-encoding")
+    |> put_resp_header("content-type", "application/json")
+    |> put_resp_header("content-length", body |> IO.iodata_length() |> Integer.to_string())
+    |> send_resp(200, body)
+    |> halt()
+  end
+
+  defp mutation_success(conn, result) do
+    conn =
+      if applied_without_restart?(result) do
+        put_resp_header(conn, "x-minio-config-applied", "true")
+      else
+        delete_resp_header(conn, "x-minio-config-applied")
+      end
+
+    conn
+    |> delete_resp_header("content-type")
+    |> delete_resp_header("transfer-encoding")
+    |> put_resp_header("content-length", "0")
+    |> send_resp(200, "")
+    |> halt()
+  end
+
+  defp applied_without_restart?(%{local_reload: local_reload} = result)
+       when local_reload in [:ok, :not_needed] do
+    Enum.all?(mutation_apply_modes(result), &(&1 in [:hot, :next_cycle]))
+  end
+
+  defp applied_without_restart?(_result), do: false
+
   defp send_empty_success(conn), do: conn |> send_resp(200, "") |> halt()
 
   defp render_not_implemented(conn, path) do
@@ -842,8 +1262,11 @@ defmodule Maxio.Admin.Plug do
     end
   end
 
-  defp p7_route?("GET", "/minio/admin/v3/idp/builtin/policy-entities"), do: true
-  defp p7_route?(_method, _path), do: false
+  defp raw_query_route?("GET", "/minio/admin/v3/idp/builtin/policy-entities"), do: true
+  defp raw_query_route?("GET", "/minio/admin/v3/get-config-kv"), do: true
+  defp raw_query_route?("PUT", "/minio/admin/v3/set-config-kv"), do: true
+  defp raw_query_route?("DELETE", "/minio/admin/v3/del-config-kv"), do: true
+  defp raw_query_route?(_method, _path), do: false
 
   defp principal_arn(conn) do
     case conn.assigns[:principal] do

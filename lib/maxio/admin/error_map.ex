@@ -8,6 +8,10 @@ defmodule Maxio.Admin.ErrorMap do
 
   alias Maxio.S3.Error
 
+  @safe_identifier ~r/\A[a-z0-9][a-z0-9_.:-]{0,127}\z/
+  @safe_command ~r/\A[a-z0-9][a-z0-9_.-]{0,63}(?: [a-z0-9][a-z0-9_.-]{0,63}(?:=[A-Za-z0-9_.:+\/-]{0,128})?)*\z/
+  @sensitive_marker ~r/(?:secret|password|token|credential|access[_-]?key|private|cipher|plaintext|root[_-]?user)/i
+
   @spec from_reason(term()) :: Error.t()
   def from_reason(:user_not_found), do: Error.new(:admin_no_such_user)
   def from_reason(:group_not_found), do: Error.new(:admin_no_such_group)
@@ -62,6 +66,20 @@ defmodule Maxio.Admin.ErrorMap do
   def from_reason(:user_already_exists), do: Error.new(:admin_user_already_exists)
   def from_reason(:config_too_large), do: Error.new(:admin_config_too_large)
   def from_reason(:config_bad_json), do: Error.new(:admin_config_bad_json)
+  def from_reason(:admin_version_mismatch), do: Error.new(:admin_version_mismatch)
+  def from_reason(:config_generic), do: Error.new(:config_error)
+  def from_reason(:config_not_found), do: Error.new(:config_not_found)
+  def from_reason(:access_denied), do: Error.new(:access_denied)
+
+  def from_reason({:config_generic, description}) do
+    config_error_with_description(:config_error, description)
+  end
+
+  def from_reason({:config_not_found, description}) do
+    config_error_with_description(:config_not_found, description)
+  end
+
+  def from_reason({:config_store_unavailable, _safe_reason}), do: Error.new(:internal_error)
   def from_reason(:invalid_access_key), do: Error.new(:admin_invalid_access_key)
   def from_reason(:invalid_secret_key), do: Error.new(:admin_invalid_secret_key)
   def from_reason(:payload_hash_mismatch), do: Error.new(:x_amz_content_sha256_mismatch)
@@ -150,5 +168,54 @@ defmodule Maxio.Admin.ErrorMap do
       |> Enum.sort()
 
     if names == [], do: nil, else: "#{label} [#{Enum.join(names, ", ")}]"
+  end
+
+  defp config_error_with_description(code, description) do
+    if safe_config_description?(description) do
+      Error.new(code, message: description)
+    else
+      Error.new(code)
+    end
+  end
+
+  defp safe_config_description?("unknown subsystem: " <> subsystem) do
+    subsystem == "" or safe_identifier?(subsystem)
+  end
+
+  defp safe_config_description?("unknown sub-system " <> command),
+    do: safe_command?(command)
+
+  defp safe_config_description?("sub-system '" <> rest) do
+    suffix = "' cannot have empty keys"
+
+    if String.ends_with?(rest, suffix) do
+      rest
+      |> binary_part(0, byte_size(rest) - byte_size(suffix))
+      |> safe_identifier?()
+    else
+      false
+    end
+  end
+
+  defp safe_config_description?("key " <> rest) do
+    suffix = " doesn't exist"
+
+    if String.ends_with?(rest, suffix) do
+      rest
+      |> binary_part(0, byte_size(rest) - byte_size(suffix))
+      |> safe_identifier?()
+    else
+      false
+    end
+  end
+
+  defp safe_config_description?(_description), do: false
+
+  defp safe_identifier?(value) when is_binary(value) do
+    Regex.match?(@safe_identifier, value) and not Regex.match?(@sensitive_marker, value)
+  end
+
+  defp safe_command?(value) when is_binary(value) do
+    Regex.match?(@safe_command, value) and not Regex.match?(@sensitive_marker, value)
   end
 end

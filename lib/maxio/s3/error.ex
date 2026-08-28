@@ -186,6 +186,11 @@ defmodule Maxio.S3.Error do
        "Configuration data provided exceeds the allowed maximum of 262272 bytes"},
     admin_config_bad_json:
       {"XMinioAdminConfigBadJSON", 400, "JSON configuration provided is of incorrect format"},
+    admin_version_mismatch:
+      {"XMinioAdminVersionMismatch", 426,
+       "This 'admin' API is not supported by server in 'maxio'"},
+    config_error: {"XMinioConfigError", 400, "Configuration specified is invalid"},
+    config_not_found: {"XMinioConfigNotFoundError", 404, "Configuration key/value not found"},
     admin_policy_change_already_applied:
       {"XMinioAdminPolicyChangeAlreadyApplied", 400,
        "The specified policy change is already in effect. (Specified policy update has no net effect)"},

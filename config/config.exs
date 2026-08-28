@@ -156,7 +156,14 @@ config :logger, :default_formatter,
     # 无从判断是丢广播还是有人直接改了库。
     :config_digest,
     :config_local_digest,
-    :config_attention_record
+    :config_attention_record,
+    :config_key_count,
+    :config_changed_count,
+    :config_apply_modes,
+    :config_local_reload,
+    :config_broadcast,
+    :config_attention,
+    :config_failure_stage
   ]
 
 # Use Jason for JSON parsing in Phoenix

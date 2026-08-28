@@ -105,7 +105,14 @@ defmodule Maxio.S3.Log do
     :config_source,
     :config_digest,
     :config_local_digest,
-    :config_attention_record
+    :config_attention_record,
+    :config_key_count,
+    :config_changed_count,
+    :config_apply_modes,
+    :config_local_reload,
+    :config_broadcast,
+    :config_attention,
+    :config_failure_stage
   ]
 
   @doc "把关键字参数中已知的 S3 元数据键提取为 Logger metadata keyword 列表。"
