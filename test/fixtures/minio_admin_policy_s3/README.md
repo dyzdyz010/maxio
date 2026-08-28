@@ -96,6 +96,13 @@ the exactly one trailing LF emitted by `printMsg`. `mc --json` for association
 uses one-space indentation; entities uses two-space indentation. These are
 source-derived expected contracts, not observed live transcripts.
 
+The opt-in Maxio external smoke uses this output contract for control-plane
+commands and invokes the native data-plane command at every policy/status
+transition: `mc ls ALIAS` in human mode and `mc --json ls ALIAS` in JSON mode.
+`MC_CONFIG_DIR` and the short-lived `MC_HOST_<alias>` credential are passed only
+through the environment. Fake-runner tests prove orchestration and exact output
+verification; only a run with an installed native `mc` is live evidence.
+
 ## Verification
 
 ```powershell

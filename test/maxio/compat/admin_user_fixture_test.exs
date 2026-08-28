@@ -110,6 +110,54 @@ defmodule Maxio.Compat.AdminUserFixtureTest do
     assert :error = IAM.get_user(user_name)
   end
 
+  test "native mc capability replaces root alias and config env with one fixture value" do
+    owner = self()
+
+    assert {:ok, :captured, %{blockers: []}} =
+             AdminUserFixture.with_user(
+               [
+                 endpoint: "http://127.0.0.1:4000",
+                 initial_list_buckets_policy: false
+               ],
+               fn user, _http_probe, mc_probe ->
+                 command_runner = fn command, args, opts ->
+                   send(owner, {:mc_probe_call, command, args, opts})
+                   {"", "", 0}
+                 end
+
+                 assert {"", "", 0} =
+                          mc_probe.(%{
+                            command_runner: command_runner,
+                            executable: "mc.exe",
+                            alias: "maxiocompat",
+                            config_dir: "fixture-config",
+                            json?: false,
+                            opts: [
+                              env: [
+                                {"MC_CONFIG_DIR", "root-config"},
+                                {"MC_HOST_maxiocompat", "http://root:secret@127.0.0.1:4000"}
+                              ]
+                            ]
+                          })
+
+                 assert_received {:mc_probe_call, "mc.exe", ["ls", "maxiocompat"], opts}
+                 env = Keyword.fetch!(opts, :env)
+
+                 assert Enum.count(env, &(elem(&1, 0) == "MC_CONFIG_DIR")) == 1
+                 assert Enum.count(env, &(elem(&1, 0) == "MC_HOST_maxiocompat")) == 1
+                 assert {"MC_CONFIG_DIR", "fixture-config"} in env
+
+                 {"MC_HOST_maxiocompat", fixture_host} =
+                   Enum.find(env, &(elem(&1, 0) == "MC_HOST_maxiocompat"))
+
+                 assert URI.parse(fixture_host).userinfo
+                        |> String.starts_with?(user.user_name <> ":")
+
+                 :captured
+               end
+             )
+  end
+
   defp fixture_opts(owner) do
     [
       start_repo: fn -> :ok end,

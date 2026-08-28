@@ -240,14 +240,24 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       File.write!(Path.join(config_dir, "initialized-by-mc"), "temporary")
 
       cond do
+        subcommand == "ls" ->
+          allowed? =
+            Process.get(:admin_fixture_status) == :enabled and
+              Process.get(:admin_fixture_policy_attached) == true
+
+          cond do
+            allowed? -> {"", "", 0}
+            json? -> {Jason.encode!(%{"status" => "error"}) <> "\n", "", 1}
+            true -> {"", "mc: <ERROR> Unable to list folder. Access Denied.\n", 1}
+          end
+
         subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
           ["policy", "create", _mc_alias, policy_name, policy_path] = command_args
           Process.put(:policy_name, policy_name)
           Process.put(:policy_fixture, File.read!(policy_path))
 
           if json? do
-            {Jason.encode!(%{"status" => "success", "policy" => policy_name, "isGroup" => false}),
-             0}
+            {json_policy_output(policy_name), 0}
           else
             {"Created policy `#{policy_name}` successfully.\n", 0}
           end
@@ -268,11 +278,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:admin_fixture_policy_attached, true)
 
           if json? do
-            {Jason.encode!(%{
-               "status" => "success",
-               "policiesAttached" => policies,
-               "user" => user_name
-             }), "", 0}
+            {json_association_output(:attach, policies, user_name), "", 0}
           else
             {"Attached Policies: [#{Enum.join(policies, " ")}]\nTo User: #{user_name}\n", "", 0}
           end
@@ -286,11 +292,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:admin_fixture_policy_attached, false)
 
           if json? do
-            {Jason.encode!(%{
-               "status" => "success",
-               "policiesDetached" => policies,
-               "user" => user_name
-             }), "", 0}
+            {json_association_output(:detach, policies, user_name), "", 0}
           else
             {"Detached Policies: [#{Enum.join(policies, " ")}]\nFrom User: #{user_name}\n", "", 0}
           end
@@ -301,15 +303,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           timestamp = "2026-08-28T01:02:03Z"
 
           if json? do
-            {Jason.encode!(%{
-               "status" => "success",
-               "result" => %{
-                 "timestamp" => timestamp,
-                 "policyMappings" => [
-                   %{"policy" => policy_name, "users" => [user_name], "groups" => nil}
-                 ]
-               }
-             }), "", 0}
+            {json_entities_output(policy_name, user_name, timestamp), "", 0}
           else
             {"Query time: #{timestamp}\nPolicy -> Entity Mappings:\n" <>
                "  Policy: #{policy_name}\n    User Mappings:\n      #{user_name}\n", "", 0}
@@ -319,8 +313,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           policy_name = List.last(command_args)
 
           if json? do
-            {Jason.encode!(%{"status" => "success", "policy" => policy_name, "isGroup" => false}),
-             "", 0}
+            {json_policy_output(policy_name), "", 0}
           else
             {"Removed policy `#{policy_name}` successfully.\n", "", 0}
           end
@@ -339,11 +332,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             status =
               if Process.get(:admin_fixture_status) == :disabled, do: "disabled", else: "enabled"
 
-            {Jason.encode!(%{
-               "accessKey" => user_name,
-               "status" => "success",
-               "userStatus" => status
-             }), "", 0}
+            {json_user_info_output(user_name, status), "", 0}
           else
             status =
               if user_name != @config.access_key and
@@ -360,7 +349,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:admin_fixture_status, :disabled)
 
           if json? do
-            {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}), "", 0}
+            {json_user_mutation_output(user_name), "", 0}
           else
             {"Disabled user `#{user_name}` successfully.\n", "", 0}
           end
@@ -371,7 +360,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:admin_fixture_status, :enabled)
 
           if json? do
-            {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}), "", 0}
+            {json_user_mutation_output(user_name), "", 0}
           else
             {"Enabled user `#{user_name}` successfully.\n", "", 0}
           end
@@ -388,7 +377,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             Process.put(:admin_fixture_status, :removed)
 
             if json? do
-              {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}), "", 0}
+              {json_user_mutation_output(user_name), "", 0}
             else
               {"Removed user `#{user_name}` successfully.\n", "", 0}
             end
@@ -439,20 +428,20 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "admin_policy_human_info",
              "admin_user_list",
              "admin_user_info",
-             "admin_policy_human_s3_baseline_denied",
+             "admin_policy_human_mc_ls_baseline_denied",
              "admin_policy_human_attach",
-             "admin_policy_human_s3_attached",
+             "admin_policy_human_mc_ls_attached",
              "admin_policy_human_attach_no_effect",
              "admin_policy_human_entities",
              "admin_policy_human_detach",
-             "admin_policy_human_s3_detached",
+             "admin_policy_human_mc_ls_detached",
              "admin_policy_human_reattach",
              "admin_user_human_disable",
              "admin_user_human_info_disabled",
-             "admin_user_human_s3_disabled",
+             "admin_user_human_mc_ls_disabled",
              "admin_user_human_enable",
              "admin_user_human_info_reenabled",
-             "admin_user_human_s3_reenabled",
+             "admin_user_human_mc_ls_reenabled",
              "admin_policy_human_cleanup_detach",
              "admin_user_human_remove",
              "admin_user_human_remove_again",
@@ -465,20 +454,20 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "admin_user_fixture_cleanup_human",
              "admin_policy_json_create",
              "admin_user_json_info_enabled",
-             "admin_policy_json_s3_baseline_denied",
+             "admin_policy_json_mc_ls_baseline_denied",
              "admin_policy_json_attach",
-             "admin_policy_json_s3_attached",
+             "admin_policy_json_mc_ls_attached",
              "admin_policy_json_attach_no_effect",
              "admin_policy_json_entities",
              "admin_policy_json_detach",
-             "admin_policy_json_s3_detached",
+             "admin_policy_json_mc_ls_detached",
              "admin_policy_json_reattach",
              "admin_user_json_disable",
              "admin_user_json_info_disabled",
-             "admin_user_json_s3_disabled",
+             "admin_user_json_mc_ls_disabled",
              "admin_user_json_enable",
              "admin_user_json_info_reenabled",
-             "admin_user_json_s3_reenabled",
+             "admin_user_json_mc_ls_reenabled",
              "admin_policy_json_cleanup_detach",
              "admin_user_json_remove",
              "admin_policy_json_remove",
@@ -498,16 +487,23 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     refute encoded =~ "test-access"
 
     calls = Process.get(:mc_calls) |> Enum.reverse()
-    [{_command, ["--config-dir", config_dir | _args], _opts} | _rest] = calls
+
+    [{_command, _args, first_opts} | _rest] = calls
+
+    {"MC_CONFIG_DIR", config_dir} =
+      first_opts
+      |> Keyword.fetch!(:env)
+      |> Enum.find(&(elem(&1, 0) == "MC_CONFIG_DIR"))
 
     assert config_dir |> Path.dirname() |> Path.dirname() |> Path.expand() |> Path.split() ==
              tmp_root |> Path.expand() |> Path.split()
 
-    assert length(calls) == 44
+    assert length(calls) == 54
 
     Enum.each(calls, fn {command, args, opts} ->
       assert command == "mc.exe"
       refute Enum.any?(args, &String.contains?(&1, "super-secret"))
+      refute "--config-dir" in args
 
       if "test-access" in args, do: assert(admin_user_action(args) == "remove")
 
@@ -519,26 +515,22 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       assert mc_host =~ "test-access"
       assert mc_host =~ "super-secret"
 
+      {"MC_CONFIG_DIR", call_config_dir} =
+        Enum.find(env, &(elem(&1, 0) == "MC_CONFIG_DIR"))
+
       if "--json" in args do
-        assert ["--json", "admin", kind | _rest] = args
-        assert kind in ["user", "policy"]
-
-        assert {"MC_CONFIG_DIR", json_config_dir} =
-                 Enum.find(env, &(elem(&1, 0) == "MC_CONFIG_DIR"))
-
-        assert json_config_dir == config_dir <> "-json"
+        assert hd(args) == "--json"
+        assert call_config_dir == config_dir <> "-json"
       else
-        assert Enum.take(args, 2) == ["--config-dir", config_dir]
+        assert call_config_dir == config_dir
       end
 
       assert_loopback_bypass(opts, "127.0.0.1")
     end)
 
-    assert ["--config-dir", ^config_dir, "mb", _bucket] = elem(hd(calls), 1)
+    assert ["mb", _bucket] = elem(hd(calls), 1)
 
     assert [
-             "--config-dir",
-             ^config_dir,
              "cp",
              "--attr",
              "maxio-smoke=deep-matrix",
@@ -547,8 +539,6 @@ defmodule Maxio.Compat.ExternalSmokeTest do
            ] = elem(Enum.at(calls, 1), 1)
 
     assert [
-             "--config-dir",
-             ^config_dir,
              "admin",
              "policy",
              "create",
@@ -569,12 +559,10 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              }
            }
 
-    assert ["--config-dir", ^config_dir, "admin", "policy", "ls", "maxiocompat"] =
+    assert ["admin", "policy", "ls", "maxiocompat"] =
              elem(Enum.at(calls, 8), 1)
 
     assert [
-             "--config-dir",
-             ^config_dir,
              "admin",
              "policy",
              "info",
@@ -583,8 +571,6 @@ defmodule Maxio.Compat.ExternalSmokeTest do
            ] = elem(Enum.at(calls, 9), 1)
 
     assert [
-             "--config-dir",
-             ^config_dir,
              "admin",
              "user",
              "list",
@@ -592,8 +578,6 @@ defmodule Maxio.Compat.ExternalSmokeTest do
            ] = elem(Enum.at(calls, 10), 1)
 
     assert [
-             "--config-dir",
-             ^config_dir,
              "admin",
              "user",
              "info",
@@ -606,30 +590,41 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert_received {:admin_user_info, ^fixture_user}
     assert_received {:admin_fixture_cleaned, ^fixture_user}
 
-    assert ["--json", "admin", "user", "info", "maxiocompatjson", json_fixture_user] =
-             elem(Enum.at(calls, 31), 1)
+    {_command, ["--json", "admin", "user", "info", "maxiocompatjson", json_fixture_user], _opts} =
+      Enum.find(calls, fn {_command, args, _opts} ->
+        Enum.take(args, 5) == ["--json", "admin", "user", "info", "maxiocompatjson"]
+      end)
 
     assert json_fixture_user != fixture_user
     assert_received {:admin_fixture_created, ^json_fixture_user}
     assert_received {:admin_fixture_cleaned, ^json_fixture_user}
 
-    assert [
-             "--config-dir",
-             ^config_dir,
-             "admin",
-             "policy",
-             "rm",
-             "maxiocompat",
-             ^policy_name
-           ] = elem(Enum.at(calls, 26), 1)
+    assert Enum.any?(calls, fn {_command, args, _opts} ->
+             args == ["admin", "policy", "rm", "maxiocompat", policy_name]
+           end)
 
     refute Enum.any?(calls, fn {_command, args, _opts} ->
              Enum.chunk_every(args, 3, 1, :discard)
              |> Enum.any?(&(&1 == ["admin", "user", "add"]))
            end)
 
-    assert ["--json", "admin", "user", "remove", "maxiocompatjson", ^json_fixture_user] =
-             elem(Enum.at(calls, 42), 1)
+    assert Enum.any?(calls, fn {_command, args, _opts} ->
+             args == [
+               "--json",
+               "admin",
+               "user",
+               "remove",
+               "maxiocompatjson",
+               json_fixture_user
+             ]
+           end)
+
+    mc_ls_calls =
+      Enum.filter(calls, fn {_command, args, _opts} ->
+        args in [["ls", "maxiocompat"], ["--json", "ls", "maxiocompatjson"]]
+      end)
+
+    assert length(mc_ls_calls) == 10
 
     refute File.exists?(config_dir)
     refute File.exists?(Path.dirname(config_dir))
@@ -648,7 +643,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:policy_remove_calls, Process.get(:policy_remove_calls) + 1)
           user_runner.(command, args, opts)
 
-        subcommand == "admin" ->
+        subcommand in ["admin", "ls"] ->
           user_runner.(command, args, opts)
 
         true ->
@@ -725,22 +720,22 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       |> Enum.map(& &1["id"])
 
     assert association_ids == [
-             "admin_policy_human_s3_baseline_denied",
+             "admin_policy_human_mc_ls_baseline_denied",
              "admin_policy_human_attach",
-             "admin_policy_human_s3_attached",
+             "admin_policy_human_mc_ls_attached",
              "admin_policy_human_attach_no_effect",
              "admin_policy_human_entities",
              "admin_policy_human_detach",
-             "admin_policy_human_s3_detached",
+             "admin_policy_human_mc_ls_detached",
              "admin_policy_human_reattach",
              "admin_policy_human_cleanup_detach",
-             "admin_policy_json_s3_baseline_denied",
+             "admin_policy_json_mc_ls_baseline_denied",
              "admin_policy_json_attach",
-             "admin_policy_json_s3_attached",
+             "admin_policy_json_mc_ls_attached",
              "admin_policy_json_attach_no_effect",
              "admin_policy_json_entities",
              "admin_policy_json_detach",
-             "admin_policy_json_s3_detached",
+             "admin_policy_json_mc_ls_detached",
              "admin_policy_json_reattach",
              "admin_policy_json_cleanup_detach"
            ]
@@ -853,36 +848,109 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     end)
   end
 
-  test "human and JSON user lifecycles interleave info and S3 probes in the pinned order" do
+  for mutation <- [:missing_lf, :double_lf, :compact] do
+    @json_document_mutation mutation
+    test "JSON admin framing rejects #{mutation}" do
+      mutation = @json_document_mutation
+      base_runner = successful_mc_runner()
+
+      runner = fn command, args, opts ->
+        result = base_runner.(command, args, opts)
+
+        case {result, json_mode?(args), admin_user_action(args)} do
+          {{stdout, 0}, true, "info"} ->
+            {mutate_json_document(stdout, mutation), 0}
+
+          _other ->
+            result
+        end
+      end
+
+      [entry] =
+        @config
+        |> Map.put(:clients, ["minio_mc"])
+        |> ExternalSmoke.run(
+          executable_finder: fn "mc" -> "mc.exe" end,
+          command_runner: runner,
+          tmp_root_fun: &tmp_root/0,
+          admin_user_fixture_opts: fixture_opts(self())
+        )
+
+      assert entry["status"] == "blocked"
+      assert hd(entry["blockers"])["step"] == "admin_user_json_info_enabled"
+    end
+  end
+
+  test "fake runner emits the source-pinned complete JSON documents" do
+    assert json_association_output(:attach, ["a-policy", "z-policy"], "alice") ==
+             "{\n \"status\": \"success\",\n \"policiesAttached\": [\n  \"a-policy\",\n  \"z-policy\"\n ],\n \"user\": \"alice\"\n}\n"
+
+    assert json_entities_output("a-policy", "alice", "2026-08-28T01:02:03Z") ==
+             "{\n  \"status\": \"success\",\n  \"result\": {\n    \"timestamp\": \"2026-08-28T01:02:03Z\",\n    \"policyMappings\": [\n      {\n        \"policy\": \"a-policy\",\n        \"users\": [\n          \"alice\"\n        ],\n        \"groups\": null\n      }\n    ]\n  }\n}\n"
+
+    assert json_user_info_output("NAME", "enabled") ==
+             "{\n \"status\": \"success\",\n \"accessKey\": \"NAME\",\n \"userStatus\": \"enabled\"\n}\n"
+
+    assert json_user_mutation_output("NAME") ==
+             "{\n \"status\": \"success\",\n \"accessKey\": \"NAME\"\n}\n"
+  end
+
+  for mutation <- [:missing_lf, :double_lf, :compact] do
+    @json_entities_mutation mutation
+    test "JSON policy entities framing rejects #{mutation}" do
+      mutation = @json_entities_mutation
+      base_runner = successful_mc_runner()
+
+      runner = fn command, args, opts ->
+        result = base_runner.(command, args, opts)
+
+        if "--json" in args and Enum.slice(args, 1, 3) == ["admin", "policy", "entities"] do
+          {stdout, exit_status} = result
+          {mutate_json_document(stdout, mutation), exit_status}
+        else
+          result
+        end
+      end
+
+      [entry] =
+        @config
+        |> Map.put(:clients, ["minio_mc"])
+        |> ExternalSmoke.run(
+          executable_finder: fn "mc" -> "mc.exe" end,
+          command_runner: runner,
+          tmp_root_fun: &tmp_root/0,
+          admin_user_fixture_opts: fixture_opts(self())
+        )
+
+      assert entry["status"] == "blocked"
+      assert hd(entry["blockers"])["step"] == "admin_policy_json_entities"
+    end
+  end
+
+  test "human and JSON user lifecycles interleave info and real mc ls probes in pinned order" do
     Process.put(:admin_lifecycle_trace, [])
     base_runner = successful_mc_runner()
 
     runner = fn command, args, opts ->
-      case admin_user_action(args) do
-        action when action in ["info", "disable", "enable", "remove"] ->
-          append_lifecycle_trace({:mc, json_mode?(args), action})
+      {_config_dir, json?, [subcommand | _command_args]} = parse_mc_args(args, opts)
 
-        _other ->
-          :ok
+      if subcommand == "ls" do
+        append_lifecycle_trace(
+          {:mc_ls, json?, Process.get(:admin_fixture_status),
+           Process.get(:admin_fixture_policy_attached)}
+        )
+      else
+        case admin_user_action(args) do
+          action when action in ["info", "disable", "enable", "remove"] ->
+            append_lifecycle_trace({:mc, json?, action})
+
+          _other ->
+            :ok
+        end
       end
 
       base_runner.(command, args, opts)
     end
-
-    s3_probe = fn ->
-      status = Process.get(:admin_fixture_status)
-      append_lifecycle_trace({:s3, status})
-
-      case {status, Process.get(:admin_fixture_policy_attached)} do
-        {:enabled, true} -> %{status: 200, code: nil, message: nil}
-        {:enabled, false} -> disabled_probe()
-        {:disabled, _attached?} -> disabled_probe()
-        {:removed, _attached?} -> disabled_probe()
-        _other -> disabled_probe()
-      end
-    end
-
-    opts = Keyword.put(fixture_opts(self()), :s3_probe, s3_probe)
 
     [entry] =
       @config
@@ -891,7 +959,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
-        admin_user_fixture_opts: opts
+        admin_user_fixture_opts: fixture_opts(self())
       )
 
     assert entry["status"] == "ok"
@@ -901,21 +969,21 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       |> Enum.reverse()
       |> Enum.filter(fn
         {:mc, _json?, action} when action in ["info", "disable", "enable"] -> true
-        {:s3, _status} -> true
+        {:mc_ls, _json?, _status, _attached?} -> true
         _other -> false
       end)
 
     expected_one_mode = [
       {:mc, :json_mode, "info"},
-      {:s3, :enabled},
-      {:s3, :enabled},
-      {:s3, :enabled},
+      {:mc_ls, :json_mode, :enabled, false},
+      {:mc_ls, :json_mode, :enabled, true},
+      {:mc_ls, :json_mode, :enabled, false},
       {:mc, :json_mode, "disable"},
       {:mc, :json_mode, "info"},
-      {:s3, :disabled},
+      {:mc_ls, :json_mode, :disabled, true},
       {:mc, :json_mode, "enable"},
       {:mc, :json_mode, "info"},
-      {:s3, :enabled}
+      {:mc_ls, :json_mode, :enabled, true}
     ]
 
     assert lifecycle ==
@@ -1110,31 +1178,35 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     end
   end
 
-  for {label, evidence} <- [
-        server_error: %{status: 500, code: "InvalidAccessKeyId", message: "internal"},
-        wrong_status: %{status: 401, code: "InvalidAccessKeyId", message: "unauthorized"},
-        missing_code: %{status: 403, code: nil, message: "missing"},
-        wrong_code: %{status: 403, code: "AccessDenied", message: "denied"},
-        wrong_message: %{
-          status: 403,
-          code: "InvalidAccessKeyId",
-          message: "wrong disabled credential classification"
-        }
+  for {label, mode, evidence} <- [
+        {:human_wrong_exit, :human, {"", "mc: <ERROR> Access Denied.\n", 0}},
+        {:human_wrong_stderr, :human, {"", "permission refused\n", 1}},
+        {:human_wrong_stdout, :human, {"unexpected", "mc: <ERROR> Access Denied.\n", 1}},
+        {:json_wrong_exit, :json, {"{\"status\":\"error\"}\n", "", 0}},
+        {:json_wrong_status, :json, {"{\"status\":\"success\"}\n", "", 1}},
+        {:json_nonempty_stderr, :json, {"{\"status\":\"error\"}\n", "Access Denied\n", 1}}
       ] do
-    @invalid_disabled_probe evidence
-    test "disabled S3 probe rejects #{label} evidence" do
-      invalid = @invalid_disabled_probe
+    @invalid_mc_ls_mode mode
+    @invalid_mc_ls_evidence evidence
+    @invalid_mc_ls_step if(mode == :json,
+                          do: "admin_user_json_mc_ls_disabled",
+                          else: "admin_user_human_mc_ls_disabled"
+                        )
+    test "disabled real mc ls rejects #{label} evidence" do
+      invalid_mode = @invalid_mc_ls_mode
+      invalid = @invalid_mc_ls_evidence
 
-      s3_probe = fn ->
-        case {Process.get(:admin_fixture_status), Process.get(:admin_fixture_policy_attached)} do
-          {:disabled, _attached?} -> invalid
-          {:enabled, false} -> disabled_probe()
-          {:enabled, true} -> %{status: 200, code: nil, message: nil}
-          _other -> disabled_probe()
+      mc_probe = fn probe ->
+        mode = if probe.json?, do: :json, else: :human
+
+        if Process.get(:admin_fixture_status) == :disabled and mode == invalid_mode do
+          invalid
+        else
+          invoke_fixture_mc_probe(probe)
         end
       end
 
-      opts = Keyword.put(fixture_opts(self()), :s3_probe, s3_probe)
+      opts = Keyword.put(fixture_opts(self()), :mc_probe, mc_probe)
 
       [entry] =
         @config
@@ -1147,7 +1219,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         )
 
       assert entry["status"] == "blocked"
-      assert hd(entry["blockers"])["step"] == "admin_user_human_s3_disabled"
+
+      assert hd(entry["blockers"])["step"] == @invalid_mc_ls_step
     end
   end
 
@@ -1529,8 +1602,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   test "mc JSON lifecycle rejects malformed objects, mismatched fields, stderr, and exit status" do
     cases = [
       {"json lines", "{\"accessKey\":\"wrong\"}\n{\"status\":\"enabled\"}\n", "", 0,
-       "external_smoke_json_invalid"},
-      {"array", "[]", "", 0, "external_smoke_json_not_object"},
+       "external_smoke_json_mismatch"},
+      {"array", "[]", "", 0, "external_smoke_json_mismatch"},
       {"wrong access key",
        Jason.encode!(%{
          "accessKey" => "wrong",
@@ -1736,11 +1809,20 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           _other -> %{status: nil, code: "probe_not_configured", message: nil}
         end
       end,
+      mc_probe: fn probe ->
+        args = if probe.json?, do: ["--json", "ls", probe.alias], else: ["ls", probe.alias]
+        probe.command_runner.(probe.executable, args, probe.opts)
+      end,
       cleanup_user: fn name ->
         send(owner, {:admin_fixture_cleaned, name})
         cleanup_result
       end
     ]
+  end
+
+  defp invoke_fixture_mc_probe(probe) do
+    args = if probe.json?, do: ["--json", "ls", probe.alias], else: ["ls", probe.alias]
+    probe.command_runner.(probe.executable, args, probe.opts)
   end
 
   defp disabled_probe do
@@ -1758,6 +1840,10 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   end
 
   defp put_json_mode({:mc, :json_mode, action}, json?), do: {:mc, json?, action}
+
+  defp put_json_mode({:mc_ls, :json_mode, status, attached?}, json?),
+    do: {:mc_ls, json?, status, attached?}
+
   defp put_json_mode(other, _json?), do: other
 
   defp successful_mc_runner(opts \\ []) do
@@ -1770,6 +1856,25 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       user_name = Process.get(:admin_fixture_user)
 
       cond do
+        subcommand == "ls" ->
+          allowed? =
+            Process.get(:admin_fixture_status) == :enabled and
+              Process.get(:admin_fixture_policy_attached) == true
+
+          cond do
+            allowed? ->
+              {"", "", 0}
+
+            json? ->
+              {Jason.encode!(%{
+                 "status" => "error",
+                 "error" => %{"message" => "Access Denied"}
+               }) <> "\n", "", 1}
+
+            true ->
+              {"", "mc: <ERROR> Unable to list folder. Access Denied.\n", 1}
+          end
+
         subcommand == "cp" and Enum.any?(command_args, &File.regular?/1) ->
           payload_path = Enum.find(command_args, &File.regular?/1)
           Process.put(:successful_mc_payload, File.read!(payload_path))
@@ -1786,12 +1891,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:successful_mc_policy, policy_name)
 
           if json?,
-            do:
-              {Jason.encode!(%{
-                 "status" => "success",
-                 "policy" => policy_name,
-                 "isGroup" => false
-               }), 0},
+            do: {json_policy_output(policy_name), 0},
             else: {"Created policy `#{policy_name}` successfully.\n", 0}
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "ls"] ->
@@ -1809,10 +1909,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:admin_fixture_policy_attached, true)
 
           if json? do
-            {Jason.encode!(
-               %{"status" => "success", "policiesAttached" => policies, "user" => target_name},
-               pretty: true
-             ), 0}
+            {json_association_output(:attach, policies, target_name), 0}
           else
             {"Attached Policies: [#{Enum.join(policies, " ")}]\nTo User: #{target_name}\n", 0}
           end
@@ -1826,10 +1923,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:admin_fixture_policy_attached, false)
 
           if json? do
-            {Jason.encode!(
-               %{"status" => "success", "policiesDetached" => policies, "user" => target_name},
-               pretty: true
-             ), 0}
+            {json_association_output(:detach, policies, target_name), 0}
           else
             {"Detached Policies: [#{Enum.join(policies, " ")}]\nFrom User: #{target_name}\n", 0}
           end
@@ -1839,18 +1933,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           timestamp = "2026-08-28T01:02:03Z"
 
           if json? do
-            {Jason.encode!(
-               %{
-                 "status" => "success",
-                 "result" => %{
-                   "timestamp" => timestamp,
-                   "policyMappings" => [
-                     %{"policy" => policy_name, "users" => [user_name], "groups" => nil}
-                   ]
-                 }
-               },
-               pretty: true
-             ), 0}
+            {json_entities_output(policy_name, user_name, timestamp), 0}
           else
             {"Query time: #{timestamp}\nPolicy -> Entity Mappings:\n" <>
                "  Policy: #{policy_name}\n    User Mappings:\n      #{user_name}\n", 0}
@@ -1860,12 +1943,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           policy_name = List.last(command_args)
 
           if json?,
-            do:
-              {Jason.encode!(%{
-                 "status" => "success",
-                 "policy" => policy_name,
-                 "isGroup" => false
-               }), 0},
+            do: {json_policy_output(policy_name), 0},
             else: {"Removed policy `#{policy_name}` successfully.\n", 0}
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["user", "list"] ->
@@ -1878,10 +1956,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             status =
               if Process.get(:admin_fixture_status) == :disabled, do: "disabled", else: "enabled"
 
-            {Jason.encode!(
-               %{"accessKey" => target_name, "status" => "success", "userStatus" => status},
-               pretty: true
-             ), 0}
+            {json_user_info_output(target_name, status), 0}
           else
             case admin_user_info do
               nil ->
@@ -1905,16 +1980,14 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           Process.put(:admin_fixture_status, :disabled)
 
           if json?,
-            do:
-              {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}, pretty: true), 0},
+            do: {json_user_mutation_output(user_name), 0},
             else: {"Disabled user `#{user_name}` successfully.\n", 0}
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["user", "enable"] ->
           Process.put(:admin_fixture_status, :enabled)
 
           if json?,
-            do:
-              {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}, pretty: true), 0},
+            do: {json_user_mutation_output(user_name), 0},
             else: {"Enabled user `#{user_name}` successfully.\n", 0}
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["user", "remove"] ->
@@ -1928,9 +2001,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             Process.put(:admin_fixture_status, :removed)
 
             if json?,
-              do:
-                {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}, pretty: true),
-                 "", 0},
+              do: {json_user_mutation_output(user_name), "", 0},
               else: {"Removed user `#{user_name}` successfully.\n", "", 0}
           end
 
@@ -1958,6 +2029,60 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     end
   end
 
+  defp json_policy_output(policy_name) do
+    "{\n" <>
+      " \"status\": \"success\",\n" <>
+      " \"policy\": #{Jason.encode!(policy_name)},\n" <>
+      " \"isGroup\": false\n" <>
+      "}\n"
+  end
+
+  defp json_association_output(operation, policies, user_name) do
+    field = if operation == :attach, do: "policiesAttached", else: "policiesDetached"
+    policy_lines = Enum.map_join(policies, ",\n", &("  " <> Jason.encode!(&1)))
+
+    "{\n" <>
+      " \"status\": \"success\",\n" <>
+      " \"#{field}\": [\n" <>
+      policy_lines <>
+      "\n ],\n" <>
+      " \"user\": #{Jason.encode!(user_name)}\n" <>
+      "}\n"
+  end
+
+  defp json_entities_output(policy_name, user_name, timestamp) do
+    "{\n" <>
+      "  \"status\": \"success\",\n" <>
+      "  \"result\": {\n" <>
+      "    \"timestamp\": #{Jason.encode!(timestamp)},\n" <>
+      "    \"policyMappings\": [\n" <>
+      "      {\n" <>
+      "        \"policy\": #{Jason.encode!(policy_name)},\n" <>
+      "        \"users\": [\n" <>
+      "          #{Jason.encode!(user_name)}\n" <>
+      "        ],\n" <>
+      "        \"groups\": null\n" <>
+      "      }\n" <>
+      "    ]\n" <>
+      "  }\n" <>
+      "}\n"
+  end
+
+  defp json_user_info_output(user_name, status) do
+    "{\n" <>
+      " \"status\": \"success\",\n" <>
+      " \"accessKey\": #{Jason.encode!(user_name)},\n" <>
+      " \"userStatus\": #{Jason.encode!(status)}\n" <>
+      "}\n"
+  end
+
+  defp json_user_mutation_output(user_name) do
+    "{\n" <>
+      " \"status\": \"success\",\n" <>
+      " \"accessKey\": #{Jason.encode!(user_name)}\n" <>
+      "}\n"
+  end
+
   defp human_user_info(user_name, status) do
     "AccessKey: #{user_name}\nStatus: #{status}\nPolicyName: \nMemberOf: []\n"
   end
@@ -1966,6 +2091,16 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   defp mutate_human_success(canonical, :double_lf), do: canonical <> "\n\n"
   defp mutate_human_success(canonical, :trailing_space), do: canonical <> " \n"
   defp mutate_human_success(canonical, :lone_cr), do: canonical <> "\r"
+
+  defp mutate_json_document(output, :missing_lf), do: String.trim_trailing(output, "\n")
+  defp mutate_json_document(output, :double_lf), do: String.trim_trailing(output, "\n") <> "\n\n"
+
+  defp mutate_json_document(output, :compact) do
+    output
+    |> Jason.decode!()
+    |> Jason.encode!()
+    |> Kernel.<>("\n")
+  end
 
   defp tmp_root do
     Path.join(

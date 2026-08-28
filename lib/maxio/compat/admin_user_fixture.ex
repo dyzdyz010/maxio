@@ -3,8 +3,9 @@ defmodule Maxio.Compat.AdminUserFixture do
   Creates one short-lived credential-bearing IAM user for external admin smoke.
 
   Setup and cleanup use public IAM facades. The plaintext secret exists only in
-  the closure environment of a zero-argument S3 probe capability; it is never
-  returned in fixture maps, argv, logs, or artifact evidence.
+  the closure environments of an optional signed-HTTP diagnostic and the live
+  `mc ls` capability; it is never returned in fixture maps, argv, logs, or
+  artifact evidence. External smoke uses the latter for its data-plane proof.
   """
 
   alias Maxio.Config.CLI
@@ -19,16 +20,18 @@ defmodule Maxio.Compat.AdminUserFixture do
           {:ok, term(), cleanup_component()}
           | {:error, map(), cleanup_component()}
   def with_user(opts, callback)
-      when is_list(opts) and (is_function(callback, 1) or is_function(callback, 2)) do
+      when is_list(opts) and
+             (is_function(callback, 1) or is_function(callback, 2) or is_function(callback, 3)) do
     start_repo = Keyword.get(opts, :start_repo, &CLI.start_repo/0)
     create_user = Keyword.get(opts, :create_user, fn name -> default_create_user(name, opts) end)
     cleanup_user = Keyword.get(opts, :cleanup_user, &IAM.delete_user/1)
     name = Keyword.get(opts, :name, unique_name())
     injected_probe = Keyword.get(opts, :s3_probe, &unconfigured_probe/0)
+    injected_mc_probe = Keyword.get(opts, :mc_probe, &unconfigured_mc_probe/1)
 
-    case setup_user(start_repo, create_user, name, injected_probe) do
-      {:ok, user, s3_probe} ->
-        primary = invoke_callback(callback, user, s3_probe)
+    case setup_user(start_repo, create_user, name, injected_probe, injected_mc_probe) do
+      {:ok, user, s3_probe, mc_probe} ->
+        primary = invoke_callback(callback, user, s3_probe, mc_probe)
         cleanup = cleanup_user(cleanup_user, user.user_name)
 
         case primary do
@@ -41,11 +44,12 @@ defmodule Maxio.Compat.AdminUserFixture do
     end
   end
 
-  defp setup_user(start_repo, create_user, name, injected_probe) do
+  defp setup_user(start_repo, create_user, name, injected_probe, injected_mc_probe) do
     with :ok <- start_repo.(),
          {:ok, created} <- create_user.(name),
-         {:ok, user, s3_probe} <- normalize_created(created, injected_probe) do
-      {:ok, user, s3_probe}
+         {:ok, user, s3_probe, mc_probe} <-
+           normalize_created(created, injected_probe, injected_mc_probe) do
+      {:ok, user, s3_probe, mc_probe}
     else
       failure -> {:error, setup_blocker(failure)}
     end
@@ -55,19 +59,33 @@ defmodule Maxio.Compat.AdminUserFixture do
     kind, reason -> {:error, setup_catch_blocker(kind, reason)}
   end
 
-  defp normalize_created(%{user: %{user_name: user_name} = user, s3_probe: s3_probe}, _injected)
-       when is_binary(user_name) and is_function(s3_probe, 0),
-       do: {:ok, user, s3_probe}
+  defp normalize_created(
+         %{
+           user: %{user_name: user_name} = user,
+           s3_probe: s3_probe,
+           mc_probe: mc_probe
+         },
+         _injected_probe,
+         _injected_mc_probe
+       )
+       when is_binary(user_name) and is_function(s3_probe, 0) and is_function(mc_probe, 1),
+       do: {:ok, user, s3_probe, mc_probe}
 
-  defp normalize_created(%{user_name: user_name} = user, injected_probe)
-       when is_binary(user_name) and is_function(injected_probe, 0),
-       do: {:ok, user, injected_probe}
+  defp normalize_created(%{user_name: user_name} = user, injected_probe, injected_mc_probe)
+       when is_binary(user_name) and is_function(injected_probe, 0) and
+              is_function(injected_mc_probe, 1),
+       do: {:ok, user, injected_probe, injected_mc_probe}
 
-  defp normalize_created(_created, _injected_probe), do: {:error, :invalid_fixture_user}
+  defp normalize_created(_created, _injected_probe, _injected_mc_probe),
+    do: {:error, :invalid_fixture_user}
 
-  defp invoke_callback(callback, user, s3_probe) do
+  defp invoke_callback(callback, user, s3_probe, mc_probe) do
     result =
-      if is_function(callback, 2), do: callback.(user, s3_probe), else: callback.(user)
+      cond do
+        is_function(callback, 3) -> callback.(user, s3_probe, mc_probe)
+        is_function(callback, 2) -> callback.(user, s3_probe)
+        true -> callback.(user)
+      end
 
     {:ok, result}
   rescue
@@ -169,7 +187,8 @@ defmodule Maxio.Compat.AdminUserFixture do
       {:ok,
        %{
          user: user,
-         s3_probe: s3_probe(name, secret_key, Keyword.get(opts, :endpoint))
+         s3_probe: s3_probe(name, secret_key, Keyword.get(opts, :endpoint)),
+         mc_probe: mc_probe(name, secret_key, Keyword.get(opts, :endpoint))
        }}
     else
       failure ->
@@ -230,6 +249,55 @@ defmodule Maxio.Compat.AdminUserFixture do
 
   defp unconfigured_probe,
     do: %{status: nil, code: "probe_not_configured", message: nil}
+
+  defp mc_probe(access_key_id, secret_key, configured_endpoint) do
+    endpoint = configured_endpoint || System.get_env("MAXIO_COMPAT_ENDPOINT")
+
+    fn probe ->
+      with true <- is_binary(endpoint) and endpoint != "",
+           command_runner when is_function(command_runner, 3) <- Map.get(probe, :command_runner),
+           executable when is_binary(executable) <- Map.get(probe, :executable),
+           alias_name when is_binary(alias_name) <- Map.get(probe, :alias),
+           config_dir when is_binary(config_dir) <- Map.get(probe, :config_dir) do
+        args =
+          if Map.get(probe, :json?, false),
+            do: ["--json", "ls", alias_name],
+            else: ["ls", alias_name]
+
+        secret_env = [
+          {"MC_CONFIG_DIR", config_dir},
+          {"MC_HOST_#{alias_name}", endpoint_with_userinfo(endpoint, access_key_id, secret_key)}
+        ]
+
+        opts = replace_env(Map.get(probe, :opts, []), secret_env)
+
+        command_runner.(executable, args, opts)
+      else
+        _other -> {"", "mc fixture probe is not configured", 2}
+      end
+    end
+  end
+
+  defp unconfigured_mc_probe(_probe),
+    do: {"", "mc fixture probe is not configured", 2}
+
+  defp replace_env(opts, injected) do
+    injected_names = MapSet.new(injected, &elem(&1, 0))
+
+    existing =
+      opts
+      |> Keyword.get(:env, [])
+      |> Enum.reject(fn {name, _value} -> MapSet.member?(injected_names, name) end)
+
+    Keyword.put(opts, :env, existing ++ injected)
+  end
+
+  defp endpoint_with_userinfo(endpoint, access_key_id, secret_key) do
+    uri = URI.parse(endpoint)
+    encoded_user = URI.encode_www_form(access_key_id)
+    encoded_secret = URI.encode_www_form(secret_key)
+    %{uri | userinfo: "#{encoded_user}:#{encoded_secret}"} |> URI.to_string()
+  end
 
   defp list_buckets_policy do
     Jason.encode!(%{

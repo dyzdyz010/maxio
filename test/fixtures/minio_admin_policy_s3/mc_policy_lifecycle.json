@@ -154,16 +154,16 @@
     "per_mode_order": [
       "create dedicated managed policy",
       "create credential-bearing user without bootstrap ListBuckets policy",
-      "baseline S3 list denied",
+      "native mc ls ALIAS data-plane list denied",
       "attach policy",
-      "S3 list allowed",
+      "native mc ls ALIAS data-plane list allowed",
       "repeat attach with duplicate positional policy argv and observe mc no-effect synthesis",
       "query policy entities with repeated user and policy filters",
       "detach policy",
-      "S3 list denied",
+      "native mc ls ALIAS data-plane list denied",
       "reattach policy",
-      "disable user and observe S3 rejection",
-      "enable user and observe S3 recovery",
+      "disable user and observe native mc ls ALIAS rejection",
+      "enable user and observe native mc ls ALIAS recovery",
       "detach policy",
       "remove user",
       "remove policy"
@@ -173,6 +173,11 @@
       "remove user",
       "remove managed policy"
     ],
+    "data_plane_commands": {
+      "human": "mc ls ALIAS",
+      "json": "mc --json ls ALIAS"
+    },
+    "credential_transport": "MC_HOST_<alias> and MC_CONFIG_DIR environment only; never argv",
     "json_position": "--json is the first mc argument and MC_CONFIG_DIR remains environment-only",
     "evidence_note": "This is expected source-pinned contract data. Fake-runner automation is not strict native mc live evidence."
   }
