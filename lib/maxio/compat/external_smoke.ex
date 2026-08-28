@@ -1035,9 +1035,20 @@ defmodule Maxio.Compat.ExternalSmoke do
       )
     ]
 
+    {before_user_remove, user_remove_and_after} =
+      Enum.split_while(steps, &(&1.id != "admin_user_human_remove"))
+
+    steps =
+      before_user_remove ++
+        mc_human_group_steps(executable, paths, opts, user_name, mc_probe) ++
+        user_remove_and_after
+
     cleanup_steps =
       select_cleanup_steps(steps, [
         {"admin_policy_human_cleanup_detach", "admin_policy_human_create"},
+        {"admin_group_human_cleanup_detach", "admin_group_human_add"},
+        {"admin_group_human_cleanup_remove_member", "admin_group_human_add"},
+        {"admin_group_human_remove", "admin_group_human_add"},
         {"admin_user_human_remove", "admin_policy_human_create"},
         {"admin_policy_human_remove", "admin_policy_human_create"},
         {"delete_copied_object", "copy_object"},
@@ -1259,14 +1270,336 @@ defmodule Maxio.Compat.ExternalSmoke do
       )
     ]
 
+    {before_user_remove, user_remove_and_after} =
+      Enum.split_while(steps, &(&1.id != "admin_user_json_remove"))
+
+    steps =
+      before_user_remove ++
+        mc_json_group_steps(executable, paths, opts, user_name, mc_probe) ++
+        user_remove_and_after
+
     cleanup_steps =
       select_cleanup_steps(steps, [
         {"admin_policy_json_cleanup_detach", "admin_policy_json_create"},
+        {"admin_group_json_cleanup_detach", "admin_group_json_add"},
+        {"admin_group_json_cleanup_remove_member", "admin_group_json_add"},
+        {"admin_group_json_remove", "admin_group_json_add"},
         {"admin_user_json_remove", "admin_policy_json_create"},
         {"admin_policy_json_remove", "admin_policy_json_create"}
       ])
 
     {steps, cleanup_steps}
+  end
+
+  defp mc_human_group_steps(executable, paths, opts, user_name, mc_probe) do
+    group_name = smoke_group_name(paths)
+    alias_name = paths.mc_alias
+
+    [
+      step(
+        "admin_group_human_add",
+        executable,
+        ["admin", "group", "add", alias_name, group_name, user_name],
+        opts,
+        {:output_exact, "Added members `#{user_name}` to group `#{group_name}` successfully.\n"},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "mc creates a temporary group with the unprivileged fixture user"
+      ),
+      mc_probe_step(
+        "admin_group_human_mc_ls_baseline_denied",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :human,
+        :rejected,
+        "admin_group_human_lifecycle",
+        "group membership alone does not grant ListBuckets"
+      ),
+      step(
+        "admin_group_human_attach",
+        executable,
+        [
+          "admin",
+          "policy",
+          "attach",
+          alias_name,
+          paths.policy_name,
+          "--group",
+          group_name
+        ],
+        opts,
+        {:output_exact, association_group_human_output(:attach, [paths.policy_name], group_name)},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "mc attaches the ListBuckets policy to the temporary group"
+      ),
+      step(
+        "admin_group_human_list",
+        executable,
+        ["admin", "group", "ls", alias_name],
+        opts,
+        {:output_contains, [group_name]},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "mc group ls contains the temporary group"
+      ),
+      step(
+        "admin_group_human_info",
+        executable,
+        ["admin", "group", "info", alias_name, group_name],
+        opts,
+        {:output_exact, human_group_info(group_name, user_name, paths.policy_name, "enabled")},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "mc group info returns exact status, policy and member framing"
+      ),
+      mc_probe_step(
+        "admin_group_human_mc_ls_attached",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :human,
+        :success,
+        "admin_group_human_lifecycle",
+        "group managed policy enables real mc ls"
+      ),
+      group_human_status_step(executable, opts, alias_name, group_name, "disable"),
+      mc_probe_step(
+        "admin_group_human_mc_ls_disabled",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :human,
+        :rejected,
+        "admin_group_human_lifecycle",
+        "disabled group removes its data-plane grant"
+      ),
+      group_human_status_step(executable, opts, alias_name, group_name, "enable"),
+      mc_probe_step(
+        "admin_group_human_mc_ls_reenabled",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :human,
+        :success,
+        "admin_group_human_lifecycle",
+        "re-enabled group restores its data-plane grant"
+      ),
+      step(
+        "admin_group_human_cleanup_remove_member",
+        executable,
+        ["admin", "group", "remove", alias_name, group_name, user_name],
+        opts,
+        {:output_exact,
+         "Removed members {#{user_name}} from group #{group_name} successfully.\n"},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "cleanup removes the user from the group before deleting it"
+      ),
+      mc_probe_step(
+        "admin_group_human_mc_ls_removed",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :human,
+        :rejected,
+        "admin_group_human_lifecycle",
+        "removed member immediately loses the group grant"
+      ),
+      step(
+        "admin_group_human_cleanup_detach",
+        executable,
+        [
+          "admin",
+          "policy",
+          "detach",
+          alias_name,
+          paths.policy_name,
+          "--group",
+          group_name
+        ],
+        opts,
+        {:output_exact, association_group_human_output(:detach, [paths.policy_name], group_name)},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "cleanup detaches the policy mapping before group deletion"
+      ),
+      step(
+        "admin_group_human_remove",
+        executable,
+        ["admin", "group", "remove", alias_name, group_name],
+        opts,
+        {:output_exact, "Removed group #{group_name} successfully.\n"},
+        scenario: "admin_group_human_lifecycle",
+        assertion: "mc removes the now-empty temporary group"
+      )
+    ]
+  end
+
+  defp mc_json_group_steps(executable, paths, opts, user_name, mc_probe) do
+    group_name = smoke_group_name(paths)
+    alias_name = paths.mc_alias
+    base = ["--json"]
+
+    [
+      group_json_step(
+        "admin_group_json_add",
+        executable,
+        base,
+        ["add", alias_name, group_name, user_name],
+        opts,
+        group_json_output(:add, group_name, user_name, nil, nil)
+      ),
+      mc_probe_step(
+        "admin_group_json_mc_ls_baseline_denied",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :json,
+        :rejected,
+        "admin_group_json_lifecycle",
+        "independent JSON group begins without ListBuckets permission"
+      ),
+      step(
+        "admin_group_json_attach",
+        executable,
+        base ++
+          ["admin", "policy", "attach", alias_name, paths.policy_name, "--group", group_name],
+        opts,
+        {:json_exact, association_group_json_output(:attach, [paths.policy_name], group_name)},
+        scenario: "admin_group_json_lifecycle",
+        assertion: "JSON mode attaches policy to the group"
+      ),
+      group_json_step(
+        "admin_group_json_list",
+        executable,
+        base,
+        ["ls", alias_name],
+        opts,
+        group_json_output(:list, group_name, nil, nil, nil)
+      ),
+      group_json_step(
+        "admin_group_json_info",
+        executable,
+        base,
+        ["info", alias_name, group_name],
+        opts,
+        group_json_output(:info, group_name, user_name, "enabled", paths.policy_name)
+      ),
+      mc_probe_step(
+        "admin_group_json_mc_ls_attached",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :json,
+        :success,
+        "admin_group_json_lifecycle",
+        "JSON group policy enables real mc ls"
+      ),
+      group_json_step(
+        "admin_group_json_disable",
+        executable,
+        base,
+        ["disable", alias_name, group_name],
+        opts,
+        group_json_output(:status, group_name, nil, "disabled", nil)
+      ),
+      mc_probe_step(
+        "admin_group_json_mc_ls_disabled",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :json,
+        :rejected,
+        "admin_group_json_lifecycle",
+        "disabled JSON group removes the data-plane grant"
+      ),
+      group_json_step(
+        "admin_group_json_enable",
+        executable,
+        base,
+        ["enable", alias_name, group_name],
+        opts,
+        group_json_output(:status, group_name, nil, "enabled", nil)
+      ),
+      mc_probe_step(
+        "admin_group_json_mc_ls_reenabled",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :json,
+        :success,
+        "admin_group_json_lifecycle",
+        "re-enabled JSON group restores the data-plane grant"
+      ),
+      group_json_step(
+        "admin_group_json_cleanup_remove_member",
+        executable,
+        base,
+        ["remove", alias_name, group_name, user_name],
+        opts,
+        group_json_output(:remove_members, group_name, user_name, nil, nil)
+      ),
+      mc_probe_step(
+        "admin_group_json_mc_ls_removed",
+        executable,
+        paths,
+        opts,
+        mc_probe,
+        :json,
+        :rejected,
+        "admin_group_json_lifecycle",
+        "removed JSON member immediately loses the grant"
+      ),
+      step(
+        "admin_group_json_cleanup_detach",
+        executable,
+        base ++
+          ["admin", "policy", "detach", alias_name, paths.policy_name, "--group", group_name],
+        opts,
+        {:json_exact, association_group_json_output(:detach, [paths.policy_name], group_name)},
+        scenario: "admin_group_json_lifecycle",
+        assertion: "JSON cleanup detaches policy before group deletion"
+      ),
+      group_json_step(
+        "admin_group_json_remove",
+        executable,
+        base,
+        ["remove", alias_name, group_name],
+        opts,
+        group_json_output(:remove_group, group_name, nil, nil, nil)
+      )
+    ]
+  end
+
+  defp group_human_status_step(executable, opts, alias_name, group_name, action) do
+    past = if action == "disable", do: "Disabled", else: "Enabled"
+
+    step(
+      "admin_group_human_#{action}",
+      executable,
+      ["admin", "group", action, alias_name, group_name],
+      opts,
+      {:output_exact, "#{past} group `#{group_name}` successfully.\n"},
+      scenario: "admin_group_human_lifecycle",
+      assertion: "mc #{action}s the group through G4"
+    )
+  end
+
+  defp group_json_step(id, executable, base, args, opts, expected) do
+    step(
+      id,
+      executable,
+      base ++ ["admin", "group" | args],
+      opts,
+      {:json_exact, expected},
+      scenario: "admin_group_json_lifecycle",
+      assertion: "mc --json group command returns one compact exact JSON document"
+    )
   end
 
   defp association_human_output(:attach, policies, user_name) do
@@ -1275,6 +1608,22 @@ defmodule Maxio.Compat.ExternalSmoke do
 
   defp association_human_output(:detach, policies, user_name) do
     "Detached Policies: [#{Enum.join(policies, " ")}]\nFrom User: #{user_name}\n"
+  end
+
+  defp association_group_human_output(:attach, policies, group_name) do
+    "Attached Policies: [#{Enum.join(policies, " ")}]\nTo Group: #{group_name}\n"
+  end
+
+  defp association_group_human_output(:detach, policies, group_name) do
+    "Detached Policies: [#{Enum.join(policies, " ")}]\nFrom Group: #{group_name}\n"
+  end
+
+  defp human_group_info(group_name, user_name, policy_name, status) do
+    "Group: #{group_name}\nStatus: #{status}\nPolicy: #{policy_name}\nMembers: #{user_name}\n"
+  end
+
+  defp smoke_group_name(paths) do
+    "maxio-compat-group-#{:erlang.phash2({paths.mc_alias, paths.policy_name})}"
   end
 
   defp policy_json_output(policy_name) do
@@ -1299,6 +1648,58 @@ defmodule Maxio.Compat.ExternalSmoke do
       "\n ],\n" <>
       " \"user\": #{Jason.encode!(user_name)}\n" <>
       "}\n"
+  end
+
+  defp association_group_json_output(operation, policies, group_name) do
+    field = if operation == :attach, do: "policiesAttached", else: "policiesDetached"
+
+    ordered_json([{"status", "success"}, {field, policies}, {"group", group_name}])
+  end
+
+  defp group_json_output(:add, group_name, member, _status, _policy) do
+    ordered_json([
+      {"status", "success"},
+      {"groupName", group_name},
+      {"members", [member]}
+    ])
+  end
+
+  defp group_json_output(:remove_members, group_name, member, _status, _policy),
+    do:
+      ordered_json([
+        {"status", "success"},
+        {"groupName", group_name},
+        {"members", [member]}
+      ])
+
+  defp group_json_output(:remove_group, group_name, _member, _status, _policy),
+    do: ordered_json([{"status", "success"}, {"groupName", group_name}])
+
+  defp group_json_output(:list, group_name, _member, _status, _policy),
+    do: ordered_json([{"status", "success"}, {"groups", [group_name]}])
+
+  defp group_json_output(:status, group_name, _member, status, _policy),
+    do:
+      ordered_json([
+        {"status", "success"},
+        {"groupName", group_name},
+        {"groupStatus", status}
+      ])
+
+  defp group_json_output(:info, group_name, member, status, policy) do
+    ordered_json([
+      {"status", "success"},
+      {"groupName", group_name},
+      {"members", [member]},
+      {"groupStatus", status},
+      {"groupPolicy", policy}
+    ])
+  end
+
+  defp ordered_json(values) do
+    %Jason.OrderedObject{values: values}
+    |> Jason.encode!()
+    |> Kernel.<>("\n")
   end
 
   defp policy_entities_args(policy_name, user_name, mc_alias \\ "maxiocompat") do

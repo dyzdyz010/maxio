@@ -1,6 +1,9 @@
 defmodule Maxio.Compat.AdminUserFixture do
   @moduledoc """
-  Creates one short-lived credential-bearing IAM user for external admin smoke.
+  Creates one short-lived credential-bearing IAM user for external admin smoke,
+  including the independent Admin group lifecycle scenarios that temporarily
+  add and remove this user. Group and policy cleanup stays in the external
+  command plan; this fixture remains the sole owner of user cleanup.
 
   Setup and cleanup use public IAM facades. The plaintext secret exists only in
   the closure environments of an optional signed-HTTP diagnostic and the live
