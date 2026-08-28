@@ -12,6 +12,7 @@ defmodule Maxio.Policy.Store.EctoStore do
 
   alias Maxio.IAM.{
     Group,
+    GroupIdentity,
     GroupManagedPolicyAttachment,
     GroupMembership,
     Role,
@@ -23,6 +24,7 @@ defmodule Maxio.Policy.Store.EctoStore do
   }
 
   alias Maxio.Policy.{
+    AdvisoryLock,
     BucketPolicy,
     ManagedPolicy,
     ManagedPolicyVersion,
@@ -981,10 +983,7 @@ defmodule Maxio.Policy.Store.EctoStore do
     do: UserIdentity.snapshot(Repo, user_name)
 
   defp builtin_principal_snapshot(:group, "arn:aws:iam:::group/" <> group_name) do
-    case fetch_group_by_name(group_name) do
-      %Group{id: id} -> {:existing, id}
-      nil -> :missing
-    end
+    GroupIdentity.snapshot(Repo, group_name)
   end
 
   defp builtin_principal_snapshot(_kind, _principal_arn), do: :invalid
@@ -1006,23 +1005,17 @@ defmodule Maxio.Policy.Store.EctoStore do
   end
 
   defp lock_builtin_principal(:group, "arn:aws:iam:::group/" <> group_name, snapshot) do
-    lock_group_name!(group_name)
-
-    case {snapshot, fetch_group_by_name(group_name, "FOR UPDATE")} do
-      {{:existing, id}, %Group{id: current_id, status: "active"} = group}
-      when current_id == id ->
+    case GroupIdentity.lock_snapshot(Repo, group_name, snapshot) do
+      {:ok, %Group{status: "active"} = group} ->
         {:ok, group}
 
-      {{:existing, id}, %Group{id: current_id}} when current_id == id ->
+      {:ok, %Group{}} ->
         {:error, :group_disabled}
 
-      {{:existing, _old_id}, %Group{}} ->
+      {:error, :identity_changed} ->
         {:error, :identity_changed}
 
-      {_snapshot, nil} ->
-        {:error, :group_not_found}
-
-      _other ->
+      {:ok, :missing} ->
         {:error, :group_not_found}
     end
   end
@@ -1035,6 +1028,8 @@ defmodule Maxio.Policy.Store.EctoStore do
   end
 
   defp mutate_builtin_policy_associations(kind, principal_arn, :attach, requested) do
+    :ok = AdvisoryLock.managed_policies!(Repo, requested)
+
     policies =
       Repo.all(
         from p in ManagedPolicy,
@@ -1058,8 +1053,16 @@ defmodule Maxio.Policy.Store.EctoStore do
           {:error, :managed_policy_attachment_limit_exceeded}
 
         true ->
-          insert_builtin_attachments(kind, principal_arn, changed)
-          {:ok, changed}
+          :telemetry.execute(
+            [:maxio, :policy, :managed_policy_attachment, :before_insert],
+            %{system_time: System.system_time()},
+            %{kind: kind, principal_arn: principal_arn, policy_arns: changed}
+          )
+
+          case insert_builtin_attachments(kind, principal_arn, changed) do
+            [] -> {:error, :policy_change_already_applied}
+            inserted -> {:ok, inserted}
+          end
       end
     end
   end
@@ -1128,7 +1131,14 @@ defmodule Maxio.Policy.Store.EctoStore do
         }
       end)
 
-    {_count, nil} = Repo.insert_all(UserManagedPolicyAttachment, rows)
+    {_count, inserted} =
+      Repo.insert_all(UserManagedPolicyAttachment, rows,
+        on_conflict: :nothing,
+        conflict_target: [:user_arn, :policy_arn],
+        returning: [:policy_arn]
+      )
+
+    inserted |> Enum.map(& &1.policy_arn) |> Enum.sort()
   end
 
   defp insert_builtin_attachments(:group, principal_arn, policy_arns) do
@@ -1145,7 +1155,14 @@ defmodule Maxio.Policy.Store.EctoStore do
         }
       end)
 
-    {_count, nil} = Repo.insert_all(GroupManagedPolicyAttachment, rows)
+    {_count, inserted} =
+      Repo.insert_all(GroupManagedPolicyAttachment, rows,
+        on_conflict: :nothing,
+        conflict_target: [:group_arn, :policy_arn],
+        returning: [:policy_arn]
+      )
+
+    inserted |> Enum.map(& &1.policy_arn) |> Enum.sort()
   end
 
   defp delete_builtin_attachments(:user, principal_arn, policy_arns) do
@@ -1163,41 +1180,11 @@ defmodule Maxio.Policy.Store.EctoStore do
   end
 
   defp lock_builtin_principal_quota(principal_arn) do
-    Ecto.Adapters.SQL.query!(
-      Repo,
-      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      ["maxio.principal_policy_quota", principal_arn]
-    )
-
-    :ok
+    AdvisoryLock.principal_quota!(Repo, principal_arn)
   end
 
   defp builtin_principal_arn!(:user, %User{user_arn: user_arn}), do: user_arn
   defp builtin_principal_arn!(:group, %Group{group_arn: group_arn}), do: group_arn
-
-  defp lock_group_name!(group_name) do
-    Ecto.Adapters.SQL.query!(
-      Repo,
-      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      ["maxio.iam.group_identity", String.downcase(group_name)]
-    )
-
-    :ok
-  end
-
-  defp fetch_group_by_name(group_name, nil),
-    do: Repo.one(group_name_query(group_name))
-
-  defp fetch_group_by_name(group_name, "FOR UPDATE"),
-    do: Repo.one(from(g in group_name_query(group_name), lock: "FOR UPDATE"))
-
-  defp fetch_group_by_name(group_name), do: fetch_group_by_name(group_name, nil)
-
-  defp group_name_query(group_name) do
-    from g in Group,
-      where: fragment("lower(?)", g.group_name) == ^String.downcase(group_name),
-      limit: 1
-  end
 
   defp configured_root_user do
     :maxio

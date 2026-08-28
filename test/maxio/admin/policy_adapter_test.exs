@@ -2,7 +2,9 @@ defmodule Maxio.Admin.PolicyAdapterTest do
   use Maxio.DataCase, async: false
 
   alias Maxio.Admin.PolicyAdapter
+  alias Maxio.Cluster.Notify
   alias Maxio.IAM
+  alias Maxio.IAM.GroupManagedPolicyAttachment
   alias Maxio.IAM.UserManagedPolicyAttachment
 
   test "rejects empty, Unicode-edge-whitespace, comma, slash, backslash, and dot path segments" do
@@ -217,8 +219,11 @@ defmodule Maxio.Admin.PolicyAdapterTest do
 
   test "association target classification precedes policy addressability and uses canonical identity ARN" do
     user_name = unique_name("CaseUser")
+    group_name = unique_name("CaseGroup")
     policy_name = unique_name("assoc-case")
+    :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Notify.topic())
     assert {:ok, user} = IAM.create_user(name: user_name)
+    assert {:ok, group} = IAM.create_group(name: group_name)
     assert {:ok, _} = PolicyAdapter.create(policy_name, policy_json("s3:GetObject"))
 
     assert {:error, :user_not_found} =
@@ -240,6 +245,22 @@ defmodule Maxio.Admin.PolicyAdapterTest do
              )
 
     assert canonical_arn == user.user_arn
+    assert_receive {:principal_policy_changed, ^canonical_arn}
+
+    assert {:ok, %{changed_count: 1}} =
+             PolicyAdapter.update_associations(
+               :attach,
+               {:group, String.downcase(group_name)},
+               [policy_name]
+             )
+
+    assert %GroupManagedPolicyAttachment{group_arn: canonical_group_arn} =
+             Repo.get_by(GroupManagedPolicyAttachment,
+               policy_arn: IAM.managed_policy_arn(policy_name, "/")
+             )
+
+    assert canonical_group_arn == group.group_arn
+    assert_receive {:principal_policy_changed, ^canonical_group_arn}
   end
 
   test "entities adapter applies exact madmin omission, null and stable field projection" do

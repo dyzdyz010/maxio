@@ -1093,7 +1093,7 @@ defmodule Maxio.IAMTest do
 
     assert :ok = IAM.attach_role_policy(role_arn, hd(policies).policy_arn)
 
-    assert {:error, :policy_limit_exceeded} =
+    assert {:error, :managed_policy_attachment_limit_exceeded} =
              IAM.attach_role_policy(role_arn, List.last(policies).policy_arn)
   end
 

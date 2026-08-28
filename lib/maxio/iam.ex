@@ -18,6 +18,7 @@ defmodule Maxio.IAM do
     CredentialInvalidation,
     CredentialNamespace,
     Group,
+    GroupIdentity,
     GroupManagedPolicyAttachment,
     GroupMembership,
     InstanceProfile,
@@ -40,7 +41,7 @@ defmodule Maxio.IAM do
     UserManagedPolicyAttachment
   }
 
-  alias Maxio.Policy.{ManagedPolicyVersion, PrincipalPolicy}
+  alias Maxio.Policy.{AdvisoryLock, ManagedPolicyVersion, PrincipalPolicy}
   alias Maxio.Policy.{Statement, Store}
   alias Maxio.Tags
 
@@ -1400,15 +1401,25 @@ defmodule Maxio.IAM do
       tags: opts |> Keyword.get(:tags, %{}) |> normalize_tags()
     }
 
-    with :ok <- reject_group_name_case_insensitive_duplicate(group_name) do
-      case %Group{} |> Group.changeset(attrs) |> Repo.insert() do
-        {:ok, group} ->
-          Notify.broadcast({:iam_changed, group.group_arn})
-          {:ok, public_group(group)}
+    snapshot = GroupIdentity.snapshot(Repo, group_name)
 
-        {:error, changeset} ->
-          {:error, changeset}
+    Repo.transaction(fn ->
+      with {:ok, :missing} <- GroupIdentity.lock_snapshot(Repo, group_name, snapshot),
+           {:ok, group} <- %Group{} |> Group.changeset(attrs) |> Repo.insert() do
+        group
+      else
+        {:ok, %Group{}} -> Repo.rollback(:group_already_exists)
+        {:error, :identity_changed} -> Repo.rollback(:group_already_exists)
+        {:error, reason} -> Repo.rollback(reason)
       end
+    end)
+    |> case do
+      {:ok, group} ->
+        Notify.broadcast({:iam_changed, group.group_arn})
+        {:ok, public_group(group)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1460,18 +1471,37 @@ defmodule Maxio.IAM do
   @doc "Deletes an IAM group, its memberships, and policies bound to the group ARN."
   @spec delete_group(String.t()) :: :ok
   def delete_group(group_name_or_arn) when is_binary(group_name_or_arn) do
-    case get_group(group_name_or_arn) do
-      {:ok, group} ->
+    case fetch_group_record(group_name_or_arn) do
+      %Group{} = initial ->
         Repo.transaction(fn ->
-          Repo.delete_all(from p in PrincipalPolicy, where: p.principal_arn == ^group.group_arn)
-          Repo.delete_all(from g in Group, where: g.group_arn == ^group.group_arn)
+          case GroupIdentity.lock_snapshot(
+                 Repo,
+                 initial.group_name,
+                 {:existing, initial.id}
+               ) do
+            {:ok, %Group{} = group} ->
+              Repo.delete_all(
+                from p in PrincipalPolicy, where: p.principal_arn == ^group.group_arn
+              )
+
+              Repo.delete!(group)
+              group
+
+            {:error, :identity_changed} ->
+              Repo.rollback(:identity_changed)
+          end
         end)
+        |> case do
+          {:ok, group} ->
+            Notify.broadcast({:principal_policy_changed, group.group_arn})
+            Notify.broadcast({:iam_changed, group.group_arn})
+            :ok
 
-        Notify.broadcast({:principal_policy_changed, group.group_arn})
-        Notify.broadcast({:iam_changed, group.group_arn})
-        :ok
+          {:error, :identity_changed} ->
+            :ok
+        end
 
-      :error ->
+      nil ->
         :ok
     end
   end
@@ -4799,17 +4829,6 @@ defmodule Maxio.IAM do
     )
   end
 
-  defp reject_group_name_case_insensitive_duplicate(group_name)
-       when is_binary(group_name) and group_name != "" do
-    if fetch_group_by_case_insensitive_name(group_name) do
-      {:error, :group_already_exists}
-    else
-      :ok
-    end
-  end
-
-  defp reject_group_name_case_insensitive_duplicate(_group_name), do: :ok
-
   defp fetch_group_record(group_name_or_arn) do
     value = normalize_iam_text(group_name_or_arn)
 
@@ -5390,7 +5409,7 @@ defmodule Maxio.IAM do
             attach_fun.(principal_arn, policy_arn)
 
           true ->
-            Repo.rollback({:error, :policy_limit_exceeded})
+            Repo.rollback({:error, :managed_policy_attachment_limit_exceeded})
         end
         |> case do
           :ok -> :ok
@@ -5683,13 +5702,7 @@ defmodule Maxio.IAM do
   end
 
   defp lock_principal_policy_quota!(principal_arn) do
-    Ecto.Adapters.SQL.query!(
-      Repo,
-      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      ["maxio.principal_policies", principal_arn]
-    )
-
-    :ok
+    AdvisoryLock.principal_quota!(Repo, principal_arn)
   end
 
   defp access_key_transaction_result({:ok, access_key}), do: {:ok, access_key}
@@ -6007,13 +6020,7 @@ defmodule Maxio.IAM do
   end
 
   defp lock_managed_policy!(policy_arn) do
-    Ecto.Adapters.SQL.query!(
-      Repo,
-      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      ["maxio.managed_policy", policy_arn]
-    )
-
-    :ok
+    AdvisoryLock.managed_policy!(Repo, policy_arn)
   end
 
   defp validate_inline_policy_document(json) when is_binary(json) do

@@ -6366,6 +6366,9 @@ defmodule Maxio.IAM.QueryPlug do
 
   defp error_from_reason(:policy_limit_exceeded), do: QueryError.new(:limit_exceeded)
 
+  defp error_from_reason(:managed_policy_attachment_limit_exceeded),
+    do: QueryError.new(:limit_exceeded)
+
   defp error_from_reason(:policy_version_limit_exceeded), do: QueryError.new(:limit_exceeded)
 
   defp error_from_reason(:invalid_provider_issuer),
