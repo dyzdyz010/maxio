@@ -133,6 +133,14 @@ defmodule Maxio.Policy.StoreOptionalCallbacksTest do
                  ["arn:aws:iam:::policy/readwrite"]
                )
 
+      assert {:error, :not_supported} =
+               Store.query_builtin_managed_policy_entities(%{
+                 users: [],
+                 groups: [],
+                 policy_arns: [],
+                 requested: MapSet.new()
+               })
+
       refute Store.managed_session_policy_attached?("arn:aws:iam:::policy/legacy")
     after
       Application.put_env(:maxio, :policy_store, previous_store)

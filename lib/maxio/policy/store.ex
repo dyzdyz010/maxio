@@ -93,6 +93,12 @@ defmodule Maxio.Policy.Store do
             ) ::
               {:ok, %{changed_policy_arns: [String.t()], updated_at: DateTime.t()}}
               | {:error, term()}
+  @callback query_builtin_managed_policy_entities(%{
+              required(:users) => [String.t()],
+              required(:groups) => [String.t()],
+              required(:policy_arns) => [String.t()],
+              required(:requested) => MapSet.t()
+            }) :: {:ok, map()} | {:error, term()}
 
   @optional_callbacks put_principal_policy: 3,
                       principal_permissions_boundary: 1,
@@ -126,7 +132,8 @@ defmodule Maxio.Policy.Store do
                       managed_session_policy_attached?: 1,
                       managed_session_policy_attachment_count: 1,
                       managed_session_policy_permissions_boundary_count: 1,
-                      update_builtin_managed_policy_associations: 4
+                      update_builtin_managed_policy_associations: 4,
+                      query_builtin_managed_policy_entities: 1
 
   @doc "当前配置的策略后端模块。"
   @spec impl() :: module()
@@ -684,6 +691,19 @@ defmodule Maxio.Policy.Store do
       {:error, :not_supported}
     end
   end
+
+  @spec query_builtin_managed_policy_entities(map()) :: {:ok, map()} | {:error, term()}
+  def query_builtin_managed_policy_entities(filters) when is_map(filters) do
+    backend = impl()
+
+    if callback_exported?(backend, :query_builtin_managed_policy_entities, 1) do
+      backend.query_builtin_managed_policy_entities(filters)
+    else
+      {:error, :not_supported}
+    end
+  end
+
+  def query_builtin_managed_policy_entities(_filters), do: {:error, :malformed}
 
   @spec managed_session_policy_attached?(String.t()) :: boolean()
   def managed_session_policy_attached?(policy_arn) do

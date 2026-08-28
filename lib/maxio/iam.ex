@@ -2209,6 +2209,36 @@ defmodule Maxio.IAM do
   def update_managed_policy_associations_strict(_operation, _principal, _policy_names),
     do: {:error, :malformed}
 
+  @doc "Returns a consistent builtin user/group/policy association projection."
+  @spec query_builtin_policy_entities(%{
+          required(:users) => [String.t()],
+          required(:groups) => [String.t()],
+          required(:policy_arns) => [String.t()],
+          required(:requested) => MapSet.t()
+        }) :: {:ok, map()} | {:error, term()}
+  def query_builtin_policy_entities(%{
+        users: users,
+        groups: groups,
+        policy_arns: policy_arns,
+        requested: %MapSet{} = requested
+      })
+      when is_list(users) and is_list(groups) and is_list(policy_arns) do
+    filters = %{
+      users: users |> Enum.filter(&is_binary/1) |> Enum.uniq() |> Enum.sort(),
+      groups: groups |> Enum.filter(&is_binary/1) |> Enum.uniq() |> Enum.sort(),
+      policy_arns:
+        policy_arns
+        |> Enum.filter(&root_builtin_policy_arn?/1)
+        |> Enum.uniq()
+        |> Enum.sort(),
+      requested: requested
+    }
+
+    Store.query_builtin_managed_policy_entities(filters)
+  end
+
+  def query_builtin_policy_entities(_filters), do: {:error, :malformed}
+
   defp builtin_policy_arns(policy_names) do
     if policy_names != [] and
          Enum.all?(policy_names, &(is_binary(&1) and &1 != "" and not String.contains?(&1, "/"))) do
@@ -2220,6 +2250,11 @@ defmodule Maxio.IAM do
 
   defp builtin_principal_arn(:user, name), do: user_arn(name)
   defp builtin_principal_arn(:group, name), do: group_arn(name)
+
+  defp root_builtin_policy_arn?("arn:aws:iam:::policy/" <> name),
+    do: name != "" and not String.contains?(name, "/")
+
+  defp root_builtin_policy_arn?(_policy_arn), do: false
 
   @doc "Attaches a local managed policy to a user using AWS Query strict semantics."
   @spec attach_user_policy_strict(String.t(), String.t()) :: :ok | {:error, term()}

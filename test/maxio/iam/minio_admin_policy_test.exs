@@ -153,6 +153,92 @@ defmodule Maxio.IAM.MinioAdminPolicyTest do
              )
   end
 
+  test "policy entities projects direct, membership, group and reverse mappings in one snapshot",
+       %{
+         user: user,
+         group: group,
+         policies: [{name_a, arn_a}, {name_b, arn_b}, {_name_c, _arn_c}]
+       } do
+    assert {:ok, _} =
+             IAM.update_managed_policy_associations_strict(:attach, {:user, user.user_name}, [
+               name_b
+             ])
+
+    assert {:ok, _} =
+             IAM.update_managed_policy_associations_strict(
+               :attach,
+               {:group, group.group_name},
+               [name_a]
+             )
+
+    assert :ok = IAM.add_user_to_group(user.user_name, group.group_name)
+
+    assert {:ok,
+            %{
+              timestamp: %DateTime{},
+              user_mappings: [
+                %{
+                  user: user_name,
+                  policy_arns: [^arn_b],
+                  member_of_mappings: [%{group: group_name, policy_arns: [^arn_a]}]
+                }
+              ],
+              group_mappings: [%{group: group_name, policy_arns: [^arn_a]}],
+              policy_mappings: [
+                %{policy_arn: ^arn_a, users: [], groups: [group_name]},
+                %{policy_arn: ^arn_b, users: [user_name], groups: []}
+              ]
+            }} =
+             IAM.query_builtin_policy_entities(%{
+               users: [user.user_name, "missing"],
+               groups: [group.group_name, "missing"],
+               policy_arns: [arn_b, arn_a, "arn:aws:iam:::policy/missing"],
+               requested: MapSet.new([:user, :group, :policy])
+             })
+
+    assert user_name == user.user_name
+    assert group_name == group.group_name
+  end
+
+  test "empty query activates all root policy mappings and empty or unknown mappings are omitted",
+       %{
+         user: user,
+         policies: [{name_a, arn_a}, {_name_b, _arn_b}, {_name_c, _arn_c}]
+       } do
+    assert {:ok, %{timestamp: %DateTime{}} = empty} =
+             IAM.query_builtin_policy_entities(%{
+               users: [],
+               groups: [],
+               policy_arns: [],
+               requested: MapSet.new()
+             })
+
+    assert empty.user_mappings == []
+    assert empty.group_mappings == []
+    assert empty.policy_mappings == []
+
+    assert {:ok, _} =
+             IAM.update_managed_policy_associations_strict(:attach, {:user, user.user_name}, [
+               name_a
+             ])
+
+    assert {:ok, %{policy_mappings: [%{policy_arn: ^arn_a}]}} =
+             IAM.query_builtin_policy_entities(%{
+               users: [],
+               groups: [],
+               policy_arns: [],
+               requested: MapSet.new()
+             })
+
+    assert {:ok, %{user_mappings: [], group_mappings: [], policy_mappings: []}} =
+             IAM.query_builtin_policy_entities(%{
+               users: ["missing"],
+               groups: ["missing"],
+               policy_arns: ["arn:aws:iam:::policy/missing"],
+               requested: MapSet.new([:user, :group, :policy])
+             })
+  end
+
   defp drain_policy_notifications do
     receive do
       {:principal_policy_changed, _principal_arn} -> drain_policy_notifications()

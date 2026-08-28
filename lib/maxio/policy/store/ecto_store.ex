@@ -753,6 +753,191 @@ defmodule Maxio.Policy.Store.EctoStore do
   def update_builtin_managed_policy_associations(_kind, _principal_arn, _operation, _policy_arns),
     do: {:error, :malformed}
 
+  @impl true
+  def query_builtin_managed_policy_entities(%{
+        users: requested_users,
+        groups: requested_groups,
+        policy_arns: requested_policy_arns,
+        requested: %MapSet{} = requested_dimensions
+      })
+      when is_list(requested_users) and is_list(requested_groups) and
+             is_list(requested_policy_arns) do
+    Repo.transaction(
+      fn ->
+        users = Repo.all(from u in User, select: {u.user_arn, u.user_name})
+        groups = Repo.all(from g in Group, select: {g.group_arn, g.group_name})
+
+        user_attachments =
+          Repo.all(
+            from a in UserManagedPolicyAttachment,
+              select: {a.user_arn, a.policy_arn}
+          )
+          |> Enum.filter(fn {_user_arn, policy_arn} -> root_builtin_policy_arn?(policy_arn) end)
+
+        group_attachments =
+          Repo.all(
+            from a in GroupManagedPolicyAttachment,
+              select: {a.group_arn, a.policy_arn}
+          )
+          |> Enum.filter(fn {_group_arn, policy_arn} -> root_builtin_policy_arn?(policy_arn) end)
+
+        memberships =
+          Repo.all(from m in GroupMembership, select: {m.user_arn, m.group_arn})
+
+        build_builtin_policy_entities(%{
+          timestamp: database_timestamp!(),
+          users: users,
+          groups: groups,
+          user_attachments: user_attachments,
+          group_attachments: group_attachments,
+          memberships: memberships,
+          requested_users: requested_users,
+          requested_groups: requested_groups,
+          requested_policy_arns: requested_policy_arns,
+          requested_dimensions: requested_dimensions
+        })
+      end,
+      isolation: :repeatable_read
+    )
+    |> case do
+      {:ok, projection} -> {:ok, projection}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def query_builtin_managed_policy_entities(_filters), do: {:error, :malformed}
+
+  defp build_builtin_policy_entities(data) do
+    user_names = Map.new(data.users)
+    group_names = Map.new(data.groups)
+    user_arns_by_name = Map.new(data.users, fn {arn, name} -> {name, arn} end)
+    group_arns_by_name = Map.new(data.groups, fn {arn, name} -> {name, arn} end)
+    user_policies = grouped_values(data.user_attachments)
+    group_policies = grouped_values(data.group_attachments)
+    user_groups = grouped_values(data.memberships)
+
+    user_mappings =
+      if MapSet.member?(data.requested_dimensions, :user) do
+        data.requested_users
+        |> Enum.flat_map(fn name ->
+          case Map.get(user_arns_by_name, name) do
+            nil ->
+              []
+
+            user_arn ->
+              direct = Map.get(user_policies, user_arn, [])
+
+              inherited =
+                user_groups
+                |> Map.get(user_arn, [])
+                |> Enum.flat_map(fn group_arn ->
+                  case {Map.get(group_names, group_arn), Map.get(group_policies, group_arn, [])} do
+                    {group_name, policies} when is_binary(group_name) and policies != [] ->
+                      [%{group: group_name, policy_arns: policies}]
+
+                    _other ->
+                      []
+                  end
+                end)
+                |> Enum.sort_by(& &1.group)
+
+              if direct == [] and inherited == [] do
+                []
+              else
+                [%{user: name, policy_arns: direct, member_of_mappings: inherited}]
+              end
+          end
+        end)
+        |> Enum.sort_by(& &1.user)
+      else
+        []
+      end
+
+    group_mappings =
+      if MapSet.member?(data.requested_dimensions, :group) do
+        data.requested_groups
+        |> Enum.flat_map(fn name ->
+          case Map.get(group_arns_by_name, name) do
+            nil -> []
+            group_arn -> mapping_if_present(:group, name, Map.get(group_policies, group_arn, []))
+          end
+        end)
+        |> Enum.sort_by(& &1.group)
+      else
+        []
+      end
+
+    policy_candidates =
+      cond do
+        MapSet.member?(data.requested_dimensions, :policy) ->
+          data.requested_policy_arns
+
+        MapSet.size(data.requested_dimensions) == 0 ->
+          (Enum.map(data.user_attachments, &elem(&1, 1)) ++
+             Enum.map(data.group_attachments, &elem(&1, 1)))
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        true ->
+          []
+      end
+
+    policy_mappings =
+      policy_candidates
+      |> Enum.flat_map(fn policy_arn ->
+        users =
+          data.user_attachments
+          |> Enum.flat_map(fn
+            {user_arn, ^policy_arn} -> list_if_binary(Map.get(user_names, user_arn))
+            _other -> []
+          end)
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        groups =
+          data.group_attachments
+          |> Enum.flat_map(fn
+            {group_arn, ^policy_arn} -> list_if_binary(Map.get(group_names, group_arn))
+            _other -> []
+          end)
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        if users == [] and groups == [] do
+          []
+        else
+          [%{policy_arn: policy_arn, users: users, groups: groups}]
+        end
+      end)
+      |> Enum.sort_by(& &1.policy_arn)
+
+    %{
+      timestamp: data.timestamp,
+      user_mappings: user_mappings,
+      group_mappings: group_mappings,
+      policy_mappings: policy_mappings
+    }
+  end
+
+  defp grouped_values(pairs) do
+    pairs
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Map.new(fn {key, values} -> {key, values |> Enum.uniq() |> Enum.sort()} end)
+  end
+
+  defp mapping_if_present(_kind, _name, []), do: []
+
+  defp mapping_if_present(:group, name, policy_arns),
+    do: [%{group: name, policy_arns: policy_arns}]
+
+  defp list_if_binary(value) when is_binary(value), do: [value]
+  defp list_if_binary(_value), do: []
+
+  defp root_builtin_policy_arn?("arn:aws:iam:::policy/" <> name),
+    do: name != "" and not String.contains?(name, "/")
+
+  defp root_builtin_policy_arn?(_policy_arn), do: false
+
   defp builtin_principal_snapshot(:user, "arn:aws:iam:::user/" <> user_name),
     do: UserIdentity.snapshot(Repo, user_name)
 
