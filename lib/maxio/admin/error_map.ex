@@ -10,6 +10,12 @@ defmodule Maxio.Admin.ErrorMap do
 
   @spec from_reason(term()) :: Error.t()
   def from_reason(:user_not_found), do: Error.new(:admin_no_such_user)
+  def from_reason(:user_already_exists), do: Error.new(:admin_user_already_exists)
+  def from_reason(:config_too_large), do: Error.new(:admin_config_too_large)
+  def from_reason(:config_bad_json), do: Error.new(:admin_config_bad_json)
+  def from_reason(:invalid_access_key), do: Error.new(:admin_invalid_access_key)
+  def from_reason(:invalid_secret_key), do: Error.new(:admin_invalid_secret_key)
+  def from_reason(:payload_hash_mismatch), do: Error.new(:x_amz_content_sha256_mismatch)
 
   def from_reason(reason) when reason in [:not_found, :policy_not_found],
     do: Error.new(:admin_no_such_policy)

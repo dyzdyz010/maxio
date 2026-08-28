@@ -10,6 +10,7 @@ defmodule Maxio.Admin.UserAdapter do
   alias Maxio.IAM
 
   @user_name_pattern ~r/\A[A-Za-z0-9+=.@_-]{1,64}\z/
+  @access_key_pattern ~r/\A[A-Za-z0-9+=.@_-]{3,20}\z/
 
   @type reason :: :invalid_argument | :invalid_resource_name | :user_not_found | term()
 
@@ -31,6 +32,41 @@ defmodule Maxio.Admin.UserAdapter do
   end
 
   def validate_name(_name), do: {:error, :invalid_argument}
+
+  @spec add(term(), map()) :: {:ok, map()} | {:error, reason()}
+  def add(access_key, request) do
+    with :ok <- validate_access_key(access_key),
+         {:ok, secret_key} <- validate_add_request(request),
+         {:ok, result} <- IAM.create_minio_user_strict(access_key, secret_key, "active") do
+      {:ok, result}
+    end
+  end
+
+  @spec list() :: {:ok, %{wire: %{String.t() => map()}, evidence: map()}} | {:error, reason()}
+  def list do
+    IAM.list_users()
+    |> Enum.reduce_while({:ok, %{wire: %{}, projections: []}}, fn user, {:ok, acc} ->
+      case project_fetched_user(user) do
+        {:ok, projection} ->
+          next = %{
+            wire: Map.put(acc.wire, user.user_name, projection.wire),
+            projections: [{user.user_name, projection.evidence} | acc.projections]
+          }
+
+          {:cont, {:ok, next}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, %{wire: wire, projections: projections}} ->
+        {:ok, %{wire: wire, evidence: list_evidence(projections)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   @spec info(term()) :: {:ok, %{wire: map(), evidence: map()}} | {:error, reason()}
   def info(name) do
@@ -104,6 +140,59 @@ defmodule Maxio.Admin.UserAdapter do
   end
 
   def project(_user, _sources), do: {:error, :invalid_argument}
+
+  defp validate_access_key(access_key) when is_binary(access_key) do
+    if Regex.match?(@access_key_pattern, access_key) do
+      :ok
+    else
+      {:error, :invalid_access_key}
+    end
+  end
+
+  defp validate_access_key(_access_key), do: {:error, :invalid_access_key}
+
+  defp validate_add_request(%{secret_key: secret_key, policy: "", status: "enabled"})
+       when is_binary(secret_key) do
+    if byte_size(secret_key) >= 8 do
+      {:ok, secret_key}
+    else
+      {:error, :invalid_secret_key}
+    end
+  end
+
+  defp validate_add_request(%{secret_key: secret_key})
+       when not is_binary(secret_key) or byte_size(secret_key) < 8,
+       do: {:error, :invalid_secret_key}
+
+  defp validate_add_request(_request), do: {:error, :config_bad_json}
+
+  defp list_evidence(projections) do
+    entries = Enum.reverse(projections)
+
+    %{
+      user_count: length(entries),
+      user_names: entries |> Enum.map(&elem(&1, 0)) |> Enum.sort(),
+      credential_bearing_count: count_evidence(entries, & &1.credential_bearing),
+      managed_policies: sum_evidence(entries, & &1.direct_managed.count),
+      inline_policies: sum_evidence(entries, & &1.direct_inline.count),
+      group_inherited: sum_evidence(entries, &(&1.group_inline.count + &1.group_managed.count)),
+      role_attached: sum_evidence(entries, & &1.role_managed.count),
+      minio_view_partial_count: count_evidence(entries, & &1.minio_view_partial),
+      omitted_reason:
+        entries
+        |> Enum.flat_map(fn {_name, evidence} -> evidence.omitted_reason end)
+        |> Enum.uniq()
+        |> Enum.sort()
+    }
+  end
+
+  defp count_evidence(entries, predicate) do
+    Enum.count(entries, fn {_name, evidence} -> predicate.(evidence) end)
+  end
+
+  defp sum_evidence(entries, mapper) do
+    Enum.reduce(entries, 0, fn {_name, evidence}, total -> total + mapper.(evidence) end)
+  end
 
   defp fetch_user(name) do
     case IAM.get_user(name) do

@@ -1,8 +1,153 @@
 defmodule Maxio.Admin.UserAdapterTest do
   use Maxio.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Maxio.Admin.UserAdapter
   alias Maxio.IAM
+
+  test "adds only valid enabled new users without exposing the supplied secret" do
+    access_key = unique_access_name("ADDUSER")
+    secret = "eight+++"
+
+    log =
+      capture_log(fn ->
+        assert {:ok, result} =
+                 UserAdapter.add(access_key, %{
+                   secret_key: secret,
+                   policy: "",
+                   status: "enabled"
+                 })
+
+        refute inspect(result) =~ secret
+        refute Map.has_key?(result.access_key, :secret_key)
+      end)
+
+    refute log =~ secret
+
+    assert {:ok, _three_byte_boundary} =
+             UserAdapter.add("a1b", %{
+               secret_key: "12345678",
+               policy: "",
+               status: "enabled"
+             })
+
+    for invalid <- [nil, "", "aa", "contains space", String.duplicate("A", 21)] do
+      assert {:error, :invalid_access_key} =
+               UserAdapter.add(invalid, %{secret_key: "eight+++", policy: "", status: "enabled"})
+    end
+
+    assert {:error, :invalid_secret_key} =
+             UserAdapter.add(unique_access_name("NOSECRET"), %{
+               secret_key: "1234567",
+               policy: "",
+               status: "enabled"
+             })
+
+    assert {:error, :config_bad_json} =
+             UserAdapter.add(unique_access_name("DISABLED"), %{
+               secret_key: "12345678",
+               policy: "",
+               status: "disabled"
+             })
+
+    assert {:error, :config_bad_json} =
+             UserAdapter.add(unique_access_name("POLICY"), %{
+               secret_key: "12345678",
+               policy: "readwrite",
+               status: "enabled"
+             })
+
+    duplicate_result =
+      UserAdapter.add(access_key, %{
+        secret_key: "replacement-secret",
+        policy: "",
+        status: "enabled"
+      })
+
+    assert duplicate_result == {:error, :user_already_exists}
+    refute inspect(duplicate_result) =~ "replacement-secret"
+  end
+
+  test "lists every explicit user as an exact UserInfo map and omits credential internals" do
+    root_key = unique_access_name("ROOTONLY")
+    root_secret = "root-only-secret"
+
+    assert {:ok, _root} =
+             IAM.create_access_key(
+               access_key_id: root_key,
+               secret_key: root_secret,
+               type: "root",
+               principal_arn: "arn:aws:iam:::root"
+             )
+
+    assert {:ok, %{wire: %{}, evidence: %{user_count: 0}}} = UserAdapter.list()
+
+    enabled = unique_access_name("LISTENABLED")
+    disabled = unique_access_name("LISTDISABLED")
+    no_key = unique_access_name("LISTNOKEY")
+    user_secret = "list-user-secret"
+
+    assert {:ok, %{user: enabled_user}} =
+             IAM.create_minio_user_strict(enabled, user_secret, "active")
+
+    assert {:ok, disabled_user} = IAM.create_user(name: disabled, status: "inactive")
+    assert {:ok, no_key_user} = IAM.create_user(name: no_key, status: "active")
+
+    policy_name = unique_name("direct-policy")
+    policy_arn = create_managed_policy!(policy_name)
+    assert :ok = IAM.attach_user_policy(enabled, policy_arn)
+
+    group_name = unique_name("list-group")
+    group_policy_name = unique_name("group-policy")
+    group_policy_arn = create_managed_policy!(group_policy_name)
+    assert {:ok, _group} = IAM.create_group(name: group_name)
+    assert :ok = IAM.add_user_to_group(enabled, group_name)
+    assert :ok = IAM.attach_group_policy(group_name, group_policy_arn)
+
+    assert {:ok, %{wire: wire, evidence: evidence} = result} = UserAdapter.list()
+
+    assert wire == %{
+             disabled => %{
+               "status" => "disabled",
+               "updatedAt" => DateTime.to_iso8601(disabled_user.updated_at)
+             },
+             enabled => %{
+               "memberOf" => [group_name],
+               "policyName" => policy_name,
+               "status" => "enabled",
+               "updatedAt" => DateTime.to_iso8601(enabled_user.updated_at)
+             },
+             no_key => %{
+               "status" => "enabled",
+               "updatedAt" => DateTime.to_iso8601(no_key_user.updated_at)
+             }
+           }
+
+    assert evidence.user_count == 3
+    assert evidence.user_names == Enum.sort([disabled, enabled, no_key])
+    assert evidence.credential_bearing_count == 1
+    refute Map.has_key?(wire, root_key)
+
+    encoded = Jason.encode!(wire)
+
+    for forbidden <- [
+          "secretKey",
+          "userAuthInfo",
+          "credential_bearing",
+          root_secret,
+          user_secret,
+          root_key,
+          policy_json(),
+          "session_token"
+        ] do
+      refute encoded =~ forbidden
+    end
+
+    for forbidden <- [root_secret, user_secret, root_key, policy_json(), "session_token"] do
+      refute inspect(result.evidence) =~ forbidden
+    end
+  end
 
   test "validates MinIO user names before IAM lookup" do
     for name <- [nil, "", String.duplicate("a", 65), "team/alice", "team\\alice", "alice!"] do

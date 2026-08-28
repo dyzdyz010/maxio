@@ -3,6 +3,48 @@ defmodule Maxio.Admin.ErrorMapTest do
 
   alias Maxio.Admin.ErrorMap
 
+  test "maps every S2b input error to its exact public code, status, and message" do
+    assert_error(
+      :config_too_large,
+      "XMinioAdminConfigTooLarge",
+      "Configuration data provided exceeds the allowed maximum of 262272 bytes"
+    )
+
+    assert_error(
+      :config_bad_json,
+      "XMinioAdminConfigBadJSON",
+      "JSON configuration provided is of incorrect format"
+    )
+
+    assert_error(
+      :invalid_access_key,
+      "XMinioAdminInvalidAccessKey",
+      "The access key is invalid."
+    )
+
+    assert_error(
+      :invalid_secret_key,
+      "XMinioAdminInvalidSecretKey",
+      "The secret key is invalid."
+    )
+
+    duplicate = ErrorMap.from_reason(:user_already_exists)
+
+    assert duplicate.code == "XMaxioAdminUserAlreadyExists"
+    assert duplicate.http_status == 400
+    assert duplicate.message == "The specified user already exists."
+    refute duplicate.code in ["XMinioAdminNoSuchUser", "XMinioAdminInvalidArgument"]
+    refute duplicate.http_status == 409
+
+    payload = ErrorMap.from_reason(:payload_hash_mismatch)
+
+    assert payload.code == "XAmzContentSHA256Mismatch"
+    assert payload.http_status == 400
+
+    assert payload.message ==
+             "The provided 'x-amz-content-sha256' header does not match what was computed."
+  end
+
   test "maps policy absence and invalid documents or names to exact MinIO admin errors" do
     assert %{code: "XMinioAdminNoSuchPolicy", http_status: 404} =
              ErrorMap.from_reason(:not_found)
@@ -76,5 +118,12 @@ defmodule Maxio.Admin.ErrorMapTest do
     assert unknown.http_status == 500
     refute unknown.message =~ "credential"
     refute unknown.message =~ "do-not-leak"
+  end
+
+  defp assert_error(reason, code, message) do
+    error = ErrorMap.from_reason(reason)
+    assert error.code == code
+    assert error.http_status == 400
+    assert error.message == message
   end
 end

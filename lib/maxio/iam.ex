@@ -846,6 +846,56 @@ defmodule Maxio.IAM do
   @spec group_arn(String.t()) :: String.t()
   def group_arn(group_name), do: "arn:aws:iam:::group/#{group_name}"
 
+  @doc "Atomically creates a new MinIO admin user and its same-name long-term credential."
+  @spec create_minio_user_strict(String.t(), String.t(), String.t()) ::
+          {:ok, %{user: map(), access_key: map()}} | {:error, term()}
+  def create_minio_user_strict(access_key_id, secret_key, "active")
+      when is_binary(access_key_id) and access_key_id != "" and is_binary(secret_key) and
+             secret_key != "" do
+    user_arn = user_arn(access_key_id)
+
+    with {:ok, stored_secret} <- AccessKeySecret.wrap(secret_key, access_key_id) do
+      user_changeset =
+        User.changeset(%User{}, %{
+          user_name: access_key_id,
+          user_arn: user_arn,
+          status: "active",
+          tags: %{}
+        })
+
+      access_key_changeset =
+        AccessKey.changeset(%AccessKey{}, %{
+          access_key_id: access_key_id,
+          secret_key: stored_secret,
+          principal_arn: user_arn,
+          type: "iam_user",
+          status: "active",
+          tags: %{}
+        })
+
+      Ecto.Multi.new()
+      |> Ecto.Multi.run(:locks, fn _repo, _changes ->
+        lock_minio_user_identity!(String.downcase(access_key_id))
+        lock_minio_access_key!(access_key_id)
+        {:ok, :locked}
+      end)
+      |> Ecto.Multi.run(:identity, fn _repo, _changes ->
+        if fetch_user_by_case_insensitive_name(access_key_id) do
+          {:error, :user_already_exists}
+        else
+          {:ok, :available}
+        end
+      end)
+      |> Ecto.Multi.insert(:user, user_changeset)
+      |> Ecto.Multi.insert(:access_key, access_key_changeset)
+      |> Repo.transaction()
+      |> minio_user_transaction_result(access_key_id)
+    end
+  end
+
+  def create_minio_user_strict(_access_key_id, _secret_key, _status),
+    do: {:error, :invalid_argument}
+
   @doc "Creates an explicit IAM user. Access keys may later bind to this user ARN."
   @spec create_user(keyword()) :: {:ok, map()} | {:error, term()}
   def create_user(opts \\ []) do
@@ -5358,6 +5408,41 @@ defmodule Maxio.IAM do
   defp access_key_transaction_result({:error, {:error, reason}}), do: {:error, reason}
   defp access_key_transaction_result({:error, reason}), do: {:error, reason}
 
+  defp minio_user_transaction_result(
+         {:ok, %{user: %User{} = user, access_key: %AccessKey{} = access_key}},
+         access_key_id
+       ) do
+    Notify.broadcast({:iam_changed, access_key_id})
+    {:ok, %{user: public_user(user), access_key: public_access_key(access_key)}}
+  end
+
+  defp minio_user_transaction_result(
+         {:error, :identity, :user_already_exists, _changes},
+         _access_key_id
+       ),
+       do: {:error, :user_already_exists}
+
+  defp minio_user_transaction_result(
+         {:error, operation, %Ecto.Changeset{} = changeset, _changes},
+         _access_key_id
+       )
+       when operation in [:user, :access_key] do
+    if unique_constraint_error?(changeset) do
+      {:error, :user_already_exists}
+    else
+      {:error, changeset}
+    end
+  end
+
+  defp minio_user_transaction_result({:error, _operation, reason, _changes}, _access_key_id),
+    do: {:error, reason}
+
+  defp unique_constraint_error?(%Ecto.Changeset{} = changeset) do
+    Enum.any?(changeset.errors, fn {_field, {_message, metadata}} ->
+      Keyword.get(metadata, :constraint) == :unique
+    end)
+  end
+
   defp signing_certificate_transaction_result({:ok, certificate}), do: {:ok, certificate}
   defp signing_certificate_transaction_result({:error, {:error, reason}}), do: {:error, reason}
   defp signing_certificate_transaction_result({:error, reason}), do: {:error, reason}
@@ -5371,6 +5456,26 @@ defmodule Maxio.IAM do
       Repo,
       "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
       ["maxio.access_keys", principal_arn]
+    )
+
+    :ok
+  end
+
+  defp lock_minio_user_identity!(case_folded_user_name) do
+    Ecto.Adapters.SQL.query!(
+      Repo,
+      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+      ["maxio.minio_admin_users", case_folded_user_name]
+    )
+
+    :ok
+  end
+
+  defp lock_minio_access_key!(access_key_id) do
+    Ecto.Adapters.SQL.query!(
+      Repo,
+      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+      ["maxio.access_keys.exact", access_key_id]
     )
 
     :ok
