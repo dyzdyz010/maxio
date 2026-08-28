@@ -17,6 +17,8 @@ defmodule Maxio.S3.Plugs.RequestMetrics do
   def init(opts), do: opts
 
   @impl true
+  def call(%{assigns: %{maxio_surface: :admin}} = conn, _opts), do: conn
+
   def call(conn, _opts) do
     conn
     |> put_private(:maxio_request_metrics_started_at, System.monotonic_time(:microsecond))

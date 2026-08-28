@@ -76,6 +76,7 @@ defmodule Maxio.Admin.PlugTest do
       |> Plug.Conn.assign(:principal, %{type: :anonymous, arn: nil})
       |> Plug.Conn.assign(:auth_type, :anonymous)
       |> Plug.Conn.assign(:s3_address_style, :path)
+      |> Plug.Conn.assign(:maxio_surface, :admin)
       |> Maxio.Admin.Plug.call(Maxio.Admin.Plug.init([]))
 
     assert conn.status == 403
@@ -90,6 +91,7 @@ defmodule Maxio.Admin.PlugTest do
       :get
       |> SigV4Request.anon_conn("/minio/admin/v3/info")
       |> Plug.Conn.assign(:s3_address_style, :path)
+      |> Plug.Conn.assign(:maxio_surface, :admin)
       |> Maxio.Admin.Plug.call(Maxio.Admin.Plug.init([]))
     end
   end

@@ -27,6 +27,8 @@ defmodule Maxio.S3.Plugs.AccessLogDelivery do
   def init(opts), do: opts
 
   @impl true
+  def call(%{assigns: %{maxio_surface: :admin}} = conn, _opts), do: conn
+
   def call(conn, _opts) do
     conn
     |> put_private(:maxio_access_log_event_time, event_time(conn))

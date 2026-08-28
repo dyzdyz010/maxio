@@ -49,9 +49,15 @@ defmodule Maxio.Admin.Plug do
   def init(opts), do: opts
 
   @impl true
+  def call(%{assigns: %{maxio_surface: :admin}} = conn, _opts), do: handle(conn)
+  def call(%{assigns: %{maxio_surface: :s3}} = conn, _opts), do: conn
+
   def call(conn, _opts) do
-    if ReservedNamespace.claimed?(conn, :admin) do
-      handle(conn)
+    if ReservedNamespace.admin_path?(conn.request_path || "") do
+      raise PipelineOrderError,
+            "admin surface requires assigns.maxio_surface; mount " <>
+              "Maxio.S3.Plugs.SurfaceClassifier after Maxio.S3.Plugs.AddressStyle and before " <>
+              "Maxio.Admin.Plug"
     else
       conn
     end
