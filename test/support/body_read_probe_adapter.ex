@@ -8,6 +8,16 @@ defmodule Maxio.Test.BodyReadProbeAdapter do
     {:ok, sent_body, {owner, next_state}}
   end
 
+  def read_req_body({owner, {:chunks, [last]}}, _opts) do
+    send(owner, :body_reader_called)
+    {:ok, last, {owner, {:chunks, []}}}
+  end
+
+  def read_req_body({owner, {:chunks, [chunk | rest]}}, _opts) do
+    send(owner, :body_reader_called)
+    {:more, chunk, {owner, {:chunks, rest}}}
+  end
+
   def read_req_body({owner, state}, opts) do
     send(owner, :body_reader_called)
 

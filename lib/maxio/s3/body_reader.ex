@@ -115,15 +115,37 @@ defmodule Maxio.S3.BodyReader do
 
   def read_small_with_trailers!(conn, limit, too_large_message)
       when is_integer(limit) and limit > 0 do
-    case Plug.Conn.read_body(conn, length: limit, read_length: limit) do
-      {:ok, body, conn} ->
-        {conn, body, %{}}
+    {conn, body} = read_small_chunks!(conn, limit, too_large_message, [], 0)
+    {conn, body, %{}}
+  end
 
-      {:more, _partial, _conn} ->
-        raise Error.new(:malformed_xml, message: too_large_message)
+  defp read_small_chunks!(conn, limit, too_large_message, chunks, size) do
+    read_size = limit + 1
+
+    case Plug.Conn.read_body(conn, length: read_size, read_length: read_size) do
+      {:ok, chunk, conn} ->
+        collect_small_chunk!(conn, chunk, limit, too_large_message, chunks, size, :done)
+
+      {:more, chunk, conn} ->
+        collect_small_chunk!(conn, chunk, limit, too_large_message, chunks, size, :more)
 
       {:error, _reason} ->
         raise Error.new(:malformed_xml)
+    end
+  end
+
+  defp collect_small_chunk!(conn, chunk, limit, too_large_message, chunks, size, state) do
+    size = size + byte_size(chunk)
+
+    if size > limit do
+      raise Error.new(:malformed_xml, message: too_large_message)
+    end
+
+    chunks = [chunk | chunks]
+
+    case state do
+      :done -> {conn, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+      :more -> read_small_chunks!(conn, limit, too_large_message, chunks, size)
     end
   end
 
