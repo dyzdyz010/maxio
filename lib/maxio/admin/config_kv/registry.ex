@@ -1,6 +1,8 @@
 defmodule Maxio.Admin.ConfigKV.Registry do
   @moduledoc false
 
+  alias Maxio.Config.Schema
+
   @entries [
     %{
       wire_subsystem: "s3",
@@ -30,34 +32,6 @@ defmodule Maxio.Admin.ConfigKV.Registry do
 
   @wire_hidden_paths MapSet.new([{"cluster", "deployment_id"}])
 
-  @forbidden_subsystems MapSet.new([
-                          "storage_backend",
-                          "credential_store",
-                          "policy_store",
-                          "mfa_delete_verifier",
-                          "shard_transport",
-                          "authoritative_source",
-                          "topology_source",
-                          "read_prefer_index",
-                          "dev_routes",
-                          "Elixir.Maxio.Repo"
-                        ])
-
-  @forbidden_paths MapSet.new([
-                     {"sse", "master_key"},
-                     {"kms", "master_key"},
-                     {"kms", "provider"},
-                     {"access_key_secret", "secret_key"},
-                     {"access_key_secret", "keyring"},
-                     {"access_key_secret", "keyring_file"},
-                     {"mfa", "secret_key"},
-                     {"s3", "root_user"},
-                     {"s3", "root_password"},
-                     {"erasure", "drives"},
-                     {"erasure", "data_shards"},
-                     {"erasure", "parity_shards"}
-                   ])
-
   @spec entries() :: [map()]
   def entries, do: @entries
 
@@ -73,10 +47,10 @@ defmodule Maxio.Admin.ConfigKV.Registry do
   def classify_path(wire_subsystem, wire_key)
       when is_binary(wire_subsystem) and is_binary(wire_key) do
     cond do
-      MapSet.member?(@forbidden_subsystems, wire_subsystem) ->
+      MapSet.member?(forbidden_subsystems(), wire_subsystem) ->
         {:error, :forbidden}
 
-      MapSet.member?(@forbidden_paths, {wire_subsystem, wire_key}) ->
+      MapSet.member?(forbidden_paths(), {wire_subsystem, wire_key}) ->
         {:error, :forbidden}
 
       MapSet.member?(@wire_hidden_paths, {wire_subsystem, wire_key}) ->
@@ -91,5 +65,15 @@ defmodule Maxio.Admin.ConfigKV.Registry do
       true ->
         {:error, :unknown_key}
     end
+  end
+
+  defp forbidden_subsystems do
+    Schema.forbidden_subsystems()
+    |> MapSet.new(&Atom.to_string/1)
+  end
+
+  defp forbidden_paths do
+    Schema.forbidden_keys()
+    |> MapSet.new(fn {subsystem, key} -> {Atom.to_string(subsystem), Atom.to_string(key)} end)
   end
 end
