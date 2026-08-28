@@ -12,6 +12,17 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     region: "us-east-1"
   }
 
+  @config_lifecycle_stages [
+    :metrics_denied_before,
+    :get_false,
+    :set_true,
+    :get_true,
+    :metrics_public,
+    :reset_public,
+    :get_false_after_reset,
+    :metrics_denied_after_reset
+  ]
+
   test "missing endpoint or credentials are attention evidence without invoking clients" do
     [entry] =
       ExternalSmoke.run(%{clients: ["aws_cli"]},
@@ -272,6 +283,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             executable_finder: fn "mc" -> "mc.exe" end,
             command_runner: echoing_runner,
             tmp_root_fun: &tmp_root/0,
+            metrics_probe: &successful_metrics_probe/2,
             admin_user_fixture_opts: fixture
           )
 
@@ -320,6 +332,9 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             json? -> {Jason.encode!(%{"status" => "error"}) <> "\n", "", 1}
             true -> {"", "mc: <ERROR> Unable to list folder. Access Denied.\n", 1}
           end
+
+        subcommand == "admin" and Enum.take(command_args, 1) == ["config"] ->
+          config_command_result(command_args, json?)
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
           ["policy", "create", _mc_alias, policy_name, policy_path] = command_args
@@ -481,12 +496,16 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: command_runner,
         tmp_root_fun: fn -> tmp_root end,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
     assert entry["status"] == "ok"
 
-    assert Enum.map(entry["steps"], & &1["id"]) == [
+    non_config_steps =
+      Enum.reject(entry["steps"], &String.starts_with?(&1["scenario"], "admin_config_"))
+
+    assert Enum.map(non_config_steps, & &1["id"]) == [
              "make_bucket",
              "put_object",
              "stat_object",
@@ -584,6 +603,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert entry["scenario_counts"]["admin_user_json_lifecycle"] == 8
     assert entry["scenario_counts"]["admin_group_human_lifecycle"] == 16
     assert entry["scenario_counts"]["admin_group_json_lifecycle"] == 14
+    assert entry["scenario_counts"]["admin_config_human_lifecycle"] == 8
+    assert entry["scenario_counts"]["admin_config_json_lifecycle"] == 8
 
     encoded = Jason.encode!(entry)
     refute encoded =~ "super-secret"
@@ -601,7 +622,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert config_dir |> Path.dirname() |> Path.dirname() |> Path.expand() |> Path.split() ==
              tmp_root |> Path.expand() |> Path.split()
 
-    assert length(calls) == 84
+    assert calls |> Enum.reject(&config_command_call?/1) |> length() == 84
 
     Enum.each(calls, fn {command, args, opts} ->
       assert command == "mc.exe"
@@ -733,6 +754,320 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     refute File.exists?(Path.dirname(config_dir))
   end
 
+  test "mc human config lifecycle records exact hot-change bytes and anonymous metrics proof" do
+    run_ref = make_ref()
+    {runner, metrics_probe} = config_lifecycle_harness(self(), run_ref)
+    entry = run_config_lifecycle(runner, metrics_probe)
+    events = lifecycle_events(run_ref)
+
+    assert entry["status"] == "ok"
+    assert_lifecycle_evidence(entry, :human)
+
+    assert Enum.filter(events, &(&1.mode == :human and &1.kind == :command)) == [
+             %{
+               kind: :command,
+               mode: :human,
+               stage: :get_false,
+               command: "mc.exe",
+               args: ["admin", "config", "get", "maxiocompat", "prometheus_metrics"],
+               stdout: "prometheus_metrics public=false \n",
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :human,
+               stage: :set_true,
+               command: "mc.exe",
+               args: [
+                 "admin",
+                 "config",
+                 "set",
+                 "maxiocompat",
+                 "prometheus_metrics",
+                 "public=true"
+               ],
+               stdout: "Successfully applied new settings.\n",
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :human,
+               stage: :get_true,
+               command: "mc.exe",
+               args: ["admin", "config", "get", "maxiocompat", "prometheus_metrics"],
+               stdout: "prometheus_metrics public=true \n",
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :human,
+               stage: :reset_public,
+               command: "mc.exe",
+               args: [
+                 "admin",
+                 "config",
+                 "reset",
+                 "maxiocompat",
+                 "prometheus_metrics",
+                 "public"
+               ],
+               stdout: "'prometheus_metrics public' is successfully reset.\n",
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :human,
+               stage: :get_false_after_reset,
+               command: "mc.exe",
+               args: ["admin", "config", "get", "maxiocompat", "prometheus_metrics"],
+               stdout: "prometheus_metrics public=false \n",
+               stderr: "",
+               exit_status: 0
+             }
+           ]
+
+    human_metrics = Enum.filter(events, &(&1.mode == :human and &1.kind == :metrics))
+
+    assert Enum.map(human_metrics, &{&1.stage, &1.status}) == [
+             {:metrics_denied_before, 403},
+             {:metrics_public, 200},
+             {:metrics_denied_after_reset, 403}
+           ]
+
+    Enum.each(human_metrics, fn event ->
+      assert event.url == "http://127.0.0.1:9900/minio/v2/metrics/cluster"
+      assert event.options == [redirect: false]
+      refute authorization_header?(event.options)
+    end)
+
+    refute Enum.any?(events, &(&1.mode == :human and &1.stage == :cleanup_reset))
+    refute Enum.any?(events, &String.contains?(Map.get(&1, :stdout, ""), "restart"))
+  end
+
+  test "mc JSON config lifecycle keeps prefix-first argv compact bytes and independent state" do
+    run_ref = make_ref()
+    {runner, metrics_probe} = config_lifecycle_harness(self(), run_ref)
+    entry = run_config_lifecycle(runner, metrics_probe)
+    events = lifecycle_events(run_ref)
+
+    assert entry["status"] == "ok"
+    assert_lifecycle_evidence(entry, :json)
+
+    false_output =
+      "{\"status\":\"success\",\"config\":[{\"subSystem\":\"prometheus_metrics\",\"kv\":[{\"key\":\"public\",\"value\":\"false\"}]}]}\n"
+
+    true_output =
+      "{\"status\":\"success\",\"config\":[{\"subSystem\":\"prometheus_metrics\",\"kv\":[{\"key\":\"public\",\"value\":\"true\"}]}]}\n"
+
+    success_output = "{\"status\":\"success\"}\n"
+
+    assert Enum.filter(events, &(&1.mode == :json and &1.kind == :command)) == [
+             %{
+               kind: :command,
+               mode: :json,
+               stage: :get_false,
+               command: "mc.exe",
+               args: [
+                 "--json",
+                 "admin",
+                 "config",
+                 "get",
+                 "maxiocompatjson",
+                 "prometheus_metrics"
+               ],
+               stdout: false_output,
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :json,
+               stage: :set_true,
+               command: "mc.exe",
+               args: [
+                 "--json",
+                 "admin",
+                 "config",
+                 "set",
+                 "maxiocompatjson",
+                 "prometheus_metrics",
+                 "public=true"
+               ],
+               stdout: success_output,
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :json,
+               stage: :get_true,
+               command: "mc.exe",
+               args: [
+                 "--json",
+                 "admin",
+                 "config",
+                 "get",
+                 "maxiocompatjson",
+                 "prometheus_metrics"
+               ],
+               stdout: true_output,
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :json,
+               stage: :reset_public,
+               command: "mc.exe",
+               args: [
+                 "--json",
+                 "admin",
+                 "config",
+                 "reset",
+                 "maxiocompatjson",
+                 "prometheus_metrics",
+                 "public"
+               ],
+               stdout: success_output,
+               stderr: "",
+               exit_status: 0
+             },
+             %{
+               kind: :command,
+               mode: :json,
+               stage: :get_false_after_reset,
+               command: "mc.exe",
+               args: [
+                 "--json",
+                 "admin",
+                 "config",
+                 "get",
+                 "maxiocompatjson",
+                 "prometheus_metrics"
+               ],
+               stdout: false_output,
+               stderr: "",
+               exit_status: 0
+             }
+           ]
+
+    json_metrics = Enum.filter(events, &(&1.mode == :json and &1.kind == :metrics))
+
+    assert Enum.map(json_metrics, &{&1.stage, &1.status}) == [
+             {:metrics_denied_before, 403},
+             {:metrics_public, 200},
+             {:metrics_denied_after_reset, 403}
+           ]
+
+    Enum.each(json_metrics, fn event ->
+      assert event.url == "http://127.0.0.1:9900/minio/v2/metrics/cluster"
+      assert event.options == [redirect: false]
+      refute authorization_header?(event.options)
+    end)
+
+    assert Enum.any?(events, &(&1.mode == :human and &1.stage == :get_false))
+    refute Enum.any?(events, &(&1.mode == :json and &1.stage == :cleanup_reset))
+
+    refute Enum.any?(events, fn event ->
+             event.mode == :json and
+               String.contains?(Map.get(event, :stdout, ""), "Successfully applied")
+           end)
+  end
+
+  test "every config lifecycle failure runs a visible reset cleanup and preserves its blocker" do
+    for mode <- [:human, :json], stage <- @config_lifecycle_stages do
+      run_ref = make_ref()
+
+      {runner, metrics_probe} =
+        config_lifecycle_harness(self(), run_ref, fail_at: {mode, stage})
+
+      entry = run_config_lifecycle(runner, metrics_probe)
+      events = lifecycle_events(run_ref)
+      cleanup_id = lifecycle_step_id(mode, :cleanup_reset)
+
+      assert entry["status"] == "blocked", "expected #{mode}/#{stage} to block"
+      assert hd(entry["blockers"])["step"] == lifecycle_step_id(mode, stage)
+
+      assert [cleanup] =
+               Enum.filter(events, &(&1.mode == mode and &1.stage == :cleanup_reset))
+
+      assert cleanup.exit_status == 0
+      assert cleanup.stderr == ""
+      assert cleanup.args == config_reset_args(mode)
+
+      primary_index = Enum.find_index(events, &(&1.mode == mode and &1.stage == stage))
+      cleanup_index = Enum.find_index(events, &(&1 == cleanup))
+      assert cleanup_index > primary_index
+
+      assert %{
+               "id" => ^cleanup_id,
+               "status" => "ok",
+               "exit_status" => 0,
+               "scenario" => scenario_id
+             } = Enum.find(entry["steps"], &(&1["id"] == cleanup_id))
+
+      assert scenario_id == lifecycle_scenario(mode)
+    end
+  end
+
+  test "config lifecycle exact matchers reject framing changes and restart text" do
+    cases = [
+      {:human, :get_false, "prometheus_metrics public=false\n"},
+      {:human, :set_true, "Successfully applied new settings.\nPlease restart your server.\n"},
+      {:human, :reset_public,
+       "'prometheus_metrics public' is successfully reset.\nPlease restart your server.\n"},
+      {:json, :get_false,
+       "{\"status\":\"success\",\"config\":[{\"subSystem\":\"prometheus_metrics\",\"kv\":[{\"key\":\"public\",\"value\":\"false\"}]}]}"},
+      {:json, :set_true, "Successfully applied new settings.\n"},
+      {:json, :reset_public, "{\"status\":\"success\"}\n\n"}
+    ]
+
+    for {mode, stage, mutated_output} <- cases do
+      run_ref = make_ref()
+
+      {runner, metrics_probe} =
+        config_lifecycle_harness(self(), run_ref, mutate_at: {mode, stage, mutated_output})
+
+      entry = run_config_lifecycle(runner, metrics_probe)
+      events = lifecycle_events(run_ref)
+
+      assert entry["status"] == "blocked", "expected #{mode}/#{stage} framing to block"
+      assert hd(entry["blockers"])["step"] == lifecycle_step_id(mode, stage)
+      assert Enum.any?(events, &(&1.mode == mode and &1.stage == :cleanup_reset))
+    end
+  end
+
+  test "config reset cleanup failure remains separate and secondary to the primary blocker" do
+    run_ref = make_ref()
+
+    {runner, metrics_probe} =
+      config_lifecycle_harness(self(), run_ref,
+        fail_at: {:human, :get_true},
+        cleanup_failure_mode: :human
+      )
+
+    entry = run_config_lifecycle(runner, metrics_probe)
+    events = lifecycle_events(run_ref)
+
+    assert entry["status"] == "blocked"
+
+    assert [primary, cleanup | _rest] = entry["blockers"]
+    assert primary["reason"] == "external_smoke_step_failed"
+    assert primary["step"] == lifecycle_step_id(:human, :get_true)
+    assert cleanup["reason"] == "external_smoke_cleanup_failed"
+    assert cleanup["step"] == lifecycle_step_id(:human, :cleanup_reset)
+
+    assert [cleanup_event] =
+             Enum.filter(events, &(&1.mode == :human and &1.stage == :cleanup_reset))
+
+    assert cleanup_event.exit_status == 23
+    assert cleanup_event.stderr == "injected cleanup reset failure"
+  end
+
   test "late mc failure does not replay resources already removed successfully" do
     Process.put(:policy_remove_calls, 0)
     Process.put(:delete_copied_calls, 0)
@@ -781,6 +1116,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -812,6 +1148,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: tracing_runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -886,6 +1223,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -931,6 +1269,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -971,6 +1310,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1036,6 +1376,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: runner,
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1069,6 +1410,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: runner,
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1102,6 +1444,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: runner,
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1148,6 +1491,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: runner,
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1188,6 +1532,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1232,6 +1577,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1256,6 +1602,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1283,6 +1630,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1307,6 +1655,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1341,6 +1690,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1401,6 +1751,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: runner,
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1450,6 +1801,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: successful_mc_runner(),
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: opts
         )
 
@@ -1486,6 +1838,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1546,6 +1899,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: command_runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self())
       )
 
@@ -1567,6 +1921,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: successful_mc_runner(admin_user_list: list_result),
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1615,6 +1970,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             executable_finder: fn "mc" -> "mc.exe" end,
             command_runner: runner,
             tmp_root_fun: &tmp_root/0,
+            metrics_probe: &successful_metrics_probe/2,
             admin_user_fixture_opts: fixture_opts(owner)
           )
 
@@ -1652,6 +2008,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: successful_mc_runner(),
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self(), {:error, :cleanup_failed})
       )
 
@@ -1679,6 +2036,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         executable_finder: fn "mc" -> "mc.exe" end,
         command_runner: successful_mc_runner(admin_user_info: {"user info failed", 17}),
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self(), {:error, :cleanup_failed})
       )
 
@@ -1814,6 +2172,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self()),
         system_env: %{
           "NO_PROXY" => "example.com,LOCALHOST",
@@ -1824,7 +2183,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert Enum.map(entries, & &1["status"]) == ["blocked", "blocked", "blocked"]
 
     calls = Process.get(:proxy_env_calls)
-    assert length(calls) == 9
+    assert calls |> Enum.reject(&config_command_call?/1) |> length() == 9
     expected = "example.com,LOCALHOST,service.internal,127.0.0.1"
 
     Enum.each(calls, fn {_command, _args, opts} ->
@@ -1883,6 +2242,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: runner,
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1937,6 +2297,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           executable_finder: fn "mc" -> "mc.exe" end,
           command_runner: runner,
           tmp_root_fun: &tmp_root/0,
+          metrics_probe: &successful_metrics_probe/2,
           admin_user_fixture_opts: fixture_opts(self())
         )
 
@@ -1975,6 +2336,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
         end,
         command_runner: runner,
         tmp_root_fun: &tmp_root/0,
+        metrics_probe: &successful_metrics_probe/2,
         admin_user_fixture_opts: fixture_opts(self()),
         system_env: %{"NO_PROXY" => "existing.local", "no_proxy" => "legacy.local"}
       )
@@ -2118,6 +2480,352 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
   defp put_json_mode(other, _json?), do: other
 
+  defp run_config_lifecycle(runner, metrics_probe) do
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        metrics_probe: metrics_probe,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    entry
+  end
+
+  defp config_lifecycle_harness(owner, run_ref, opts \\ []) do
+    Process.put({run_ref, :active_mode}, :human)
+    Process.put({run_ref, :human, :index}, 0)
+    Process.put({run_ref, :json, :index}, 0)
+    Process.put({run_ref, :human, :primary_failed}, false)
+    Process.put({run_ref, :json, :primary_failed}, false)
+
+    fail_at = Keyword.get(opts, :fail_at)
+    mutate_at = Keyword.get(opts, :mutate_at)
+    cleanup_failure_mode = Keyword.get(opts, :cleanup_failure_mode)
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, command_opts ->
+      {_config_dir, json?, [subcommand | command_args]} = parse_mc_args(args, command_opts)
+      mode = if json?, do: :json, else: :human
+
+      if subcommand == "admin" and Enum.take(command_args, 1) == ["config"] do
+        stage = next_lifecycle_stage(run_ref, mode)
+
+        {stdout, stderr, exit_status} =
+          lifecycle_command_result(
+            run_ref,
+            mode,
+            stage,
+            fail_at,
+            mutate_at,
+            cleanup_failure_mode
+          )
+
+        send(owner, {
+          :config_lifecycle_event,
+          run_ref,
+          %{
+            kind: :command,
+            mode: mode,
+            stage: stage,
+            command: command,
+            args: args,
+            stdout: stdout,
+            stderr: stderr,
+            exit_status: exit_status
+          }
+        })
+
+        if stage == :cleanup_reset, do: finish_lifecycle_mode(run_ref, mode)
+        {stdout, stderr, exit_status}
+      else
+        base_runner.(command, args, command_opts)
+      end
+    end
+
+    metrics_probe = fn url, request_opts ->
+      mode = Process.get({run_ref, :active_mode}, :human)
+      stage = next_lifecycle_stage(run_ref, mode)
+      injected_failure? = fail_at == {mode, stage}
+      status = if injected_failure?, do: 500, else: lifecycle_metrics_status(stage)
+
+      if injected_failure?, do: mark_lifecycle_failed(run_ref, mode)
+
+      send(owner, {
+        :config_lifecycle_event,
+        run_ref,
+        %{
+          kind: :metrics,
+          mode: mode,
+          stage: stage,
+          url: to_string(url),
+          options: request_opts,
+          status: status
+        }
+      })
+
+      if stage == :metrics_denied_after_reset and not injected_failure? do
+        finish_lifecycle_mode(run_ref, mode)
+      end
+
+      status
+    end
+
+    {runner, metrics_probe}
+  end
+
+  defp lifecycle_command_result(
+         _run_ref,
+         mode,
+         :cleanup_reset,
+         _fail_at,
+         _mutate_at,
+         cleanup_failure_mode
+       ) do
+    if cleanup_failure_mode == mode do
+      {"", "injected cleanup reset failure", 23}
+    else
+      {config_output(mode, :reset_public), "", 0}
+    end
+  end
+
+  defp lifecycle_command_result(
+         run_ref,
+         mode,
+         stage,
+         fail_at,
+         mutate_at,
+         _cleanup_failure_mode
+       ) do
+    cond do
+      fail_at == {mode, stage} ->
+        mark_lifecycle_failed(run_ref, mode)
+        {"injected config lifecycle failure", "", 19}
+
+      match?({^mode, ^stage, _output}, mutate_at) ->
+        {^mode, ^stage, output} = mutate_at
+        mark_lifecycle_failed(run_ref, mode)
+        {output, "", 0}
+
+      true ->
+        {config_output(mode, stage), "", 0}
+    end
+  end
+
+  defp next_lifecycle_stage(run_ref, mode) do
+    if Process.get({run_ref, mode, :primary_failed}, false) do
+      :cleanup_reset
+    else
+      index = Process.get({run_ref, mode, :index}, 0)
+      Process.put({run_ref, mode, :index}, index + 1)
+      Enum.fetch!(@config_lifecycle_stages, index)
+    end
+  end
+
+  defp mark_lifecycle_failed(run_ref, mode) do
+    Process.put({run_ref, mode, :primary_failed}, true)
+  end
+
+  defp finish_lifecycle_mode(run_ref, :human) do
+    Process.put({run_ref, :active_mode}, :json)
+  end
+
+  defp finish_lifecycle_mode(run_ref, :json) do
+    Process.put({run_ref, :active_mode}, :done)
+  end
+
+  defp lifecycle_events(run_ref, events \\ []) do
+    receive do
+      {:config_lifecycle_event, ^run_ref, event} ->
+        lifecycle_events(run_ref, [event | events])
+    after
+      0 -> Enum.reverse(events)
+    end
+  end
+
+  defp assert_lifecycle_evidence(entry, mode) do
+    scenario = lifecycle_scenario(mode)
+    steps = Enum.filter(entry["steps"], &(&1["scenario"] == scenario))
+
+    assert Enum.map(steps, fn step ->
+             Map.take(step, [
+               "id",
+               "scenario",
+               "command",
+               "exit_status",
+               "status",
+               "output_snippet",
+               "stderr_snippet",
+               "assertion"
+             ])
+           end) == Enum.map(@config_lifecycle_stages, &expected_lifecycle_evidence(mode, &1))
+  end
+
+  defp expected_lifecycle_evidence(mode, stage) do
+    %{
+      "id" => lifecycle_step_id(mode, stage),
+      "scenario" => lifecycle_scenario(mode),
+      "command" => lifecycle_command(mode, stage),
+      "exit_status" => 0,
+      "status" => "ok",
+      "output_snippet" => lifecycle_output_snippet(mode, stage),
+      "stderr_snippet" => "",
+      "assertion" => lifecycle_assertion(stage)
+    }
+  end
+
+  defp lifecycle_step_id(mode, stage) do
+    suffix =
+      case stage do
+        :metrics_denied_before -> "metrics_denied_before"
+        :get_false -> "get_false"
+        :set_true -> "set_true"
+        :get_true -> "get_true"
+        :metrics_public -> "metrics_public"
+        :reset_public -> "reset_public"
+        :get_false_after_reset -> "get_false_after_reset"
+        :metrics_denied_after_reset -> "metrics_denied_after_reset"
+        :cleanup_reset -> "cleanup_reset_public"
+      end
+
+    "admin_config_#{mode}_#{suffix}"
+  end
+
+  defp lifecycle_scenario(mode), do: "admin_config_#{mode}_lifecycle"
+
+  defp lifecycle_command(_mode, stage)
+       when stage in [
+              :metrics_denied_before,
+              :metrics_public,
+              :metrics_denied_after_reset
+            ],
+       do: "GET http://127.0.0.1:9900/minio/v2/metrics/cluster"
+
+  defp lifecycle_command(mode, stage) do
+    Enum.join(["mc.exe" | lifecycle_command_args(mode, stage)], " ")
+  end
+
+  defp lifecycle_command_args(mode, stage) do
+    prefix = if mode == :json, do: ["--json"], else: []
+    alias_name = if mode == :json, do: "maxiocompatjson", else: "maxiocompat"
+
+    tail =
+      case stage do
+        stage when stage in [:get_false, :get_true, :get_false_after_reset] ->
+          ["get", alias_name, "prometheus_metrics"]
+
+        :set_true ->
+          ["set", alias_name, "prometheus_metrics", "public=true"]
+
+        stage when stage in [:reset_public, :cleanup_reset] ->
+          ["reset", alias_name, "prometheus_metrics", "public"]
+      end
+
+    prefix ++ ["admin", "config"] ++ tail
+  end
+
+  defp config_reset_args(mode), do: lifecycle_command_args(mode, :cleanup_reset)
+
+  defp lifecycle_output_snippet(_mode, :metrics_denied_before), do: "403"
+  defp lifecycle_output_snippet(_mode, :metrics_public), do: "200"
+  defp lifecycle_output_snippet(_mode, :metrics_denied_after_reset), do: "403"
+
+  defp lifecycle_output_snippet(mode, stage) do
+    mode |> config_output(stage) |> String.trim()
+  end
+
+  defp lifecycle_assertion(:metrics_denied_before),
+    do: "anonymous metrics are denied before prometheus_metrics.public is enabled"
+
+  defp lifecycle_assertion(:get_false),
+    do: "mc admin config get reports effective prometheus_metrics.public=false"
+
+  defp lifecycle_assertion(:set_true),
+    do: "mc admin config set hot-applies prometheus_metrics.public=true without restart text"
+
+  defp lifecycle_assertion(:get_true),
+    do: "mc admin config get reports effective prometheus_metrics.public=true"
+
+  defp lifecycle_assertion(:metrics_public),
+    do: "anonymous metrics become available after the hot config change"
+
+  defp lifecycle_assertion(:reset_public),
+    do: "mc admin config reset removes only the prometheus_metrics public key"
+
+  defp lifecycle_assertion(:get_false_after_reset),
+    do: "mc admin config get reports public=false after reset"
+
+  defp lifecycle_assertion(:metrics_denied_after_reset),
+    do: "anonymous metrics are denied again after reset"
+
+  defp lifecycle_metrics_status(:metrics_denied_before), do: 403
+  defp lifecycle_metrics_status(:metrics_public), do: 200
+  defp lifecycle_metrics_status(:metrics_denied_after_reset), do: 403
+
+  defp config_output(:human, stage) when stage in [:get_false, :get_false_after_reset],
+    do: "prometheus_metrics public=false \n"
+
+  defp config_output(:human, :get_true), do: "prometheus_metrics public=true \n"
+  defp config_output(:human, :set_true), do: "Successfully applied new settings.\n"
+
+  defp config_output(:human, :reset_public),
+    do: "'prometheus_metrics public' is successfully reset.\n"
+
+  defp config_output(:json, stage) when stage in [:get_false, :get_false_after_reset] do
+    "{\"status\":\"success\",\"config\":[{\"subSystem\":\"prometheus_metrics\",\"kv\":[{\"key\":\"public\",\"value\":\"false\"}]}]}\n"
+  end
+
+  defp config_output(:json, :get_true) do
+    "{\"status\":\"success\",\"config\":[{\"subSystem\":\"prometheus_metrics\",\"kv\":[{\"key\":\"public\",\"value\":\"true\"}]}]}\n"
+  end
+
+  defp config_output(:json, stage) when stage in [:set_true, :reset_public],
+    do: "{\"status\":\"success\"}\n"
+
+  defp config_command_result(command_args, json?) do
+    mode = if json?, do: :json, else: :human
+
+    case command_args do
+      ["config", "get", alias_name, "prometheus_metrics"] ->
+        stage =
+          if Process.get({:metrics_public, alias_name}, false),
+            do: :get_true,
+            else: :get_false
+
+        {config_output(mode, stage), 0}
+
+      ["config", "set", alias_name, "prometheus_metrics", "public=true"] ->
+        Process.put({:metrics_public, alias_name}, true)
+        {config_output(mode, :set_true), 0}
+
+      ["config", "reset", alias_name, "prometheus_metrics", "public"] ->
+        Process.put({:metrics_public, alias_name}, false)
+        {config_output(mode, :reset_public), 0}
+    end
+  end
+
+  defp config_command_call?({_command, args, _opts}) do
+    case Enum.find_index(args, &(&1 == "admin")) do
+      nil -> false
+      index -> Enum.slice(args, index, 2) == ["admin", "config"]
+    end
+  end
+
+  defp successful_metrics_probe(_url, _opts) do
+    count = Process.get(:successful_metrics_probe_count, 0)
+    Process.put(:successful_metrics_probe_count, count + 1)
+    Enum.at([403, 200, 403], rem(count, 3))
+  end
+
+  defp authorization_header?(opts) do
+    opts
+    |> Keyword.get(:headers, [])
+    |> Enum.any?(fn {name, _value} -> String.downcase(to_string(name)) == "authorization" end)
+  end
+
   defp successful_mc_runner(opts \\ []) do
     admin_user_list = Keyword.get(opts, :admin_user_list)
     admin_user_info = Keyword.get(opts, :admin_user_info)
@@ -2160,6 +2868,9 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
         subcommand == "cat" ->
           {Process.get(:successful_mc_payload), 0}
+
+        subcommand == "admin" and Enum.take(command_args, 1) == ["config"] ->
+          config_command_result(command_args, json?)
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["policy", "create"] ->
           ["policy", "create", _mc_alias, policy_name, _policy_path] = command_args
