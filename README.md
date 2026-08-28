@@ -979,10 +979,10 @@ Admin API 的硬前置，也是 `deploymentID` 的落脚点。
 - **读**：统一门面 `Maxio.Config.get/2,3` / `fetch!/2` / `get_all/1` / `source/2`，
   优先级 **runtime override > env var > 编译期默认**。读路径走 `:persistent_term` 快照，
   永不打 DB；未命中运行时覆盖时逐字回落 `Application.get_env`（行为与改造前完全相同）。
-- **白名单**：`Maxio.Config.Schema` 是编译期数据结构，不是 DB 数据。第一批只放四个低风险键
+- **白名单**：`Maxio.Config.Schema` 是编译期数据结构，不是 DB 数据。core 第一批只放四个低风险键
   `cluster.deployment_id` / `prometheus_metrics.public` / `listing.sql_hard_limit` /
-  `s3.clock_skew_ms`。未知键 400、§4 禁止清单（密钥 / behaviour 绑定 / 改变既有落盘数据解释 /
-  config store 自举依赖 / compile_env）403，且**绝不落库**。
+  `s3.clock_skew_ms`；其中部署身份不暴露给 Admin Config KVS。未知键 400、§4 禁止清单（密钥 /
+  behaviour 绑定 / 改变既有落盘数据解释 / config store 自举依赖 / compile_env）403，且**绝不落库**。
 - **写成功 ≠ 生效**：写路径返回 `applied: hot | next_cycle | restart`，CLI 原样打印。
 - **多节点**：PG 是单一事实来源。失效走 `Cluster.Notify` 广播（快路径，best-effort），
   外加 30s 周期的**内容指纹**对账兜底（`md5(string_agg(subsystem/key/version/md5(value)))`）——
@@ -996,6 +996,23 @@ Admin API 的硬前置，也是 `deploymentID` 的落脚点。
   边界（如实说明，不是承诺之外的保证）：指纹只覆盖 `runtime_configs` 表本身，且收敛下界是
   一个对账周期；`Cluster.Notify` 眼下只是节点本地 transport（V-C2），跨节点唯一的收敛通路
   就是这次周期对账。
+
+MinIO v3 Config KVS 兼容面严格限于以下路由：
+
+- `GET /minio/admin/v3/get-config-kv?key={subsystem}`
+- `PUT /minio/admin/v3/set-config-kv`
+- `DELETE /minio/admin/v3/del-config-kv`
+
+对 mc 暴露的只有三个 **Maxio 扩展键**：`s3.clock_skew_ms`、
+`listing.sql_hard_limit`、`prometheus_metrics.public`；它们不是 MinIO 官方 config catalog 的同名替代。
+同一 subsystem 的 set/reset 会先验证完整候选配置，再在一个数据库事务内原子写 runtime rows 与
+audit；任一键失败则整批不落库。set 为当前相同 runtime override，或 reset 一个没有 runtime
+override 的合法键，都是成功 no-op：不增加 version/audit，也不触发 reload/broadcast。
+
+opt-in external smoke 会分别用 human 与全局 `--json` mc alias 执行完整 lifecycle，并以匿名请求
+`/minio/v2/metrics/cluster` 证明 `prometheus_metrics.public` 的数据面状态确实为
+`403 → set true → 200 → reset public → 403`，而不是只验证控制面回显。fake runner 只证明协议与
+取证编排；只有对隔离、已运行 Maxio endpoint 的 opt-in 执行才是活体结果。
 
 CLI：
 
@@ -1012,8 +1029,9 @@ mix maxio.config.status [--json] [--reconcile]      # 本节点快照 vs PG、�
 
 ### 本批显式不做（文档化，绝不静默）
 
-`mc admin config get/set`（依赖 madmin 的 Argon2id 加密封装，属独立的密码学互操作批次）、
-`mc admin user/policy/group *`、`mc admin heal/trace/console`、Tiers / Site Replication /
-Batch Jobs、`/minio/health/cluster[/read]`（FS 后端没有 quorum 概念，一个恒真的 200 是用假
-答案冒充集群健康判定）、`/minio/admin/v4/*` → 426 回落（当前 mc 的 madmin 硬编码打 v3，
-做了无法活体验证）。
+Config KVS 的 help、全量 export/import、history list/clear/restore、命名 targets、MinIO 官方
+config catalog、任何 secret/credential/KMS/SSE/MFA 配置、storage/credential/policy backend 或
+behaviour 绑定，以及 `mc admin service restart` 均不支持；这些路径不会伪造成功。
+此外，`mc admin heal/trace/console`、Tiers / Site Replication / Batch Jobs、
+`/minio/health/cluster[/read]`（FS 后端没有 quorum 概念，一个恒真的 200 是用假答案冒充集群健康
+判定）仍不在本批范围；`/minio/admin/v4/*` 继续 426 回落。

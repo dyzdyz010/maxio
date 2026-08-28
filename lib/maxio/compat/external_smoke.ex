@@ -70,6 +70,7 @@ defmodule Maxio.Compat.ExternalSmoke do
     command_runner = Keyword.get(opts, :command_runner, &run_command/3)
     tmp_root_fun = Keyword.get(opts, :tmp_root_fun, &System.tmp_dir!/0)
     admin_user_fixture_opts = Keyword.get(opts, :admin_user_fixture_opts, [])
+    metrics_probe = Keyword.get(opts, :metrics_probe, &default_metrics_probe/2)
 
     config.clients
     |> Enum.map(
@@ -79,9 +80,16 @@ defmodule Maxio.Compat.ExternalSmoke do
         executable_finder,
         command_runner,
         tmp_root_fun,
-        admin_user_fixture_opts
+        admin_user_fixture_opts,
+        metrics_probe
       )
     )
+  end
+
+  defp default_metrics_probe(url, request_opts) do
+    url
+    |> Req.get!(request_opts)
+    |> Map.fetch!(:status)
   end
 
   defp normalize_config(config) do
@@ -115,7 +123,8 @@ defmodule Maxio.Compat.ExternalSmoke do
          executable_finder,
          command_runner,
          tmp_root_fun,
-         admin_user_fixture_opts
+         admin_user_fixture_opts,
+         metrics_probe
        ) do
     started = System.monotonic_time(:millisecond)
 
@@ -136,6 +145,7 @@ defmodule Maxio.Compat.ExternalSmoke do
               command_runner,
               tmp_root_fun,
               admin_user_fixture_opts,
+              metrics_probe,
               started
             )
           else
@@ -158,6 +168,7 @@ defmodule Maxio.Compat.ExternalSmoke do
          command_runner,
          tmp_root_fun,
          admin_user_fixture_opts,
+         metrics_probe,
          started
        ) do
     with_temp_paths(spec.id, tmp_root_fun, fn paths ->
@@ -173,6 +184,7 @@ defmodule Maxio.Compat.ExternalSmoke do
             paths,
             command_runner,
             admin_user_fixture_opts,
+            metrics_probe,
             started
           )
 
@@ -246,6 +258,7 @@ defmodule Maxio.Compat.ExternalSmoke do
          paths,
          command_runner,
          admin_user_fixture_opts,
+         metrics_probe,
          started
        ) do
     redactions = redactions(config)
@@ -266,6 +279,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         env,
         command_runner,
         admin_user_fixture_opts,
+        metrics_probe,
         redactions,
         started
       )
@@ -280,6 +294,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         env,
         command_runner,
         independent_fixture_opts(admin_user_fixture_opts, :json),
+        metrics_probe,
         redactions,
         started
       )
@@ -296,6 +311,7 @@ defmodule Maxio.Compat.ExternalSmoke do
          env,
          command_runner,
          fixture_opts,
+         metrics_probe,
          redactions,
          started
        ) do
@@ -305,7 +321,15 @@ defmodule Maxio.Compat.ExternalSmoke do
            {steps, cleanup_steps} =
              case mode do
                :human ->
-                 mc_steps(executable, config, mode_paths, env, user.user_name, mc_probe)
+                 mc_steps(
+                   executable,
+                   config,
+                   mode_paths,
+                   env,
+                   user.user_name,
+                   mc_probe,
+                   metrics_probe
+                 )
 
                :json ->
                  mc_json_user_steps(
@@ -314,7 +338,8 @@ defmodule Maxio.Compat.ExternalSmoke do
                    mode_paths,
                    env,
                    user.user_name,
-                   mc_probe
+                   mc_probe,
+                   metrics_probe
                  )
              end
 
@@ -704,7 +729,163 @@ defmodule Maxio.Compat.ExternalSmoke do
     {steps, cleanup_steps}
   end
 
-  defp mc_steps(executable, config, paths, env, user_name, mc_probe) do
+  defp mc_config_lifecycle_steps(mode, executable, config, paths, opts, metrics_probe) do
+    scenario = mc_config_scenario(mode)
+    metrics_url = metrics_url(config.endpoint)
+    base_args = mc_config_base_args(mode)
+    mc_alias = paths.mc_alias
+
+    [
+      metrics_probe_step(
+        mc_config_step_id(mode, :metrics_denied_before),
+        metrics_url,
+        metrics_probe,
+        403,
+        scenario,
+        "anonymous metrics are denied before prometheus_metrics.public is enabled"
+      ),
+      step(
+        mc_config_step_id(mode, :get_false),
+        executable,
+        base_args ++ ["admin", "config", "get", mc_alias, "prometheus_metrics"],
+        opts,
+        {:output_exact, mc_config_output(mode, :get_false)},
+        scenario: scenario,
+        assertion: "mc admin config get reports effective prometheus_metrics.public=false"
+      ),
+      step(
+        mc_config_step_id(mode, :set_true),
+        executable,
+        base_args ++
+          ["admin", "config", "set", mc_alias, "prometheus_metrics", "public=true"],
+        opts,
+        {:output_exact, mc_config_output(mode, :set_true)},
+        scenario: scenario,
+        assertion:
+          "mc admin config set hot-applies prometheus_metrics.public=true without restart text"
+      ),
+      step(
+        mc_config_step_id(mode, :get_true),
+        executable,
+        base_args ++ ["admin", "config", "get", mc_alias, "prometheus_metrics"],
+        opts,
+        {:output_exact, mc_config_output(mode, :get_true)},
+        scenario: scenario,
+        assertion: "mc admin config get reports effective prometheus_metrics.public=true"
+      ),
+      metrics_probe_step(
+        mc_config_step_id(mode, :metrics_public),
+        metrics_url,
+        metrics_probe,
+        200,
+        scenario,
+        "anonymous metrics become available after the hot config change"
+      ),
+      step(
+        mc_config_step_id(mode, :reset_public),
+        executable,
+        base_args ++
+          ["admin", "config", "reset", mc_alias, "prometheus_metrics", "public"],
+        opts,
+        {:output_exact, mc_config_output(mode, :reset_public)},
+        scenario: scenario,
+        assertion: "mc admin config reset removes only the prometheus_metrics public key"
+      ),
+      step(
+        mc_config_step_id(mode, :get_false_after_reset),
+        executable,
+        base_args ++ ["admin", "config", "get", mc_alias, "prometheus_metrics"],
+        opts,
+        {:output_exact, mc_config_output(mode, :get_false)},
+        scenario: scenario,
+        assertion: "mc admin config get reports public=false after reset"
+      ),
+      metrics_probe_step(
+        mc_config_step_id(mode, :metrics_denied_after_reset),
+        metrics_url,
+        metrics_probe,
+        403,
+        scenario,
+        "anonymous metrics are denied again after reset"
+      )
+    ]
+  end
+
+  defp mc_config_cleanup_step(mode, executable, paths, opts) do
+    step(
+      mc_config_step_id(mode, :cleanup_reset),
+      executable,
+      mc_config_base_args(mode) ++
+        ["admin", "config", "reset", paths.mc_alias, "prometheus_metrics", "public"],
+      opts,
+      {:output_exact, mc_config_output(mode, :reset_public)},
+      scenario: mc_config_scenario(mode),
+      assertion: "failed config lifecycle cleanup restores prometheus_metrics.public default"
+    )
+    |> Map.put(:created_by, :always)
+    |> Map.put(:failure_scenario, mc_config_scenario(mode))
+  end
+
+  defp metrics_probe_step(id, metrics_url, metrics_probe, expected, scenario, assertion) do
+    %{
+      id: id,
+      command: "GET",
+      args: [metrics_url],
+      opts: [],
+      verify: {:output_exact, Integer.to_string(expected)},
+      scenario: scenario,
+      assertion: assertion,
+      local_fun: fn -> metrics_probe.(metrics_url, redirect: false) end
+    }
+  end
+
+  defp metrics_url(endpoint) do
+    endpoint
+    |> URI.merge("/minio/v2/metrics/cluster")
+    |> to_string()
+  end
+
+  defp mc_config_base_args(:human), do: []
+  defp mc_config_base_args(:json), do: ["--json"]
+
+  defp mc_config_scenario(mode), do: "admin_config_#{mode}_lifecycle"
+
+  defp mc_config_step_id(mode, stage) do
+    suffix =
+      case stage do
+        :metrics_denied_before -> "metrics_denied_before"
+        :get_false -> "get_false"
+        :set_true -> "set_true"
+        :get_true -> "get_true"
+        :metrics_public -> "metrics_public"
+        :reset_public -> "reset_public"
+        :get_false_after_reset -> "get_false_after_reset"
+        :metrics_denied_after_reset -> "metrics_denied_after_reset"
+        :cleanup_reset -> "cleanup_reset_public"
+      end
+
+    "admin_config_#{mode}_#{suffix}"
+  end
+
+  defp mc_config_output(:human, :get_false), do: "prometheus_metrics public=false \n"
+  defp mc_config_output(:human, :get_true), do: "prometheus_metrics public=true \n"
+  defp mc_config_output(:human, :set_true), do: "Successfully applied new settings.\n"
+
+  defp mc_config_output(:human, :reset_public),
+    do: "'prometheus_metrics public' is successfully reset.\n"
+
+  defp mc_config_output(:json, :get_false) do
+    "{\"status\":\"success\",\"config\":[{\"subSystem\":\"prometheus_metrics\",\"kv\":[{\"key\":\"public\",\"value\":\"false\"}]}]}\n"
+  end
+
+  defp mc_config_output(:json, :get_true) do
+    "{\"status\":\"success\",\"config\":[{\"subSystem\":\"prometheus_metrics\",\"kv\":[{\"key\":\"public\",\"value\":\"true\"}]}]}\n"
+  end
+
+  defp mc_config_output(:json, stage) when stage in [:set_true, :reset_public],
+    do: "{\"status\":\"success\"}\n"
+
+  defp mc_steps(executable, config, paths, env, user_name, mc_probe, metrics_probe) do
     opts = command_opts(config, [{"MC_CONFIG_DIR", paths.mc_config_dir} | env])
     base_args = []
     object = "maxiocompat/#{paths.bucket}/#{paths.key}"
@@ -1041,25 +1222,29 @@ defmodule Maxio.Compat.ExternalSmoke do
     steps =
       before_user_remove ++
         mc_human_group_steps(executable, paths, opts, user_name, mc_probe) ++
-        user_remove_and_after
+        user_remove_and_after ++
+        mc_config_lifecycle_steps(:human, executable, config, paths, opts, metrics_probe)
 
     cleanup_steps =
-      select_cleanup_steps(steps, [
-        {"admin_policy_human_cleanup_detach", "admin_policy_human_create"},
-        {"admin_group_human_cleanup_detach", "admin_group_human_add"},
-        {"admin_group_human_cleanup_remove_member", "admin_group_human_add"},
-        {"admin_group_human_remove", "admin_group_human_add"},
-        {"admin_user_human_remove", "admin_policy_human_create"},
-        {"admin_policy_human_remove", "admin_policy_human_create"},
-        {"delete_copied_object", "copy_object"},
-        {"delete_object", "put_object"},
-        {"delete_bucket", "make_bucket"}
-      ])
+      [
+        mc_config_cleanup_step(:human, executable, paths, opts)
+        | select_cleanup_steps(steps, [
+            {"admin_policy_human_cleanup_detach", "admin_policy_human_create"},
+            {"admin_group_human_cleanup_detach", "admin_group_human_add"},
+            {"admin_group_human_cleanup_remove_member", "admin_group_human_add"},
+            {"admin_group_human_remove", "admin_group_human_add"},
+            {"admin_user_human_remove", "admin_policy_human_create"},
+            {"admin_policy_human_remove", "admin_policy_human_create"},
+            {"delete_copied_object", "copy_object"},
+            {"delete_object", "put_object"},
+            {"delete_bucket", "make_bucket"}
+          ])
+      ]
 
     {steps, cleanup_steps}
   end
 
-  defp mc_json_user_steps(executable, config, paths, env, user_name, mc_probe) do
+  defp mc_json_user_steps(executable, config, paths, env, user_name, mc_probe, metrics_probe) do
     opts = command_opts(config, [{"MC_CONFIG_DIR", paths.mc_config_dir} | env])
     base_args = ["--json"]
     mc_alias = paths.mc_alias
@@ -1276,17 +1461,21 @@ defmodule Maxio.Compat.ExternalSmoke do
     steps =
       before_user_remove ++
         mc_json_group_steps(executable, paths, opts, user_name, mc_probe) ++
-        user_remove_and_after
+        user_remove_and_after ++
+        mc_config_lifecycle_steps(:json, executable, config, paths, opts, metrics_probe)
 
     cleanup_steps =
-      select_cleanup_steps(steps, [
-        {"admin_policy_json_cleanup_detach", "admin_policy_json_create"},
-        {"admin_group_json_cleanup_detach", "admin_group_json_add"},
-        {"admin_group_json_cleanup_remove_member", "admin_group_json_add"},
-        {"admin_group_json_remove", "admin_group_json_add"},
-        {"admin_user_json_remove", "admin_policy_json_create"},
-        {"admin_policy_json_remove", "admin_policy_json_create"}
-      ])
+      [
+        mc_config_cleanup_step(:json, executable, paths, opts)
+        | select_cleanup_steps(steps, [
+            {"admin_policy_json_cleanup_detach", "admin_policy_json_create"},
+            {"admin_group_json_cleanup_detach", "admin_group_json_add"},
+            {"admin_group_json_cleanup_remove_member", "admin_group_json_add"},
+            {"admin_group_json_remove", "admin_group_json_add"},
+            {"admin_user_json_remove", "admin_policy_json_create"},
+            {"admin_policy_json_remove", "admin_policy_json_create"}
+          ])
+      ]
 
     {steps, cleanup_steps}
   end
@@ -1847,9 +2036,18 @@ defmodule Maxio.Compat.ExternalSmoke do
       |> Enum.filter(&(&1["status"] == "ok"))
       |> MapSet.new(& &1["id"])
 
+    failed_scenario = step_views |> List.last() |> Map.get("scenario")
+
     Enum.filter(cleanup_steps, fn step ->
-      MapSet.member?(successful_ids, step.created_by) and
-        not MapSet.member?(successful_ids, step.id)
+      created? =
+        case step.created_by do
+          :always -> Map.get(step, :failure_scenario) == failed_scenario
+          created_by -> MapSet.member?(successful_ids, created_by)
+        end
+
+      completed? = MapSet.member?(successful_ids, step.id)
+
+      created? and not completed?
     end)
   end
 
