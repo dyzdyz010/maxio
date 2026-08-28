@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "fixture_id": "minio-admin-v3-p7-policy-entities",
+  "evidence_class": "pinned-upstream-source-derived-not-live",
+  "provenance": {
+    "minio_commit": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+    "madmin_go_tag": "v3.0.109",
+    "madmin_go_commit": "6897865311e2be91d814ea0ef4814a730d87d1cd",
+    "minio_pkg_v3_tag": "v3.1.3",
+    "minio_pkg_v3_commit": "63a2eac5884b50aede4df00b84d16060dfd6791d"
+  },
+  "frozen_contract": {
+    "route": {
+      "method": "GET",
+      "path": "/minio/admin/v3/idp/builtin/policy-entities"
+    },
+    "authorization": {
+      "semantics": "OR",
+      "ordered_actions": [
+        "admin:ListGroups",
+        "admin:ListUsers",
+        "admin:ListUserPolicies"
+      ]
+    },
+    "query": {
+      "repeatable_keys": [
+        "user",
+        "group",
+        "policy"
+      ],
+      "mixed_dimensions_allowed": true,
+      "duplicate_values": "de-duplicated before projection",
+      "normalization": "lexicographically sorted values are passed to the Maxio IAM boundary",
+      "percent_encoded_values": {
+        "query_string": "user=alice%2Bops&group=data+science&policy=read%2Fonly",
+        "decoded": {
+          "users": [
+            "alice+ops"
+          ],
+          "groups": [
+            "data science"
+          ],
+          "policies": [
+            "read/only"
+          ]
+        }
+      },
+      "unknown_or_unmapped_values": "omitted without error",
+      "unrelated_query_key": "does not activate a user/group dimension; with no recognized values this is the empty-filter policy projection",
+      "bare_recognized_key": "an empty value that yields no matching mapping",
+      "malformed_percent_encoding": "VERIFY-AT-IMPL"
+    },
+    "success": {
+      "http_status": 200,
+      "content_type": "application/json",
+      "response_encrypted": true,
+      "timestamp": "one Go time.Time JSON value for the projection"
+    },
+    "projection_activation": {
+      "userMappings": "included only when user filters were requested and at least one mapping survives",
+      "groupMappings": "included only when group filters were requested and at least one mapping survives",
+      "policyMappings": "included when policy filters were requested, or when no recognized filters were supplied, and at least one mapping survives",
+      "empty_query": "all policy-to-entity mappings only",
+      "empty_query_without_mappings": "timestamp only"
+    },
+    "json_schema": {
+      "top_level": {
+        "timestamp": "required RFC3339Nano string",
+        "userMappings": "optional array; omitted when nil or empty",
+        "groupMappings": "optional array; omitted when nil or empty",
+        "policyMappings": "optional array; omitted when nil or empty"
+      },
+      "user_mapping": {
+        "user": "required string",
+        "policies": "required array or null when the Go slice is nil",
+        "memberOfMappings": "optional array; omitted when nil or empty"
+      },
+      "group_mapping": {
+        "group": "required string",
+        "policies": "required array or null when the Go slice is nil"
+      },
+      "policy_mapping": {
+        "policy": "required string",
+        "users": "required array or null when the Go slice is nil",
+        "groups": "required array or null when the Go slice is nil"
+      }
+    },
+    "ordering": {
+      "userMappings": "user ascending",
+      "groupMappings": "group ascending",
+      "policyMappings": "policy ascending",
+      "policies": "ascending",
+      "users": "ascending",
+      "groups": "ascending",
+      "memberOfMappings": "group ascending with each nested policies list ascending"
+    }
+  },
+  "exact_plaintext_cases": {
+    "empty_query_no_mappings": {
+      "query_string": "",
+      "json": {
+        "timestamp": "2026-08-28T01:02:03Z"
+      }
+    },
+    "unknown_values_omitted": {
+      "query_string": "user=missing&group=missing&policy=missing",
+      "json": {
+        "timestamp": "2026-08-28T01:02:03Z"
+      }
+    },
+    "inner_nil_slices_are_null": {
+      "query_string": "user=alice&policy=group-only&policy=user-only",
+      "json": {
+        "timestamp": "2026-08-28T01:02:03Z",
+        "userMappings": [
+          {
+            "user": "alice",
+            "policies": null,
+            "memberOfMappings": [
+              {
+                "group": "auditors",
+                "policies": [
+                  "group-only"
+                ]
+              }
+            ]
+          }
+        ],
+        "policyMappings": [
+          {
+            "policy": "group-only",
+            "users": null,
+            "groups": [
+              "auditors"
+            ]
+          },
+          {
+            "policy": "user-only",
+            "users": [
+              "bob"
+            ],
+            "groups": null
+          }
+        ]
+      }
+    },
+    "repeated_mixed_filters_sorted": {
+      "query_string": "user=zoe&user=alice&user=zoe&group=writers&group=auditors&policy=z-policy&policy=a-policy",
+      "normalized": {
+        "users": [
+          "alice",
+          "zoe"
+        ],
+        "groups": [
+          "auditors",
+          "writers"
+        ],
+        "policies": [
+          "a-policy",
+          "z-policy"
+        ],
+        "requested_dimensions": [
+          "group",
+          "policy",
+          "user"
+        ]
+      },
+      "json": {
+        "timestamp": "2026-08-28T01:02:03Z",
+        "userMappings": [
+          {
+            "user": "alice",
+            "policies": [
+              "a-policy",
+              "z-policy"
+            ]
+          },
+          {
+            "user": "zoe",
+            "policies": [
+              "a-policy",
+              "z-policy"
+            ]
+          }
+        ],
+        "groupMappings": [
+          {
+            "group": "auditors",
+            "policies": [
+              "a-policy"
+            ]
+          },
+          {
+            "group": "writers",
+            "policies": [
+              "a-policy",
+              "z-policy"
+            ]
+          }
+        ],
+        "policyMappings": [
+          {
+            "policy": "a-policy",
+            "users": [
+              "alice",
+              "zoe"
+            ],
+            "groups": [
+              "auditors",
+              "writers"
+            ]
+          },
+          {
+            "policy": "z-policy",
+            "users": [
+              "alice",
+              "zoe"
+            ],
+            "groups": [
+              "writers"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "upstream_persisted_sts_projection": {
+    "included": true,
+    "scope": "persisted stsUser mapped-policy records are loaded from object-store or etcd paths into policyMappings users",
+    "not_session_policies": true,
+    "source_lines": "minio/cmd/iam-store.go:2378-2438"
+  },
+  "maxio_model_scope_deviations": [
+    {
+      "id": "p7-persisted-sts-user-policy-mapping",
+      "classification": "model_scope_deviation",
+      "wire_visible": true,
+      "upstream_behavior": "persisted STS-user policy mappings contribute users to policyMappings",
+      "maxio_behavior": "omit this relation because the current Maxio model cannot represent it",
+      "parity_claim": "not full upstream parity"
+    }
+  ]
+}

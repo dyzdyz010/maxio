@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "fixture_id": "mc-admin-policy-p6-p7-lifecycle",
+  "evidence_class": "pinned-source-derived-not-live",
+  "provenance": {
+    "mc_commit": "77f82e18b5401a65958f1619df6ebb994634bd88",
+    "mc_madmin_pin": "4b504b82db633e978a57d49443b2be75824244c3",
+    "server_madmin_contract_commit": "6897865311e2be91d814ea0ef4814a730d87d1cd"
+  },
+  "capture_canonicalization": {
+    "encoding": "UTF-8",
+    "line_ending": "LF",
+    "non_tty_without_ansi": true,
+    "exactly_one_trailing_lf": true,
+    "association_json_indent_spaces": 1,
+    "entities_json_indent_spaces": 2
+  },
+  "argv_contract": {
+    "attach_human": [
+      "admin",
+      "policy",
+      "attach",
+      "ALIAS",
+      "z-policy",
+      "a-policy",
+      "z-policy",
+      "--user",
+      "alice"
+    ],
+    "attach_json": [
+      "--json",
+      "admin",
+      "policy",
+      "attach",
+      "ALIAS",
+      "z-policy",
+      "a-policy",
+      "z-policy",
+      "--user",
+      "alice"
+    ],
+    "detach_human": [
+      "admin",
+      "policy",
+      "detach",
+      "ALIAS",
+      "readonly",
+      "audit-policy",
+      "--group",
+      "auditors"
+    ],
+    "detach_json": [
+      "--json",
+      "admin",
+      "policy",
+      "detach",
+      "ALIAS",
+      "readonly",
+      "audit-policy",
+      "--group",
+      "auditors"
+    ],
+    "entities_human": [
+      "admin",
+      "policy",
+      "entities",
+      "ALIAS",
+      "--user",
+      "alice",
+      "--user",
+      "zoe",
+      "--group",
+      "auditors",
+      "--policy",
+      "a-policy",
+      "--policy",
+      "z-policy"
+    ],
+    "entities_json": [
+      "--json",
+      "admin",
+      "policy",
+      "entities",
+      "ALIAS",
+      "--user",
+      "alice",
+      "--user",
+      "zoe",
+      "--group",
+      "auditors",
+      "--policy",
+      "a-policy",
+      "--policy",
+      "z-policy"
+    ],
+    "association_requirement": "one-or-more positional policy names and exactly one of --user or --group",
+    "entities_filters": "--user, --group and --policy are independently repeatable"
+  },
+  "association_success_outputs": {
+    "attach_user_human_stdout": "Attached Policies: [a-policy z-policy]\nTo User: alice\n",
+    "attach_user_json_stdout": "{\n \"status\": \"success\",\n \"policiesAttached\": [\n  \"a-policy\",\n  \"z-policy\"\n ],\n \"user\": \"alice\"\n}\n",
+    "detach_group_human_stdout": "Detached Policies: [audit-policy readonly]\nFrom Group: auditors\n",
+    "detach_group_json_stdout": "{\n \"status\": \"success\",\n \"policiesDetached\": [\n  \"audit-policy\",\n  \"readonly\"\n ],\n \"group\": \"auditors\"\n}\n",
+    "stderr": "",
+    "exit_code": 0
+  },
+  "no_effect_synthesis": {
+    "server_http_status": 400,
+    "server_code": "XMinioAdminPolicyChangeAlreadyApplied",
+    "mc_exit_code": 0,
+    "mc_stderr": "",
+    "condition": "madmin response remains the zero PolicyAssociationResp after the swallowed server error",
+    "synthesized_from": "original positional policy argv",
+    "preserves_order": true,
+    "preserves_duplicates": true,
+    "attach_human_stdout": "Attached Policies: [z-policy a-policy z-policy]\nTo User: alice\n",
+    "attach_json_stdout": "{\n \"status\": \"success\",\n \"policiesAttached\": [\n  \"z-policy\",\n  \"a-policy\",\n  \"z-policy\"\n ],\n \"user\": \"alice\"\n}\n"
+  },
+  "entities_outputs": {
+    "input_plaintext": {
+      "timestamp": "2026-08-28T01:02:03Z",
+      "policyMappings": [
+        {
+          "policy": "a-policy",
+          "users": [
+            "alice"
+          ],
+          "groups": null
+        }
+      ]
+    },
+    "human_stdout": "Query time: 2026-08-28T01:02:03Z\nPolicy -> Entity Mappings:\n  Policy: a-policy\n    User Mappings:\n      alice\n",
+    "json_stdout": "{\n  \"status\": \"success\",\n  \"result\": {\n    \"timestamp\": \"2026-08-28T01:02:03Z\",\n    \"policyMappings\": [\n      {\n        \"policy\": \"a-policy\",\n        \"users\": [\n          \"alice\"\n        ],\n        \"groups\": null\n      }\n    ]\n  }\n}\n",
+    "stderr": "",
+    "exit_code": 0
+  },
+  "lifecycle_order": [
+    "create managed policy",
+    "create unprivileged user",
+    "baseline S3 list denied",
+    "attach policy",
+    "S3 list allowed",
+    "repeat attach and observe mc no-effect synthesis",
+    "query policy entities with repeated filters",
+    "detach policy",
+    "S3 list denied",
+    "cleanup user before policy"
+  ]
+}

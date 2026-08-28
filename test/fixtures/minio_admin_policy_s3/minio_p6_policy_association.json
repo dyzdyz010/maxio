@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "fixture_id": "minio-admin-v3-p6-policy-association",
+  "evidence_class": "pinned-upstream-source-derived-not-live",
+  "provenance": {
+    "minio_commit": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+    "madmin_go_tag": "v3.0.109",
+    "madmin_go_commit": "6897865311e2be91d814ea0ef4814a730d87d1cd",
+    "minio_pkg_v3_tag": "v3.1.3",
+    "minio_pkg_v3_commit": "63a2eac5884b50aede4df00b84d16060dfd6791d"
+  },
+  "frozen_contract": {
+    "route": {
+      "method": "POST",
+      "path_template": "/minio/admin/v3/idp/builtin/policy/{operation}",
+      "accepted_operations": [
+        "attach",
+        "detach"
+      ]
+    },
+    "authorization": {
+      "semantics": "OR",
+      "ordered_actions": [
+        "admin:UpdatePolicyAssociation",
+        "admin:AttachUserOrGroupPolicy"
+      ]
+    },
+    "transport": {
+      "gate_order_after_authentication": [
+        "content_length",
+        "content_type",
+        "operation",
+        "decrypt"
+      ],
+      "content_type_exact": "application/octet-stream",
+      "maximum_encrypted_content_length": 262272,
+      "content_length_must_be_known": true,
+      "unknown_operation": {
+        "http_status": 400,
+        "code": "XMinioAdminInvalidArgument",
+        "decrypts_body": false
+      },
+      "known_operation_zero_length": {
+        "reaches_decrypt": true,
+        "maxio_http_status": 400,
+        "maxio_code": "XMinioAdminConfigBadJSON"
+      },
+      "success_content_type": "application/json",
+      "request_encrypted": true,
+      "success_response_encrypted": true,
+      "error_response_encrypted": false
+    },
+    "request_plaintext": {
+      "fields": {
+        "policies": "non-empty array of non-empty strings",
+        "user": "optional non-empty string",
+        "group": "optional non-empty string"
+      },
+      "principal_cardinality": "exactly one of user or group",
+      "unknown_json_fields": "ignored by Go encoding/json",
+      "duplicate_policy_normalization": "set de-duplication before mutation",
+      "is_valid_error_order": [
+        {
+          "condition": "policies missing or empty",
+          "error": "no policy names were given"
+        },
+        {
+          "condition": "first encountered policy name is empty",
+          "error": "an empty policy name was given"
+        },
+        {
+          "condition": "both user and group are empty",
+          "error": "no user or group association was given"
+        },
+        {
+          "condition": "both user and group are non-empty",
+          "error": "either a group or a user association must be given, not both"
+        }
+      ]
+    },
+    "validation_precedence": {
+      "overall": [
+        "request_is_valid",
+        "target",
+        "operation_specific_policy_or_no_effect"
+      ],
+      "user_target": [
+        "temporary_user_forbidden",
+        "configured_root_forbidden",
+        "user_exists"
+      ],
+      "group_target": [
+        "group_exists",
+        "group_enabled"
+      ],
+      "attach": [
+        "validate_each_net_new_policy_exists",
+        "no_effect"
+      ],
+      "detach": [
+        "intersect_requested_with_current_attachments",
+        "no_effect_if_intersection_empty"
+      ]
+    },
+    "combination_error_matrix": [
+      {
+        "case": "invalid-request-beats-target-and-policy",
+        "request": {
+          "policies": [],
+          "user": "missing-user"
+        },
+        "also_present": [
+          "missing_target",
+          "missing_policy"
+        ],
+        "expected_stage": "request_is_valid"
+      },
+      {
+        "case": "missing-user-beats-attach-missing-policy",
+        "request": {
+          "policies": [
+            "missing-policy"
+          ],
+          "user": "missing-user"
+        },
+        "expected_stage": "user_exists",
+        "http_status": 404,
+        "code": "XMinioAdminNoSuchUser"
+      },
+      {
+        "case": "disabled-group-beats-attach-missing-policy",
+        "request": {
+          "policies": [
+            "missing-policy"
+          ],
+          "group": "disabled-group"
+        },
+        "expected_stage": "group_enabled",
+        "maxio_http_status": 400,
+        "maxio_code": "XMinioAdminInvalidArgument"
+      },
+      {
+        "case": "attach-missing-policy-beats-no-effect-and-writes-nothing",
+        "request": {
+          "policies": [
+            "already-attached",
+            "missing-policy"
+          ],
+          "user": "alice"
+        },
+        "expected_stage": "validate_each_net_new_policy_exists",
+        "http_status": 404,
+        "code": "XMinioAdminNoSuchPolicy",
+        "atomic_writes": 0
+      },
+      {
+        "case": "detach-ignores-unmapped-or-undefined-items-when-intersection-exists",
+        "request": {
+          "policies": [
+            "undefined-policy",
+            "attached-policy",
+            "unmapped-policy"
+          ],
+          "user": "alice"
+        },
+        "expected_result": "success",
+        "policiesDetached": [
+          "attached-policy"
+        ]
+      },
+      {
+        "case": "detach-empty-intersection-is-no-effect",
+        "request": {
+          "policies": [
+            "undefined-policy",
+            "unmapped-policy"
+          ],
+          "user": "alice"
+        },
+        "expected_stage": "no_effect_if_intersection_empty",
+        "http_status": 400,
+        "code": "XMinioAdminPolicyChangeAlreadyApplied"
+      }
+    ],
+    "success": {
+      "http_status": 200,
+      "plaintext_attach_fields": [
+        "policiesAttached",
+        "updatedAt"
+      ],
+      "plaintext_detach_fields": [
+        "policiesDetached",
+        "updatedAt"
+      ],
+      "policy_values": "actual changed names, de-duplicated and lexicographically sorted",
+      "updated_at_encoding": "Go time.Time JSON RFC3339Nano string"
+    },
+    "no_effect": {
+      "http_status": 400,
+      "code": "XMinioAdminPolicyChangeAlreadyApplied",
+      "description": "The specified policy change is already in effect.",
+      "cause": "Specified policy update has no net effect",
+      "message": "The specified policy change is already in effect. (Specified policy update has no net effect)",
+      "writes": 0,
+      "notifications": 0,
+      "mc_behavior": "swallow error and synthesize success from the original requested policy slice, preserving order and duplicates"
+    },
+    "concurrency_and_idempotency": {
+      "mutation_serialization": "upstream IAMStoreSys holds its exclusive store lock across read/compute/persist/cache update",
+      "same_request_duplicates": "one set member and at most one actual change",
+      "sequential_repeat": "400 no-effect rather than a second 200",
+      "concurrent_overlapping_batches": "lock acquisition order selects the winner; each later batch computes against the committed in-memory mapping and cannot expose a partial mapping"
+    },
+    "target_errors": {
+      "temporary_user": {
+        "http_status": 403,
+        "code": "XMinioIAMActionNotAllowed"
+      },
+      "configured_root": {
+        "http_status": 403,
+        "code": "XMinioIAMActionNotAllowed"
+      },
+      "missing_user": {
+        "http_status": 404,
+        "code": "XMinioAdminNoSuchUser"
+      },
+      "missing_group": {
+        "http_status": 404,
+        "code": "XMinioAdminNoSuchGroup"
+      },
+      "disabled_group_maxio": {
+        "http_status": 400,
+        "code": "XMinioAdminInvalidArgument",
+        "message": "The specified group is disabled and cannot receive policy association updates."
+      },
+      "missing_attach_policy": {
+        "http_status": 404,
+        "code": "XMinioAdminNoSuchPolicy"
+      }
+    },
+    "upstream_bug_deviations": [
+      {
+        "id": "p6-bad-envelope-internal-error",
+        "upstream": "unmapped decrypt/JSON error falls through to HTTP 500",
+        "maxio": {
+          "http_status": 400,
+          "code": "XMinioAdminConfigBadJSON"
+        }
+      },
+      {
+        "id": "p6-disabled-group-internal-error",
+        "upstream": "errGroupDisabled is not mapped by toAdminAPIErr and falls through to HTTP 500",
+        "maxio": {
+          "http_status": 400,
+          "code": "XMinioAdminInvalidArgument",
+          "message": "The specified group is disabled and cannot receive policy association updates."
+        }
+      }
+    ]
+  },
+  "exact_wire_samples": {
+    "attach_user_request_plaintext": "{\"policies\":[\"z-policy\",\"a-policy\",\"z-policy\"],\"user\":\"alice\"}",
+    "attach_success_plaintext": "{\"policiesAttached\":[\"a-policy\",\"z-policy\"],\"updatedAt\":\"2026-08-28T01:02:03.123456789Z\"}",
+    "detach_group_request_plaintext": "{\"policies\":[\"readonly\",\"audit-policy\"],\"group\":\"auditors\"}",
+    "detach_success_plaintext": "{\"policiesDetached\":[\"audit-policy\",\"readonly\"],\"updatedAt\":\"2026-08-28T01:02:03Z\"}"
+  }
+}
