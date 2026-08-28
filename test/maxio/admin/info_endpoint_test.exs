@@ -156,6 +156,13 @@ defmodule Maxio.Admin.InfoEndpointTest do
   end
 
   defp put_alice_key do
+    %{user_arn: @alice_arn} =
+      create_user_with_access_key!(
+        user_name: @alice_ak,
+        access_key_id: @alice_ak,
+        secret_key: @alice_secret
+      )
+
     :ok =
       CredentialStore.put_access_key(%{
         access_key: @alice_ak,

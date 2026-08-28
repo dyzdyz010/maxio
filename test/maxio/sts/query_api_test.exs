@@ -251,8 +251,8 @@ defmodule Maxio.STS.QueryAPITest do
     access_key = "AKIAGETCALLER#{System.unique_integer([:positive])}"
     secret_key = "get-caller-secret"
 
-    assert {:ok, key} =
-             IAM.create_access_key(access_key_id: access_key, secret_key: secret_key)
+    key =
+      create_user_with_access_key!(access_key_id: access_key, secret_key: secret_key)
 
     response =
       signed_sts_conn(%{"Action" => "GetCallerIdentity"},
@@ -293,7 +293,7 @@ defmodule Maxio.STS.QueryAPITest do
 
     access_key = "AKIAGSTMFA#{System.unique_integer([:positive])}"
     secret_key = "get-session-token-mfa-secret"
-    assert {:ok, key} = IAM.create_access_key(access_key_id: access_key, secret_key: secret_key)
+    key = create_user_with_access_key!(access_key_id: access_key, secret_key: secret_key)
 
     policy =
       ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::#{bucket}/open/*"},{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::#{bucket}/protected/*","Condition":{"Bool":{"aws:MultiFactorAuthPresent":"true"}}},{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::#{bucket}/deny-false/*"},{"Effect":"Deny","Action":"s3:PutObject","Resource":"arn:aws:s3:::#{bucket}/deny-false/*","Condition":{"Bool":{"aws:MultiFactorAuthPresent":"false"}}}]})
@@ -1609,8 +1609,8 @@ defmodule Maxio.STS.QueryAPITest do
   end
 
   test "AssumeRole account-principal trust requires caller identity policy" do
-    {:ok, caller} =
-      IAM.create_access_key(
+    caller =
+      create_user_with_access_key!(
         access_key_id: unique_access_key("ACCOUNTTRUST"),
         secret_key: "issuer-secret"
       )
@@ -1653,8 +1653,8 @@ defmodule Maxio.STS.QueryAPITest do
   end
 
   test "AssumeRole direct same-account principal trust does not require caller identity policy" do
-    {:ok, caller} =
-      IAM.create_access_key(
+    caller =
+      create_user_with_access_key!(
         access_key_id: unique_access_key("DIRECTTRUST"),
         secret_key: "issuer-secret"
       )
@@ -1681,8 +1681,8 @@ defmodule Maxio.STS.QueryAPITest do
   end
 
   test "AssumeRole session tags require caller TagSession identity policy" do
-    {:ok, caller} =
-      IAM.create_access_key(
+    caller =
+      create_user_with_access_key!(
         access_key_id: unique_access_key("TAGCALLER"),
         secret_key: "issuer-secret"
       )

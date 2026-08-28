@@ -179,104 +179,163 @@ defmodule Maxio.IAM.UserIdentityTest do
       root_access_key = unique_access_key("ROOTISSUER#{mutation}")
       second_root_access_key = unique_access_key("ROOTSPARE#{mutation}")
       session_access_key = unique_access_key("ROOTRACE#{mutation}")
-
-      assert {:ok, _root} =
-               unboxed(fn ->
-                 IAM.create_access_key(
-                   access_key_id: root_access_key,
-                   secret_key: "root-race-issuer-secret",
-                   type: "root",
-                   principal_arn: IAM.root_principal_arn()
-                 )
-               end)
-
-      assert {:ok, _second_root} =
-               unboxed(fn ->
-                 IAM.create_access_key(
-                   access_key_id: second_root_access_key,
-                   secret_key: "root-race-spare-secret",
-                   type: "root",
-                   principal_arn: IAM.root_principal_arn()
-                 )
-               end)
-
+      cleanup_ids = [root_access_key, second_root_access_key, session_access_key]
       owner = self()
       barrier_ref = make_ref()
       handler_id = {__MODULE__, barrier_ref}
       barrier_once = :atomics.new(1, signed: false)
 
-      on_exit(fn ->
-        :telemetry.detach(handler_id)
+      on_exit(fn -> cleanup_unboxed_credentials!(cleanup_ids) end)
 
-        unboxed(fn ->
-          Repo.delete_all(from(s in STSSession, where: s.access_key_id == ^session_access_key))
+      try do
+        assert {:ok, _root} =
+                 unboxed(fn ->
+                   IAM.create_access_key(
+                     access_key_id: root_access_key,
+                     secret_key: "root-race-issuer-secret",
+                     type: "root",
+                     principal_arn: IAM.root_principal_arn()
+                   )
+                 end)
 
-          Repo.delete_all(
-            from(a in AccessKey,
-              where: a.access_key_id in ^[root_access_key, second_root_access_key]
-            )
-          )
-        end)
-      end)
+        assert {:ok, _second_root} =
+                 unboxed(fn ->
+                   IAM.create_access_key(
+                     access_key_id: second_root_access_key,
+                     secret_key: "root-race-spare-secret",
+                     type: "root",
+                     principal_arn: IAM.root_principal_arn()
+                   )
+                 end)
 
-      :ok =
-        :telemetry.attach(
-          handler_id,
-          [:maxio, :iam, :credential_namespace, :lock_wait],
-          fn _event, _measurements, metadata, {test_pid, ref, expected_access_key, once} ->
-            if metadata.access_key_id == expected_access_key and
-                 :atomics.compare_exchange(once, 1, 0, 1) == :ok do
-              send(test_pid, {:root_namespace_wait, ref, self()})
+        on_exit(fn -> :telemetry.detach(handler_id) end)
 
-              receive do
-                {:release_root_namespace, ^ref} -> :ok
-              after
-                5_000 -> raise "root namespace barrier timed out"
+        :ok =
+          :telemetry.attach(
+            handler_id,
+            [:maxio, :iam, :credential_namespace, :lock_wait],
+            fn _event, _measurements, metadata, {test_pid, ref, expected_access_key, once} ->
+              if metadata.access_key_id == expected_access_key and
+                   :atomics.compare_exchange(once, 1, 0, 1) == :ok do
+                send(test_pid, {:root_namespace_wait, ref, self()})
+
+                receive do
+                  {:release_root_namespace, ^ref} -> :ok
+                after
+                  5_000 -> raise "root namespace barrier timed out"
+                end
               end
-            end
-          end,
-          {owner, barrier_ref, root_access_key, barrier_once}
-        )
-
-      session_task =
-        Task.async(fn ->
-          Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
-            STS.issue_session(
-              issuer_access_key_id: root_access_key,
-              session_access_key_id: session_access_key,
-              secret_key: "root-race-session-secret",
-              session_token: "root-race-session-token",
-              duration_seconds: 900
-            )
-          end)
-        end)
-
-      assert_receive {:root_namespace_wait, ^barrier_ref, session_pid}, 5_000
-
-      mutation_result =
-        unboxed(fn ->
-          case mutation do
-            :disable -> IAM.update_access_key_strict(root_access_key, "inactive")
-            :delete -> IAM.delete_access_key_strict(root_access_key)
-          end
-        end)
-
-      assert {:ok, _root} = mutation_result
-      send(session_pid, {:release_root_namespace, barrier_ref})
-
-      assert {:error, :issuer_access_key_not_found} = Task.await(session_task, 10_000)
-      refute unboxed(fn -> Repo.get_by(STSSession, access_key_id: session_access_key) end)
-
-      :telemetry.detach(handler_id)
-
-      unboxed(fn ->
-        Repo.delete_all(
-          from(a in AccessKey,
-            where: a.access_key_id in ^[root_access_key, second_root_access_key]
+            end,
+            {owner, barrier_ref, root_access_key, barrier_once}
           )
-        )
-      end)
+
+        session_task =
+          Task.async(fn ->
+            Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+              STS.issue_session(
+                issuer_access_key_id: root_access_key,
+                session_access_key_id: session_access_key,
+                secret_key: "root-race-session-secret",
+                session_token: "root-race-session-token",
+                duration_seconds: 900
+              )
+            end)
+          end)
+
+        assert_receive {:root_namespace_wait, ^barrier_ref, session_pid}, 5_000
+
+        mutation_result =
+          unboxed(fn ->
+            case mutation do
+              :disable -> IAM.update_access_key_strict(root_access_key, "inactive")
+              :delete -> IAM.delete_access_key_strict(root_access_key)
+            end
+          end)
+
+        assert {:ok, _root} = mutation_result
+        send(session_pid, {:release_root_namespace, barrier_ref})
+
+        assert {:error, :issuer_access_key_not_found} = Task.await(session_task, 10_000)
+        refute unboxed(fn -> Repo.get_by(STSSession, access_key_id: session_access_key) end)
+
+        :telemetry.detach(handler_id)
+      after
+        :telemetry.detach(handler_id)
+        cleanup_unboxed_credentials!(cleanup_ids)
+      end
+
+      assert unboxed(fn ->
+               Repo.aggregate(
+                 from(s in STSSession,
+                   where:
+                     s.access_key_id in ^cleanup_ids or s.issuer_access_key_id in ^cleanup_ids
+                 ),
+                 :count
+               )
+             end) == 0
+
+      assert unboxed(fn ->
+               Repo.aggregate(
+                 from(a in AccessKey, where: a.access_key_id in ^cleanup_ids),
+                 :count
+               )
+             end) == 0
     end
+  end
+
+  test "root race cleanup removes active and revoked STS descendants by exact issuer graph" do
+    root_access_key = unique_access_key("ROOTCLEANUP")
+    active_session_access_key = unique_access_key("ROOTCLEANUPACTIVE")
+    revoked_session_access_key = unique_access_key("ROOTCLEANUPREVOKED")
+
+    cleanup_ids = [
+      root_access_key,
+      active_session_access_key,
+      revoked_session_access_key
+    ]
+
+    on_exit(fn -> cleanup_unboxed_credentials!(cleanup_ids) end)
+
+    assert {:ok, _root} =
+             unboxed(fn ->
+               IAM.create_access_key(
+                 access_key_id: root_access_key,
+                 secret_key: "root-cleanup-secret",
+                 type: "root",
+                 principal_arn: IAM.root_principal_arn()
+               )
+             end)
+
+    unboxed(fn ->
+      insert_session!(
+        active_session_access_key,
+        root_access_key,
+        IAM.root_principal_arn()
+      )
+
+      insert_session!(
+        revoked_session_access_key,
+        active_session_access_key,
+        IAM.root_principal_arn(),
+        status: "revoked"
+      )
+    end)
+
+    cleanup_unboxed_credentials!([root_access_key])
+
+    assert unboxed(fn ->
+             Repo.aggregate(
+               from(s in STSSession, where: s.access_key_id in ^cleanup_ids),
+               :count
+             )
+           end) == 0
+
+    assert unboxed(fn ->
+             Repo.aggregate(
+               from(a in AccessKey, where: a.access_key_id in ^cleanup_ids),
+               :count
+             )
+           end) == 0
   end
 
   test "strict identity policy events are emitted only after committed rows are visible" do
@@ -390,6 +449,33 @@ defmodule Maxio.IAM.UserIdentityTest do
 
   defp unboxed(fun), do: Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fun)
 
+  defp cleanup_unboxed_credentials!(access_key_ids) do
+    unboxed(fn ->
+      session_ids = session_descendant_ids(MapSet.new(access_key_ids)) |> MapSet.to_list()
+      Repo.delete_all(from(s in STSSession, where: s.access_key_id in ^session_ids))
+      Repo.delete_all(from(a in AccessKey, where: a.access_key_id in ^access_key_ids))
+    end)
+  end
+
+  defp session_descendant_ids(access_key_ids) do
+    child_ids =
+      Repo.all(
+        from(s in STSSession,
+          where: s.issuer_access_key_id in ^MapSet.to_list(access_key_ids),
+          select: s.access_key_id
+        )
+      )
+      |> MapSet.new()
+
+    expanded = MapSet.union(access_key_ids, child_ids)
+
+    if MapSet.equal?(expanded, access_key_ids) do
+      expanded
+    else
+      session_descendant_ids(expanded)
+    end
+  end
+
   defp insert_session!(access_key_id, issuer_access_key_id, principal_arn, opts \\ []) do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
@@ -401,7 +487,7 @@ defmodule Maxio.IAM.UserIdentityTest do
       principal_arn: principal_arn,
       principal_type: "assumed_role",
       session_name: "fixture",
-      status: "active",
+      status: Keyword.get(opts, :status, "active"),
       issued_at: now,
       expires_at: DateTime.add(now, 900, :second),
       tags: %{},

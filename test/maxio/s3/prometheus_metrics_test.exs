@@ -19,6 +19,13 @@ defmodule Maxio.S3.PrometheusMetricsTest do
   @alice_arn "arn:aws:iam:::user/#{@alice_ak}"
 
   setup do
+    %{user_arn: @alice_arn} =
+      create_user_with_access_key!(
+        user_name: @alice_ak,
+        access_key_id: @alice_ak,
+        secret_key: @alice_secret
+      )
+
     prev = Application.get_env(:maxio, :prometheus_metrics)
     Application.put_env(:maxio, :prometheus_metrics, public: true)
 

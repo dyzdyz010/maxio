@@ -66,6 +66,44 @@ defmodule Maxio.DataCase do
   end
 
   @doc """
+  Creates a concrete IAM user and a long-term access key bound to that user.
+
+  Policy-bearing tests must use the returned `user_arn` instead of synthesizing
+  an ARN from an otherwise legacy access-key-only fixture.
+  """
+  def create_user_with_access_key!(opts \\ []) do
+    suffix = System.unique_integer([:positive, :monotonic])
+    access_key_id = Keyword.get(opts, :access_key_id, "AKIATEST#{suffix}")
+    user_name = Keyword.get(opts, :user_name, access_key_id)
+    secret_key = Keyword.get(opts, :secret_key, "test-secret-#{suffix}")
+
+    {:ok, user} =
+      Maxio.IAM.create_user(
+        name: user_name,
+        status: Keyword.get(opts, :user_status, "active"),
+        tags: Keyword.get(opts, :user_tags, %{})
+      )
+
+    {:ok, access_key} =
+      Maxio.IAM.create_access_key(
+        access_key_id: access_key_id,
+        secret_key: secret_key,
+        principal_arn: user.user_arn,
+        status: Keyword.get(opts, :access_key_status, "active"),
+        tags: Keyword.get(opts, :access_key_tags, %{})
+      )
+
+    %{
+      user: user,
+      user_arn: user.user_arn,
+      access_key: access_key,
+      access_key_id: access_key.access_key_id,
+      principal_arn: user.user_arn,
+      secret_key: secret_key
+    }
+  end
+
+  @doc """
   A helper that transforms changeset errors into a map of messages.
 
       assert {:error, changeset} = Accounts.create_user(%{password: "short"})

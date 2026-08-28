@@ -27,6 +27,10 @@ defmodule MaxioWeb.ConnCase do
       # Import conveniences for testing with connections
       import Plug.Conn
       import Phoenix.ConnTest
+
+      import Maxio.DataCase,
+        only: [create_user_with_access_key!: 0, create_user_with_access_key!: 1]
+
       import MaxioWeb.ConnCase
     end
   end

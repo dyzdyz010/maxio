@@ -17,6 +17,13 @@ defmodule Maxio.S3.MFADeleteTest do
   @alice_arn "arn:aws:iam:::user/" <> @alice_ak
 
   setup do
+    %{user_arn: @alice_arn} =
+      create_user_with_access_key!(
+        user_name: @alice_ak,
+        access_key_id: @alice_ak,
+        secret_key: @alice_secret
+      )
+
     File.rm_rf(@data_dir)
     File.mkdir_p!(@data_dir)
     prev = Application.get_env(:maxio, :s3)

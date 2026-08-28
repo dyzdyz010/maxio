@@ -93,7 +93,7 @@ defmodule MaxioWeb.AccessKeyLiveTest do
   end
 
   test "access key identity policy panel stores edits and deletes inline policies", %{conn: conn} do
-    {:ok, %{access_key_id: ak, principal_arn: arn}} = Maxio.IAM.create_access_key()
+    %{access_key_id: ak, user_arn: arn} = create_user_with_access_key!()
     {:ok, view, _html} = live(conn, ~p"/access-keys")
 
     view |> element("#manage-policies-#{ak}") |> render_click()
@@ -130,7 +130,7 @@ defmodule MaxioWeb.AccessKeyLiveTest do
   end
 
   test "identity policy DOM ids do not collide for AWS policy-name punctuation", %{conn: conn} do
-    {:ok, %{access_key_id: ak, principal_arn: arn}} = Maxio.IAM.create_access_key()
+    %{access_key_id: ak, user_arn: arn} = create_user_with_access_key!()
     :ok = Maxio.IAM.put_principal_policy(arn, "s3.readonly", @identity_policy)
     :ok = Maxio.IAM.put_principal_policy(arn, "s3-readonly", @identity_policy)
 
@@ -144,7 +144,7 @@ defmodule MaxioWeb.AccessKeyLiveTest do
   end
 
   test "invalid identity policy does not overwrite existing principal policy", %{conn: conn} do
-    {:ok, %{access_key_id: ak, principal_arn: arn}} = Maxio.IAM.create_access_key()
+    %{access_key_id: ak, user_arn: arn} = create_user_with_access_key!()
     :ok = Maxio.IAM.put_principal_policy(arn, "list-buckets", @identity_policy)
 
     {:ok, view, _html} = live(conn, ~p"/access-keys")
