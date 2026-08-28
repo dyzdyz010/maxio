@@ -150,6 +150,30 @@ defmodule Maxio.ConfigTest do
   end
 
   describe "写路径：版本、并发与审计" do
+    test "单键 set 适配器保留返回字段，等值写显式报告 no-op" do
+      # Catches an adapter that loses the old public map shape or turns an equal set into a new
+      # version/audit merely because the implementation moved behind the batch coordinator.
+      assert {:ok,
+              %{
+                applied: :hot,
+                changed?: true,
+                operation: :set,
+                value: 10,
+                version: 1
+              }} = Config.set(:listing, :sql_hard_limit, 10, source: "cli")
+
+      assert {:ok,
+              %{
+                applied: :hot,
+                changed?: false,
+                operation: :set,
+                value: 10,
+                version: 1
+              }} = Config.set(:listing, :sql_hard_limit, 10, source: "cli")
+
+      assert [%{to_version: 1}] = Config.history(:listing, :sql_hard_limit)
+    end
+
     test "首次写 version=1，再写 version=2，previous_value 保留上一版" do
       assert {:ok, %{version: 1}} = Config.set(:listing, :sql_hard_limit, 10, source: "cli")
       assert {:ok, %{version: 2}} = Config.set(:listing, :sql_hard_limit, 20, source: "cli")
@@ -203,7 +227,15 @@ defmodule Maxio.ConfigTest do
                )
 
       assert {:ok, _} = Config.set(:listing, :sql_hard_limit, 20, source: "cli")
-      assert {:ok, %{changed?: true}} = Config.reset(:listing, :sql_hard_limit, source: "cli")
+
+      assert {:ok,
+              %{
+                applied: :hot,
+                changed?: true,
+                operation: :reset,
+                value: nil,
+                version: nil
+              }} = Config.reset(:listing, :sql_hard_limit, source: "cli")
 
       audits =
         Repo.all(from a in RuntimeConfigAudit, order_by: [asc: a.to_version, asc: a.inserted_at])
@@ -245,7 +277,15 @@ defmodule Maxio.ConfigTest do
 
       # 空转的 reset **不写审计行**：审计流水是"发生过的变更"，把一次什么都没做的操作
       # 记进去，会让回滚取证时数不清到底改过几次。
-      assert {:ok, %{changed?: false}} = Config.reset(:listing, :sql_hard_limit, source: "cli")
+      assert {:ok,
+              %{
+                applied: :hot,
+                changed?: false,
+                operation: :reset,
+                value: nil,
+                version: nil
+              }} = Config.reset(:listing, :sql_hard_limit, source: "cli")
+
       assert Repo.aggregate(RuntimeConfigAudit, :count) == 2
     end
 
