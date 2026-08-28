@@ -92,6 +92,51 @@ defmodule Maxio.Admin.ErrorMapTest do
              "The provided 'x-amz-content-sha256' header does not match what was computed."
   end
 
+  test "maps Config KVS route and adapter reasons to the three frozen public contracts" do
+    assert %{
+             code: "XMinioAdminVersionMismatch",
+             http_status: 426,
+             message: "This 'admin' API is not supported by server in 'maxio'"
+           } = ErrorMap.from_reason(:admin_version_mismatch)
+
+    assert %{
+             code: "XMinioConfigError",
+             http_status: 400,
+             message: "Configuration specified is invalid"
+           } = ErrorMap.from_reason(:config_generic)
+
+    assert %{
+             code: "XMinioConfigNotFoundError",
+             http_status: 404,
+             message: "Configuration key/value not found"
+           } = ErrorMap.from_reason(:config_not_found)
+  end
+
+  test "Config KVS tuple mappings preserve only pinned safe descriptions" do
+    for {reason, status, code, message} <- [
+          {{:config_generic, "unknown subsystem: "}, 400, "XMinioConfigError",
+           "unknown subsystem: "},
+          {{:config_generic, "unknown subsystem: absent"}, 400, "XMinioConfigError",
+           "unknown subsystem: absent"},
+          {{:config_generic, "unknown sub-system absent value=1"}, 400, "XMinioConfigError",
+           "unknown sub-system absent value=1"},
+          {{:config_generic, "sub-system 's3' cannot have empty keys"}, 400, "XMinioConfigError",
+           "sub-system 's3' cannot have empty keys"},
+          {{:config_not_found, "key absent doesn't exist"}, 404, "XMinioConfigNotFoundError",
+           "key absent doesn't exist"}
+        ] do
+      assert %{http_status: ^status, code: ^code, message: ^message} =
+               ErrorMap.from_reason(reason)
+    end
+
+    secret = "caller_secret=CONFIG-KV-DO-NOT-DISCLOSE"
+    unsafe = ErrorMap.from_reason({:config_generic, secret})
+    assert unsafe.code == "XMinioConfigError"
+    assert unsafe.http_status == 400
+    assert unsafe.message == "Configuration specified is invalid"
+    refute unsafe.message =~ secret
+  end
+
   test "maps policy absence and invalid documents or names to exact MinIO admin errors" do
     assert %{code: "XMinioAdminNoSuchPolicy", http_status: 404} =
              ErrorMap.from_reason(:not_found)

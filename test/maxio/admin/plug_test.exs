@@ -66,6 +66,43 @@ defmodule Maxio.Admin.PlugTest do
     end
   end
 
+  test "Config KVS neighboring versions methods and deferred catalogs remain JSON 501" do
+    # Catches prefix dispatch while adding the three exact Config KVS method/path triples.
+    for {method, path} <- [
+          {:post, "/minio/admin/v3/get-config-kv"},
+          {:get, "/minio/admin/v3/set-config-kv"},
+          {:put, "/minio/admin/v3/del-config-kv"},
+          {:get, "/minio/admin/v4/get-config-kv"},
+          {:get, "/minio/admin/v3/get-config-kv/extra"},
+          {:get, "/minio/admin/v3/help-config-kv"},
+          {:get, "/minio/admin/v3/config"},
+          {:get, "/minio/admin/v3/list-config-history"}
+        ] do
+      conn = signed(method, path, region: "")
+
+      assert conn.status == 501
+      assert content_type(conn) =~ "application/json"
+      assert Jason.decode!(conn.resp_body)["Code"] == "NotImplemented"
+    end
+  end
+
+  test "anonymous Config KVS requests are denied before route query or body details" do
+    # Catches route matching, missing-key classification, or mutation framing moving above auth.
+    for {method, path} <- [
+          {:get, "/minio/admin/v3/get-config-kv"},
+          {:put, "/minio/admin/v3/set-config-kv"},
+          {:delete, "/minio/admin/v3/del-config-kv"}
+        ] do
+      conn =
+        method
+        |> SigV4Request.anon_conn(path)
+        |> Endpoint.call(Endpoint.init([]))
+
+      assert conn.status == 403
+      assert Jason.decode!(conn.resp_body)["Code"] == "AccessDenied"
+    end
+  end
+
   test "authentication is decided by auth_type, not by the shape of the principal" do
     # SigV4 今天用原子 :anonymous 表示匿名。若哪天改成 map 形状的匿名 principal，
     # 形状推断（is_map/1）会让匿名请求静默走进 501——看起来像"功能未实现"，实则鉴权

@@ -17,6 +17,7 @@ defmodule Maxio.Admin.AuthzTest do
   alias Maxio.Test.SigV4Request
 
   @action "admin:ServerInfo"
+  @config_action "admin:ConfigUpdate"
   @ak "AKIAADMINAUTHZ0001"
   @arn "arn:aws:iam:::user/#{@ak}"
 
@@ -119,6 +120,49 @@ defmodule Maxio.Admin.AuthzTest do
       )
 
     assert {:error, _reason} = Authz.authorize(conn(), principal(), @action)
+  end
+
+  test "admin:ConfigUpdate remains an exact identity-only action with deny and STS boundaries" do
+    # Catches GET being assigned a weaker read action, bucket policy escalation, explicit-deny
+    # loss, or an issuer allow escaping a temporary session policy.
+    put_key()
+
+    :ok =
+      Store.put_bucket_policy(
+        "admin-config-kv-authz-bucket",
+        ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"#{@arn}"},"Action":"admin:ConfigUpdate","Resource":"arn:aws:s3:::*"}]})
+      )
+
+    assert {:error, _reason} = Authz.authorize(conn(), principal(), @config_action)
+
+    :ok =
+      Store.put_principal_policy(
+        @arn,
+        "admin-config-update",
+        ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"admin:ConfigUpdate"}]})
+      )
+
+    assert Authz.authorize(conn(), principal(), @config_action) == :ok
+    assert {:error, _reason} = Authz.authorize(conn(), principal(), "admin:GetConfig")
+
+    bounded =
+      principal(%{
+        session_policy_statements:
+          statements!(
+            ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::*"}]})
+          )
+      })
+
+    assert Authz.authorize(conn(), bounded, @config_action) == {:error, :session_policy}
+
+    :ok =
+      Store.put_principal_policy(
+        @arn,
+        "admin-config-update-deny",
+        ~s({"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"admin:ConfigUpdate"}]})
+      )
+
+    assert {:error, _reason} = Authz.authorize(conn(), principal(), @config_action)
   end
 
   test "admin:GetUser uses the same exact-action identity-only boundary" do
