@@ -17,6 +17,17 @@ defmodule Maxio.Admin.ErrorMapTest do
              ErrorMap.from_reason(:malformed_policy_document)
   end
 
+  test "maps user absence without changing the policy absence contract" do
+    assert %{
+             code: "XMinioAdminNoSuchUser",
+             http_status: 404,
+             message: "The specified user does not exist."
+           } = ErrorMap.from_reason(:user_not_found)
+
+    assert %{code: "XMinioAdminNoSuchPolicy", http_status: 404} =
+             ErrorMap.from_reason(:not_found)
+  end
+
   test "delete blockers are actionable without embedding entity maps" do
     attached =
       ErrorMap.from_reason(

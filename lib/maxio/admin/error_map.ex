@@ -9,6 +9,8 @@ defmodule Maxio.Admin.ErrorMap do
   alias Maxio.S3.Error
 
   @spec from_reason(term()) :: Error.t()
+  def from_reason(:user_not_found), do: Error.new(:admin_no_such_user)
+
   def from_reason(reason) when reason in [:not_found, :policy_not_found],
     do: Error.new(:admin_no_such_policy)
 

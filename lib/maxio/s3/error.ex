@@ -170,6 +170,7 @@ defmodule Maxio.S3.Error do
       {"InvalidBucketState", 409,
        "The request is not valid with the current state of the bucket."},
     bucket_quota_exceeded: {"XMinioAdminBucketQuotaExceeded", 400, "Bucket quota exceeded."},
+    admin_no_such_user: {"XMinioAdminNoSuchUser", 404, "The specified user does not exist."},
     admin_no_such_policy: {"XMinioAdminNoSuchPolicy", 404, "The canned policy does not exist."},
     admin_invalid_argument: {"XMinioAdminInvalidArgument", 400, "Invalid arguments specified."},
     admin_resource_invalid_argument:
