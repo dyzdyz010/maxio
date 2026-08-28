@@ -355,7 +355,7 @@ defmodule Maxio.IAMTest do
     assert {:error, :invalid_access_key_secret} =
              IAM.create_access_key(access_key_id: "AKIAEMPTYSECRET", secret_key: "")
 
-    assert {:error, :invalid_access_key_secret} =
+    assert {:error, :read_only_store} =
              EctoStore.put_access_key(%{access_key: "AKIAPUTEMPTY", secret_key: ""})
   end
 
@@ -425,18 +425,13 @@ defmodule Maxio.IAMTest do
     assert :error = EctoStore.get_secret("AKIAINACTIVE")
   end
 
-  test "Ecto credential store preserves tags from injected principal shape" do
-    assert :ok =
-             EctoStore.put_access_key(%{
-               access_key: "AKIAPRINCIPALTAGS",
+  test "public IAM creation preserves credential tags for Ecto reads" do
+    assert {:ok, _key} =
+             IAM.create_access_key(
+               access_key_id: "AKIAPRINCIPALTAGS",
                secret_key: "tagsecret",
-               principal: %{
-                 type: :iam_user,
-                 access_key: "AKIAPRINCIPALTAGS",
-                 arn: "arn:aws:iam:::user/AKIAPRINCIPALTAGS",
-                 tags: %{"team" => "platform"}
-               }
-             })
+               tags: %{"team" => "platform"}
+             )
 
     stored = Repo.get_by!(AccessKey, access_key_id: "AKIAPRINCIPALTAGS")
     refute stored.secret_key == "tagsecret"
@@ -548,7 +543,9 @@ defmodule Maxio.IAMTest do
   end
 
   test "principal identity policy lifecycle" do
-    principal_arn = "arn:aws:iam:::user/AKIAIAMPOLICY1"
+    user_name = unique_name("policy-user")
+    assert {:ok, user} = IAM.create_user(name: user_name)
+    principal_arn = user.user_arn
 
     policy =
       ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}})
@@ -782,7 +779,7 @@ defmodule Maxio.IAMTest do
                principal_arn: group.group_arn
              )
 
-    assert {:error, _changeset} =
+    assert {:error, :read_only_store} =
              EctoStore.put_access_key(%{
                access_key: "AKIAGROUPLOGINB",
                secret_key: "group-login-secret",

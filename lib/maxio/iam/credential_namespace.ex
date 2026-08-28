@@ -16,7 +16,7 @@ defmodule Maxio.IAM.CredentialNamespace do
 
   @spec reserve_exact(module(), String.t()) :: :ok | {:error, :access_key_id_conflict}
   def reserve_exact(repo, access_key_id) when is_binary(access_key_id) do
-    lock_exact!(repo, access_key_id)
+    lock_exact(repo, access_key_id)
 
     if available?(repo, access_key_id) do
       :ok
@@ -25,7 +25,9 @@ defmodule Maxio.IAM.CredentialNamespace do
     end
   end
 
-  defp lock_exact!(repo, access_key_id) do
+  @doc false
+  @spec lock_exact(module(), String.t()) :: :ok
+  def lock_exact(repo, access_key_id) when is_binary(access_key_id) do
     :telemetry.execute(
       @lock_wait_event,
       %{system_time: System.system_time()},

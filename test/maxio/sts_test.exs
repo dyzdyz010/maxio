@@ -797,8 +797,7 @@ defmodule Maxio.STSTest do
   end
 
   test "assume_role requires caller SetSourceIdentity identity policy even when called directly" do
-    {:ok, caller} =
-      IAM.create_access_key(access_key_id: unique_ak("CALLSRCID"), secret_key: "issuer-secret")
+    {:ok, caller} = create_explicit_caller("CALLSRCID")
 
     {:ok, role} =
       IAM.create_role(
@@ -847,8 +846,7 @@ defmodule Maxio.STSTest do
   end
 
   test "assume_role requires caller AssumeRole identity policy for account principal trust" do
-    {:ok, caller} =
-      IAM.create_access_key(access_key_id: unique_ak("CALLASSUME"), secret_key: "issuer-secret")
+    {:ok, caller} = create_explicit_caller("CALLASSUME")
 
     {:ok, role} =
       IAM.create_role(
@@ -1068,8 +1066,7 @@ defmodule Maxio.STSTest do
   end
 
   test "assume_role direct principal trust still honors caller explicit deny" do
-    {:ok, caller} =
-      IAM.create_access_key(access_key_id: unique_ak("DIRECTDENY"), secret_key: "issuer-secret")
+    {:ok, caller} = create_explicit_caller("DIRECTDENY")
 
     {:ok, role} =
       IAM.create_role(
@@ -1144,8 +1141,7 @@ defmodule Maxio.STSTest do
   end
 
   test "assume_role session tags require caller TagSession identity policy" do
-    {:ok, caller} =
-      IAM.create_access_key(access_key_id: unique_ak("TAGCALL"), secret_key: "issuer-secret")
+    {:ok, caller} = create_explicit_caller("TAGCALL")
 
     {:ok, role} =
       IAM.create_role(
@@ -1289,8 +1285,7 @@ defmodule Maxio.STSTest do
   end
 
   test "assume_role inherits caller SourceIdentity in core calls and gates caller policy" do
-    {:ok, caller} =
-      IAM.create_access_key(access_key_id: unique_ak("INHERITSRC"), secret_key: "issuer-secret")
+    {:ok, caller} = create_explicit_caller("INHERITSRC")
 
     {:ok, role} =
       IAM.create_role(
@@ -1433,6 +1428,19 @@ defmodule Maxio.STSTest do
   defp unique_session_ak(prefix), do: "ASIA#{prefix}#{System.unique_integer([:positive])}"
   defp unique_role(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
   defp unique_user(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
+
+  defp create_explicit_caller(prefix) do
+    user_name = unique_user(String.downcase(prefix))
+
+    with {:ok, user} <- IAM.create_user(name: user_name) do
+      IAM.create_access_key(
+        access_key_id: unique_ak(prefix),
+        secret_key: "issuer-secret",
+        user_name: user.user_name
+      )
+    end
+  end
+
   defp sha256_hex(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   defp web_identity_token(jwk, issuer, subject, audience) do

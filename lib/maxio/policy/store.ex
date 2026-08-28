@@ -22,7 +22,8 @@ defmodule Maxio.Policy.Store do
               :ok | {:error, term()}
   @callback get_principal_policy(principal_arn :: String.t(), name :: String.t()) ::
               {:ok, map()} | {:error, :not_found | :not_supported | term()}
-  @callback delete_principal_policy(principal_arn :: String.t(), name :: String.t()) :: :ok
+  @callback delete_principal_policy(principal_arn :: String.t(), name :: String.t()) ::
+              :ok | {:error, term()}
   @callback list_principal_policies(principal_arn :: String.t()) :: [map()]
   @callback put_managed_session_policy(policy_arn :: String.t(), json :: binary()) ::
               :ok | {:error, term()}
@@ -192,16 +193,25 @@ defmodule Maxio.Policy.Store do
     end
   end
 
-  @spec delete_principal_policy(String.t(), String.t()) :: :ok
+  @spec delete_principal_policy(String.t(), String.t()) :: :ok | {:error, term()}
   def delete_principal_policy(principal_arn, name) do
     backend = impl()
 
-    if callback_exported?(backend, :delete_principal_policy, 2) do
-      :ok = backend.delete_principal_policy(principal_arn, name)
-    end
+    result =
+      if callback_exported?(backend, :delete_principal_policy, 2) do
+        backend.delete_principal_policy(principal_arn, name)
+      else
+        :ok
+      end
 
-    Notify.broadcast({:principal_policy_changed, principal_arn})
-    :ok
+    case result do
+      :ok ->
+        Notify.broadcast({:principal_policy_changed, principal_arn})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @spec list_principal_policies(String.t()) :: [map()]

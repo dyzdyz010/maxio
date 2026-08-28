@@ -4,6 +4,11 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
 
   Long-term access keys live in `access_keys`; temporary STS session credentials
   live in `sts_sessions` and require a matching session token.
+
+  This backend is authoritative and read-only at the credential-store boundary.
+  Production writes must use `Maxio.IAM`, which owns identity and exact-key
+  namespace serialization. `put_access_key/1` remains in the behaviour for the
+  in-memory fixture backend but is deliberately closed here.
   """
   @behaviour Maxio.Auth.CredentialStore
 
@@ -45,43 +50,7 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
   end
 
   @impl true
-  def put_access_key(%{access_key: ak, secret_key: sk} = attrs) do
-    principal = Map.get(attrs, :principal, %{})
-    type = principal |> Map.get(:type, Map.get(attrs, :type, "iam_user")) |> to_string()
-
-    arn =
-      Map.get(principal, :arn) ||
-        Map.get(attrs, :arn) ||
-        if type == "root", do: "arn:aws:iam:::root", else: "arn:aws:iam:::user/#{ak}"
-
-    tags =
-      attrs
-      |> Map.get(:tags, Map.get(principal, :tags, %{}))
-      |> normalize_tags()
-
-    with {:ok, stored_secret} <- AccessKeySecret.wrap(sk, ak) do
-      %AccessKey{}
-      |> AccessKey.changeset(%{
-        access_key_id: ak,
-        secret_key: stored_secret,
-        principal_arn: arn,
-        type: type,
-        status: "active",
-        tags: tags
-      })
-      |> Repo.insert(
-        on_conflict:
-          {:replace, [:secret_key, :principal_arn, :type, :status, :tags, :updated_at]},
-        conflict_target: :access_key_id
-      )
-      |> case do
-        {:ok, _} -> :ok
-        {:error, cs} -> {:error, cs}
-      end
-    end
-  end
-
-  def put_access_key(_), do: {:error, :invalid_attrs}
+  def put_access_key(_attrs), do: {:error, :read_only_store}
 
   @impl true
   def list_keys do
@@ -286,13 +255,4 @@ defmodule Maxio.Auth.CredentialStore.EctoStore do
   end
 
   defp session_policy_statements(_document), do: :invalid
-
-  defp normalize_tags(tags) when is_map(tags) do
-    Map.new(tags, fn {key, value} -> {to_string(key), tag_value(value)} end)
-  end
-
-  defp normalize_tags(_tags), do: %{}
-
-  defp tag_value(nil), do: ""
-  defp tag_value(value), do: to_string(value)
 end

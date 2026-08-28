@@ -17,6 +17,7 @@ defmodule Maxio.Policy.Store.EctoStore do
     Role,
     RoleManagedPolicyAttachment,
     User,
+    UserIdentity,
     UserManagedPolicyAttachment
   }
 
@@ -102,20 +103,22 @@ defmodule Maxio.Policy.Store.EctoStore do
     with {:ok, statements} <- Statement.parse_identity_policy(json),
          true <- statements != [],
          {:ok, %{} = doc} <- Jason.decode(json) do
-      %PrincipalPolicy{}
-      |> PrincipalPolicy.changeset(%{
-        principal_arn: principal_arn,
-        policy_name: name,
-        document: doc
-      })
-      |> Repo.insert(
-        on_conflict: {:replace, [:document, :updated_at]},
-        conflict_target: [:principal_arn, :policy_name]
-      )
-      |> case do
-        {:ok, _} -> :ok
-        {:error, cs} -> {:error, cs}
-      end
+      with_local_user_identity(principal_arn, :existing, fn ->
+        %PrincipalPolicy{}
+        |> PrincipalPolicy.changeset(%{
+          principal_arn: principal_arn,
+          policy_name: name,
+          document: doc
+        })
+        |> Repo.insert(
+          on_conflict: {:replace, [:document, :updated_at]},
+          conflict_target: [:principal_arn, :policy_name]
+        )
+        |> case do
+          {:ok, _} -> :ok
+          {:error, changeset} -> {:error, changeset}
+        end
+      end)
     else
       _ -> {:error, :malformed}
     end
@@ -145,15 +148,55 @@ defmodule Maxio.Policy.Store.EctoStore do
   @impl true
   def delete_principal_policy(principal_arn, name)
       when is_binary(principal_arn) and is_binary(name) do
-    Repo.delete_all(
-      from p in PrincipalPolicy,
-        where: p.principal_arn == ^principal_arn and p.policy_name == ^name
-    )
+    with_local_user_identity(principal_arn, :missing_ok, fn ->
+      Repo.delete_all(
+        from p in PrincipalPolicy,
+          where: p.principal_arn == ^principal_arn and p.policy_name == ^name
+      )
 
-    :ok
+      :ok
+    end)
   end
 
   def delete_principal_policy(_principal_arn, _name), do: :ok
+
+  defp with_local_user_identity(principal_arn, missing, fun) do
+    case UserIdentity.local_user_name(principal_arn) do
+      {:ok, user_name} ->
+        snapshot = UserIdentity.snapshot(Repo, user_name)
+
+        cond do
+          snapshot == :missing and missing == :existing ->
+            {:error, :user_not_found}
+
+          true ->
+            run_identity_transaction(fn ->
+              case UserIdentity.lock_snapshot(Repo, user_name, snapshot) do
+                {:ok, %User{user_arn: ^principal_arn}} -> fun.()
+                {:ok, %User{}} -> Repo.rollback({:error, :identity_changed})
+                {:ok, :missing} when missing == :missing_ok -> :ok
+                {:ok, :missing} -> Repo.rollback({:error, :user_not_found})
+                {:error, reason} -> Repo.rollback({:error, reason})
+              end
+            end)
+        end
+
+      :not_local_user ->
+        fun.()
+    end
+  end
+
+  defp run_identity_transaction(fun) do
+    if Repo.in_transaction?() do
+      fun.()
+    else
+      case Repo.transaction(fun) do
+        {:ok, result} -> result
+        {:error, {:error, reason}} -> {:error, reason}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
 
   @impl true
   def list_principal_policies(principal_arn) when is_binary(principal_arn) do

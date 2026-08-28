@@ -34,6 +34,7 @@ defmodule Maxio.IAM do
     SigningSecretRewriter,
     TOTP,
     User,
+    UserIdentity,
     UserManagedPolicyAttachment
   }
 
@@ -364,16 +365,28 @@ defmodule Maxio.IAM do
 
     with {:ok, arn} <- access_key_principal_arn(type, ak, opts),
          {:ok, stored_secret} <- AccessKeySecret.wrap(sk, ak) do
-      case %AccessKey{}
-           |> AccessKey.changeset(%{
-             access_key_id: ak,
-             secret_key: stored_secret,
-             principal_arn: arn,
-             type: type,
-             status: status,
-             tags: tags
-           })
-           |> Repo.insert() do
+      identity = credential_identity_snapshot(arn)
+
+      Repo.transaction(fn ->
+        with :ok <- lock_credential_identity(identity, allow_missing: true),
+             :ok <- CredentialNamespace.reserve_exact(Repo, ak),
+             {:ok, row} <-
+               %AccessKey{}
+               |> AccessKey.changeset(%{
+                 access_key_id: ak,
+                 secret_key: stored_secret,
+                 principal_arn: arn,
+                 type: type,
+                 status: status,
+                 tags: tags
+               })
+               |> Repo.insert() do
+          row
+        else
+          {:error, reason} -> Repo.rollback({:error, reason})
+        end
+      end)
+      |> case do
         {:ok, row} ->
           Notify.broadcast({:iam_changed, row.access_key_id})
 
@@ -387,8 +400,11 @@ defmodule Maxio.IAM do
              tags: tags
            }}
 
-        {:error, cs} ->
-          {:error, cs}
+        {:error, {:error, reason}} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
@@ -443,26 +459,47 @@ defmodule Maxio.IAM do
   @doc "删除 access key（幂等）。拒绝删除最后一个 root（避免锁死，铁律 3 不静默放行也不让系统不可用）。"
   @spec delete_access_key(String.t()) :: :ok | {:error, :cannot_delete_last_root}
   def delete_access_key(access_key_id) do
-    case Repo.get_by(AccessKey, access_key_id: access_key_id) do
-      nil ->
-        Notify.broadcast({:iam_changed, access_key_id})
-        :ok
+    initial = Repo.get_by(AccessKey, access_key_id: access_key_id)
 
-      %AccessKey{type: "root"} = row ->
-        root_count = Repo.aggregate(from(a in AccessKey, where: a.type == "root"), :count, :id)
+    identity =
+      if initial, do: credential_identity_snapshot(initial.principal_arn), else: :not_local_user
 
-        if root_count <= 1 do
-          {:error, :cannot_delete_last_root}
-        else
-          Repo.delete!(row)
-          Notify.broadcast({:iam_changed, access_key_id})
-          :ok
+    Repo.transaction(fn ->
+      with :ok <- lock_credential_identity(identity, require_active: false, allow_missing: true),
+           :ok <- CredentialNamespace.lock_exact(Repo, access_key_id) do
+        case Repo.get_by(AccessKey, access_key_id: access_key_id) do
+          nil ->
+            :ok
+
+          %AccessKey{type: "root"} = row ->
+            root_count =
+              Repo.aggregate(from(a in AccessKey, where: a.type == "root"), :count, :id)
+
+            if root_count <= 1 do
+              Repo.rollback({:error, :cannot_delete_last_root})
+            else
+              Repo.delete!(row)
+              :ok
+            end
+
+          %AccessKey{} = row ->
+            Repo.delete!(row)
+            :ok
         end
-
-      %AccessKey{} = row ->
-        Repo.delete!(row)
+      else
+        {:error, reason} -> Repo.rollback({:error, reason})
+      end
+    end)
+    |> case do
+      {:ok, :ok} ->
         Notify.broadcast({:iam_changed, access_key_id})
         :ok
+
+      {:error, {:error, reason}} ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -477,31 +514,43 @@ defmodule Maxio.IAM do
   @spec create_access_key_strict(String.t() | nil) :: {:ok, map()} | {:error, term()}
   def create_access_key_strict(user_name \\ nil) do
     with {:ok, scope} <- create_access_key_scope(user_name) do
-      Repo.transaction(fn ->
-        lock_access_key_principal!(scope.principal_arn)
+      access_key_id = gen_access_key_id()
+      secret_key = gen_secret_key()
+      identity = credential_identity_snapshot(scope.principal_arn)
 
-        with :ok <- access_key_quota_available?(scope.principal_arn),
-             {:ok, key} <-
-               create_access_key(
-                 type: scope.type,
-                 user_name: scope.user_name,
-                 principal_arn: scope.principal_arn
-               ) do
-          case Repo.get_by(AccessKey, access_key_id: key.access_key_id) do
-            %AccessKey{} = row ->
-              public_access_key(row, secret_key: key.secret_key)
-
-            nil ->
-              Repo.rollback({:error, :not_found})
+      with {:ok, stored_secret} <- AccessKeySecret.wrap(secret_key, access_key_id) do
+        Repo.transaction(fn ->
+          with :ok <- lock_credential_identity(identity, require_active: true),
+               :ok <- lock_access_key_principal!(scope.principal_arn),
+               :ok <- access_key_quota_available?(scope.principal_arn),
+               :ok <- CredentialNamespace.reserve_exact(Repo, access_key_id),
+               {:ok, row} <-
+                 %AccessKey{}
+                 |> AccessKey.changeset(%{
+                   access_key_id: access_key_id,
+                   secret_key: stored_secret,
+                   principal_arn: scope.principal_arn,
+                   type: scope.type,
+                   status: "active",
+                   tags: %{}
+                 })
+                 |> Repo.insert() do
+            public_access_key(row, secret_key: secret_key)
+          else
+            {:error, reason} -> Repo.rollback({:error, reason})
           end
-        else
-          {:error, reason} -> Repo.rollback({:error, reason})
+        end)
+        |> case do
+          {:ok, access_key} ->
+            Notify.broadcast({:iam_changed, access_key.access_key_id})
+            {:ok, access_key}
+
+          {:error, {:error, reason}} ->
+            {:error, reason}
+
+          {:error, reason} ->
+            {:error, reason}
         end
-      end)
-      |> case do
-        {:ok, access_key} -> {:ok, access_key}
-        {:error, {:error, reason}} -> {:error, reason}
-        {:error, reason} -> {:error, reason}
       end
     end
   end
@@ -530,14 +579,16 @@ defmodule Maxio.IAM do
   def update_access_key_strict(access_key_id, status, user_name)
       when is_binary(access_key_id) and is_binary(status) do
     with {:ok, scope} <- access_key_scope(user_name) do
-      Repo.transaction(fn ->
-        lock_access_key_principal!(scope.principal_arn)
+      identity = credential_identity_snapshot(scope.principal_arn)
 
-        with {:ok, row} <- scoped_access_key(access_key_id, scope),
+      Repo.transaction(fn ->
+        with :ok <- lock_credential_identity(identity, require_active: false),
+             :ok <- lock_access_key_principal!(scope.principal_arn),
+             :ok <- CredentialNamespace.lock_exact(Repo, access_key_id),
+             {:ok, row} <- scoped_access_key(access_key_id, scope),
              :ok <- ensure_root_status_update_safe(row, status) do
           case row |> AccessKey.changeset(%{status: status}) |> Repo.update() do
             {:ok, updated} ->
-              Notify.broadcast({:iam_changed, updated.access_key_id})
               public_access_key(updated)
 
             {:error, changeset} ->
@@ -548,6 +599,7 @@ defmodule Maxio.IAM do
         end
       end)
       |> access_key_transaction_result()
+      |> notify_access_key_result()
     end
   end
 
@@ -559,20 +611,23 @@ defmodule Maxio.IAM do
 
   def delete_access_key_strict(access_key_id, user_name) when is_binary(access_key_id) do
     with {:ok, scope} <- access_key_scope(user_name) do
-      Repo.transaction(fn ->
-        lock_access_key_principal!(scope.principal_arn)
+      identity = credential_identity_snapshot(scope.principal_arn)
 
-        with {:ok, row} <- scoped_access_key(access_key_id, scope),
+      Repo.transaction(fn ->
+        with :ok <- lock_credential_identity(identity, require_active: false),
+             :ok <- lock_access_key_principal!(scope.principal_arn),
+             :ok <- CredentialNamespace.lock_exact(Repo, access_key_id),
+             {:ok, row} <- scoped_access_key(access_key_id, scope),
              :ok <- ensure_root_delete_safe(row) do
           deleted = public_access_key(row)
           Repo.delete!(row)
-          Notify.broadcast({:iam_changed, access_key_id})
           deleted
         else
           {:error, reason} -> Repo.rollback({:error, reason})
         end
       end)
       |> access_key_transaction_result()
+      |> notify_access_key_result()
     end
   end
 
@@ -859,6 +914,7 @@ defmodule Maxio.IAM do
       when is_binary(access_key_id) and access_key_id != "" and is_binary(secret_key) and
              secret_key != "" do
     user_arn = user_arn(access_key_id)
+    identity_snapshot = UserIdentity.snapshot(Repo, access_key_id)
 
     with {:ok, stored_secret} <- AccessKeySecret.wrap(secret_key, access_key_id) do
       user_changeset =
@@ -881,18 +937,14 @@ defmodule Maxio.IAM do
 
       Ecto.Multi.new()
       |> Ecto.Multi.run(:locks, fn repo, _changes ->
-        lock_minio_user_identity!(String.downcase(access_key_id))
-
-        case CredentialNamespace.reserve_exact(repo, access_key_id) do
-          :ok -> {:ok, :locked}
-          {:error, :access_key_id_conflict} -> {:error, :user_already_exists}
-        end
-      end)
-      |> Ecto.Multi.run(:identity, fn _repo, _changes ->
-        if fetch_user_by_case_insensitive_name(access_key_id) do
-          {:error, :user_already_exists}
+        with {:ok, :missing} <-
+               UserIdentity.lock_snapshot(repo, access_key_id, identity_snapshot),
+             :ok <- CredentialNamespace.reserve_exact(repo, access_key_id) do
+          {:ok, :locked}
         else
-          {:ok, :available}
+          {:ok, %User{}} -> {:error, :user_already_exists}
+          {:error, :access_key_id_conflict} -> {:error, :user_already_exists}
+          {:error, _identity_reason} -> {:error, :user_already_exists}
         end
       end)
       |> Ecto.Multi.insert(:user, user_changeset)
@@ -919,15 +971,34 @@ defmodule Maxio.IAM do
       permissions_boundary_policy_arn: permissions_boundary_policy_arn_from_opts(opts)
     }
 
-    with :ok <- reject_user_name_case_insensitive_duplicate(user_name),
-         :ok <- ensure_permissions_boundary_policy(attrs.permissions_boundary_policy_arn) do
-      case %User{} |> User.changeset(attrs) |> Repo.insert() do
-        {:ok, user} ->
-          Notify.broadcast({:iam_changed, user.user_arn})
+    identity_snapshot = UserIdentity.snapshot(Repo, user_name)
+
+    with :ok <- ensure_permissions_boundary_policy(attrs.permissions_boundary_policy_arn) do
+      Repo.transaction(fn ->
+        with {:ok, :missing} <- UserIdentity.lock_snapshot(Repo, user_name, identity_snapshot),
+             {:ok, user} <- %User{} |> User.changeset(attrs) |> Repo.insert() do
+          legacy_ids =
+            access_keys_for_principal(user.user_arn) ++
+              session_access_keys_for_principal(user.user_arn)
+
+          {user, legacy_ids}
+        else
+          {:ok, %User{}} -> Repo.rollback({:error, :user_already_exists})
+          {:error, :identity_changed} -> Repo.rollback({:error, :user_already_exists})
+          {:error, reason} -> Repo.rollback({:error, reason})
+        end
+      end)
+      |> case do
+        {:ok, {%User{} = user, legacy_ids}} ->
+          Enum.each(Enum.uniq(legacy_ids), &Notify.broadcast({:iam_changed, &1}))
+          Notify.broadcast({:principal_policy_changed, user.user_arn})
           {:ok, public_user(user)}
 
-        {:error, changeset} ->
-          {:error, changeset}
+        {:error, {:error, reason}} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
@@ -949,19 +1020,47 @@ defmodule Maxio.IAM do
       when is_binary(current_user_name) and (is_binary(new_user_name) or is_nil(new_user_name)) do
     new_user_name = normalize_iam_text(new_user_name || current_user_name)
 
-    with %User{} = user <- fetch_user_record(current_user_name),
-         :ok <- reject_user_name_update_duplicate(user, new_user_name) do
-      old_arn = user.user_arn
-      new_arn = default_user_arn(new_user_name)
+    case fetch_user_record(current_user_name) do
+      %User{} = user ->
+        old_snapshot = {:existing, user.id}
+        new_snapshot = UserIdentity.snapshot(Repo, new_user_name)
+        old_arn = user.user_arn
+        new_arn = default_user_arn(new_user_name)
 
-      if user.user_name == new_user_name and old_arn == new_arn do
-        {:ok, public_user(user)}
-      else
-        update_user_name_transaction(user, new_user_name, new_arn)
-      end
-    else
-      nil -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
+        Repo.transaction(fn ->
+          with {:ok, [locked_user, new_identity]} <-
+                 UserIdentity.lock_snapshots(Repo, [
+                   {user.user_name, old_snapshot},
+                   {new_user_name, new_snapshot}
+                 ]),
+               :ok <- ensure_rename_target(locked_user, new_identity),
+               {:ok, updated} <-
+                 locked_user
+                 |> User.changeset(%{user_name: new_user_name, user_arn: new_arn})
+                 |> Repo.update() do
+            access_key_ids =
+              access_keys_for_principal(old_arn) ++ session_access_keys_for_principal(old_arn)
+
+            update_user_principal_references(old_arn, new_arn)
+            {updated, access_key_ids}
+          else
+            {:error, reason} -> Repo.rollback({:error, reason})
+          end
+        end)
+        |> case do
+          {:ok, {updated, access_key_ids}} ->
+            broadcast_principal_rename(old_arn, new_arn, access_key_ids)
+            {:ok, public_user(updated)}
+
+          {:error, {:error, reason}} ->
+            {:error, reason}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      nil ->
+        {:error, :not_found}
     end
   end
 
@@ -972,17 +1071,10 @@ defmodule Maxio.IAM do
           {:ok, map()} | {:error, term()}
   def put_user_permissions_boundary_strict(user_name_or_arn, policy_arn)
       when is_binary(user_name_or_arn) and is_binary(policy_arn) do
-    with :ok <- ensure_permissions_boundary_policy(policy_arn),
-         %User{} = user <- fetch_user_record(user_name_or_arn),
-         {:ok, updated} <-
-           user
-           |> User.changeset(%{permissions_boundary_policy_arn: policy_arn})
-           |> Repo.update() do
-      broadcast_permissions_boundary_change(updated.user_arn)
-      {:ok, public_user(updated)}
-    else
-      nil -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
+    with :ok <- ensure_permissions_boundary_policy(policy_arn) do
+      update_user(user_name_or_arn, fn user ->
+        User.changeset(user, %{permissions_boundary_policy_arn: policy_arn})
+      end)
     end
   end
 
@@ -993,22 +1085,9 @@ defmodule Maxio.IAM do
   @spec delete_user_permissions_boundary_strict(String.t()) :: {:ok, map()} | {:error, term()}
   def delete_user_permissions_boundary_strict(user_name_or_arn)
       when is_binary(user_name_or_arn) do
-    case fetch_user_record(user_name_or_arn) do
-      %User{} = user ->
-        case user
-             |> User.changeset(%{permissions_boundary_policy_arn: nil})
-             |> Repo.update() do
-          {:ok, updated} ->
-            broadcast_permissions_boundary_change(updated.user_arn)
-            {:ok, public_user(updated)}
-
-          {:error, changeset} ->
-            {:error, changeset}
-        end
-
-      nil ->
-        {:error, :not_found}
-    end
+    update_user(user_name_or_arn, fn user ->
+      User.changeset(user, %{permissions_boundary_policy_arn: nil})
+    end)
   end
 
   def delete_user_permissions_boundary_strict(_user_name_or_arn), do: {:error, :malformed}
@@ -1029,47 +1108,91 @@ defmodule Maxio.IAM do
   AWS IAM Query `DeleteUser` uses `delete_user_strict/1`, which rejects deletion
   until subordinate IAM resources are removed explicitly.
   """
-  @spec delete_user(String.t()) :: :ok
+  @spec delete_user(String.t()) :: :ok | {:error, term()}
   def delete_user(user_name_or_arn) when is_binary(user_name_or_arn) do
-    case get_user(user_name_or_arn) do
-      {:ok, user} ->
-        access_key_ids = access_keys_for_principal(user.user_arn)
-        session_access_key_ids = revoke_user_sessions(user.user_arn, access_key_ids)
+    case fetch_user_record(user_name_or_arn) do
+      nil ->
+        :ok
+
+      %User{} = initial ->
+        snapshot = {:existing, initial.id}
 
         Repo.transaction(fn ->
-          Repo.delete_all(from p in PrincipalPolicy, where: p.principal_arn == ^user.user_arn)
-          Repo.delete_all(from a in AccessKey, where: a.principal_arn == ^user.user_arn)
-          Repo.delete_all(from c in SigningCertificate, where: c.user_arn == ^user.user_arn)
-          Repo.delete_all(from k in SSHPublicKey, where: k.user_arn == ^user.user_arn)
-          Repo.delete_all(from u in User, where: u.user_arn == ^user.user_arn)
+          with {:ok, %User{} = user} <-
+                 UserIdentity.lock_snapshot(Repo, initial.user_name, snapshot) do
+            credential_ids = UserIdentity.descendant_credential_ids(Repo, user)
+            session_access_key_ids = revoke_user_sessions(user.user_arn, credential_ids.long_term)
+
+            Repo.delete_all(from p in PrincipalPolicy, where: p.principal_arn == ^user.user_arn)
+            Repo.delete_all(from m in MFADevice, where: m.principal_arn == ^user.user_arn)
+            Repo.delete_all(from a in AccessKey, where: a.principal_arn == ^user.user_arn)
+            Repo.delete_all(from c in SigningCertificate, where: c.user_arn == ^user.user_arn)
+            Repo.delete_all(from k in SSHPublicKey, where: k.user_arn == ^user.user_arn)
+            Repo.delete!(user)
+
+            {user.user_arn,
+             Enum.uniq(
+               credential_ids.long_term ++ credential_ids.sessions ++ session_access_key_ids
+             )}
+          else
+            {:error, :user_not_found} -> Repo.rollback(:already_missing)
+            {:error, reason} -> Repo.rollback(reason)
+          end
         end)
+        |> case do
+          {:ok, {user_arn, credential_ids}} ->
+            Notify.broadcast({:principal_policy_changed, user_arn})
+            Enum.each(credential_ids, &Notify.broadcast({:iam_changed, &1}))
+            :ok
 
-        Notify.broadcast({:principal_policy_changed, user.user_arn})
-        Enum.each(access_key_ids, &Notify.broadcast({:iam_changed, &1}))
-        Enum.each(session_access_key_ids, &Notify.broadcast({:iam_changed, &1}))
-        Notify.broadcast({:iam_changed, user.user_arn})
-        :ok
+          {:error, :already_missing} ->
+            :ok
 
-      :error ->
-        :ok
+          {:error, reason} ->
+            {:error, reason}
+        end
     end
   end
 
-  def delete_user(_user_name_or_arn), do: :ok
+  def delete_user(_user_name_or_arn), do: {:error, :malformed}
 
   @doc "Deletes an IAM user only when no subordinate IAM resources remain."
   @spec delete_user_strict(String.t()) :: {:ok, map()} | {:error, term()}
   def delete_user_strict(user_name_or_arn) when is_binary(user_name_or_arn) do
     case fetch_user_record(user_name_or_arn) do
-      %User{} = user ->
-        case user_delete_blockers(user) do
-          [] ->
-            Repo.delete!(user)
-            Notify.broadcast({:iam_changed, user.user_arn})
+      %User{} = initial ->
+        Repo.transaction(fn ->
+          with {:ok, %User{} = user} <-
+                 UserIdentity.lock_snapshot(
+                   Repo,
+                   initial.user_name,
+                   {:existing, initial.id}
+                 ) do
+            case user_delete_blockers(user) do
+              [] ->
+                Repo.delete!(user)
+                user
+
+              blockers ->
+                Repo.rollback({:error, {:delete_conflict, blockers}})
+            end
+          else
+            {:error, reason} -> Repo.rollback({:error, reason})
+          end
+        end)
+        |> case do
+          {:ok, user} ->
+            Notify.broadcast({:principal_policy_changed, user.user_arn})
             {:ok, public_user(user)}
 
-          blockers ->
-            {:error, {:delete_conflict, blockers}}
+          {:error, {:error, :user_not_found}} ->
+            {:error, :not_found}
+
+          {:error, {:error, reason}} ->
+            {:error, reason}
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       nil ->
@@ -3266,26 +3389,28 @@ defmodule Maxio.IAM do
         drift_steps: 1
       }
 
-      case %MFADevice{} |> MFADevice.changeset(attrs) |> Repo.insert() do
-        {:ok, device} ->
-          {:ok,
-           %{
-             device: public_mfa_device(device),
-             serial: device.serial,
-             secret_base32: secret_base32,
-             otpauth_uri:
-               TOTP.verification_uri(secret_base32,
-                 issuer: "maxio",
-                 label: device.device_name,
-                 algorithm: device.algorithm,
-                 digits: device.digits,
-                 period_seconds: device.period_seconds
-               )
-           }}
+      with_mfa_user_identities([principal_arn], fn ->
+        case %MFADevice{} |> MFADevice.changeset(attrs) |> Repo.insert() do
+          {:ok, device} ->
+            {:ok,
+             %{
+               device: public_mfa_device(device),
+               serial: device.serial,
+               secret_base32: secret_base32,
+               otpauth_uri:
+                 TOTP.verification_uri(secret_base32,
+                   issuer: "maxio",
+                   label: device.device_name,
+                   algorithm: device.algorithm,
+                   digits: device.digits,
+                   period_seconds: device.period_seconds
+                 )
+             }}
 
-        {:error, changeset} ->
-          {:error, changeset}
-      end
+          {:error, changeset} ->
+            {:error, changeset}
+        end
+      end)
     end
   end
 
@@ -3316,12 +3441,17 @@ defmodule Maxio.IAM do
   @doc "Activates a pending TOTP device by verifying and consuming its first code."
   @spec activate_mfa_device(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def activate_mfa_device(serial, code, opts \\ []) do
-    with {:ok, device} <- fetch_mfa_device(serial),
-         :ok <- require_status(device, "pending", :mfa_device_not_pending),
-         {:ok, secret_base32} <- MFASecret.unwrap(device.secret_envelope, device.serial),
-         {:ok, matched_step, _offset} <- TOTP.match(secret_base32, code, totp_opts(device, opts)),
-         {:ok, updated} <- activate_mfa_device_step(device, matched_step) do
-      {:ok, public_mfa_device(updated)}
+    with {:ok, initial} <- fetch_mfa_device(serial) do
+      with_mfa_user_identities([initial.principal_arn], fn ->
+        with {:ok, device} <- fetch_mfa_device(serial),
+             :ok <- require_status(device, "pending", :mfa_device_not_pending),
+             {:ok, secret_base32} <- MFASecret.unwrap(device.secret_envelope, device.serial),
+             {:ok, matched_step, _offset} <-
+               TOTP.match(secret_base32, code, totp_opts(device, opts)),
+             {:ok, updated} <- activate_mfa_device_step(device, matched_step) do
+          {:ok, public_mfa_device(updated)}
+        end
+      end)
     end
   end
 
@@ -3335,12 +3465,16 @@ defmodule Maxio.IAM do
           {:ok, map()} | {:error, term()}
   def enable_mfa_device(principal, serial, code1, code2, opts \\ []) do
     with {:ok, principal_arn} <- principal_arn(principal),
-         {:ok, device} <- fetch_mfa_device(serial),
-         :ok <- require_status(device, "pending", :mfa_device_not_pending),
-         :ok <- authorize_mfa_enable_principal(device, principal_arn, opts),
-         {:ok, step1, step2} <- match_consecutive_mfa_codes(device, code1, code2, opts),
-         {:ok, updated} <- enable_mfa_device_steps(device, principal_arn, step1, step2) do
-      {:ok, public_mfa_device(updated)}
+         {:ok, initial} <- fetch_mfa_device(serial) do
+      with_mfa_user_identities([initial.principal_arn, principal_arn], fn ->
+        with {:ok, device} <- fetch_mfa_device(serial),
+             :ok <- require_status(device, "pending", :mfa_device_not_pending),
+             :ok <- authorize_mfa_enable_principal(device, principal_arn, opts),
+             {:ok, step1, step2} <- match_consecutive_mfa_codes(device, code1, code2, opts),
+             {:ok, updated} <- enable_mfa_device_steps(device, principal_arn, step1, step2) do
+          {:ok, public_mfa_device(updated)}
+        end
+      end)
     end
   end
 
@@ -3349,12 +3483,16 @@ defmodule Maxio.IAM do
           {:ok, map()} | {:error, term()}
   def resync_mfa_device(principal, serial, code1, code2, opts \\ []) do
     with {:ok, principal_arn} <- principal_arn(principal),
-         {:ok, device} <- fetch_mfa_device(serial),
-         :ok <- require_status(device, "active", :mfa_device_not_active),
-         :ok <- require_principal_match(device, principal_arn),
-         {:ok, step1, step2} <- match_consecutive_mfa_codes(device, code1, code2, opts),
-         {:ok, updated} <- resync_mfa_device_steps(device, step1, step2) do
-      {:ok, public_mfa_device(updated)}
+         {:ok, initial} <- fetch_mfa_device(serial) do
+      with_mfa_user_identities([initial.principal_arn, principal_arn], fn ->
+        with {:ok, device} <- fetch_mfa_device(serial),
+             :ok <- require_status(device, "active", :mfa_device_not_active),
+             :ok <- require_principal_match(device, principal_arn),
+             {:ok, step1, step2} <- match_consecutive_mfa_codes(device, code1, code2, opts),
+             {:ok, updated} <- resync_mfa_device_steps(device, step1, step2) do
+          {:ok, public_mfa_device(updated)}
+        end
+      end)
     end
   end
 
@@ -3368,15 +3506,26 @@ defmodule Maxio.IAM do
           :ok | {:error, term()}
   def verify_mfa_device(principal, serial, code, opts \\ []) do
     with {:ok, principal_arn} <- principal_arn(principal),
-         {:ok, device} <- fetch_mfa_device(serial),
-         :ok <- require_status(device, "active", :mfa_device_not_active),
-         :ok <- require_principal_match(device, principal_arn),
-         {:ok, secret_base32} <- MFASecret.unwrap(device.secret_envelope, device.serial),
-         {:ok, matched_step, _offset} <- TOTP.match(secret_base32, code, totp_opts(device, opts)) do
+         {:ok, initial} <- fetch_mfa_device(serial) do
+      verify = fn ->
+        with {:ok, device} <- fetch_mfa_device(serial),
+             :ok <- require_status(device, "active", :mfa_device_not_active),
+             :ok <- require_principal_match(device, principal_arn),
+             {:ok, secret_base32} <- MFASecret.unwrap(device.secret_envelope, device.serial),
+             {:ok, matched_step, _offset} <-
+               TOTP.match(secret_base32, code, totp_opts(device, opts)) do
+          if Keyword.get(opts, :consume, true) do
+            consume_mfa_step(device, matched_step)
+          else
+            :ok
+          end
+        end
+      end
+
       if Keyword.get(opts, :consume, true) do
-        consume_mfa_step(device, matched_step)
+        with_mfa_user_identities([initial.principal_arn, principal_arn], verify)
       else
-        :ok
+        verify.()
       end
     end
   end
@@ -3384,10 +3533,14 @@ defmodule Maxio.IAM do
   @doc "Disables an MFA device while preserving the row for audit."
   @spec disable_mfa_device(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def disable_mfa_device(serial, opts \\ []) do
-    with {:ok, device} <- fetch_mfa_device(serial),
-         :ok <- authorize_mfa_disable(device, opts),
-         {:ok, updated} <- disable_mfa_device_row(device) do
-      {:ok, public_mfa_device(updated)}
+    with {:ok, initial} <- fetch_mfa_device(serial) do
+      with_mfa_user_identities([initial.principal_arn], fn ->
+        with {:ok, device} <- fetch_mfa_device(serial),
+             :ok <- authorize_mfa_disable(device, opts),
+             {:ok, updated} <- disable_mfa_device_row(device) do
+          {:ok, public_mfa_device(updated)}
+        end
+      end)
     end
   end
 
@@ -3398,17 +3551,25 @@ defmodule Maxio.IAM do
       nil ->
         :ok
 
-      %MFADevice{status: "active"} = device ->
-        if Keyword.get(opts, :force, false) do
-          Repo.delete!(device)
-          :ok
-        else
-          {:error, :active_mfa_device_requires_force}
-        end
+      %MFADevice{} = initial ->
+        with_mfa_user_identities([initial.principal_arn], fn ->
+          case Repo.get_by(MFADevice, serial: serial) do
+            nil ->
+              :ok
 
-      %MFADevice{} = device ->
-        Repo.delete!(device)
-        :ok
+            %MFADevice{status: "active"} = device ->
+              if Keyword.get(opts, :force, false) do
+                Repo.delete!(device)
+                :ok
+              else
+                {:error, :active_mfa_device_requires_force}
+              end
+
+            %MFADevice{} = device ->
+              Repo.delete!(device)
+              :ok
+          end
+        end)
     end
   end
 
@@ -4008,8 +4169,6 @@ defmodule Maxio.IAM do
   defp broadcast_principal_rename(old_arn, new_arn, access_key_ids) do
     Notify.broadcast({:principal_policy_changed, old_arn})
     Notify.broadcast({:principal_policy_changed, new_arn})
-    Notify.broadcast({:iam_changed, old_arn})
-    Notify.broadcast({:iam_changed, new_arn})
 
     access_key_ids
     |> Enum.uniq()
@@ -4287,7 +4446,6 @@ defmodule Maxio.IAM do
 
   defp broadcast_permissions_boundary_change(principal_arn) do
     Notify.broadcast({:principal_policy_changed, principal_arn})
-    Notify.broadcast({:iam_changed, principal_arn})
   end
 
   defp managed_policy_only_attached?(value) when value in [true, "true", "True", "TRUE"], do: true
@@ -4477,56 +4635,9 @@ defmodule Maxio.IAM do
     }
   end
 
-  defp update_user_name_transaction(%User{} = user, new_user_name, new_arn) do
-    old_arn = user.user_arn
-    access_key_ids = access_keys_for_principal(old_arn)
-    session_access_key_ids = session_access_keys_for_principal(old_arn)
-
-    transaction_result =
-      Repo.transaction(fn ->
-        case user
-             |> User.changeset(%{user_name: new_user_name, user_arn: new_arn})
-             |> Repo.update() do
-          {:ok, updated} ->
-            update_user_principal_references(old_arn, new_arn)
-            updated
-
-          {:error, changeset} ->
-            Repo.rollback(changeset)
-        end
-      end)
-
-    case transaction_result do
-      {:ok, updated} ->
-        broadcast_principal_rename(old_arn, new_arn, access_key_ids ++ session_access_key_ids)
-        {:ok, public_user(updated)}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp reject_user_name_update_duplicate(%User{} = user, new_user_name)
-       when is_binary(new_user_name) and new_user_name != "" do
-    case fetch_user_by_case_insensitive_name(new_user_name) do
-      nil -> :ok
-      %User{id: id} when id == user.id -> :ok
-      %User{} -> {:error, :user_already_exists}
-    end
-  end
-
-  defp reject_user_name_update_duplicate(_user, _new_user_name), do: :ok
-
-  defp reject_user_name_case_insensitive_duplicate(user_name)
-       when is_binary(user_name) and user_name != "" do
-    if fetch_user_by_case_insensitive_name(user_name) do
-      {:error, :user_already_exists}
-    else
-      :ok
-    end
-  end
-
-  defp reject_user_name_case_insensitive_duplicate(_user_name), do: :ok
+  defp ensure_rename_target(%User{id: id}, %User{id: id}), do: :ok
+  defp ensure_rename_target(%User{}, :missing), do: :ok
+  defp ensure_rename_target(%User{}, %User{}), do: {:error, :user_already_exists}
 
   defp fetch_user_record(user_name_or_arn) do
     value = normalize_iam_text(user_name_or_arn)
@@ -4833,10 +4944,35 @@ defmodule Maxio.IAM do
 
   defp update_user(user_name_or_arn, fun) when is_function(fun, 1) do
     case fetch_user_record(user_name_or_arn) do
-      %User{} = user ->
-        with {:ok, updated} <- user |> fun.() |> Repo.update() do
-          Notify.broadcast({:iam_changed, updated.user_arn})
-          {:ok, public_user(updated)}
+      %User{} = initial ->
+        Repo.transaction(fn ->
+          with {:ok, %User{} = user} <-
+                 UserIdentity.lock_snapshot(
+                   Repo,
+                   initial.user_name,
+                   {:existing, initial.id}
+                 ),
+               {:ok, updated} <- user |> fun.() |> Repo.update() do
+            credential_ids = UserIdentity.descendant_credential_ids(Repo, updated)
+            {updated, credential_ids.long_term ++ credential_ids.sessions}
+          else
+            {:error, reason} -> Repo.rollback({:error, reason})
+          end
+        end)
+        |> case do
+          {:ok, {updated, credential_ids}} ->
+            Notify.broadcast({:principal_policy_changed, updated.user_arn})
+            Enum.each(Enum.uniq(credential_ids), &Notify.broadcast({:iam_changed, &1}))
+            {:ok, public_user(updated)}
+
+          {:error, {:error, :user_not_found}} ->
+            {:error, :not_found}
+
+          {:error, {:error, reason}} ->
+            {:error, reason}
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       nil ->
@@ -5418,6 +5554,13 @@ defmodule Maxio.IAM do
   defp access_key_transaction_result({:error, {:error, reason}}), do: {:error, reason}
   defp access_key_transaction_result({:error, reason}), do: {:error, reason}
 
+  defp notify_access_key_result({:ok, %{access_key_id: access_key_id}} = result) do
+    Notify.broadcast({:iam_changed, access_key_id})
+    result
+  end
+
+  defp notify_access_key_result({:error, _reason} = error), do: error
+
   defp minio_user_transaction_result(
          {:ok, %{user: %User{} = user, access_key: %AccessKey{} = access_key}},
          access_key_id
@@ -5477,14 +5620,40 @@ defmodule Maxio.IAM do
     :ok
   end
 
-  defp lock_minio_user_identity!(case_folded_user_name) do
-    Ecto.Adapters.SQL.query!(
-      Repo,
-      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      ["maxio.minio_admin_users", case_folded_user_name]
-    )
+  defp credential_identity_snapshot(principal_arn) do
+    case UserIdentity.local_user_name(principal_arn) do
+      {:ok, user_name} ->
+        {user_name, principal_arn, UserIdentity.snapshot(Repo, user_name)}
 
-    :ok
+      :not_local_user ->
+        :not_local_user
+    end
+  end
+
+  defp lock_credential_identity(:not_local_user, _opts), do: :ok
+
+  defp lock_credential_identity({user_name, principal_arn, snapshot}, opts) do
+    case UserIdentity.lock_snapshot(Repo, user_name, snapshot) do
+      {:ok, %User{user_arn: ^principal_arn, status: "active"}} ->
+        :ok
+
+      {:ok, %User{user_arn: ^principal_arn}} ->
+        if Keyword.get(opts, :require_active, false), do: {:error, :user_inactive}, else: :ok
+
+      {:ok, %User{}} ->
+        {:error, :identity_changed}
+
+      {:ok, :missing} ->
+        if Keyword.get(opts, :allow_missing, false),
+          do: :ok,
+          else: {:error, :user_not_found}
+
+      {:error, :user_not_found} ->
+        {:error, :user_not_found}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp lock_signing_certificate_principal!(principal_key) do
@@ -5888,6 +6057,62 @@ defmodule Maxio.IAM do
         {:ok, step1, step2}
       else
         {:error, :mfa_consecutive_codes_required}
+      end
+    end
+  end
+
+  defp with_mfa_user_identities(principal_arns, fun) when is_function(fun, 0) do
+    identities =
+      principal_arns
+      |> Enum.uniq()
+      |> Enum.flat_map(fn principal_arn ->
+        case UserIdentity.local_user_name(principal_arn) do
+          {:ok, user_name} ->
+            [{user_name, principal_arn, UserIdentity.snapshot(Repo, user_name)}]
+
+          :not_local_user ->
+            []
+        end
+      end)
+
+    if Enum.any?(identities, fn {_name, _arn, snapshot} -> snapshot == :missing end) do
+      {:error, :user_not_found}
+    else
+      run_mfa_identity_transaction(identities, fun)
+    end
+  end
+
+  defp run_mfa_identity_transaction([], fun), do: fun.()
+
+  defp run_mfa_identity_transaction(identities, fun) do
+    transaction_fun = fn ->
+      named_snapshots = Enum.map(identities, fn {name, _arn, snapshot} -> {name, snapshot} end)
+
+      with {:ok, rows} <- UserIdentity.lock_snapshots(Repo, named_snapshots),
+           true <-
+             Enum.zip(identities, rows)
+             |> Enum.all?(fn {{_name, principal_arn, _snapshot}, row} ->
+               match?(%User{user_arn: ^principal_arn}, row)
+             end) do
+        case fun.() do
+          {:error, reason} -> Repo.rollback({:operation_error, reason})
+          result -> result
+        end
+      else
+        false -> Repo.rollback({:identity_error, :identity_changed})
+        {:error, reason} -> Repo.rollback({:identity_error, reason})
+      end
+    end
+
+    if Repo.in_transaction?() do
+      transaction_fun.()
+    else
+      case Repo.transaction(transaction_fun) do
+        {:ok, result} -> result
+        {:error, {:operation_error, reason}} -> {:error, reason}
+        {:error, {:identity_error, :user_not_found}} -> {:error, :user_not_found}
+        {:error, {:identity_error, reason}} -> {:error, reason}
+        {:error, reason} -> {:error, reason}
       end
     end
   end

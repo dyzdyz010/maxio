@@ -110,7 +110,8 @@ defmodule Maxio.IAM.MFADeviceTest do
 
     assert %{serial: [_message], device_name: [_device_message]} = errors_on(changeset)
 
-    user_arn = "arn:aws:iam:::user/alice"
+    assert {:ok, user} = IAM.create_user(name: "alice")
+    user_arn = user.user_arn
     user_serial = serial("alice")
 
     assert {:ok, enrolled} =

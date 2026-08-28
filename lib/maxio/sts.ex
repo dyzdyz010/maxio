@@ -13,7 +13,7 @@ defmodule Maxio.STS do
   alias Maxio.Auth.SessionToken
   alias Maxio.Cluster.Notify
   alias Maxio.IAM
-  alias Maxio.IAM.{AccessKey, CredentialNamespace, STSSession, STSSessionSecret}
+  alias Maxio.IAM.{AccessKey, CredentialNamespace, STSSession, STSSessionSecret, UserIdentity}
   alias Maxio.Policy.{Evaluator, RequestContext, Statement, Store}
   alias Maxio.Repo
   alias Maxio.Tags
@@ -76,7 +76,7 @@ defmodule Maxio.STS do
           mfa_serial_hash: Keyword.get(opts, :mfa_serial_hash)
         }
 
-        case persist_session(attrs) do
+        case persist_session(attrs, now) do
           {:ok, session} ->
             Notify.broadcast({:iam_changed, session.access_key_id})
 
@@ -163,7 +163,7 @@ defmodule Maxio.STS do
           mfa_serial_hash: Map.get(mfa_context, :serial_hash)
         }
 
-        case persist_session(attrs) do
+        case persist_session(attrs, now) do
           {:ok, session} ->
             Notify.broadcast({:iam_changed, session.access_key_id})
 
@@ -247,7 +247,7 @@ defmodule Maxio.STS do
           web_identity_audience: web_identity.audience
         }
 
-        case persist_session(attrs) do
+        case persist_session(attrs, now) do
           {:ok, session} ->
             Notify.broadcast({:iam_changed, session.access_key_id})
 
@@ -1599,11 +1599,23 @@ defmodule Maxio.STS do
     end
   end
 
-  defp persist_session(attrs) do
+  defp persist_session(attrs, now) do
     access_key_id = Map.fetch!(attrs, :access_key_id)
     changeset = STSSession.changeset(%STSSession{}, attrs)
 
     Ecto.Multi.new()
+    |> Ecto.Multi.run(:issuer_identity, fn repo, _changes ->
+      case Map.get(attrs, :issuer_access_key_id) do
+        issuer_access_key_id
+        when is_binary(issuer_access_key_id) and issuer_access_key_id != "" ->
+          UserIdentity.lock_and_validate_issuer(repo, issuer_access_key_id, now)
+
+        nil ->
+          if web_identity_attrs?(attrs),
+            do: {:ok, :web_identity},
+            else: {:error, :issuer_access_key_not_found}
+      end
+    end)
     |> Ecto.Multi.run(:credential_namespace, fn repo, _changes ->
       case CredentialNamespace.reserve_exact(repo, access_key_id) do
         :ok -> {:ok, :available}
@@ -1619,6 +1631,9 @@ defmodule Maxio.STS do
       {:error, :credential_namespace, :access_key_id_conflict, _changes} ->
         {:error, :access_key_id_conflict}
 
+      {:error, :issuer_identity, :issuer_access_key_not_found, _changes} ->
+        {:error, :issuer_access_key_not_found}
+
       {:error, :session, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, sanitize_changeset_errors(changeset)}
 
@@ -1626,6 +1641,13 @@ defmodule Maxio.STS do
         {:error, reason}
     end
   end
+
+  defp web_identity_attrs?(attrs) do
+    present?(Map.get(attrs, :web_identity_provider_arn)) and
+      present?(Map.get(attrs, :web_identity_subject_sha256))
+  end
+
+  defp present?(value), do: is_binary(value) and value != ""
 
   defp maybe_filter(query, _field, nil), do: query
   defp maybe_filter(query, _field, ""), do: query

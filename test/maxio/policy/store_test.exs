@@ -44,7 +44,9 @@ defmodule Maxio.Policy.StoreTest do
   end
 
   test "principal identity policy put/list/delete and parse" do
-    principal_arn = "arn:aws:iam:::user/AKIAIDENTITY1"
+    user_name = "AKIAIDENTITY#{System.unique_integer([:positive, :monotonic])}"
+    assert {:ok, user} = Maxio.IAM.create_user(name: user_name)
+    principal_arn = user.user_arn
 
     policy =
       ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::identity/*"}})
@@ -398,7 +400,9 @@ defmodule Maxio.Policy.StoreTest do
     assert :ok = Store.delete_bucket_policy("notify-policy-bucket")
     assert_receive {:bucket_policy_changed, "notify-policy-bucket"}
 
-    principal_arn = "arn:aws:iam:::user/AKIANOTIFYPOLICY"
+    user_name = "AKIANOTIFY#{System.unique_integer([:positive, :monotonic])}"
+    assert {:ok, user} = Maxio.IAM.create_user(name: user_name)
+    principal_arn = user.user_arn
 
     identity_policy =
       ~s({"Statement":{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::notify-policy-bucket"}})
