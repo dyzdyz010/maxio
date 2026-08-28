@@ -73,7 +73,7 @@ defmodule Maxio.Test.ConfigPostcommitStore do
       end)
 
     send(owner, {:config_postcommit_dependency, :attention, fields})
-    apply_outcome(outcome, fn -> :ok end)
+    apply_outcome(outcome, fn -> Store.note_postcommit_attention(fields) end)
   end
 
   # Repo facade used by Store event tests. The real Repo still performs every query; this facade

@@ -5,6 +5,7 @@ defmodule Maxio.Test.ConfigBatchFailureRepo do
   alias Maxio.Repo
 
   @failure_key {__MODULE__, :failure}
+  @observations_key {__MODULE__, :observations}
 
   def arm!(stage, key) when is_atom(stage) and is_atom(key) do
     Process.put(@failure_key, {stage, Atom.to_string(key)})
@@ -13,15 +14,35 @@ defmodule Maxio.Test.ConfigBatchFailureRepo do
 
   def clear! do
     Process.delete(@failure_key)
+    Process.put(@observations_key, %{transactions: 0, query_calls: 0, advisory_locks: 0})
     :ok
   end
 
-  def transaction(fun), do: Repo.transaction(fun)
-  def transaction(fun, opts), do: Repo.transaction(fun, opts)
+  def observations do
+    Process.get(@observations_key, %{transactions: 0, query_calls: 0, advisory_locks: 0})
+  end
+
+  def transaction(fun) do
+    record(:transactions)
+    Repo.transaction(fun)
+  end
+
+  def transaction(fun, opts) do
+    record(:transactions)
+    Repo.transaction(fun, opts)
+  end
+
   def rollback(reason), do: Repo.rollback(reason)
 
-  def query!(sql, params \\ [], opts \\ []),
-    do: Ecto.Adapters.SQL.query!(Repo, sql, params, opts)
+  def query!(sql, params \\ [], opts \\ []) do
+    record(:query_calls)
+
+    if String.contains?(sql, "pg_advisory_xact_lock") do
+      record(:advisory_locks)
+    end
+
+    Ecto.Adapters.SQL.query!(Repo, sql, params, opts)
+  end
 
   def one(queryable, opts \\ []), do: Repo.one(queryable, opts)
   def all(queryable, opts \\ []), do: Repo.all(queryable, opts)
@@ -85,6 +106,12 @@ defmodule Maxio.Test.ConfigBatchFailureRepo do
       Repo.rollback({:forced_config_batch_failure, stage, key})
     end
 
+    :ok
+  end
+
+  defp record(key) do
+    observations = observations()
+    Process.put(@observations_key, Map.update!(observations, key, &(&1 + 1)))
     :ok
   end
 end

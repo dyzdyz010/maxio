@@ -9,6 +9,7 @@ defmodule Maxio.Config.CoordinatorPostcommitTest do
 
   alias Maxio.Test.{
     ConfigBatchFailureRepo,
+    ConfigBatchSchema,
     ConfigPostcommitNotify,
     ConfigPostcommitStore
   }
@@ -19,6 +20,7 @@ defmodule Maxio.Config.CoordinatorPostcommitTest do
     "POSTCOMMIT-CIPHERTEXT-S3CR3T",
     "POSTCOMMIT-CALLER-S3CR3T"
   ]
+  @unknown_reload_sentinel "POSTCOMMIT-UNKNOWN-MAP-S3CR3T"
 
   setup do
     ConfigBatchFailureRepo.clear!()
@@ -64,6 +66,123 @@ defmodule Maxio.Config.CoordinatorPostcommitTest do
     assert ConfigPostcommitNotify.observations().legacy_calls == []
     assert Store.lookup(:listing, :sql_hard_limit) == {:ok, 1_001}
     assert_committed_once(1_001)
+  end
+
+  test "real two-key batch crosses one transaction, advisory lock, reload, and checked broadcast" do
+    # Catches transaction/lock/callback orchestration being repeated per key. Repo facade counters
+    # observe the real coordinator boundaries; PG rows/audits prove the result is not mock-only.
+    assert {:ok, result} = mutate_batch_fixture(11, 22)
+
+    assert %{
+             committed?: true,
+             changed_count: 2,
+             changed_keys: [:left, :right],
+             local_reload: :ok,
+             broadcast: :ok,
+             attention?: false
+           } = result
+
+    assert ConfigBatchFailureRepo.observations() == %{
+             transactions: 1,
+             query_calls: 1,
+             advisory_locks: 1
+           }
+
+    assert event_kinds(dependency_events()) == [:reload, :checked]
+    assert length(ConfigPostcommitStore.observations().reload_calls) == 1
+    assert ConfigPostcommitStore.observations().attention_calls == []
+
+    assert ConfigPostcommitNotify.observations() == %{
+             checked_calls: [{:config_changed, :batch_fixture}],
+             legacy_calls: []
+           }
+
+    assert_batch_fixture_committed_once(11, 22)
+  end
+
+  for {label, stage} <- [
+        {"reload", :reload},
+        {"checked broadcast", :broadcast},
+        {"attention recorder", :recorder}
+      ] do
+    test "two-key batch is not retried after #{label} failure" do
+      # Catches postcommit recovery re-entering the mutation. Even under each independent failure
+      # stage there is one real transaction/lock and exactly two v1 rows/two audits.
+      stage = unquote(stage)
+      configure_multi_key_failure(stage)
+
+      assert {:returned, {:ok, result}} =
+               capture_outcome(fn -> mutate_batch_fixture(33, 44) end)
+
+      assert %{committed?: true, changed_count: 2, attention?: true} = result
+      assert Map.take(result, [:local_reload, :broadcast]) == multi_key_postcommit(stage)
+
+      assert ConfigBatchFailureRepo.observations() == %{
+               transactions: 1,
+               query_calls: 1,
+               advisory_locks: 1
+             }
+
+      assert event_kinds(dependency_events()) == [:reload, :checked, :attention]
+      assert length(ConfigPostcommitStore.observations().reload_calls) == 1
+      assert length(ConfigPostcommitStore.observations().attention_calls) == 1
+
+      assert ConfigPostcommitNotify.observations().checked_calls == [
+               {:config_changed, :batch_fixture}
+             ]
+
+      assert ConfigPostcommitNotify.observations().legacy_calls == []
+      assert_batch_fixture_committed_once(33, 44)
+    end
+  end
+
+  test "secret-bearing unknown reload map is a safe committed attention result" do
+    # Catches the broad `is_map(result)` success branch accepting malformed reload returns. The
+    # sentinel pressures result, persisted attention status, and structured log redaction together.
+    ConfigPostcommitStore.configure(reload: {:return, %{unexpected: @unknown_reload_sentinel}})
+
+    outcome_ref = make_ref()
+
+    log =
+      capture_log(fn ->
+        send(self(), {outcome_ref, capture_outcome(fn -> mutate(1_051) end)})
+      end)
+
+    assert_receive {^outcome_ref, {:returned, {:ok, result}}}
+
+    assert %{
+             committed?: true,
+             changed_count: 1,
+             local_reload: {:error, :reload_failed},
+             broadcast: :ok,
+             attention?: true
+           } = result
+
+    assert event_kinds(dependency_events()) == [:reload, :checked, :attention]
+
+    assert ConfigPostcommitStore.observations().attention_calls == [
+             %{
+               subsystem: :listing,
+               local_reload: {:error, :reload_failed},
+               broadcast: :ok
+             }
+           ]
+
+    assert %{
+             postcommit_attention: %{
+               subsystem: :listing,
+               local_reload: {:error, :reload_failed},
+               broadcast: :ok
+             }
+           } = Store.status()
+
+    assert log =~ "config_attention_record=ok"
+    assert log =~ "config_subsystem=listing"
+    assert log =~ "reason=reload_failed"
+
+    serialized = inspect(result, limit: :infinity) <> inspect(Store.status()) <> log
+    refute serialized =~ @unknown_reload_sentinel
+    assert_committed_once(1_051)
   end
 
   for {label, reload_outcome} <- [
@@ -244,6 +363,42 @@ defmodule Maxio.Config.CoordinatorPostcommitTest do
     Config.mutate_subsystem(:listing, [{:set, :sql_hard_limit, value}], opts)
   end
 
+  defp mutate_batch_fixture(left, right) do
+    Config.mutate_subsystem(
+      :batch_fixture,
+      [{:set, :left, left}, {:set, :right, right}],
+      source: "admin_api",
+      principal_arn: "arn:aws:iam:::root",
+      access_key_id: "AKIA-POSTCOMMIT-BATCH",
+      request_id: "req-postcommit-batch",
+      repo: ConfigBatchFailureRepo,
+      schema: ConfigBatchSchema,
+      store: ConfigPostcommitStore,
+      notify: ConfigPostcommitNotify
+    )
+  end
+
+  defp configure_multi_key_failure(:reload) do
+    ConfigPostcommitStore.configure(reload: {:raise, "private multi-key reload failure"})
+  end
+
+  defp configure_multi_key_failure(:broadcast) do
+    ConfigPostcommitNotify.configure(checked: {:return, {:error, :transport}})
+  end
+
+  defp configure_multi_key_failure(:recorder) do
+    ConfigPostcommitStore.configure(attention: {:raise, "private multi-key recorder failure"})
+    ConfigPostcommitNotify.configure(checked: {:return, {:error, :transport}})
+  end
+
+  defp multi_key_postcommit(:reload) do
+    %{local_reload: {:error, :reload_failed}, broadcast: :ok}
+  end
+
+  defp multi_key_postcommit(stage) when stage in [:broadcast, :recorder] do
+    %{local_reload: :ok, broadcast: {:error, :broadcast_failed}}
+  end
+
   defp configure_attention_failure(:reload, recorder_outcome) do
     ConfigPostcommitStore.configure(
       reload: {:return, {:error, {:transport, "private reload detail"}}},
@@ -334,5 +489,27 @@ defmodule Maxio.Config.CoordinatorPostcommitTest do
 
     assert audit.operation == "set"
     assert audit.to_version == 1
+  end
+
+  defp assert_batch_fixture_committed_once(left, right) do
+    assert Repo.all(
+             from row in RuntimeConfig,
+               where: row.subsystem == "batch_fixture",
+               order_by: [asc: row.key],
+               select: {row.key, row.value, row.version}
+           ) == [
+             {"left", %{"v" => left}, 1},
+             {"right", %{"v" => right}, 1}
+           ]
+
+    assert Repo.all(
+             from audit in RuntimeConfigAudit,
+               where: audit.subsystem == "batch_fixture",
+               order_by: [asc: audit.key],
+               select: {audit.key, audit.operation, audit.to_version}
+           ) == [
+             {"left", "set", 1},
+             {"right", "set", 1}
+           ]
   end
 end

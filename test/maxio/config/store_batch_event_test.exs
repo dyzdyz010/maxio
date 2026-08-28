@@ -43,12 +43,12 @@ defmodule Maxio.Config.StoreBatchEventTest do
   end
 
   test "attention status keeps only the latest safe postcommit record" do
-    # Catches an unbounded attention history or a recorder copying arbitrary value/reason fields
-    # into the operator-visible status payload.
+    # Catches the first unsafe record being copied into status. It is inspected before a later
+    # record can overwrite it, then the second write independently proves bounded latest-only state.
     first = %{
       subsystem: :listing,
-      local_reload: {:error, :reload_failed},
-      broadcast: :ok,
+      local_reload: {:error, {:transport, "ATTENTION-RAW-RELOAD-MUST-NOT-PERSIST"}},
+      broadcast: {:error, {:transport, "ATTENTION-RAW-BROADCAST-MUST-NOT-PERSIST"}},
       value: "ATTENTION-RAW-VALUE-MUST-NOT-PERSIST",
       reason: {:transport, "ATTENTION-RAW-REASON-MUST-NOT-PERSIST"}
     }
@@ -61,6 +61,22 @@ defmodule Maxio.Config.StoreBatchEventTest do
 
     assert {:returned, :ok} =
              capture_outcome(fn -> apply(Store, :note_postcommit_attention, [first]) end)
+
+    first_status = Store.status()
+
+    assert %{
+             postcommit_attention: %{
+               subsystem: :listing,
+               local_reload: {:error, :reload_failed},
+               broadcast: {:error, :broadcast_failed}
+             }
+           } = first_status
+
+    first_serialized = inspect(first_status.postcommit_attention, limit: :infinity)
+    refute first_serialized =~ "ATTENTION-RAW-RELOAD-MUST-NOT-PERSIST"
+    refute first_serialized =~ "ATTENTION-RAW-BROADCAST-MUST-NOT-PERSIST"
+    refute first_serialized =~ "ATTENTION-RAW-VALUE-MUST-NOT-PERSIST"
+    refute first_serialized =~ "ATTENTION-RAW-REASON-MUST-NOT-PERSIST"
 
     assert :ok = apply(Store, :note_postcommit_attention, [second])
 
@@ -78,6 +94,8 @@ defmodule Maxio.Config.StoreBatchEventTest do
     refute is_list(attention)
 
     serialized = inspect(attention, limit: :infinity)
+    refute serialized =~ "ATTENTION-RAW-RELOAD-MUST-NOT-PERSIST"
+    refute serialized =~ "ATTENTION-RAW-BROADCAST-MUST-NOT-PERSIST"
     refute serialized =~ "ATTENTION-RAW-VALUE-MUST-NOT-PERSIST"
     refute serialized =~ "ATTENTION-RAW-REASON-MUST-NOT-PERSIST"
   end
