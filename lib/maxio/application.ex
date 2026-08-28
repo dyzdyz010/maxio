@@ -17,6 +17,7 @@ defmodule Maxio.Application do
         Maxio.Repo
       ] ++
         cluster_children() ++
+        credential_store_children() ++
         [
           {DNSCluster, query: Application.get_env(:maxio, :dns_cluster_query) || :ignore},
           {Phoenix.PubSub, name: Maxio.PubSub},
@@ -107,6 +108,18 @@ defmodule Maxio.Application do
     case :persistent_term.get(@pt_started_at, nil) do
       %{system_time: at} -> at
       nil -> nil
+    end
+  end
+
+  # MemoryStore 把凭据放在 ETS 里，而 ETS 表随创建者进程一起消亡。只要没有被监督的持有
+  # 者，表就归"第一个碰它的调用方"（一次性的请求/测试进程）所有，它一退出整张凭据表就静默
+  # 消失，并在异步回收窗口里让紧随其后的写入抛 ArgumentError 冲出鉴权路径。所以配置了该后端
+  # 时必须把持有者纳入监督树（与 `Maxio.S3.InFlight` 同一约定）。EctoStore 无 ETS，不需要。
+  defp credential_store_children do
+    if Application.get_env(:maxio, :credential_store) == Maxio.Auth.CredentialStore.MemoryStore do
+      [Maxio.Auth.CredentialStore.MemoryStore]
+    else
+      []
     end
   end
 

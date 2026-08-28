@@ -1,12 +1,19 @@
 # maxio · 项目状态（STATUS）
 
-> 单一事实来源（cross-session / 抗闪退）。最后更新：2026-07-14。
+> 单一事实来源（cross-session / 抗闪退）。最后更新：2026-08-28。
 > 设计 spec：`docs/superpowers/specs/2026-06-08-maxio-s3-foundation-design.md`（+ `_design_inputs/`）
 > 工程准则：`AGENTS.md`（先读）；Claude/OMC 执行细节：`CLAUDE.md`
 
 ## 项目目标
 
 用 Elixir/Phoenix 完整复刻 MinIO 的全功能、Amazon S3 兼容对象存储系统（aws-cli/boto3/mc/SDK 直连）。工程约束参考姊妹项目寰析（huanxi）。
+
+## Latest Batch Update (2026-08-28 dirty-worktree review findings closure)
+
+- `MemoryStore` 的 ETS 生命周期根因已从 owner 层收口：配置该后端时仍由 `Maxio.Application` 纳入监督树；无应用的 `mix run --no-start` 首触不再让一次性调用方持表，而是启动独立临时 owner。受监督 GenServer 收到 ETS `give_away/3` 的 `ETS-TRANSFER` 后还必须重新读取并证明 `table_owner() == self()` 才完成启动（该消息只是可伪造的普通 mailbox term）；旧 owner 在移交前恰好退出时使用启动快照重建，未知 owner 不配合、伪造 transfer 或实际 owner 不符均显式失败，绝不再出现“GenServer 存活但表归临时进程、临时进程退出后凭据静默消失”。回归用例真实终止应用监督子进程，覆盖预启动凭据无损移交及恶意 owner 伪造完全匹配 transfer tuple 两条路径。
+- `Maxio.Ops.LiveRehearsalBundle` 重跑开始前统一清理 replacement / scheduler / gate / bundle 四个制品，关闭失败重跑沿用旧成功 bundle 的证据污染。bundle 作为总成功证据优先失效，随后遍历全部 child 路径并汇总清理错误，任一中间制品失败不再跳过其余安全可删项；测试以 scheduler 路径目录制造中间失败，证明 replacement/gate/bundle 均删除且 child 零启动。清理从文件系统根到叶逐级复用 `Maxio.Native.PathSafety`，Unix symlink、Windows junction/任意 reparse point、非目录祖先、非普通叶子及 native/stat/rm 失败均返回显式 `artifact cleanup failed`；真实 Windows junction 测试证明目标四个 sentinel 均未被越界删除。祖先分解已平台无关地区分 drive root `C:/`、Unix root `/` 与完整 UNC share root `//server/share`，不再把 `//server` 当成需探测的根。
+- `CredentialStore` 与 KMS 的可选 callback 首次未加载语义已有执行级回归：test-support provider/store beam 经 `:code.purge`/`:code.delete` 后，公开门面首次调用仍先 `Code.ensure_loaded?` 再探测 export；CredentialStore 的 `get_secret/2`、`invalidate/1` 及 KMS `default_key_id/0`/provider status 均覆盖，不向生产契约增加测试专用 seam。
+- TDD 证据：首轮新增测试在实现前稳定得到 3 个预期失败（ETS owner 仍为预启动 Task、bundle 在首个子命令开始时仍存在、junction 清理未被拒绝）；复审修订再稳定得到 3 个预期失败（伪造 transfer 错误启动、scheduler 清理失败后 gate/bundle 被跳过、UNC 根函数缺失/旧递归根错误）。最终相关及相邻回归 `41 tests, 0 failures`。`mix compile --warnings-as-errors`、`mix format --check-formatted` 与 `git diff --check` 在本批最终收口执行；完整 `mix precommit` 已由协调者于 2026-08-28 收口执行且 exit 0，结果为 `4384 passed, 5 excluded`，耗时 `502.3 seconds`。
 
 ## Latest Batch Update (2026-07-14 ObjectMutation P1-CLOSEOUT-A / full-gate closeout)
 

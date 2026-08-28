@@ -27,7 +27,7 @@ defmodule Maxio.Auth.CredentialStore do
     backend = impl()
 
     cond do
-      function_exported?(backend, :get_secret, 2) ->
+      callback_exported?(backend, :get_secret, 2) ->
         backend.get_secret(access_key, opts)
 
       session_token?(Keyword.get(opts, :session_token)) ->
@@ -48,11 +48,21 @@ defmodule Maxio.Auth.CredentialStore do
   def invalidate(scope) do
     backend = impl()
 
-    if function_exported?(backend, :invalidate, 1) do
+    if callback_exported?(backend, :invalidate, 1) do
       backend.invalidate(scope)
     else
       :ok
     end
+  end
+
+  # 可选回调探测必须先确保后端模块已加载：`function_exported?/3` 对"存在但尚未被加载"
+  # 的模块返回 false，而交互式代码加载（`mix run` / `iex -S mix` / `mix maxio.*` /
+  # `mix test`）下这正是新起节点的常态。否则第一次带 session token 的请求会走
+  # `{:error, :invalid_token}` 误拒合法 STS 凭据，`invalidate/1` 也会静默跳过缓存失效，
+  # 让轮换/删除后的旧密钥继续可用（AGENTS.md §3 绝不静默失败）。与
+  # `Maxio.Policy.Store.callback_exported?/3` 同一约定。
+  defp callback_exported?(backend, function, arity) do
+    Code.ensure_loaded?(backend) and function_exported?(backend, function, arity)
   end
 
   defp session_token?(nil), do: false

@@ -40,11 +40,26 @@ defmodule Maxio.KMS do
   end
 
   defp default_key_id(provider) do
-    if function_exported?(provider, :default_key_id, 0) do
+    if callback_exported?(provider, :default_key_id, 0) do
       provider.default_key_id()
     else
       "alias/maxio/default"
     end
+  end
+
+  # `function_exported?/3` answers "is this function exported by a **loaded**
+  # module", so a provider that has simply never been called yet answers `false`
+  # and every optional provider capability below silently degrades to its
+  # built-in fallback. Under interactive code loading (`mix run`, `iex -S mix`,
+  # every `mix maxio.*` task, `mix test`) that is the normal state of a fresh
+  # node, so the first SSE-KMS request would pick `alias/maxio/default` instead
+  # of the configured `:default_key_id` — a wrong key with no error and no log
+  # (AGENTS.md §3: 绝不静默失败). Probing the pluggable backend must therefore
+  # load it first, exactly like every other backend probe in this codebase
+  # (`Maxio.Policy.Store.callback_exported?/3`, `Maxio.ObjectMeta`,
+  # `Maxio.Cluster.DriveStats`, `Maxio.IAM`).
+  defp callback_exported?(provider, function, arity) do
+    Code.ensure_loaded?(provider) and function_exported?(provider, function, arity)
   end
 
   @spec generate_data_key!(String.t() | nil, String.t() | nil) :: Maxio.KMS.Provider.data_key()
@@ -105,7 +120,7 @@ defmodule Maxio.KMS do
   defp provider_mode(_provider), do: :external_provider
 
   defp production_hsm?(provider) do
-    if function_exported?(provider, :production_hsm?, 0),
+    if callback_exported?(provider, :production_hsm?, 0),
       do: provider.production_hsm?() == true,
       else: false
   end

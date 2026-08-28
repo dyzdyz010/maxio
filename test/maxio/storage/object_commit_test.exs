@@ -245,6 +245,14 @@ defmodule Maxio.Storage.ObjectCommitTest do
       })
 
     {:ok, control} = Control.start(self())
+
+    # 监听必须在 control 还**确定活着**的时候建立：`arm_publisher/2` 内部对 publisher 下
+    # `Process.monitor/1`，publisher 若在那一刻已经不在了，BEAM 立刻投递 `:noproc` DOWN，
+    # control 随即回滚并 `:normal` 退出。若监听晚于 arm，满负载下测试进程只要被调度器挪开
+    # 一下，`Process.monitor/1` 就只能拿到 `:noproc`——真实退出原因永远观测不到，下面对
+    # `:normal` 的断言就不可能成立（实测：arm 之后插一次 `:erlang.yield/0`，3000/3000 全是
+    # `:noproc`；把监听提到 arm 之前，3000/3000 全是 `:normal`）。
+    control_ref = Process.monitor(control)
     identity = Control.identity()
 
     :ok =
@@ -262,7 +270,6 @@ defmodule Maxio.Storage.ObjectCommitTest do
       )
 
     :ok = Control.arm_publisher(control, publisher)
-    control_ref = Process.monitor(control)
     Process.exit(publisher, :publisher_failed)
 
     assert_receive {:publisher_down_control, :rollback}

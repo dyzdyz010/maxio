@@ -85,4 +85,128 @@ defmodule Maxio.Auth.CredentialStore.MemoryStoreTest do
                now: DateTime.add(expires_at, 1, :second)
              )
   end
+
+  test "supervised store takes ownership from the pre-start fallback owner without losing credentials" do
+    assert :ok = Supervisor.terminate_child(Maxio.Supervisor, MemoryStore)
+
+    test_process = self()
+
+    caller =
+      start_supervised!(
+        {Task,
+         fn ->
+           :ok = MemoryStore.put_access_key(%{access_key: "AKPRESTART", secret_key: "SKPRESTART"})
+           send(test_process, {:pre_start_credential_written, self()})
+
+           receive do
+             :release_pre_start_caller -> :ok
+           end
+         end}
+      )
+
+    on_exit(fn ->
+      caller_ref = Process.monitor(caller)
+      send(caller, :release_pre_start_caller)
+
+      receive do
+        {:DOWN, ^caller_ref, :process, ^caller, _reason} -> :ok
+      after
+        1_000 -> :ok
+      end
+
+      case Supervisor.which_children(Maxio.Supervisor)
+           |> Enum.find(fn {id, _pid, _type, _modules} -> id == MemoryStore end) do
+        {MemoryStore, :undefined, :worker, [MemoryStore]} ->
+          if pid = Process.whereis(MemoryStore) do
+            GenServer.stop(pid)
+          end
+
+          Supervisor.restart_child(Maxio.Supervisor, MemoryStore)
+
+        {MemoryStore, _pid, :worker, [MemoryStore]} ->
+          :ok
+      end
+    end)
+
+    assert_receive {:pre_start_credential_written, ^caller}
+    pre_start_owner = :ets.info(:maxio_credentials, :owner)
+    assert is_pid(pre_start_owner)
+    pre_start_owner_ref = Process.monitor(pre_start_owner)
+
+    supervised_owner = start_supervised!(MemoryStore)
+
+    assert :ets.info(:maxio_credentials, :owner) == supervised_owner
+    assert_receive {:DOWN, ^pre_start_owner_ref, :process, ^pre_start_owner, :normal}
+
+    caller_ref = Process.monitor(caller)
+    send(caller, :release_pre_start_caller)
+    assert_receive {:DOWN, ^caller_ref, :process, ^caller, :normal}
+
+    assert {:ok, %{secret_key: "SKPRESTART"}} = MemoryStore.get_secret("AKPRESTART")
+  end
+
+  test "forged ETS-TRANSFER cannot start a server that does not own the credential table" do
+    assert :ok = Supervisor.terminate_child(Maxio.Supervisor, MemoryStore)
+    test_process = self()
+
+    malicious_owner =
+      start_supervised!(
+        {Task,
+         fn ->
+           :ets.new(:maxio_credentials, [:set, :public, :named_table])
+           send(test_process, {:malicious_table_ready, self()})
+
+           receive do
+             {:take_credential_table, new_owner, ref} ->
+               send(
+                 new_owner,
+                 {:"ETS-TRANSFER", :maxio_credentials, self(),
+                  {{MemoryStore, :table_takeover}, ref}}
+               )
+
+               send(test_process, {:forged_transfer_sent, self(), new_owner})
+
+               receive do
+                 :release_malicious_owner -> :ok
+               end
+           end
+         end}
+      )
+
+    on_exit(fn ->
+      owner_ref = Process.monitor(malicious_owner)
+      send(malicious_owner, :release_malicious_owner)
+
+      receive do
+        {:DOWN, ^owner_ref, :process, ^malicious_owner, _reason} -> :ok
+      after
+        1_000 -> :ok
+      end
+
+      case Supervisor.which_children(Maxio.Supervisor)
+           |> Enum.find(fn {id, _pid, _type, _modules} -> id == MemoryStore end) do
+        {MemoryStore, :undefined, :worker, [MemoryStore]} ->
+          if pid = Process.whereis(MemoryStore) do
+            GenServer.stop(pid)
+          end
+
+          Supervisor.restart_child(Maxio.Supervisor, MemoryStore)
+
+        {MemoryStore, _pid, :worker, [MemoryStore]} ->
+          :ok
+      end
+    end)
+
+    assert_receive {:malicious_table_ready, ^malicious_owner}
+
+    assert {:error,
+            {{:credential_table_transfer_not_owned, ^malicious_owner, ^malicious_owner},
+             {:child, :undefined, MemoryStore, {MemoryStore, :start_link, [[]]}, :permanent,
+              false, 5_000, :worker, [MemoryStore]}}} =
+             start_supervised(MemoryStore)
+
+    assert_receive {:forged_transfer_sent, ^malicious_owner, attempted_server}
+    refute Process.alive?(attempted_server)
+    assert :ets.info(:maxio_credentials, :owner) == malicious_owner
+  end
 end

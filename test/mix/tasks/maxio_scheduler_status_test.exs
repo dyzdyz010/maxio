@@ -335,6 +335,10 @@ defmodule Mix.Tasks.MaxioSchedulerStatusTest do
     end
   end
 
+  # 同 `maxio_scheduler_evidence_test.exs`：耗时由外部 `mix run --no-start` 子进程主导
+  # （热启约 4s、冷启 30s+），ExUnit 默认 60s 预算按进程内用例定，全量跑会被撑爆。显式声明
+  # 真实时间预算，不削断言。
+  @tag timeout: 300_000
   test "no-start status command starts Repo dependencies but not application schedulers" do
     code = """
     Mix.Task.run("maxio.scheduler.status", [

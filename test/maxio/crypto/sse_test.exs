@@ -117,6 +117,21 @@ defmodule Maxio.Crypto.SSETest do
     refute inspect(status) =~ master_key
   end
 
+  test "first optional KMS callback loads the configured provider before probing exports" do
+    provider = Maxio.Test.UnloadedKMSProvider
+    Application.put_env(:maxio, :kms, provider: provider)
+
+    _purged? = :code.purge(provider)
+    _deleted? = :code.delete(provider)
+    refute Code.loaded?(provider)
+
+    assert KMS.default_key_id() == "alias/unloaded-provider"
+
+    status = KMS.status()
+    assert status.provider == provider
+    assert status.production_hsm? == true
+  end
+
   test "SSE-KMS can encrypt with an existing envelope" do
     plain = :crypto.strong_rand_bytes(32_000)
     context_b64 = Base.encode64(~s({"upload":"mpu"}))

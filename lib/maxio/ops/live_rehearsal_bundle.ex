@@ -10,6 +10,7 @@ defmodule Maxio.Ops.LiveRehearsalBundle do
   alias Maxio.Cluster.ReplacementLiveRehearsal
   alias Maxio.Cluster.SchedulerEnabledRehearsal
   alias Maxio.Cluster.SchedulerLiveRehearsal
+  alias Maxio.Native.PathSafety
   alias Maxio.Ops.Gate
 
   @usage """
@@ -157,6 +158,13 @@ defmodule Maxio.Ops.LiveRehearsalBundle do
   end
 
   defp run_bundle(config, opts) do
+    case clear_artifacts(config) do
+      :ok -> execute_bundle(config, opts)
+      {:error, reason} -> {:error, cleanup_error_result(config, reason)}
+    end
+  end
+
+  defp execute_bundle(config, opts) do
     command_runner = Keyword.get(opts, :command_runner, &System.cmd/3)
     artifact_writer = Keyword.get(opts, :artifact_writer, &write_artifact!/2)
     git_sha_fun = Keyword.get(opts, :git_sha_fun, &git_sha/0)
@@ -219,6 +227,162 @@ defmodule Maxio.Ops.LiveRehearsalBundle do
     }
 
     if exit_code == 0, do: {:ok, result}, else: {:error, result}
+  end
+
+  # `--artifact-dir` + `--run-id` 推导出的四个制品路径都是**本次运行的产物**（正常路径上
+  # 它们本来就会被子任务覆盖写）。不先清空的话，同一 `--run-id` 重跑时（STATUS.md 记录的
+  # operator 用法就是固定 run-id，例如 `--artifact-dir tmp --run-id p0_ops_2_..._probe`），
+  # 一旦某个子任务崩了或没写出制品，最终 p0 gate 会把**上一次**留在原地的旧制品当成本次证据
+  # 读进来，把"这次没有产出证据"静默判成通过——正是 AGENTS.md §3 禁止的静默放行。
+  #
+  # 删除前从文件系统根逐级验证每个祖先：Unix symlink 与 Windows 任意 reparse point（尤其
+  # junction）统一走 Native.PathSafety；不存在的尾部目录可以安全视为"无旧制品"，其它探测
+  # 错误、非目录祖先、非普通叶子全部显式失败，绝不静默跳过后继续跑子任务。
+  defp clear_artifacts(config) do
+    # bundle 优先：即使后续某个 child artifact 不可删，上一轮“成功总证据”也先失效；随后仍
+    # 遍历全部 child 路径，把所有清理错误收集返回，不能因首错跳过其余安全可删项。
+    [
+      config.artifact_paths.bundle,
+      config.artifact_paths.replacement,
+      config.artifact_paths.scheduler,
+      config.artifact_paths.gate
+    ]
+    |> Enum.reduce([], fn path, errors ->
+      case remove_stale_artifact(path) do
+        :ok -> errors
+        {:error, reason} -> [reason | errors]
+      end
+    end)
+    |> Enum.reverse()
+    |> case do
+      [] -> :ok
+      errors -> {:error, Enum.join(errors, "; ")}
+    end
+  end
+
+  defp remove_stale_artifact(path) do
+    with :ok <- ensure_safe_ancestor_chain(Path.dirname(path)),
+         :ok <- ensure_safe_leaf(path) do
+      :ok
+    end
+  end
+
+  defp ensure_safe_ancestor_chain(parent) do
+    parent
+    |> path_from_root()
+    |> Enum.reduce_while(:ok, fn ancestor, :ok ->
+      case safe_directory_component(ancestor) do
+        :ok -> {:cont, :ok}
+        :missing -> {:halt, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp safe_directory_component(path) do
+    case PathSafety.reparse_point(path) do
+      {:ok, true} ->
+        {:error, "ancestor #{inspect(path)} is a symlink or reparse point"}
+
+      {:ok, false} ->
+        case File.lstat(path) do
+          {:ok, %File.Stat{type: :directory}} ->
+            :ok
+
+          {:ok, %File.Stat{type: type}} ->
+            {:error, "ancestor #{inspect(path)} has unsafe path type #{inspect(type)}"}
+
+          {:error, :enoent} ->
+            :missing
+
+          {:error, reason} ->
+            {:error, "cannot inspect ancestor #{inspect(path)}: #{inspect(reason)}"}
+        end
+
+      {:error, :enoent} ->
+        :missing
+
+      {:error, reason} ->
+        {:error, "cannot verify ancestor #{inspect(path)}: #{inspect(reason)}"}
+    end
+  end
+
+  defp ensure_safe_leaf(path) do
+    case PathSafety.reparse_point(path) do
+      {:ok, true} ->
+        {:error, "stale artifact #{inspect(path)} is a symlink or reparse point"}
+
+      {:ok, false} ->
+        remove_regular_leaf(path)
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "cannot verify stale artifact #{inspect(path)}: #{inspect(reason)}"}
+    end
+  end
+
+  defp remove_regular_leaf(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        case File.rm(path) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            {:error, "cannot remove stale artifact #{inspect(path)}: #{inspect(reason)}"}
+        end
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, "stale artifact #{inspect(path)} has unsafe path type #{inspect(type)}"}
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "cannot inspect stale artifact #{inspect(path)}: #{inspect(reason)}"}
+    end
+  end
+
+  @doc false
+  @spec path_from_root(String.t()) :: [String.t()]
+  def path_from_root(path) when is_binary(path) do
+    normalized = String.replace(path, "\\", "/")
+    components = String.split(normalized, "/", trim: true)
+
+    cond do
+      String.starts_with?(normalized, "//") and length(components) >= 2 ->
+        [server, share | descendants] = components
+        build_path_from_root("//#{server}/#{share}", descendants)
+
+      Regex.match?(~r/\A[A-Za-z]:\//, normalized) ->
+        [drive | descendants] = components
+        build_path_from_root(drive <> "/", descendants)
+
+      String.starts_with?(normalized, "/") ->
+        build_path_from_root("/", components)
+
+      true ->
+        raise ArgumentError, "expected an absolute filesystem path, got: #{inspect(path)}"
+    end
+  end
+
+  defp build_path_from_root(root, descendants) do
+    [root | Enum.scan(descendants, root, &append_path_component/2)]
+  end
+
+  defp append_path_component(component, "/"), do: "/" <> component
+
+  defp append_path_component(component, parent),
+    do: String.trim_trailing(parent, "/") <> "/" <> component
+
+  defp cleanup_error_result(config, reason) do
+    %{
+      exit_code: 1,
+      artifact_path: config.artifact_paths.bundle,
+      stderr: "[maxio ops.live_rehearsal_bundle] artifact cleanup failed: #{reason}\n"
+    }
   end
 
   defp capture_result(fun) do

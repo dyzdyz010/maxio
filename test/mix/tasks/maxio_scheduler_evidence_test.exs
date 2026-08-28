@@ -230,6 +230,12 @@ defmodule Mix.Tasks.MaxioSchedulerEvidenceTest do
     end
   end
 
+  # 本用例的耗时由**外部进程**主导：它 spawn 一个完整的 `mix run --no-start` 子进程，用真实
+  # CLI 启动路径证明 evidence 命令不会拉起 scheduler。本机实测这个子进程热启约 4s、冷启
+  # 30s+（Windows 上还要叠加杀软扫描 erl.exe）。ExUnit 默认 60s 预算是按"进程内用例"定的，
+  # 全量跑时会被外部冷启撑爆（实测 seed=60221408 在此超时）。这里显式声明真实的时间预算，
+  # 既不削断言也不改成进程内假跑；真挂死仍会在 5 分钟内失败。
+  @tag timeout: 300_000
   test "no-start evidence command starts Repo dependencies but not application schedulers" do
     code = """
     try do
