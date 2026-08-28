@@ -10,7 +10,9 @@ defmodule Mix.Tasks.MaxioConfigTest do
   import ExUnit.CaptureIO
 
   alias Maxio.Config
-  alias Maxio.Config.Store
+  alias Maxio.Config.{RuntimeConfig, Store}
+  alias Mix.Tasks.Maxio.Admin.Config.Get, as: AdminConfigGet
+  alias Mix.Tasks.Maxio.Admin.Config.Set, as: AdminConfigSet
 
   setup do
     Store.reset_local!()
@@ -55,6 +57,62 @@ defmodule Mix.Tasks.MaxioConfigTest do
     assert get_out =~ "source=runtime"
 
     assert Config.get(:listing, :sql_hard_limit) == 4242
+  end
+
+  test "旧 CLI 在 KVS mutation 后保留 expected-version 并与新 GET 互操作" do
+    # Catches the new KVS path writing a second authority, or removing optimistic version checks
+    # from the existing single-key CLI while migrating both writers to the shared coordinator.
+    admin_output =
+      capture_io(fn ->
+        apply(AdminConfigSet, :run, [["listing sql_hard_limit=4242"]])
+      end)
+
+    assert admin_output ==
+             "committed=true changed_count=1 apply_modes=hot local_reload=ok broadcast=ok " <>
+               "attention=false\n"
+
+    old_output =
+      capture_io(fn ->
+        Mix.Tasks.Maxio.Config.Set.run([
+          "listing",
+          "sql_hard_limit",
+          "5252",
+          "--expected-version",
+          "1"
+        ])
+      end)
+
+    assert old_output =~ "version=2"
+    assert old_output =~ "source=cli"
+
+    conflict_output =
+      capture_io(fn ->
+        error =
+          assert_raise Mix.Error, fn ->
+            Mix.Tasks.Maxio.Config.Set.run([
+              "listing",
+              "sql_hard_limit",
+              "6262",
+              "--expected-version",
+              "1"
+            ])
+          end
+
+        send(self(), {:old_cli_version_conflict, error.message})
+      end)
+
+    assert conflict_output == ""
+    assert_receive {:old_cli_version_conflict, message}
+    assert message =~ "config_version_conflict"
+
+    assert capture_io(fn -> apply(AdminConfigGet, :run, [["listing"]]) end) ==
+             "listing sql_hard_limit=5252 \n"
+
+    assert Repo.one(
+             from row in RuntimeConfig,
+               where: row.subsystem == "listing" and row.key == "sql_hard_limit",
+               select: {row.value, row.version, row.source}
+           ) == {%{"v" => 5252}, 2, "cli"}
   end
 
   test "set 未知键 / 禁止键 / 非法值一律硬失败，绝不静默成功" do
