@@ -6,6 +6,7 @@
     "disable",
     "remove"
   ],
+  "supporting_read_operation": "info",
   "evidence_class": "pinned-source-derived-not-live",
   "execution_claim": {
     "mc_live_run_performed": false,
@@ -31,7 +32,12 @@
       {
         "path": "mc/cmd/admin-user-add.go",
         "sha256": "f9042ad23d58bfeb2ba71df7fa04876d9098fc91e36068c6e29337fad98da12b",
-        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-user-add.go"
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-user-add.go#L87-L150"
+      },
+      {
+        "path": "mc/cmd/admin-user-info.go",
+        "sha256": "95e020622dd8a01cad71d988a6461e23a2fa9cb9296f8b4a643c4b4fcaf1868c",
+        "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-user-info.go#L31-L110"
       },
       {
         "path": "mc/cmd/admin-user-disable.go",
@@ -64,6 +70,11 @@
         "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/go.mod"
       },
       {
+        "path": "madmin-go/user-commands.go",
+        "sha256": "cce048000582de809eb9b119cef85e1c32b1b752e1110922a01f40f58f968019",
+        "url": "https://github.com/minio/madmin-go/blob/4b504b82db633e978a57d49443b2be75824244c3/user-commands.go#L135-L158"
+      },
+      {
         "path": "pkg/v3/console/console.go",
         "sha256": "a9624e0d70891e23338de464c32b6682ad36c129e6e774be6f65bff2c17bbaa4",
         "url": "https://github.com/minio/pkg/blob/e97de32cd9d798d53115b831f4f7c0ad245c7fb2/console/console.go#L264-L301"
@@ -84,10 +95,107 @@
       "mc --json admin user remove TARGET USERNAME"
     ],
     "json_mode": "ordinary --json producing one pretty multiline JSON document",
+    "info_commands": {
+      "human": "mc admin user info TARGET USERNAME",
+      "json": "mc --json admin user info TARGET USERNAME"
+    },
     "remove_alias": "rm",
     "wrong_arg_count": {
       "behavior": "show command help",
       "exit_code": 1
+    }
+  },
+  "capture_canonicalization": {
+    "canonical_encoding": "UTF-8",
+    "canonical_line_ending": "LF",
+    "hash_includes_emitted_trailing_lf": true,
+    "non_tty_without_ansi": true,
+    "windows_rule": [
+      "if a capture layer materializes CRLF, replace each CRLF pair with one LF before hashing",
+      "reject any lone CR remaining after CRLF normalization",
+      "do not trim whitespace, remove the emitted final LF, add a missing LF, or otherwise rewrite bytes"
+    ],
+    "applies_to": [
+      "human info stdout",
+      "human mutation success stdout",
+      "human fatal stderr",
+      "JSON stdout documents"
+    ]
+  },
+  "info_contract": {
+    "evidence_kind": "pinned-source-derived-not-live",
+    "exit_code": 0,
+    "stderr": "",
+    "json_mode": {
+      "document_count": 1,
+      "pretty_multiline": true,
+      "schema": {
+        "status": {
+          "required": true,
+          "literal": "success",
+          "meaning": "mc command outcome, not the account enabled state"
+        },
+        "accessKey": {
+          "required_for_info": true,
+          "example": "NAME"
+        },
+        "userStatus": {
+          "required_for_info": true,
+          "enum": [
+            "enabled",
+            "disabled"
+          ],
+          "meaning": "account lifecycle state"
+        },
+        "policyName": {
+          "required": false,
+          "type": "string"
+        },
+        "memberOf": {
+          "required": false,
+          "type": "array",
+          "item": {
+            "name": "optional string",
+            "policies": "optional array of strings"
+          }
+        },
+        "authentication": {
+          "required": false,
+          "type": "string"
+        },
+        "secretKey": {
+          "emitted_by_info_command": false
+        }
+      },
+      "minimal_builtin_no_policy_no_groups_examples": {
+        "enabled": {
+          "stdout_text_lf_with_trailing_lf": "{\n \"status\": \"success\",\n \"accessKey\": \"NAME\",\n \"userStatus\": \"enabled\"\n}\n",
+          "stdout_sha256_lf": "82e3d153658e9c96e5df64b9f0c6f670d14d4395823d5d4816151d066fa3fb30"
+        },
+        "disabled": {
+          "stdout_text_lf_with_trailing_lf": "{\n \"status\": \"success\",\n \"accessKey\": \"NAME\",\n \"userStatus\": \"disabled\"\n}\n",
+          "stdout_sha256_lf": "63900eb33145954bf791a016fec9c3306e1e95c5d6693d5a93ab2077a73ec973"
+        }
+      }
+    },
+    "human_mode": {
+      "line_order": [
+        "AccessKey: NAME",
+        "Status: enabled|disabled",
+        "PolicyName: POLICY_OR_EMPTY",
+        "MemberOf: [GROUPS]",
+        "Authentication: VALUE only when non-empty"
+      ],
+      "minimal_builtin_no_policy_no_groups_examples": {
+        "enabled": {
+          "stdout_text_lf_with_trailing_lf": "AccessKey: NAME\nStatus: enabled\nPolicyName: \nMemberOf: []\n",
+          "stdout_sha256_lf": "d9aa438a4aff3fa8c1e95254521c87b57f761378b136e121103a2ea4b276bb9b"
+        },
+        "disabled": {
+          "stdout_text_lf_with_trailing_lf": "AccessKey: NAME\nStatus: disabled\nPolicyName: \nMemberOf: []\n",
+          "stdout_sha256_lf": "a95f7bbe7b92bcf2bb6c3706f8fab0accd737a1350c7408037eae72eb47b2e07"
+        }
+      }
     }
   },
   "success_contract": {
@@ -97,6 +205,20 @@
       "disable": "Disabled user `NAME` successfully.",
       "enable": "Enabled user `NAME` successfully.",
       "remove": "Removed user `NAME` successfully."
+    },
+    "human_stdout_bytes": {
+      "disable": {
+        "stdout_text_lf_with_trailing_lf": "Disabled user `NAME` successfully.\n",
+        "stdout_sha256_lf": "606f82f6e92d9170649ad801729938eedf273f259e837b3451f7e2ea6e74a566"
+      },
+      "enable": {
+        "stdout_text_lf_with_trailing_lf": "Enabled user `NAME` successfully.\n",
+        "stdout_sha256_lf": "eb0012376aa21bb61a522bc32525f6b9cd706d06621d552af5cd719585f7edec"
+      },
+      "remove": {
+        "stdout_text_lf_with_trailing_lf": "Removed user `NAME` successfully.\n",
+        "stdout_sha256_lf": "d407858006c00d42192747af35f81b8d22d58ee548ea33d575d913ee810155b3"
+      }
     },
     "human_capture_note": "These are non-TTY captured text values; an interactive terminal may add ANSI color sequences.",
     "json_stdout_object": {
@@ -122,6 +244,10 @@
         "remove": "Unable to remove"
       },
       "sequential_second_remove_source_derived_example": "mc: <ERROR> Unable to remove NAME. The specified user does not exist. (Specified user does not exist).",
+      "sequential_second_remove_stderr_bytes": {
+        "stderr_text_lf_with_trailing_lf": "mc: <ERROR> Unable to remove NAME. The specified user does not exist. (Specified user does not exist).\n",
+        "stderr_sha256_lf": "c6b6da3b3161810976e9877001aa00fb83e5fa9572dcb0b914c833c7e6964905"
+      },
       "exact_terminal_rendering_verify_at_impl": true
     },
     "json_mode": {

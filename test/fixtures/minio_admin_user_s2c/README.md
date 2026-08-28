@@ -24,7 +24,9 @@ Two kinds of Go evidence were executed against the fixed sources:
 
 The temporary test files were deleted after the run and the upstream clone was verified clean. The JSON records retain redacted structured excerpts and SHA-256 values computed over the listed LF-joined transcript lines with one trailing LF. They do not claim that a committed upstream test exists.
 
-No real `mc` executable lifecycle was run while creating this pack. `mc_user_mutations.json` is a pinned source-derived stdout/stderr/exit contract. Future Maxio external smoke is responsible for producing live `mc` evidence and must not label this source evidence as a live pass.
+No real `mc` executable lifecycle was run while creating this pack. `mc_user_mutations.json` is a pinned source-derived stdout/stderr/exit contract, including the supporting `mc admin user info` read used by the mutation lifecycle. Its JSON envelope uses top-level `status: "success"`; the actual account state is the separate `userStatus: "enabled" | "disabled"` field. Future Maxio external smoke is responsible for producing live `mc` evidence and must not label this source evidence as a live pass.
+
+All recorded command-output byte examples are canonical UTF-8 with LF line endings and include the single trailing LF emitted by `console.Println` or argument-bearing `console.Fatalln`. If a Windows capture layer materializes CRLF, verification mechanically replaces every CRLF pair with LF before hashing, rejects any remaining lone CR, and otherwise preserves every byte; it does not trim output or synthesize a missing final newline. Hash examples describe non-TTY captures without ANSI color.
 
 ## Important adjudications
 
@@ -41,7 +43,7 @@ No real `mc` executable lifecycle was run while creating this pack. `mc_user_mut
 
 - `minio_u4_remove_user.json`: DELETE wire shape, handler/store flow, exact errors, cascade, root-order decision history, STS and concurrency ambiguity, and executed transcripts.
 - `minio_u5_set_user_status.json`: PUT wire shape, enum/action/self/root behavior, reversible derived-credential effects, same-status write, and executed transcripts.
-- `mc_user_mutations.json`: pinned `mc admin user enable|disable|remove` argv, human and JSON stdout, stderr, and exit contracts; explicitly source-derived, not live.
+- `mc_user_mutations.json`: pinned `mc admin user info|enable|disable|remove` argv, info JSON schema, human and JSON stdout, stderr, trailing-newline, and exit contracts; explicitly source-derived, not live.
 
 ## Verification commands
 
