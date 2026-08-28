@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "fixture_id": "madmin-go-v3.0.109-group-wire-v1",
+  "evidence_class": "source-pinned-not-live-observed",
+  "pins": {
+    "madmin_go": "6897865311e2be91d814ea0ef4814a730d87d1cd",
+    "mc_selected_madmin_go": "4b504b82db633e978a57d49443b2be75824244c3"
+  },
+  "provenance": [
+    {
+      "url": "https://github.com/minio/madmin-go/blob/6897865311e2be91d814ea0ef4814a730d87d1cd/group-commands.go#L31-L169",
+      "symbols": ["GroupAddRemove", "GroupDesc", "GroupStatus", "UpdateGroupMembers", "GetGroupDescription", "ListGroups", "SetGroupStatus"],
+      "meaning": "JSON types, paths, methods, queries, and exact-status response handling"
+    },
+    {
+      "url": "https://github.com/minio/madmin-go/blob/6897865311e2be91d814ea0ef4814a730d87d1cd/api.go#L502-L544",
+      "symbols": ["AdminClient.newRequest"],
+      "meaning": "no automatic Content-Type, positive content length, and SigV4 payload hashing"
+    },
+    {
+      "url": "https://github.com/minio/madmin-go/blob/6897865311e2be91d814ea0ef4814a730d87d1cd/utils.go#L38-L44",
+      "symbols": ["AdminAPIVersion"],
+      "meaning": "relative /v3 prefix"
+    }
+  ],
+  "source_identity_check": {
+    "files": ["group-commands.go", "api.go", "utils.go"],
+    "mc_selected_commit_matches_v3_0_109_bytes": true
+  },
+  "json_structs": {
+    "GroupAddRemove": {
+      "fields_in_source_order": ["group", "members", "groupStatus", "isRemove"],
+      "types": {"group": "string", "members": "array<string>", "groupStatus": "string", "isRemove": "boolean"},
+      "omitempty_fields": [],
+      "unknown_fields": "ignored_by_encoding_json_Unmarshal",
+      "missing_fields": "Go_zero_values"
+    },
+    "GroupDesc": {
+      "fields_in_source_order": ["name", "status", "members", "policy", "updatedAt"],
+      "types": {"name": "string", "status": "string", "members": "array<string>", "policy": "string", "updatedAt": "time.Time"},
+      "omitempty_fields": ["updatedAt"]
+    },
+    "GroupStatus": {
+      "enabled": "enabled",
+      "disabled": "disabled"
+    }
+  },
+  "request_builder": {
+    "application_envelope": "none",
+    "EncryptData": false,
+    "DecryptData": false,
+    "automatic_content_type": false,
+    "positive_content_sets_exact_ContentLength": true,
+    "signing": "SigV4 with X-Amz-Content-Sha256 payload hash"
+  },
+  "exact_requests": [
+    {
+      "id": "add_fresh_raw_order_duplicates",
+      "method": "PUT",
+      "path_and_query": "/minio/admin/v3/update-group-members",
+      "content_type": "absent",
+      "body": "{\"group\":\"g1\",\"members\":[\"bob\",\"alice\",\"bob\"],\"groupStatus\":\"\",\"isRemove\":false}",
+      "body_utf8_length": 80,
+      "content_length": 80
+    },
+    {
+      "id": "remove_members",
+      "method": "PUT",
+      "path_and_query": "/minio/admin/v3/update-group-members",
+      "content_type": "absent",
+      "body": "{\"group\":\"g1\",\"members\":[\"alice\",\"bob\"],\"groupStatus\":\"\",\"isRemove\":true}",
+      "body_utf8_length": 73,
+      "content_length": 73
+    },
+    {
+      "id": "delete_empty_group",
+      "method": "PUT",
+      "path_and_query": "/minio/admin/v3/update-group-members",
+      "content_type": "absent",
+      "body": "{\"group\":\"g1\",\"members\":[],\"groupStatus\":\"\",\"isRemove\":true}",
+      "body_utf8_length": 60,
+      "content_length": 60
+    },
+    {
+      "id": "nonempty_group_status_is_accepted_and_ignored",
+      "method": "PUT",
+      "path_and_query": "/minio/admin/v3/update-group-members",
+      "content_type": "absent",
+      "body": "{\"group\":\"g1\",\"members\":[\"alice\"],\"groupStatus\":\"ignored-by-local-handler\",\"isRemove\":false}",
+      "body_utf8_length": 92,
+      "content_length": 92,
+      "local_status_mutation": false
+    },
+    {
+      "id": "get_group",
+      "method": "GET",
+      "path_and_query": "/minio/admin/v3/group?group=g1",
+      "body": ""
+    },
+    {
+      "id": "list_groups",
+      "method": "GET",
+      "path_and_query": "/minio/admin/v3/groups",
+      "body": ""
+    },
+    {
+      "id": "enable_group",
+      "method": "PUT",
+      "path_and_query": "/minio/admin/v3/set-group-status?group=g1&status=enabled",
+      "body": "",
+      "content_type": "absent",
+      "framing": "VERIFY-AT-IMPL:set_status_actual_framing"
+    },
+    {
+      "id": "disable_group",
+      "method": "PUT",
+      "path_and_query": "/minio/admin/v3/set-group-status?group=g1&status=disabled",
+      "body": "",
+      "content_type": "absent",
+      "framing": "VERIFY-AT-IMPL:set_status_actual_framing"
+    }
+  ],
+  "exact_success_responses": [
+    {
+      "id": "get_group",
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"name\":\"g1\",\"status\":\"enabled\",\"members\":[\"alice\",\"bob\"],\"policy\":\"p-read,p-write\",\"updatedAt\":\"2026-08-29T00:00:00Z\"}",
+      "content_length": 119,
+      "decode_target": "GroupDesc"
+    },
+    {
+      "id": "list_groups",
+      "status": 200,
+      "content_type": "application/json",
+      "body": "[\"a-group\",\"z-group\"]",
+      "content_length": 21,
+      "decode_target": "array<string>"
+    },
+    {
+      "id": "update_group_members",
+      "status": 200,
+      "content_type": "absent",
+      "body": "",
+      "content_length": "implicit_empty_response",
+      "accepted_statuses": [200]
+    },
+    {
+      "id": "set_group_status",
+      "status": 200,
+      "content_type": "absent",
+      "body": "",
+      "content_length": "implicit_empty_response",
+      "accepted_statuses": [200]
+    }
+  ],
+  "sorting": {
+    "list_group_names": "lexicographic_set_order",
+    "group_policy_names": "lexicographic_set_order",
+    "fresh_create_members": "raw_request_order_with_duplicates",
+    "existing_group_set_mutation_members": "lexicographically_sorted_unique"
+  }
+}

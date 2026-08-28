@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "fixture_id": "minio-admin-group-s4-routes-errors-v1",
+  "evidence_class": "source-pinned-not-live-observed",
+  "pins": {
+    "minio": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+    "madmin_go": "6897865311e2be91d814ea0ef4814a730d87d1cd",
+    "mc": "77f82e18b5401a65958f1619df6ebb994634bd88",
+    "mc_selected_madmin_go": "4b504b82db633e978a57d49443b2be75824244c3",
+    "minio_pkg": "63a2eac5884b50aede4df00b84d16060dfd6791d",
+    "minio_go_tag": "v7.0.91"
+  },
+  "provenance": [
+    {
+      "repository": "minio/minio",
+      "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go#L280-L290",
+      "symbols": ["adminRouter"],
+      "meaning": "four exact Admin v3 group routes and query matchers"
+    },
+    {
+      "repository": "minio/minio",
+      "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-users.go#L229-L398",
+      "symbols": ["UpdateGroupMembers", "GetGroup", "ListGroups", "SetGroupStatus"],
+      "meaning": "single-action authorization, body handling, response writing, and status precedence"
+    },
+    {
+      "repository": "minio/minio",
+      "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/iam-store.go#L857-L1112",
+      "symbols": ["AddUsersToGroup", "RemoveUsersFromGroup", "SetGroupStatus", "GetGroupDescription", "ListGroups"],
+      "meaning": "lifecycle, validation precedence, timestamps, locking, cleanup, and projections"
+    },
+    {
+      "repository": "minio/minio",
+      "url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/api-errors.go#L1354-L1398",
+      "symbols": ["errorCodeResponse"],
+      "meaning": "public group error codes, statuses, and messages"
+    },
+    {
+      "repository": "minio/pkg",
+      "url": "https://github.com/minio/pkg/blob/63a2eac5884b50aede4df00b84d16060dfd6791d/policy/admin-action.go#L126-L137",
+      "symbols": ["AddUserToGroupAdminAction", "GetGroupAdminAction", "ListGroupsAdminAction", "EnableGroupAdminAction"],
+      "meaning": "literal Admin action strings"
+    }
+  ],
+  "routes": [
+    {
+      "id": "G1",
+      "operation": "list_groups",
+      "method": "GET",
+      "path": "/minio/admin/v3/groups",
+      "required_query": {},
+      "actions_any_of": ["admin:ListGroups"],
+      "request_body": "none",
+      "success": {
+        "status": 200,
+        "body": "json",
+        "content_type": "application/json",
+        "content_length": "exact_encoded_byte_length",
+        "response_writer": "writeSuccessResponseJSON"
+      }
+    },
+    {
+      "id": "G2",
+      "operation": "get_group",
+      "method": "GET",
+      "path": "/minio/admin/v3/group",
+      "required_query": {"group": "NAME"},
+      "actions_any_of": ["admin:GetGroup"],
+      "request_body": "none",
+      "success": {
+        "status": 200,
+        "body": "json",
+        "content_type": "application/json",
+        "content_length": "exact_encoded_byte_length",
+        "response_writer": "writeSuccessResponseJSON"
+      }
+    },
+    {
+      "id": "G3",
+      "operation": "update_group_members",
+      "method": "PUT",
+      "path": "/minio/admin/v3/update-group-members",
+      "required_query": {},
+      "actions_any_of": ["admin:AddUserToGroup"],
+      "defined_but_not_used_action": "admin:RemoveUserFromGroup",
+      "request_body": "plaintext_json_GroupAddRemove",
+      "request_content_type": "absent",
+      "request_content_length": "exact_positive_json_byte_length",
+      "success": {
+        "status": 200,
+        "body_bytes": "",
+        "content_type": "absent",
+        "response_writer": "none_implicit_net_http_success"
+      }
+    },
+    {
+      "id": "G4",
+      "operation": "set_group_status",
+      "method": "PUT",
+      "path": "/minio/admin/v3/set-group-status",
+      "required_query": {"group": "NAME", "status": "enabled|disabled"},
+      "actions_any_of": ["admin:EnableGroup"],
+      "defined_but_not_used_action": "admin:DisableGroup",
+      "handler_reads_body": false,
+      "request_framing": "VERIFY-AT-IMPL:set_status_actual_framing",
+      "success": {
+        "status": 200,
+        "body_bytes": "",
+        "content_type": "absent",
+        "response_writer": "none_implicit_net_http_success"
+      }
+    }
+  ],
+  "authorization_semantics": {
+    "validate_admin_req_multiple_actions": "OR",
+    "actions_within_each_group_handler": "exactly_one",
+    "authentication_and_action_gate_precede_G3_body_read": true
+  },
+  "lifecycle": {
+    "add_missing_group": "create_enabled_group_with_raw_request_member_slice",
+    "add_existing_group": "set_union_then_lexicographically_sorted_unique_members",
+    "add_duplicates_or_existing_members": "success_with_fresh_updated_at",
+    "remove_nonempty_members": "set_difference_then_lexicographically_sorted_unique_members",
+    "remove_existing_user_absent_from_group": "success",
+    "remove_down_to_zero_members": "preserve_empty_group",
+    "delete_group": "isRemove_true_with_empty_members_only",
+    "delete_nonempty_group": "XMinioAdminGroupNotEmpty",
+    "delete_empty_cleanup": ["group", "mapped_policy"],
+    "delete_empty_sequential_retry": "XMinioAdminNoSuchGroup",
+    "set_same_status": "success_with_fresh_updated_at",
+    "groupStatus_membership_field": "accepted_as_any_string_and_ignored_by_local_status_mutation"
+  },
+  "validation_precedence": {
+    "G3_common": [
+      "authenticate_and_authorize",
+      "read_body_and_decode_json",
+      "request_order_temp_or_root_member_precheck",
+      "branch_specific_validation"
+    ],
+    "G3_add_missing_group": [
+      "surrounding_space_group_name",
+      "ldap_configuration_gate",
+      "reserved_comma_or_equals_group_name",
+      "empty_group_name",
+      "per_member_user_existence_and_service_account"
+    ],
+    "G3_remove": [
+      "empty_group_name",
+      "per_member_user_existence_and_service_account",
+      "group_lookup",
+      "empty_members_requires_empty_group"
+    ],
+    "G4": ["validate_enabled_or_disabled_status", "group_lookup"],
+    "cross_matrix": [
+      {
+        "case": "missing-user + missing-group",
+        "result": "XMinioAdminNoSuchUser"
+      },
+      {
+        "case": "empty-group + missing ordinary user",
+        "result": "XMinioAdminInvalidArgument"
+      },
+      {
+        "case": "temp-or-root member + empty-group",
+        "result": "XMinioIAMActionNotAllowed"
+      },
+      {
+        "case": "invalid status + missing-group",
+        "result": "XMinioAdminInvalidArgument"
+      }
+    ]
+  },
+  "public_errors": [
+    {"code": "AccessDenied", "status": 403, "message": "Access Denied."},
+    {"code": "InvalidRequest", "status": 400, "message": "Invalid Request"},
+    {"code": "XMinioIAMActionNotAllowed", "status": 403, "message": "Specified IAM action is not allowed"},
+    {"code": "XMinioAdminNoSuchUser", "status": 404, "message": "The specified user does not exist."},
+    {"code": "XMinioAdminNoSuchGroup", "status": 404, "message": "The specified group does not exist."},
+    {"code": "XMinioAdminGroupNotEmpty", "status": 400, "message": "The specified group is not empty - cannot remove it."},
+    {"code": "XMinioAdminInvalidArgument", "status": 400, "message": "Invalid arguments specified."},
+    {"code": "XMinioInvalidResource", "status": 400, "message": "Policy, user or group names are not allowed to begin or end with space characters"},
+    {"code": "XMinioInvalidGroupName", "status": 400, "message": "The group name is invalid."}
+  ],
+  "error_response_shape": {
+    "content_type": "application/json",
+    "fields_in_source_order": ["Code", "Message", "Key", "BucketName", "Resource", "Region", "RequestId", "HostId", "ActualObjectSize", "RangeRequested"],
+    "required_fields": ["Code", "Message", "Resource", "RequestId", "HostId"],
+    "omitempty_fields": ["Key", "BucketName", "Region", "ActualObjectSize", "RangeRequested"]
+  },
+  "concurrency_and_idempotency": {
+    "upstream_lock": "process-local IAM store exclusive lock",
+    "distributed_compare_and_swap": false,
+    "request_idempotency_key": false,
+    "conditional_version_header": false,
+    "duplicate_add": "success",
+    "absent_member_remove": "success",
+    "delete_empty_retry": "not idempotent after first success"
+  },
+  "upstream_timestamp_split": {
+    "operation": "remove_existing_user_absent_from_group",
+    "persisted_value": "old UpdatedAt because saveGroupInfo precedes assignment",
+    "returned_and_cache_value": "fresh UpdatedAt assigned after save"
+  },
+  "verify_at_impl": [
+    {
+      "id": "set_status_actual_framing",
+      "capture": "pinned native mc signed G4 request headers and body framing",
+      "rule": "no observed claim until live evidence exists"
+    },
+    {
+      "id": "cross_node_group_race",
+      "capture": "two safe nodes sharing isolated persistence race create/add/remove",
+      "rule": "no observed claim until live evidence exists"
+    },
+    {
+      "id": "absent_remove_updated_at_cross_node_reload",
+      "capture": "two-node pinned upstream absent-member remove followed by cross-node reload",
+      "rule": "no observed claim until live evidence exists"
+    },
+    {
+      "id": "dynamic_mc_fatal_output",
+      "capture": "pinned native mc stderr and exit for four safe failure classes",
+      "rule": "no observed claim until live evidence exists"
+    }
+  ],
+  "deliberate_deviations": [
+    {
+      "id": "maxio-sorted-unique-members",
+      "upstream": "fresh create preserves raw order and duplicates; later set mutation sorts and deduplicates",
+      "maxio": "validate in request order, persist and project sorted unique membership"
+    },
+    {
+      "id": "maxio-persist-fresh-absent-remove-updated-at",
+      "upstream": "save old timestamp then return/cache fresh timestamp",
+      "maxio": "persist and return the same fresh timestamp"
+    }
+  ],
+  "maxio_safety_contract": {
+    "scope": "local safety contract, not upstream parity",
+    "max_group_request_bytes": 262272,
+    "oversize_error": {
+      "code": "XMinioAdminConfigTooLarge",
+      "status": 400,
+      "message": "Configuration data provided exceeds the allowed maximum of 262272 bytes"
+    },
+    "content_type_gate": false
+  }
+}

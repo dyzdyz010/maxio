@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "fixture_id": "mc-77f82e1-admin-group-human-v1",
+  "evidence_class": "source-pinned-expected-bytes-not-live-observed",
+  "pin": "77f82e18b5401a65958f1619df6ebb994634bd88",
+  "provenance": [
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-group-add.go#L32-L149",
+      "symbols": ["groupMessage.String", "mainAdminGroupAdd"],
+      "meaning": "add request and all shared human renderers"
+    },
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-group-remove.go#L28-L95",
+      "symbols": ["adminGroupRemoveCmd", "mainAdminGroupRemove"],
+      "meaning": "remove/rm argv, delete-empty request, and fatal prefix"
+    },
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-group-info.go#L27-L82",
+      "symbols": ["adminGroupInfoCmd", "mainAdminGroupInfo"],
+      "meaning": "info argv, projection, and fatal prefix"
+    },
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-group-list.go#L27-L79",
+      "symbols": ["adminGroupListCmd", "mainAdminGroupList"],
+      "meaning": "list/ls argv, group ordering passthrough, and fatal prefix"
+    },
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-group-enable.go#L28-L90",
+      "symbols": ["mainAdminGroupEnableDisable"],
+      "meaning": "enable/disable request, rendering, and fatal prefix"
+    },
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go#L28-L50",
+      "symbols": ["printMsg"],
+      "meaning": "trim at most one existing LF then print exactly one LF"
+    }
+  ],
+  "capture_contract": {
+    "stream": "stdout",
+    "json_flag": false,
+    "ansi": false,
+    "line_ending": "LF",
+    "trailing_lf_count": 1
+  },
+  "argv": {
+    "add": ["mc", "admin", "group", "add", "ALIAS", "g1", "alice", "bob"],
+    "remove_members": ["mc", "admin", "group", "remove", "ALIAS", "g1", "alice", "bob"],
+    "remove_members_short_alias": ["mc", "admin", "group", "rm", "ALIAS", "g1", "alice", "bob"],
+    "remove_group": ["mc", "admin", "group", "remove", "ALIAS", "g1"],
+    "info": ["mc", "admin", "group", "info", "ALIAS", "g1"],
+    "list": ["mc", "admin", "group", "list", "ALIAS"],
+    "list_short_alias": ["mc", "admin", "group", "ls", "ALIAS"],
+    "enable": ["mc", "admin", "group", "enable", "ALIAS", "g1"],
+    "disable": ["mc", "admin", "group", "disable", "ALIAS", "g1"]
+  },
+  "success_stdout": {
+    "add": "Added members `alice,bob` to group `g1` successfully.\n",
+    "remove_members": "Removed members {alice,bob} from group g1 successfully.\n",
+    "remove_group": "Removed group g1 successfully.\n",
+    "info": "Group: g1\nStatus: enabled\nPolicy: p-read,p-write\nMembers: alice,bob\n",
+    "list": "a-group\nz-group\n",
+    "empty_list": "\n",
+    "enable": "Enabled group `g1` successfully.\n",
+    "disable": "Disabled group `g1` successfully.\n"
+  },
+  "source_pinned_fatal_prefixes": {
+    "add": "Unable to add new group",
+    "remove": "Could not perform remove operation",
+    "info": "Unable to fetch group info",
+    "list": "Unable to list groups",
+    "enable": "Unable set group status",
+    "disable": "Unable set group status"
+  },
+  "dynamic_error_boundary": {
+    "id": "dynamic_mc_fatal_output",
+    "source_prefix_is_complete_stderr": false,
+    "complete_stderr_and_exit": "VERIFY-AT-IMPL",
+    "safe_live_cases": ["missing-group", "missing-user", "invalid-status", "group-not-empty"]
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "fixture_id": "mc-77f82e1-admin-group-json-v1",
+  "evidence_class": "source-pinned-expected-bytes-not-live-observed",
+  "pin": "77f82e18b5401a65958f1619df6ebb994634bd88",
+  "provenance": [
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-group-add.go#L60-L107",
+      "symbols": ["groupMessage", "groupMessage.JSON"],
+      "meaning": "field order, omitempty, success status, one-space MarshalIndent"
+    },
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/globals.go#L117-L139",
+      "symbols": ["setGlobalsFromContext"],
+      "meaning": "--json becomes single-line only when stdout is non-TTY"
+    },
+    {
+      "url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go#L28-L49",
+      "symbols": ["printMsg"],
+      "meaning": "non-TTY compaction and exactly one trailing LF"
+    }
+  ],
+  "message_schema": {
+    "fields_in_source_order": ["status", "groupName", "groups", "members", "groupStatus", "groupPolicy"],
+    "required_fields": ["status"],
+    "omitempty_fields": ["groupName", "groups", "members", "groupStatus", "groupPolicy"],
+    "unexported_not_json": ["op"],
+    "status_value": "success"
+  },
+  "modes": {
+    "non_tty": {
+      "argv_requires": "--json",
+      "globalJSONLine": true,
+      "encoding": "compact JSON",
+      "trailing_lf_count": 1
+    },
+    "tty": {
+      "argv_requires": "--json",
+      "globalJSONLine": false,
+      "encoding": "json.MarshalIndent with prefix empty and indent one space",
+      "trailing_lf_count": 1
+    }
+  },
+  "argv": {
+    "add": ["mc", "--json", "admin", "group", "add", "ALIAS", "g1", "alice", "bob"],
+    "remove_members": ["mc", "--json", "admin", "group", "remove", "ALIAS", "g1", "alice", "bob"],
+    "remove_group": ["mc", "--json", "admin", "group", "remove", "ALIAS", "g1"],
+    "info": ["mc", "--json", "admin", "group", "info", "ALIAS", "g1"],
+    "list": ["mc", "--json", "admin", "group", "list", "ALIAS"],
+    "enable": ["mc", "--json", "admin", "group", "enable", "ALIAS", "g1"],
+    "disable": ["mc", "--json", "admin", "group", "disable", "ALIAS", "g1"]
+  },
+  "non_tty_compact_stdout": {
+    "add": "{\"status\":\"success\",\"groupName\":\"g1\",\"members\":[\"alice\",\"bob\"]}\n",
+    "remove_members": "{\"status\":\"success\",\"groupName\":\"g1\",\"members\":[\"alice\",\"bob\"]}\n",
+    "remove_group": "{\"status\":\"success\",\"groupName\":\"g1\"}\n",
+    "info": "{\"status\":\"success\",\"groupName\":\"g1\",\"members\":[\"alice\",\"bob\"],\"groupStatus\":\"enabled\",\"groupPolicy\":\"p-read,p-write\"}\n",
+    "list": "{\"status\":\"success\",\"groups\":[\"a-group\",\"z-group\"]}\n",
+    "empty_list": "{\"status\":\"success\"}\n",
+    "enable": "{\"status\":\"success\",\"groupName\":\"g1\",\"groupStatus\":\"enabled\"}\n",
+    "disable": "{\"status\":\"success\",\"groupName\":\"g1\",\"groupStatus\":\"disabled\"}\n"
+  },
+  "tty_pretty_stdout": {
+    "add": "{\n \"status\": \"success\",\n \"groupName\": \"g1\",\n \"members\": [\n  \"alice\",\n  \"bob\"\n ]\n}\n",
+    "remove_members": "{\n \"status\": \"success\",\n \"groupName\": \"g1\",\n \"members\": [\n  \"alice\",\n  \"bob\"\n ]\n}\n",
+    "remove_group": "{\n \"status\": \"success\",\n \"groupName\": \"g1\"\n}\n",
+    "info": "{\n \"status\": \"success\",\n \"groupName\": \"g1\",\n \"members\": [\n  \"alice\",\n  \"bob\"\n ],\n \"groupStatus\": \"enabled\",\n \"groupPolicy\": \"p-read,p-write\"\n}\n",
+    "list": "{\n \"status\": \"success\",\n \"groups\": [\n  \"a-group\",\n  \"z-group\"\n ]\n}\n",
+    "empty_list": "{\n \"status\": \"success\"\n}\n",
+    "enable": "{\n \"status\": \"success\",\n \"groupName\": \"g1\",\n \"groupStatus\": \"enabled\"\n}\n",
+    "disable": "{\n \"status\": \"success\",\n \"groupName\": \"g1\",\n \"groupStatus\": \"disabled\"\n}\n"
+  }
+}
