@@ -155,7 +155,8 @@ config :logger, :default_formatter,
     # 对账取证：漂移日志必须同时说出本地与权威的内容指纹，否则运维只知道"漂了"，
     # 无从判断是丢广播还是有人直接改了库。
     :config_digest,
-    :config_local_digest
+    :config_local_digest,
+    :config_attention_record
   ]
 
 # Use Jason for JSON parsing in Phoenix

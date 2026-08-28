@@ -167,6 +167,7 @@ defmodule Maxio.Config.Store do
   @pt_namespace Maxio.Config
   @pt_meta {Maxio.Config, :__meta__}
   @pt_subsystems {Maxio.Config, :__subsystems__}
+  @pt_postcommit_attention {Maxio.Config, :__postcommit_attention__}
 
   # 写这三类 term 的**唯一**互斥点（见 moduledoc「快照与它的指纹必须一起落地」）。
   @commit_lock {__MODULE__, :__commit__}
@@ -222,6 +223,19 @@ defmodule Maxio.Config.Store do
   @doc "本节点快照当前持有覆盖值的子系统。"
   @spec loaded_subsystems() :: [atom()]
   def loaded_subsystems, do: :persistent_term.get(@pt_subsystems, [])
+
+  @doc "记录最新一条已归一化的 postcommit 收敛告警，供 status 取证。"
+  @spec note_postcommit_attention(map()) :: :ok
+  def note_postcommit_attention(fields) when is_map(fields) do
+    safe_record = %{
+      subsystem: safe_attention_subsystem(Map.get(fields, :subsystem)),
+      local_reload: safe_local_reload(Map.get(fields, :local_reload)),
+      broadcast: safe_broadcast(Map.get(fields, :broadcast))
+    }
+
+    put_term(@pt_postcommit_attention, safe_record)
+    :ok
+  end
 
   # ── 快照写（低频）──────────────────────────────────────────────────────────
 
@@ -343,6 +357,7 @@ defmodule Maxio.Config.Store do
       Enum.each(loaded_subsystems(), &:persistent_term.erase({@pt_namespace, &1}))
       :persistent_term.erase(@pt_subsystems)
       :persistent_term.erase(@pt_meta)
+      :persistent_term.erase(@pt_postcommit_attention)
     end)
 
     :ok
@@ -446,6 +461,7 @@ defmodule Maxio.Config.Store do
       loaded_at: local.loaded_at,
       last_reload_reason: local.last_reload_reason,
       orphan_config_keys: local.orphan_config_keys,
+      postcommit_attention: postcommit_attention(),
       authoritative: authoritative,
       store_unavailable_reason: unreachable,
       drifted: authoritative != nil and authoritative != local.aggregate
@@ -492,6 +508,17 @@ defmodule Maxio.Config.Store do
   # 一次任意其它子系统的广播即可永久关掉兜底对账（见 moduledoc「为什么没有只重装一个子系统
   # 的装载器」）。subsystem/key 只进 reason，供 `mix maxio.config.status` 取证。
   @impl true
+  def handle_info({:config_changed, subsystem}, state) when is_atom(subsystem) do
+    state =
+      guarded_reload(
+        state,
+        fn -> load_all!(repo: state.repo, reason: {:broadcast, subsystem}) end,
+        "broadcast"
+      )
+
+    {:noreply, state}
+  end
+
   def handle_info({:config_changed, subsystem, key}, state) when is_atom(subsystem) do
     state =
       guarded_reload(
@@ -646,6 +673,22 @@ defmodule Maxio.Config.Store do
   end
 
   defp put_meta(meta), do: :persistent_term.put(@pt_meta, meta)
+
+  defp postcommit_attention,
+    do: :persistent_term.get(@pt_postcommit_attention, nil)
+
+  defp safe_attention_subsystem(subsystem) when is_atom(subsystem), do: subsystem
+  defp safe_attention_subsystem(_subsystem), do: :unknown
+
+  defp safe_local_reload(:ok), do: :ok
+  defp safe_local_reload(:not_needed), do: :not_needed
+  defp safe_local_reload({:error, :reload_failed}), do: {:error, :reload_failed}
+  defp safe_local_reload(_result), do: {:error, :reload_failed}
+
+  defp safe_broadcast(:ok), do: :ok
+  defp safe_broadcast(:not_needed), do: :not_needed
+  defp safe_broadcast({:error, :broadcast_failed}), do: {:error, :broadcast_failed}
+  defp safe_broadcast(_result), do: {:error, :broadcast_failed}
 
   defp repo(opts), do: Keyword.get(opts, :repo, Maxio.Repo)
 

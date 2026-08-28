@@ -47,6 +47,7 @@ defmodule Maxio.Cluster.CacheInvalidator do
       # :persistent_term 快照与周期对账定时器）。这里显式认领成 no-op，只是为了不让
       # 一个**已知**事件掉进下面的 "unknown metadata event" 分支——那条日志的意义是
       # "有人广播了没人认识的东西"，被已知事件污染就失去了诊断价值。
+      {:config_changed, _subsystem} -> :ok
       {:config_changed, _subsystem, _key} -> :ok
       {:principal_policy_changed, _principal_arn} -> :ok
       {:bucket_config_changed, _bucket, _kind} -> :ok

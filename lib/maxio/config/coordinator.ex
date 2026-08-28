@@ -374,21 +374,123 @@ defmodule Maxio.Config.Coordinator do
     |> Enum.map(& &1.key)
   end
 
-  # Task 4 expands postcommit reporting. This task keeps the established synchronous reload and
-  # best-effort notification, but performs each once per committed subsystem batch.
-  defp finish_mutation(%{changed_count: 0} = mutation, _dependencies, _opts),
-    do: {:ok, mutation}
+  defp finish_mutation(%{changed_count: 0} = mutation, _dependencies, _opts) do
+    {:ok,
+     Map.merge(mutation, %{
+       local_reload: :not_needed,
+       broadcast: :not_needed,
+       attention?: false
+     })}
+  end
 
   defp finish_mutation(mutation, dependencies, opts) do
     reason = {:write, mutation.subsystem, mutation.changed_keys}
-    dependencies.store.load_all!(repo: dependencies.repo, reason: reason)
+    local_reload = safe_reload(dependencies.store, dependencies.repo, reason)
+    broadcast = safe_broadcast(dependencies.notify, {:config_changed, mutation.subsystem})
+    attention? = postcommit_failed?(local_reload) or postcommit_failed?(broadcast)
 
-    [first_key | _rest] = mutation.changed_keys
-    dependencies.notify.broadcast({:config_changed, mutation.subsystem, first_key})
+    attention_record =
+      if attention? do
+        safe_record_attention(dependencies.store, %{
+          subsystem: mutation.subsystem,
+          local_reload: local_reload,
+          broadcast: broadcast
+        })
+      else
+        :not_needed
+      end
+
     log_changes(mutation, opts)
+    log_postcommit(mutation, local_reload, broadcast, attention?, attention_record, opts)
 
-    {:ok, mutation}
+    {:ok,
+     Map.merge(mutation, %{
+       local_reload: local_reload,
+       broadcast: broadcast,
+       attention?: attention?
+     })}
   end
+
+  defp safe_reload(store, repo, reason) do
+    case store.load_all!(repo: repo, reason: reason) do
+      :ok -> :ok
+      result when is_map(result) -> :ok
+      _discarded -> {:error, :reload_failed}
+    end
+  rescue
+    _error -> {:error, :reload_failed}
+  catch
+    _kind, _reason -> {:error, :reload_failed}
+  end
+
+  defp safe_broadcast(notify, event) do
+    case notify.broadcast_checked(event) do
+      :ok -> :ok
+      _discarded -> {:error, :broadcast_failed}
+    end
+  rescue
+    _error -> {:error, :broadcast_failed}
+  catch
+    _kind, _reason -> {:error, :broadcast_failed}
+  end
+
+  defp safe_record_attention(store, fields) do
+    case store.note_postcommit_attention(fields) do
+      :ok -> :ok
+      {:error, :unavailable} -> {:error, :recorder_unavailable}
+      {:error, :transport} -> {:error, :recorder_transport_failed}
+      {:error, {:transport, _discarded}} -> {:error, :recorder_transport_failed}
+      {:error, _discarded} -> {:error, :recorder_failed}
+      _unexpected -> {:error, :recorder_failed}
+    end
+  rescue
+    _error -> {:error, :recorder_raised}
+  catch
+    :exit, _reason -> {:error, :recorder_exited}
+    _kind, _reason -> {:error, :recorder_failed}
+  end
+
+  defp postcommit_failed?({:error, _reason}), do: true
+  defp postcommit_failed?(_result), do: false
+
+  defp log_postcommit(_mutation, _local_reload, _broadcast, false, _attention_record, _opts),
+    do: :ok
+
+  defp log_postcommit(mutation, local_reload, broadcast, true, attention_record, opts) do
+    fields = [
+      action: "config_postcommit_attention",
+      reason: postcommit_failure_reason(local_reload, broadcast),
+      code: "ConfigPostcommitAttention",
+      config_subsystem: Atom.to_string(mutation.subsystem),
+      config_attention_record: attention_record_metadata(attention_record),
+      principal_arn: Keyword.get(opts, :principal_arn),
+      access_key_id: Keyword.get(opts, :access_key_id),
+      auth_type: Keyword.get(opts, :auth_type),
+      request_id: Keyword.get(opts, :request_id)
+    ]
+
+    message =
+      "runtime config committed but postcommit convergence requires operator attention"
+
+    if postcommit_failed?(local_reload) do
+      Log.error(message, fields)
+    else
+      Log.warn(message, fields)
+    end
+  end
+
+  defp postcommit_failure_reason({:error, :reload_failed}, {:error, :broadcast_failed}),
+    do: :reload_and_broadcast_failed
+
+  defp postcommit_failure_reason({:error, :reload_failed}, _broadcast), do: :reload_failed
+
+  defp postcommit_failure_reason(_local_reload, {:error, :broadcast_failed}),
+    do: :broadcast_failed
+
+  defp attention_record_metadata(:ok), do: :ok
+  defp attention_record_metadata(:not_needed), do: :not_needed
+  defp attention_record_metadata({:error, reason}) when is_atom(reason), do: reason
+  defp attention_record_metadata(_unexpected), do: :recorder_failed
 
   defp log_changes(mutation, opts) do
     Enum.each(mutation.changed_keys, fn key ->
