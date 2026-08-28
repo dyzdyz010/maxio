@@ -100,11 +100,15 @@ defmodule Maxio.Test.SigV4Request do
       |> Map.put(:host, host)
       |> put_private(:maxio_now, now)
 
-    # host 不经 put_req_header（Plug.Test 禁止），已由 conn.host 承载并参与签名。
-    base_headers
-    |> Enum.reject(fn {k, _v} -> k == "host" end)
-    |> Enum.reduce(conn, fn {k, v}, acc -> put_req_header(acc, k, v) end)
-    |> put_req_header("authorization", auth)
+    # host 不进 req_headers（Plug.Test 禁止），已由 conn.host 承载并参与签名。
+    # 其余已签名 header 必须逐项、按原顺序进入 raw req_headers；put_req_header/3 会按
+    # 名字替换，导致重复 header 的 wire 表示与 canonical request 不一致。
+    req_headers =
+      base_headers
+      |> Enum.reject(fn {k, _v} -> k in ["host", "authorization"] end)
+      |> Kernel.++([{"authorization", auth}])
+
+    %{conn | req_headers: req_headers}
   end
 
   @doc """
