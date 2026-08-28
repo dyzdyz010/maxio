@@ -10,7 +10,6 @@ defmodule Maxio.Admin.UserAdapter do
   alias Maxio.IAM
 
   @user_name_pattern ~r/\A[A-Za-z0-9+=.@_-]{1,64}\z/
-  @access_key_pattern ~r/\A[A-Za-z0-9+.@_-]{3,64}\z/
 
   @type reason :: :invalid_argument | :invalid_resource_name | :user_not_found | term()
 
@@ -142,11 +141,7 @@ defmodule Maxio.Admin.UserAdapter do
   def project(_user, _sources), do: {:error, :invalid_argument}
 
   defp validate_access_key(access_key) when is_binary(access_key) do
-    if Regex.match?(@access_key_pattern, access_key) do
-      :ok
-    else
-      {:error, :invalid_access_key}
-    end
+    IAM.validate_minio_access_key(access_key)
   end
 
   defp validate_access_key(_access_key), do: {:error, :invalid_access_key}

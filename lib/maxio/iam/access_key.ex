@@ -3,6 +3,8 @@ defmodule Maxio.IAM.AccessKey do
   use Ecto.Schema
   import Ecto.Changeset
 
+  alias Maxio.IAM.MinioAccessKey
+
   @type t :: %__MODULE__{}
 
   @derive {Inspect, except: [:secret_key]}
@@ -29,11 +31,24 @@ defmodule Maxio.IAM.AccessKey do
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(ak, attrs) do
     ak
+    |> base_changeset(attrs)
+    |> validate_principal_arn()
+  end
+
+  @doc false
+  @spec minio_admin_changeset(t(), map()) :: Ecto.Changeset.t()
+  def minio_admin_changeset(ak, attrs) do
+    ak
+    |> base_changeset(attrs)
+    |> validate_minio_admin_principal_arn()
+  end
+
+  defp base_changeset(ak, attrs) do
+    ak
     |> cast(attrs, @required ++ @optional)
     |> validate_required(@required)
     |> validate_inclusion(:type, ["root", "iam_user"])
     |> validate_inclusion(:status, ["active", "inactive", "expired"])
-    |> validate_principal_arn()
     |> unique_constraint(:access_key_id, name: :access_keys_access_key_id_index)
   end
 
@@ -57,4 +72,17 @@ defmodule Maxio.IAM.AccessKey do
     do: Regex.match?(@user_arn_pattern, principal_arn)
 
   defp user_arn?(_principal_arn), do: false
+
+  defp validate_minio_admin_principal_arn(changeset) do
+    access_key_id = get_field(changeset, :access_key_id)
+    principal_arn = get_field(changeset, :principal_arn)
+    expected_arn = if is_binary(access_key_id), do: "arn:aws:iam:::user/#{access_key_id}"
+
+    if get_field(changeset, :type) == "iam_user" and principal_arn == expected_arn and
+         MinioAccessKey.validate(access_key_id) == :ok do
+      changeset
+    else
+      add_error(changeset, :principal_arn, "must match the MinIO access key principal")
+    end
+  end
 end

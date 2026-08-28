@@ -431,6 +431,15 @@ defmodule Maxio.STSTest do
                session_access_key_id: session_key,
                duration_seconds: 900
              )
+
+    assert {:ok, _revoked} = STS.revoke_session(session_key)
+
+    assert {:error, :access_key_id_conflict} =
+             STS.issue_session(
+               issuer_access_key_id: issuer.access_key_id,
+               session_access_key_id: session_key,
+               duration_seconds: 900
+             )
   end
 
   test "issue_session insert errors are sanitized and do not leak secret material" do

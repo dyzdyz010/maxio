@@ -142,6 +142,143 @@ defmodule Maxio.IAM.MinioAdminUserTest do
     refute_receive {:iam_changed, _target}
   end
 
+  test "U1 and STS serialize the same exact credential id without cross-table shadowing" do
+    issuer_key = unique_access_key("RACEISSUER")
+    access_key = unique_access_key("RACENAMESPACE")
+    user_secret = "concurrent-user-secret"
+    session_secret = "concurrent-session-secret"
+    session_token = "concurrent-session-token"
+
+    on_exit(fn ->
+      unboxed(fn ->
+        Repo.delete_all(from(s in STSSession, where: s.access_key_id == ^access_key))
+        Repo.delete_all(from(a in AccessKey, where: a.access_key_id in ^[access_key, issuer_key]))
+        Repo.delete_all(from(u in User, where: u.user_name == ^access_key))
+      end)
+    end)
+
+    assert {:ok, issuer} =
+             unboxed(fn ->
+               IAM.create_access_key(
+                 access_key_id: issuer_key,
+                 secret_key: "concurrent-issuer-secret"
+               )
+             end)
+
+    flush_iam_events()
+    owner = self()
+    barrier_ref = make_ref()
+    handler_id = {__MODULE__, barrier_ref}
+    query_handler_id = {__MODULE__, {:query, barrier_ref}}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:maxio, :iam, :credential_namespace, :lock_wait],
+        fn _event, _measurements, metadata, {test_pid, ref, target_access_key} ->
+          if metadata.access_key_id == target_access_key do
+            send(test_pid, {:namespace_lock_wait, ref, self()})
+
+            receive do
+              {:release_namespace_lock, ^ref} -> :ok
+            after
+              5_000 -> raise "credential namespace barrier timed out"
+            end
+          end
+        end,
+        {owner, barrier_ref, access_key}
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        query_handler_id,
+        [:maxio, :repo, :query],
+        fn _event, _measurements, metadata, {test_pid, ref, target_access_key} ->
+          if String.contains?(metadata.query, "pg_advisory_xact_lock") and
+               target_access_key in metadata.params do
+            send(test_pid, {:namespace_lock_acquired, ref, self()})
+          end
+        end,
+        {owner, barrier_ref, access_key}
+      )
+
+    on_exit(fn -> :telemetry.detach(query_handler_id) end)
+
+    user_task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          {:user, IAM.create_minio_user_strict(access_key, user_secret, "active")}
+        end)
+      end)
+
+    session_task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          {:session,
+           STS.issue_session(
+             issuer_access_key_id: issuer.access_key_id,
+             session_access_key_id: access_key,
+             secret_key: session_secret,
+             session_token: session_token,
+             duration_seconds: 900
+           )}
+        end)
+      end)
+
+    waiting_pids =
+      for _task <- [user_task, session_task] do
+        assert_receive {:namespace_lock_wait, ^barrier_ref, pid}, 5_000
+        pid
+      end
+
+    Enum.each(waiting_pids, &send(&1, {:release_namespace_lock, barrier_ref}))
+
+    results = [Task.await(user_task, 30_000), Task.await(session_task, 30_000)]
+    user_result = Keyword.fetch!(results, :user)
+    session_result = Keyword.fetch!(results, :session)
+
+    lock_pids =
+      for _task <- [user_task, session_task] do
+        assert_receive {:namespace_lock_acquired, ^barrier_ref, pid}, 5_000
+        pid
+      end
+
+    assert MapSet.size(MapSet.new(lock_pids)) == 2
+    refute_receive {:namespace_lock_acquired, ^barrier_ref, _extra}
+
+    access_key_count =
+      Repo.aggregate(from(a in AccessKey, where: a.access_key_id == ^access_key), :count)
+
+    session_count =
+      Repo.aggregate(from(s in STSSession, where: s.access_key_id == ^access_key), :count)
+
+    assert access_key_count + session_count == 1
+    refute access_key_count == 1 and session_count == 1
+
+    assert Repo.aggregate(from(u in User, where: u.user_name == ^access_key), :count) ==
+             access_key_count
+
+    case {user_result, session_result} do
+      {{:ok, _user}, {:error, :access_key_id_conflict}} ->
+        assert {:ok, %{secret_key: ^user_secret}} = EctoStore.get_secret(access_key)
+
+      {{:error, :user_already_exists}, {:ok, session}} ->
+        assert {:ok, %{secret_key: ^session_secret}} =
+                 EctoStore.get_secret(access_key,
+                   session_token: session_token,
+                   now: DateTime.add(session.issued_at, 1, :second)
+                 )
+
+      other ->
+        flunk("expected exactly one namespace winner, got: #{inspect(other)}")
+    end
+
+    assert_receive {:iam_changed, ^access_key}
+    refute_receive {:iam_changed, _other}
+  end
+
   test "two concurrent same-name creates commit exactly one pair and one notification" do
     access_key = unique_access_key("RACE")
     parent = self()
@@ -204,6 +341,11 @@ defmodule Maxio.IAM.MinioAdminUserTest do
     after
       0 -> :ok
     end
+  end
+
+  defp unboxed(fun) do
+    Task.async(fn -> Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fun) end)
+    |> Task.await(30_000)
   end
 
   defp unique_access_key(prefix) do

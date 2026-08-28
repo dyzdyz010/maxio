@@ -3,6 +3,8 @@ defmodule Maxio.IAM.User do
   use Ecto.Schema
   import Ecto.Changeset
 
+  alias Maxio.IAM.MinioAccessKey
+
   @type t :: %__MODULE__{}
 
   @primary_key {:id, :binary_id, autogenerate: true}
@@ -42,6 +44,33 @@ defmodule Maxio.IAM.User do
     |> unique_constraint(:user_name, name: :iam_users_user_name_index)
     |> unique_constraint(:user_name, name: :iam_users_user_name_ci_index)
     |> unique_constraint(:user_arn, name: :iam_users_user_arn_index)
+  end
+
+  @doc false
+  @spec minio_admin_changeset(t(), map()) :: Ecto.Changeset.t()
+  def minio_admin_changeset(user, attrs) do
+    user
+    |> cast(attrs, @required ++ @optional)
+    |> validate_required(@required)
+    |> validate_minio_access_key()
+    |> validate_length(:user_arn, min: 1, max: 512)
+    |> validate_length(:permissions_boundary_policy_arn, max: 2048)
+    |> validate_format(:permissions_boundary_policy_arn, @managed_policy_arn_pattern)
+    |> validate_arn_matches_name(:user_arn, :user_name, "user")
+    |> validate_inclusion(:status, ["active", "inactive"])
+    |> validate_tags()
+    |> unique_constraint(:user_name, name: :iam_users_user_name_index)
+    |> unique_constraint(:user_name, name: :iam_users_user_name_ci_index)
+    |> unique_constraint(:user_arn, name: :iam_users_user_arn_index)
+  end
+
+  defp validate_minio_access_key(changeset) do
+    validate_change(changeset, :user_name, fn :user_name, value ->
+      case MinioAccessKey.validate(value) do
+        :ok -> []
+        {:error, :invalid_access_key} -> [user_name: "must be a valid MinIO access key"]
+      end
+    end)
   end
 
   defp validate_tags(changeset) do

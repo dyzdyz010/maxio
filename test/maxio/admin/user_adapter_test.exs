@@ -4,6 +4,7 @@ defmodule Maxio.Admin.UserAdapterTest do
   import ExUnit.CaptureLog
 
   alias Maxio.Admin.UserAdapter
+  alias Maxio.Auth.CredentialStore.EctoStore
   alias Maxio.IAM
 
   test "adds only valid enabled new users without exposing the supplied secret" do
@@ -27,6 +28,10 @@ defmodule Maxio.Admin.UserAdapterTest do
 
     for valid <- [
           "a1b",
+          "a!b",
+          "a#b",
+          "a:b",
+          "a b",
           String.duplicate("A", 20),
           String.duplicate("B", 21),
           String.duplicate("C", 64)
@@ -37,14 +42,30 @@ defmodule Maxio.Admin.UserAdapterTest do
                  policy: "",
                  status: "enabled"
                })
+
+      assert {:ok, %{secret_key: "12345678"}} = EctoStore.get_secret(valid)
     end
 
     for invalid <- [
           nil,
           "",
           "aa",
-          "contains space",
+          " abc",
+          "abc ",
+          "a\tb",
+          "a\nb",
+          ",ab",
+          "a,b",
+          "ab,",
+          "=ab",
           "abc=def",
+          "ab=",
+          "/ab",
+          "a/b",
+          "ab/",
+          "\\ab",
+          "a\\b",
+          "ab\\",
           "abé",
           String.duplicate("D", 65)
         ] do

@@ -13,7 +13,7 @@ defmodule Maxio.STS do
   alias Maxio.Auth.SessionToken
   alias Maxio.Cluster.Notify
   alias Maxio.IAM
-  alias Maxio.IAM.{AccessKey, STSSession, STSSessionSecret}
+  alias Maxio.IAM.{AccessKey, CredentialNamespace, STSSession, STSSessionSecret}
   alias Maxio.Policy.{Evaluator, RequestContext, Statement, Store}
   alias Maxio.Repo
   alias Maxio.Tags
@@ -76,7 +76,7 @@ defmodule Maxio.STS do
           mfa_serial_hash: Keyword.get(opts, :mfa_serial_hash)
         }
 
-        case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
+        case persist_session(attrs) do
           {:ok, session} ->
             Notify.broadcast({:iam_changed, session.access_key_id})
 
@@ -85,8 +85,8 @@ defmodule Maxio.STS do
              |> public_session()
              |> Map.merge(%{secret_key: secret_key, session_token: session_token})}
 
-          {:error, changeset} ->
-            {:error, sanitize_changeset_errors(changeset)}
+          {:error, reason} ->
+            {:error, reason}
         end
       end
     end
@@ -163,7 +163,7 @@ defmodule Maxio.STS do
           mfa_serial_hash: Map.get(mfa_context, :serial_hash)
         }
 
-        case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
+        case persist_session(attrs) do
           {:ok, session} ->
             Notify.broadcast({:iam_changed, session.access_key_id})
 
@@ -178,8 +178,8 @@ defmodule Maxio.STS do
                assumed_role_id: assumed_role_id(role, session_name)
              })}
 
-          {:error, changeset} ->
-            {:error, sanitize_changeset_errors(changeset)}
+          {:error, reason} ->
+            {:error, reason}
         end
       end
     end
@@ -247,7 +247,7 @@ defmodule Maxio.STS do
           web_identity_audience: web_identity.audience
         }
 
-        case %STSSession{} |> STSSession.changeset(attrs) |> Repo.insert() do
+        case persist_session(attrs) do
           {:ok, session} ->
             Notify.broadcast({:iam_changed, session.access_key_id})
 
@@ -266,8 +266,8 @@ defmodule Maxio.STS do
                web_identity_provider_arn: web_identity.provider_arn
              })}
 
-          {:error, changeset} ->
-            {:error, sanitize_changeset_errors(changeset)}
+          {:error, reason} ->
+            {:error, reason}
         end
       end
     end
@@ -1593,16 +1593,38 @@ defmodule Maxio.STS do
   defp session_access_key_id(opts) do
     access_key_id = Keyword.get(opts, :session_access_key_id) || gen_session_access_key_id()
 
-    if access_key_available?(access_key_id) do
-      {:ok, access_key_id}
-    else
-      {:error, :access_key_id_conflict}
+    case access_key_id do
+      access_key_id when is_binary(access_key_id) -> {:ok, access_key_id}
+      _other -> {:error, :invalid_access_key_id}
     end
   end
 
-  defp access_key_available?(access_key_id) do
-    is_nil(Repo.get_by(AccessKey, access_key_id: access_key_id)) and
-      is_nil(Repo.get_by(STSSession, access_key_id: access_key_id))
+  defp persist_session(attrs) do
+    access_key_id = Map.fetch!(attrs, :access_key_id)
+    changeset = STSSession.changeset(%STSSession{}, attrs)
+
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:credential_namespace, fn repo, _changes ->
+      case CredentialNamespace.reserve_exact(repo, access_key_id) do
+        :ok -> {:ok, :available}
+        {:error, :access_key_id_conflict} = error -> error
+      end
+    end)
+    |> Ecto.Multi.insert(:session, changeset)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{session: session}} ->
+        {:ok, session}
+
+      {:error, :credential_namespace, :access_key_id_conflict, _changes} ->
+        {:error, :access_key_id_conflict}
+
+      {:error, :session, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, sanitize_changeset_errors(changeset)}
+
+      {:error, _operation, reason, _changes} ->
+        {:error, reason}
+    end
   end
 
   defp maybe_filter(query, _field, nil), do: query

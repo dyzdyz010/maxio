@@ -14,12 +14,14 @@ defmodule Maxio.IAM do
     AccountPasswordPolicy,
     AccessKey,
     AccessKeySecret,
+    CredentialNamespace,
     Group,
     GroupManagedPolicyAttachment,
     GroupMembership,
     InstanceProfile,
     MFADevice,
     MFASecret,
+    MinioAccessKey,
     OIDCProvider,
     OIDCProviderRefresh,
     Role,
@@ -822,6 +824,10 @@ defmodule Maxio.IAM do
   @spec user_arn(String.t()) :: String.t()
   def user_arn(user_name), do: "arn:aws:iam:::user/#{user_name}"
 
+  @doc false
+  @spec validate_minio_access_key(term()) :: :ok | {:error, :invalid_access_key}
+  def validate_minio_access_key(access_key), do: MinioAccessKey.validate(access_key)
+
   @doc """
   Returns whether an IAM-user principal ARN may authenticate.
 
@@ -856,7 +862,7 @@ defmodule Maxio.IAM do
 
     with {:ok, stored_secret} <- AccessKeySecret.wrap(secret_key, access_key_id) do
       user_changeset =
-        User.changeset(%User{}, %{
+        User.minio_admin_changeset(%User{}, %{
           user_name: access_key_id,
           user_arn: user_arn,
           status: "active",
@@ -864,7 +870,7 @@ defmodule Maxio.IAM do
         })
 
       access_key_changeset =
-        AccessKey.changeset(%AccessKey{}, %{
+        AccessKey.minio_admin_changeset(%AccessKey{}, %{
           access_key_id: access_key_id,
           secret_key: stored_secret,
           principal_arn: user_arn,
@@ -874,16 +880,12 @@ defmodule Maxio.IAM do
         })
 
       Ecto.Multi.new()
-      |> Ecto.Multi.run(:locks, fn _repo, _changes ->
+      |> Ecto.Multi.run(:locks, fn repo, _changes ->
         lock_minio_user_identity!(String.downcase(access_key_id))
-        lock_minio_access_key!(access_key_id)
-        {:ok, :locked}
-      end)
-      |> Ecto.Multi.run(:credential_namespace, fn repo, _changes ->
-        if credential_access_key_exists?(repo, access_key_id) do
-          {:error, :user_already_exists}
-        else
-          {:ok, :available}
+
+        case CredentialNamespace.reserve_exact(repo, access_key_id) do
+          :ok -> {:ok, :locked}
+          {:error, :access_key_id_conflict} -> {:error, :user_already_exists}
         end
       end)
       |> Ecto.Multi.run(:identity, fn _repo, _changes ->
@@ -3855,7 +3857,7 @@ defmodule Maxio.IAM do
   # 合并成一个总函数：判定逐字保留（二进制且匹配本地 user ARN 形态才继续），
   # 其余一切仍被同一个结构化错误拒绝，且这条分支现在真正可达。
   defp validate_access_key_user_arn(user_arn, access_key_id) do
-    if is_binary(user_arn) and Regex.match?(@local_user_arn_pattern, user_arn) do
+    if local_user_arn?(user_arn) do
       validate_existing_access_key_user_arn(user_arn, access_key_id)
     else
       {:error, :invalid_principal_arn}
@@ -3913,8 +3915,9 @@ defmodule Maxio.IAM do
 
   defp public_active_access_key_principal(%AccessKey{}), do: :error
 
-  defp local_user_arn?(principal_arn) when is_binary(principal_arn) do
-    Regex.match?(@local_user_arn_pattern, principal_arn)
+  defp local_user_arn?("arn:aws:iam:::user/" <> user_name = principal_arn) do
+    Regex.match?(@local_user_arn_pattern, principal_arn) or
+      MinioAccessKey.validate(user_name) == :ok
   end
 
   defp local_user_arn?(_principal_arn), do: false
@@ -5430,7 +5433,7 @@ defmodule Maxio.IAM do
        do: {:error, :user_already_exists}
 
   defp minio_user_transaction_result(
-         {:error, :credential_namespace, :user_already_exists, _changes},
+         {:error, :locks, :user_already_exists, _changes},
          _access_key_id
        ),
        do: {:error, :user_already_exists}
@@ -5482,21 +5485,6 @@ defmodule Maxio.IAM do
     )
 
     :ok
-  end
-
-  defp lock_minio_access_key!(access_key_id) do
-    Ecto.Adapters.SQL.query!(
-      Repo,
-      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      ["maxio.access_keys.exact", access_key_id]
-    )
-
-    :ok
-  end
-
-  defp credential_access_key_exists?(repo, access_key_id) do
-    repo.exists?(from(a in AccessKey, where: a.access_key_id == ^access_key_id)) or
-      repo.exists?(from(s in STSSession, where: s.access_key_id == ^access_key_id))
   end
 
   defp lock_signing_certificate_principal!(principal_key) do
