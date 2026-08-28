@@ -114,4 +114,19 @@ defmodule Maxio.Admin.AuthzTest do
 
     assert {:error, _reason} = Authz.authorize(conn(), principal(), @action)
   end
+
+  test "admin:GetUser uses the same exact-action identity-only boundary" do
+    put_key()
+    allow_identity!()
+    assert {:error, _reason} = Authz.authorize(conn(), principal(), "admin:GetUser")
+
+    :ok =
+      Store.put_principal_policy(
+        @arn,
+        "admin-user-info",
+        ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"admin:GetUser"}]})
+      )
+
+    assert Authz.authorize(conn(), principal(), "admin:GetUser") == :ok
+  end
 end

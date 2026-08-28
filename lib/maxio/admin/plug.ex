@@ -26,6 +26,7 @@ defmodule Maxio.Admin.Plug do
   | `/minio/admin/v3/list-canned-policies` | GET | `admin:ListUserPolicies` | 200 明文 JSON |
   | `/minio/admin/v3/info-canned-policy` | GET | `admin:GetPolicy` | 200 明文 JSON |
   | `/minio/admin/v3/remove-canned-policy` | DELETE | `admin:DeletePolicy` | 200 空 body |
+  | `/minio/admin/v3/user-info` | GET | `admin:GetUser` | 200 明文 JSON `UserInfo` |
 
   其余一切 `/minio/admin/*`（含 `/minio/admin/v4/*`）落 501 `NotImplemented`(JSON)；
   匿名请求一律 403 `AccessDenied`(JSON)。
@@ -44,7 +45,16 @@ defmodule Maxio.Admin.Plug do
 
   import Plug.Conn
 
-  alias Maxio.Admin.{Authz, ErrorMap, ErrorView, PolicyAdapter, PolicyRequest, ServerInfo}
+  alias Maxio.Admin.{
+    Authz,
+    ErrorMap,
+    ErrorView,
+    PolicyAdapter,
+    PolicyRequest,
+    ServerInfo,
+    UserAdapter
+  }
+
   alias Maxio.S3.{Error, Log, PipelineOrderError, RawPath, ReservedNamespace}
 
   @behaviour Plug
@@ -120,6 +130,8 @@ defmodule Maxio.Admin.Plug do
   defp dispatch(conn, "DELETE", "/minio/admin/v3/remove-canned-policy"),
     do: remove_policy(conn)
 
+  defp dispatch(conn, "GET", "/minio/admin/v3/user-info"), do: user_info(conn)
+
   defp dispatch(conn, _method, path) do
     render_not_implemented(conn, path)
   end
@@ -183,17 +195,36 @@ defmodule Maxio.Admin.Plug do
     end)
   end
 
+  defp user_info(conn) do
+    authorize_and_run(
+      conn,
+      "admin:GetUser",
+      "admin_user_info",
+      [target_user: conn.query_params["accessKey"]],
+      fn conn ->
+        case UserAdapter.info(conn.query_params["accessKey"]) do
+          {:ok, result} -> send_json(conn, result.wire)
+          {:error, reason} -> render_error(conn, ErrorMap.from_reason(reason))
+        end
+      end
+    )
+  end
+
   defp authorize_and_run(conn, required_action, admin_action, callback) do
+    authorize_and_run(conn, required_action, admin_action, [], callback)
+  end
+
+  defp authorize_and_run(conn, required_action, admin_action, target_metadata, callback) do
     metadata =
-      policy_log_metadata(conn, required_action, admin_action)
+      admin_log_metadata(conn, required_action, admin_action, target_metadata)
 
     case Authz.authorize(conn, conn.assigns[:principal], required_action) do
       :ok ->
-        Log.info("admin policy request authorized", [{:decision, "allow"} | metadata])
+        Log.info("admin request authorized", [{:decision, "allow"} | metadata])
         callback.(conn)
 
       {:error, reason} ->
-        Log.warn("admin policy request denied", [
+        Log.warn("admin request denied", [
           {:decision, "deny"},
           {:reason, to_string(reason)}
           | metadata
@@ -203,12 +234,11 @@ defmodule Maxio.Admin.Plug do
     end
   end
 
-  defp policy_log_metadata(conn, required_action, admin_action) do
-    [
+  defp admin_log_metadata(conn, required_action, admin_action, target_metadata) do
+    base = [
       action: admin_action,
       admin_action: admin_action,
       admin_endpoint: RawPath.decoded_path(conn),
-      target_policy: conn.query_params["name"],
       required_action: required_action,
       method: conn.method,
       resource: RawPath.decoded_path(conn),
@@ -217,6 +247,15 @@ defmodule Maxio.Admin.Plug do
       principal_arn: principal_arn(conn),
       surface: conn.assigns[:maxio_surface]
     ]
+
+    default_target =
+      if String.starts_with?(admin_action, "admin_policy_") do
+        [target_policy: conn.query_params["name"]]
+      else
+        []
+      end
+
+    target_metadata ++ default_target ++ base
   end
 
   defp send_json(conn, body) do
