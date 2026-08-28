@@ -52,6 +52,15 @@ defmodule Maxio.Compat.ExternalSmoke do
     end
   end
 
+  @doc false
+  def mc_output_exact?(actual, expected, os_type \\ :os.type())
+
+  def mc_output_exact?(actual, expected, {:win32, _name}) do
+    String.replace(actual, "\r\n", "\n") == expected
+  end
+
+  def mc_output_exact?(actual, expected, _os_type), do: actual == expected
+
   def run(config, opts \\ []) do
     config = normalize_config(config)
     system_env = Keyword.get(opts, :system_env, System.get_env())
@@ -792,7 +801,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         executable,
         base_args ++ ["admin", "user", "disable", "maxiocompat", user_name],
         opts,
-        {:output_equals, "Disabled user `#{user_name}` successfully."},
+        {:output_exact, "Disabled user `#{user_name}` successfully.\n"},
         scenario: "admin_user_human_lifecycle",
         assertion: "mc disables the temporary user"
       ),
@@ -817,7 +826,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         executable,
         base_args ++ ["admin", "user", "enable", "maxiocompat", user_name],
         opts,
-        {:output_equals, "Enabled user `#{user_name}` successfully."},
+        {:output_exact, "Enabled user `#{user_name}` successfully.\n"},
         scenario: "admin_user_human_lifecycle",
         assertion: "mc re-enables the temporary user"
       ),
@@ -842,7 +851,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         executable,
         base_args ++ ["admin", "user", "remove", "maxiocompat", user_name],
         opts,
-        {:output_equals, "Removed user `#{user_name}` successfully."},
+        {:output_exact, "Removed user `#{user_name}` successfully.\n"},
         scenario: "admin_user_human_lifecycle",
         assertion: "mc removes the temporary user"
       ),
@@ -918,7 +927,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "info",
         user_name,
-        %{"accessKey" => user_name, "status" => "enabled"}
+        %{"accessKey" => user_name, "status" => "success", "userStatus" => "enabled"}
       ),
       local_step(
         "admin_user_json_s3_enabled",
@@ -943,7 +952,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "info",
         user_name,
-        %{"accessKey" => user_name, "status" => "disabled"}
+        %{"accessKey" => user_name, "status" => "success", "userStatus" => "disabled"}
       ),
       local_step(
         "admin_user_json_s3_disabled",
@@ -968,7 +977,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         opts,
         "info",
         user_name,
-        %{"accessKey" => user_name, "status" => "enabled"}
+        %{"accessKey" => user_name, "status" => "success", "userStatus" => "enabled"}
       ),
       local_step(
         "admin_user_json_s3_reenabled",
@@ -1166,7 +1175,8 @@ defmodule Maxio.Compat.ExternalSmoke do
         verify_step({:output_contains, expected_stderr_values}, stderr)
 
       {:expected_streams, _exit_status, expected_stdout, expected_stderr} ->
-        if output == expected_stdout and stderr == expected_stderr do
+        if mc_output_exact?(output, expected_stdout) and
+             mc_output_exact?(stderr, expected_stderr) do
           :ok
         else
           {:error, "external_smoke_stream_mismatch", "stdout/stderr did not exactly match"}
@@ -1189,7 +1199,7 @@ defmodule Maxio.Compat.ExternalSmoke do
   defp verify_step({:json_object, expected}, output) do
     case Jason.decode(output) do
       {:ok, decoded} when is_map(decoded) ->
-        if Enum.all?(expected, fn {key, value} -> Map.get(decoded, key) == value end) do
+        if decoded == expected do
           :ok
         else
           {:error, "external_smoke_json_mismatch", "decoded object fields did not match"}
@@ -1239,7 +1249,7 @@ defmodule Maxio.Compat.ExternalSmoke do
   end
 
   defp verify_step({:output_exact, expected}, output) when is_binary(output) do
-    if output == expected do
+    if mc_output_exact?(output, expected) do
       :ok
     else
       {:error, "external_smoke_output_mismatch", "mc output did not exactly match"}
@@ -1436,12 +1446,12 @@ defmodule Maxio.Compat.ExternalSmoke do
   end
 
   defp human_user_info(user_name, status) do
-    "AccessKey: #{user_name}\nStatus: #{status}\nPolicyName: \nMemberOf: []"
+    "AccessKey: #{user_name}\nStatus: #{status}\nPolicyName: \nMemberOf: []\n"
   end
 
   defp no_such_user_stderr(user_name) do
     "mc: <ERROR> Unable to remove #{user_name}. " <>
-      "The specified user does not exist. (Specified user does not exist)."
+      "The specified user does not exist. (Specified user does not exist).\n"
   end
 
   defp boto3_env(config, paths) do

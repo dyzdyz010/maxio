@@ -267,7 +267,11 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             status =
               if Process.get(:admin_fixture_status) == :disabled, do: "disabled", else: "enabled"
 
-            {Jason.encode!(%{"accessKey" => user_name, "status" => status}), "", 0}
+            {Jason.encode!(%{
+               "accessKey" => user_name,
+               "status" => "success",
+               "userStatus" => status
+             }), "", 0}
           else
             status =
               if user_name != @config.access_key and
@@ -286,7 +290,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           if json? do
             {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}), "", 0}
           else
-            {"Disabled user `#{user_name}` successfully.", "", 0}
+            {"Disabled user `#{user_name}` successfully.\n", "", 0}
           end
 
         subcommand == "admin" and
@@ -297,7 +301,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           if json? do
             {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}), "", 0}
           else
-            {"Enabled user `#{user_name}` successfully.", "", 0}
+            {"Enabled user `#{user_name}` successfully.\n", "", 0}
           end
 
         subcommand == "admin" and
@@ -306,7 +310,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
           if user_name == @config.access_key or Process.get(:admin_fixture_status) == :removed do
             {"",
-             "mc: <ERROR> Unable to remove #{user_name}. The specified user does not exist. (Specified user does not exist).",
+             "mc: <ERROR> Unable to remove #{user_name}. The specified user does not exist. (Specified user does not exist).\n",
              1}
           else
             Process.put(:admin_fixture_status, :removed)
@@ -314,7 +318,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             if json? do
               {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}), "", 0}
             else
-              {"Removed user `#{user_name}` successfully.", "", 0}
+              {"Removed user `#{user_name}` successfully.\n", "", 0}
             end
           end
 
@@ -717,7 +721,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   end
 
   test "human info rejects contradictory status text instead of substring matching" do
-    runner = successful_mc_runner(admin_user_info: {"Status: enabled\nStatus: disabled", 0})
+    runner = successful_mc_runner(admin_user_info: {"Status: enabled\nStatus: disabled\n", 0})
 
     [entry] =
       @config
@@ -755,6 +759,152 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     assert entry["status"] == "blocked"
     assert hd(entry["blockers"])["step"] == "admin_user_human_remove_again"
+  end
+
+  test "human info rejects an otherwise exact four-line response without its trailing LF" do
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      case {base_runner.(command, args, opts), json_mode?(args), admin_user_action(args)} do
+        {{stdout, 0}, false, "info"} ->
+          {String.trim_trailing(stdout, "\n"), 0}
+
+        {other, _json?, _action} ->
+          other
+      end
+    end
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    assert entry["status"] == "blocked"
+    assert hd(entry["blockers"])["step"] == "admin_user_info"
+  end
+
+  test "human no-such-user stderr rejects an otherwise exact response without its trailing LF" do
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      case base_runner.(command, args, opts) do
+        {"", stderr, 1} -> {"", String.trim_trailing(stderr, "\n"), 1}
+        other -> other
+      end
+    end
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    assert entry["status"] == "blocked"
+    assert hd(entry["blockers"])["step"] == "admin_user_human_remove_again"
+  end
+
+  test "human exact-output full lifecycle uses the host-native line ending" do
+    base_runner = successful_mc_runner()
+    line_ending = if match?({:win32, _name}, :os.type()), do: "\r\n", else: "\n"
+
+    runner = fn command, args, opts ->
+      case {base_runner.(command, args, opts), json_mode?(args), admin_user_action(args)} do
+        {{stdout, 0}, false, action} when action in ["info", "disable", "enable"] ->
+          {String.trim_trailing(stdout, "\n") <> line_ending, 0}
+
+        {{stdout, "", 0}, false, "remove"} ->
+          {String.trim_trailing(stdout, "\n") <> line_ending, "", 0}
+
+        {{"", stderr, 1}, _json?, "remove"} ->
+          {"", String.trim_trailing(stderr, "\n") <> line_ending, 1}
+
+        {other, _json?, _action} ->
+          other
+      end
+    end
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    assert entry["status"] == "ok"
+  end
+
+  test "canonical human matcher accepts CRLF only for Windows and preserves exact LF framing" do
+    expected = "Disabled user `fixture-user` successfully.\n"
+
+    assert ExternalSmoke.mc_output_exact?(
+             "Disabled user `fixture-user` successfully.\r\n",
+             expected,
+             {:win32, :nt}
+           )
+
+    refute ExternalSmoke.mc_output_exact?(
+             "Disabled user `fixture-user` successfully.\r\n",
+             expected,
+             {:unix, :linux}
+           )
+
+    Enum.each(
+      [
+        "Disabled user `fixture-user` successfully.",
+        "Disabled user `fixture-user` successfully.\n\n",
+        "Disabled user `fixture-user` successfully. \n",
+        "Disabled user `fixture-user` successfully.\r"
+      ],
+      fn malformed ->
+        refute ExternalSmoke.mc_output_exact?(malformed, expected, {:win32, :nt})
+      end
+    )
+  end
+
+  for mutation <- [:missing_lf, :double_lf, :trailing_space, :lone_cr] do
+    @human_success_mutation mutation
+    test "human mutation success rejects #{mutation}" do
+      mutation = @human_success_mutation
+      base_runner = successful_mc_runner()
+
+      runner = fn command, args, opts ->
+        result = base_runner.(command, args, opts)
+
+        case {result, json_mode?(args), admin_user_action(args)} do
+          {{stdout, 0}, false, "disable"} ->
+            canonical = String.trim_trailing(stdout, "\n")
+            {mutate_human_success(canonical, mutation), 0}
+
+          _other ->
+            result
+        end
+      end
+
+      [entry] =
+        @config
+        |> Map.put(:clients, ["minio_mc"])
+        |> ExternalSmoke.run(
+          executable_finder: fn "mc" -> "mc.exe" end,
+          command_runner: runner,
+          tmp_root_fun: &tmp_root/0,
+          admin_user_fixture_opts: fixture_opts(self())
+        )
+
+      assert entry["status"] == "blocked"
+      assert hd(entry["blockers"])["step"] == "admin_user_human_disable"
+    end
   end
 
   for {label, evidence} <- [
@@ -1177,12 +1327,24 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       {"json lines", "{\"accessKey\":\"wrong\"}\n{\"status\":\"enabled\"}\n", "", 0,
        "external_smoke_json_invalid"},
       {"array", "[]", "", 0, "external_smoke_json_not_object"},
-      {"wrong access key", Jason.encode!(%{"accessKey" => "wrong", "status" => "enabled"}), "", 0,
-       "external_smoke_json_mismatch"},
-      {"wrong status", Jason.encode!(%{"accessKey" => "placeholder", "status" => "disabled"}), "",
-       0, "external_smoke_json_mismatch"},
-      {"stderr", Jason.encode!(%{"accessKey" => "placeholder", "status" => "enabled"}),
-       "unexpected diagnostic", 0, "external_smoke_stderr_not_empty"},
+      {"wrong access key",
+       Jason.encode!(%{
+         "accessKey" => "wrong",
+         "status" => "success",
+         "userStatus" => "enabled"
+       }), "", 0, "external_smoke_json_mismatch"},
+      {"wrong status",
+       Jason.encode!(%{
+         "accessKey" => "placeholder",
+         "status" => "enabled",
+         "userStatus" => "enabled"
+       }), "", 0, "external_smoke_json_mismatch"},
+      {"stderr",
+       Jason.encode!(%{
+         "accessKey" => "placeholder",
+         "status" => "success",
+         "userStatus" => "enabled"
+       }), "unexpected diagnostic", 0, "external_smoke_stderr_not_empty"},
       {"exit", "", "", 7, "external_smoke_step_failed"}
     ]
 
@@ -1219,6 +1381,60 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              end),
              label
     end)
+  end
+
+  for {label, response} <- [
+        missing_user_status: %{"accessKey" => "placeholder", "status" => "success"},
+        wrong_status: %{
+          "accessKey" => "placeholder",
+          "status" => "enabled",
+          "userStatus" => "enabled"
+        },
+        contradictory_user_status: %{
+          "accessKey" => "placeholder",
+          "status" => "success",
+          "userStatus" => "disabled"
+        },
+        unexpected_field: %{
+          "accessKey" => "placeholder",
+          "status" => "success",
+          "userStatus" => "enabled",
+          "message" => "unexpected"
+        }
+      ] do
+    @invalid_json_info response
+    test "mc JSON info rejects #{label} instead of accepting expected field subsets" do
+      response = @invalid_json_info
+      base_runner = successful_mc_runner()
+
+      runner = fn command, args, opts ->
+        if "--json" in args and admin_user_action(args) == "info" and
+             Process.get(:json_schema_failure_injected) != true do
+          Process.put(:json_schema_failure_injected, true)
+          user_name = List.last(args)
+          {response |> Map.put("accessKey", user_name) |> Jason.encode!(), "", 0}
+        else
+          base_runner.(command, args, opts)
+        end
+      end
+
+      [entry] =
+        @config
+        |> Map.put(:clients, ["minio_mc"])
+        |> ExternalSmoke.run(
+          executable_finder: fn "mc" -> "mc.exe" end,
+          command_runner: runner,
+          tmp_root_fun: &tmp_root/0,
+          admin_user_fixture_opts: fixture_opts(self())
+        )
+
+      assert entry["status"] == "blocked"
+
+      assert Enum.any?(entry["blockers"], fn blocker ->
+               blocker["reason"] == "external_smoke_json_mismatch" and
+                 blocker["step"] == "admin_user_json_info_enabled"
+             end)
+    end
   end
 
   test "remote endpoint does not inject a proxy bypass for any client" do
@@ -1380,7 +1596,10 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             status =
               if Process.get(:admin_fixture_status) == :disabled, do: "disabled", else: "enabled"
 
-            {Jason.encode!(%{"accessKey" => target_name, "status" => status}, pretty: true), 0}
+            {Jason.encode!(
+               %{"accessKey" => target_name, "status" => "success", "userStatus" => status},
+               pretty: true
+             ), 0}
           else
             case admin_user_info do
               nil ->
@@ -1406,7 +1625,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           if json?,
             do:
               {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}, pretty: true), 0},
-            else: {"Disabled user `#{user_name}` successfully.", 0}
+            else: {"Disabled user `#{user_name}` successfully.\n", 0}
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["user", "enable"] ->
           Process.put(:admin_fixture_status, :enabled)
@@ -1414,14 +1633,14 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           if json?,
             do:
               {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}, pretty: true), 0},
-            else: {"Enabled user `#{user_name}` successfully.", 0}
+            else: {"Enabled user `#{user_name}` successfully.\n", 0}
 
         subcommand == "admin" and Enum.take(command_args, 2) == ["user", "remove"] ->
           target_name = List.last(command_args)
 
           if target_name == @config.access_key or Process.get(:admin_fixture_status) == :removed do
             {"",
-             "mc: <ERROR> Unable to remove #{target_name}. The specified user does not exist. (Specified user does not exist).",
+             "mc: <ERROR> Unable to remove #{target_name}. The specified user does not exist. (Specified user does not exist).\n",
              1}
           else
             Process.put(:admin_fixture_status, :removed)
@@ -1430,7 +1649,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
               do:
                 {Jason.encode!(%{"accessKey" => user_name, "status" => "success"}, pretty: true),
                  "", 0},
-              else: {"Removed user `#{user_name}` successfully.", "", 0}
+              else: {"Removed user `#{user_name}` successfully.\n", "", 0}
           end
 
         true ->
@@ -1458,8 +1677,13 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   end
 
   defp human_user_info(user_name, status) do
-    "AccessKey: #{user_name}\nStatus: #{status}\nPolicyName: \nMemberOf: []"
+    "AccessKey: #{user_name}\nStatus: #{status}\nPolicyName: \nMemberOf: []\n"
   end
+
+  defp mutate_human_success(canonical, :missing_lf), do: canonical
+  defp mutate_human_success(canonical, :double_lf), do: canonical <> "\n\n"
+  defp mutate_human_success(canonical, :trailing_space), do: canonical <> " \n"
+  defp mutate_human_success(canonical, :lone_cr), do: canonical <> "\r"
 
   defp tmp_root do
     Path.join(
