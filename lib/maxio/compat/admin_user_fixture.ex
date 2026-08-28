@@ -202,26 +202,31 @@ defmodule Maxio.Compat.AdminUserFixture do
                  headers: request.headers,
                  body: request.body
                ) do
-          %{status: response.status, code: response_code(response.body)}
+          %{
+            status: response.status,
+            code: response_error_field(response.body, "Code"),
+            message: response_error_field(response.body, "Message")
+          }
         else
-          {:error, _reason} -> %{status: nil, code: "probe_failed"}
+          {:error, _reason} -> %{status: nil, code: "probe_failed", message: nil}
         end
       else
-        %{status: nil, code: "probe_not_configured"}
+        %{status: nil, code: "probe_not_configured", message: nil}
       end
     end
   end
 
-  defp response_code(body) when is_binary(body) do
-    case Regex.run(~r/<Code>([^<]+)<\/Code>/, body, capture: :all_but_first) do
-      [code] -> code
+  defp response_error_field(body, field) when is_binary(body) do
+    case Regex.run(~r/<#{field}>([^<]+)<\/#{field}>/, body, capture: :all_but_first) do
+      [value] -> value
       _other -> nil
     end
   end
 
-  defp response_code(_body), do: nil
+  defp response_error_field(_body, _field), do: nil
 
-  defp unconfigured_probe, do: %{status: nil, code: "probe_not_configured"}
+  defp unconfigured_probe,
+    do: %{status: nil, code: "probe_not_configured", message: nil}
 
   defp list_buckets_policy do
     Jason.encode!(%{

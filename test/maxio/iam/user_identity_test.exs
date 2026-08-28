@@ -2,7 +2,8 @@ defmodule Maxio.IAM.UserIdentityTest do
   use Maxio.DataCase, async: false
 
   alias Maxio.IAM
-  alias Maxio.IAM.{MFADevice, STSSession, UserIdentity}
+  alias Maxio.IAM.{AccessKey, MFADevice, STSSession, UserIdentity}
+  alias Maxio.Policy.{PrincipalPolicy, Store}
   alias Maxio.STS
 
   @policy ~s({"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::identity/*"}})
@@ -173,8 +174,221 @@ defmodule Maxio.IAM.UserIdentityTest do
     assert {:ok, %{user_name: ^user_name}} = Task.await(waiter, 10_000)
   end
 
+  test "root disable/delete linearize with final STS persistence on the exact credential lock" do
+    for mutation <- [:disable, :delete] do
+      root_access_key = unique_access_key("ROOTISSUER#{mutation}")
+      second_root_access_key = unique_access_key("ROOTSPARE#{mutation}")
+      session_access_key = unique_access_key("ROOTRACE#{mutation}")
+
+      assert {:ok, _root} =
+               unboxed(fn ->
+                 IAM.create_access_key(
+                   access_key_id: root_access_key,
+                   secret_key: "root-race-issuer-secret",
+                   type: "root",
+                   principal_arn: IAM.root_principal_arn()
+                 )
+               end)
+
+      assert {:ok, _second_root} =
+               unboxed(fn ->
+                 IAM.create_access_key(
+                   access_key_id: second_root_access_key,
+                   secret_key: "root-race-spare-secret",
+                   type: "root",
+                   principal_arn: IAM.root_principal_arn()
+                 )
+               end)
+
+      owner = self()
+      barrier_ref = make_ref()
+      handler_id = {__MODULE__, barrier_ref}
+      barrier_once = :atomics.new(1, signed: false)
+
+      on_exit(fn ->
+        :telemetry.detach(handler_id)
+
+        unboxed(fn ->
+          Repo.delete_all(from(s in STSSession, where: s.access_key_id == ^session_access_key))
+
+          Repo.delete_all(
+            from(a in AccessKey,
+              where: a.access_key_id in ^[root_access_key, second_root_access_key]
+            )
+          )
+        end)
+      end)
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:maxio, :iam, :credential_namespace, :lock_wait],
+          fn _event, _measurements, metadata, {test_pid, ref, expected_access_key, once} ->
+            if metadata.access_key_id == expected_access_key and
+                 :atomics.compare_exchange(once, 1, 0, 1) == :ok do
+              send(test_pid, {:root_namespace_wait, ref, self()})
+
+              receive do
+                {:release_root_namespace, ^ref} -> :ok
+              after
+                5_000 -> raise "root namespace barrier timed out"
+              end
+            end
+          end,
+          {owner, barrier_ref, root_access_key, barrier_once}
+        )
+
+      session_task =
+        Task.async(fn ->
+          Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+            STS.issue_session(
+              issuer_access_key_id: root_access_key,
+              session_access_key_id: session_access_key,
+              secret_key: "root-race-session-secret",
+              session_token: "root-race-session-token",
+              duration_seconds: 900
+            )
+          end)
+        end)
+
+      assert_receive {:root_namespace_wait, ^barrier_ref, session_pid}, 5_000
+
+      mutation_result =
+        unboxed(fn ->
+          case mutation do
+            :disable -> IAM.update_access_key_strict(root_access_key, "inactive")
+            :delete -> IAM.delete_access_key_strict(root_access_key)
+          end
+        end)
+
+      assert {:ok, _root} = mutation_result
+      send(session_pid, {:release_root_namespace, barrier_ref})
+
+      assert {:error, :issuer_access_key_not_found} = Task.await(session_task, 10_000)
+      refute unboxed(fn -> Repo.get_by(STSSession, access_key_id: session_access_key) end)
+
+      :telemetry.detach(handler_id)
+
+      unboxed(fn ->
+        Repo.delete_all(
+          from(a in AccessKey,
+            where: a.access_key_id in ^[root_access_key, second_root_access_key]
+          )
+        )
+      end)
+    end
+  end
+
+  test "strict identity policy events are emitted only after committed rows are visible" do
+    user_name = unique_name("policy-event-boundary")
+    policy_name = "read"
+    owner = self()
+
+    assert {:ok, user} = unboxed(fn -> IAM.create_user(name: user_name) end)
+
+    previous_transport = Application.get_env(:maxio, :cluster_notify_transport)
+    Application.put_env(:maxio, :blocking_notify_test_owner, owner)
+    Application.put_env(:maxio, :cluster_notify_transport, Maxio.Test.BlockingNotifyTransport)
+
+    on_exit(fn ->
+      if previous_transport do
+        Application.put_env(:maxio, :cluster_notify_transport, previous_transport)
+      else
+        Application.delete_env(:maxio, :cluster_notify_transport)
+      end
+
+      Application.delete_env(:maxio, :blocking_notify_test_owner)
+
+      unboxed(fn ->
+        Repo.delete_all(from(p in PrincipalPolicy, where: p.principal_arn == ^user.user_arn))
+        Repo.delete_all(from(u in Maxio.IAM.User, where: u.id == ^user.id))
+      end)
+    end)
+
+    put_task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          IAM.put_user_policy_strict(user_name, policy_name, @policy)
+        end)
+      end)
+
+    event = {:principal_policy_changed, user.user_arn}
+    assert_receive {:blocking_notify_attempt, ^event, put_pid}, 5_000
+
+    assert unboxed(fn ->
+             Repo.get_by(PrincipalPolicy,
+               principal_arn: user.user_arn,
+               policy_name: policy_name
+             )
+           end)
+
+    send(put_pid, {:release_blocking_notify, event})
+    assert :ok = Task.await(put_task, 10_000)
+
+    delete_task =
+      Task.async(fn ->
+        Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          IAM.delete_user_policy_strict(user_name, policy_name)
+        end)
+      end)
+
+    assert_receive {:blocking_notify_attempt, ^event, delete_pid}, 5_000
+
+    refute unboxed(fn ->
+             Repo.get_by(PrincipalPolicy,
+               principal_arn: user.user_arn,
+               policy_name: policy_name
+             )
+           end)
+
+    send(delete_pid, {:release_blocking_notify, event})
+    assert :ok = Task.await(delete_task, 10_000)
+  end
+
+  test "no-notify identity policy backend operations emit nothing when an outer transaction rolls back" do
+    user_name = unique_name("policy-event-rollback")
+    assert {:ok, user} = IAM.create_user(name: user_name)
+    :ok = Phoenix.PubSub.subscribe(Maxio.PubSub, Maxio.Cluster.Notify.topic())
+
+    assert {:error, :forced_rollback} =
+             Repo.transaction(fn ->
+               assert :ok =
+                        Store.put_principal_policy_without_notify(
+                          user.user_arn,
+                          "read",
+                          @policy
+                        )
+
+               Repo.rollback(:forced_rollback)
+             end)
+
+    refute Repo.get_by(PrincipalPolicy, principal_arn: user.user_arn, policy_name: "read")
+    refute_receive {:principal_policy_changed, _principal_arn}
+
+    assert :ok = Store.put_principal_policy(user.user_arn, "read", @policy)
+    assert_receive {:principal_policy_changed, principal_arn}
+    assert principal_arn == user.user_arn
+
+    assert {:error, :forced_delete_rollback} =
+             Repo.transaction(fn ->
+               assert :ok =
+                        Store.delete_principal_policy_without_notify(user.user_arn, "read")
+
+               Repo.rollback(:forced_delete_rollback)
+             end)
+
+    assert Repo.get_by(PrincipalPolicy,
+             principal_arn: user.user_arn,
+             policy_name: "read"
+           )
+
+    refute_receive {:principal_policy_changed, _principal_arn}
+  end
+
   defp unique_access_key(prefix),
     do: "ASIA#{prefix}#{System.unique_integer([:positive, :monotonic])}"
+
+  defp unboxed(fun), do: Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fun)
 
   defp insert_session!(access_key_id, issuer_access_key_id, principal_arn, opts \\ []) do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)

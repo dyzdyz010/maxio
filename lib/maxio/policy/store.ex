@@ -162,22 +162,26 @@ defmodule Maxio.Policy.Store do
 
   @spec put_principal_policy(String.t(), String.t(), binary()) :: :ok | {:error, term()}
   def put_principal_policy(principal_arn, name, json) do
-    backend = impl()
-
-    result =
-      if callback_exported?(backend, :put_principal_policy, 3) do
-        backend.put_principal_policy(principal_arn, name, json)
-      else
-        {:error, :not_supported}
-      end
-
-    case result do
+    case put_principal_policy_without_notify(principal_arn, name, json) do
       :ok ->
         Notify.broadcast({:principal_policy_changed, principal_arn})
         :ok
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @doc false
+  @spec put_principal_policy_without_notify(String.t(), String.t(), binary()) ::
+          :ok | {:error, term()}
+  def put_principal_policy_without_notify(principal_arn, name, json) do
+    backend = impl()
+
+    if callback_exported?(backend, :put_principal_policy, 3) do
+      backend.put_principal_policy(principal_arn, name, json)
+    else
+      {:error, :not_supported}
     end
   end
 
@@ -195,22 +199,25 @@ defmodule Maxio.Policy.Store do
 
   @spec delete_principal_policy(String.t(), String.t()) :: :ok | {:error, term()}
   def delete_principal_policy(principal_arn, name) do
-    backend = impl()
-
-    result =
-      if callback_exported?(backend, :delete_principal_policy, 2) do
-        backend.delete_principal_policy(principal_arn, name)
-      else
-        :ok
-      end
-
-    case result do
+    case delete_principal_policy_without_notify(principal_arn, name) do
       :ok ->
         Notify.broadcast({:principal_policy_changed, principal_arn})
         :ok
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @doc false
+  @spec delete_principal_policy_without_notify(String.t(), String.t()) :: :ok | {:error, term()}
+  def delete_principal_policy_without_notify(principal_arn, name) do
+    backend = impl()
+
+    if callback_exported?(backend, :delete_principal_policy, 2) do
+      backend.delete_principal_policy(principal_arn, name)
+    else
+      :ok
     end
   end
 

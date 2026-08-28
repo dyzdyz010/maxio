@@ -13,7 +13,7 @@ defmodule Maxio.IAM.UserIdentity do
 
   import Ecto.Query
 
-  alias Maxio.IAM.{AccessKey, STSSession, User}
+  alias Maxio.IAM.{AccessKey, CredentialNamespace, STSSession, User}
 
   @lock_namespace "maxio.iam.user_identity"
   @lock_wait_event [:maxio, :iam, :user_identity, :lock_wait]
@@ -203,7 +203,10 @@ defmodule Maxio.IAM.UserIdentity do
     end
   end
 
-  defp lock_terminal(_repo, {:root, _access_key}), do: {:ok, :root}
+  defp lock_terminal(repo, {:root, {access_key_id, _principal_arn, _type, _status}}) do
+    :ok = CredentialNamespace.lock_exact(repo, access_key_id)
+    {:ok, :root}
+  end
 
   defp lock_terminal(repo, {:legacy_user, name, _access_key}) do
     case lock_snapshot(repo, name, :missing) do

@@ -771,21 +771,21 @@ defmodule Maxio.Compat.ExternalSmoke do
         scenario: "admin_user_list",
         assertion: "mc admin user list returns the active temporary IAM user"
       ),
+      step(
+        "admin_user_info",
+        executable,
+        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
+        opts,
+        {:output_exact, human_user_info(user_name, "enabled")},
+        scenario: "admin_user_info",
+        assertion: "mc admin user info returns the active temporary IAM user"
+      ),
       local_step(
         "admin_user_human_s3_enabled",
         s3_probe,
         {:probe, :success},
         "admin_user_human_lifecycle",
         "temporary user can list buckets before disable"
-      ),
-      step(
-        "admin_user_info",
-        executable,
-        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
-        opts,
-        {:output_contains, [user_name, "Status", "enabled"]},
-        scenario: "admin_user_info",
-        assertion: "mc admin user info returns the active temporary IAM user"
       ),
       step(
         "admin_user_human_disable",
@@ -796,21 +796,21 @@ defmodule Maxio.Compat.ExternalSmoke do
         scenario: "admin_user_human_lifecycle",
         assertion: "mc disables the temporary user"
       ),
+      step(
+        "admin_user_human_info_disabled",
+        executable,
+        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
+        opts,
+        {:output_exact, human_user_info(user_name, "disabled")},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "mc reports disabled status"
+      ),
       local_step(
         "admin_user_human_s3_disabled",
         s3_probe,
         {:probe, :rejected},
         "admin_user_human_lifecycle",
         "disabled user is rejected by S3"
-      ),
-      step(
-        "admin_user_human_info_disabled",
-        executable,
-        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
-        opts,
-        {:output_contains, [user_name, "Status", "disabled"]},
-        scenario: "admin_user_human_lifecycle",
-        assertion: "mc reports disabled status"
       ),
       step(
         "admin_user_human_enable",
@@ -821,21 +821,21 @@ defmodule Maxio.Compat.ExternalSmoke do
         scenario: "admin_user_human_lifecycle",
         assertion: "mc re-enables the temporary user"
       ),
+      step(
+        "admin_user_human_info_reenabled",
+        executable,
+        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
+        opts,
+        {:output_exact, human_user_info(user_name, "enabled")},
+        scenario: "admin_user_human_lifecycle",
+        assertion: "mc reports re-enabled status"
+      ),
       local_step(
         "admin_user_human_s3_reenabled",
         s3_probe,
         {:probe, :success},
         "admin_user_human_lifecycle",
         "the same credential works after re-enable"
-      ),
-      step(
-        "admin_user_human_info_reenabled",
-        executable,
-        base_args ++ ["admin", "user", "info", "maxiocompat", user_name],
-        opts,
-        {:output_contains, [user_name, "Status", "enabled"]},
-        scenario: "admin_user_human_lifecycle",
-        assertion: "mc reports re-enabled status"
       ),
       step(
         "admin_user_human_remove",
@@ -851,12 +851,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         executable,
         base_args ++ ["admin", "user", "remove", "maxiocompat", user_name],
         opts,
-        {:expected_failure, 1,
-         [
-           "Unable to remove #{user_name}",
-           "The specified user does not exist.",
-           "(Specified user does not exist)."
-         ]},
+        {:expected_streams, 1, "", no_such_user_stderr(user_name)},
         scenario: "admin_user_human_lifecycle",
         assertion: "a sequential second remove returns the exact dynamic no-such-user error"
       ),
@@ -865,12 +860,7 @@ defmodule Maxio.Compat.ExternalSmoke do
         executable,
         base_args ++ ["admin", "user", "remove", "maxiocompat", config.access_key],
         opts,
-        {:expected_failure, 1,
-         [
-           "Unable to remove #{config.access_key}",
-           "The specified user does not exist.",
-           "(Specified user does not exist)."
-         ]},
+        {:expected_streams, 1, "", no_such_user_stderr(config.access_key)},
         scenario: "admin_user_human_lifecycle",
         assertion: "configured-root remove returns the exact dynamic no-such-user error"
       ),
@@ -917,17 +907,10 @@ defmodule Maxio.Compat.ExternalSmoke do
   end
 
   defp mc_json_user_steps(executable, config, paths, env, user_name, s3_probe) do
-    opts = command_opts(config, env)
-    base_args = ["--config-dir", paths.mc_config_dir, "--json"]
+    opts = command_opts(config, [{"MC_CONFIG_DIR", paths.mc_config_dir} | env])
+    base_args = ["--json"]
 
     steps = [
-      local_step(
-        "admin_user_json_s3_enabled",
-        s3_probe,
-        {:probe, :success},
-        "admin_user_json_lifecycle",
-        "JSON fixture credential works before disable"
-      ),
       json_user_step(
         "admin_user_json_info_enabled",
         executable,
@@ -936,6 +919,13 @@ defmodule Maxio.Compat.ExternalSmoke do
         "info",
         user_name,
         %{"accessKey" => user_name, "status" => "enabled"}
+      ),
+      local_step(
+        "admin_user_json_s3_enabled",
+        s3_probe,
+        {:probe, :success},
+        "admin_user_json_lifecycle",
+        "JSON fixture credential works before disable"
       ),
       json_user_step(
         "admin_user_json_disable",
@@ -946,13 +936,6 @@ defmodule Maxio.Compat.ExternalSmoke do
         user_name,
         %{"accessKey" => user_name, "status" => "success"}
       ),
-      local_step(
-        "admin_user_json_s3_disabled",
-        s3_probe,
-        {:probe, :rejected},
-        "admin_user_json_lifecycle",
-        "JSON fixture credential is rejected while disabled"
-      ),
       json_user_step(
         "admin_user_json_info_disabled",
         executable,
@@ -961,6 +944,13 @@ defmodule Maxio.Compat.ExternalSmoke do
         "info",
         user_name,
         %{"accessKey" => user_name, "status" => "disabled"}
+      ),
+      local_step(
+        "admin_user_json_s3_disabled",
+        s3_probe,
+        {:probe, :rejected},
+        "admin_user_json_lifecycle",
+        "JSON fixture credential is rejected while disabled"
       ),
       json_user_step(
         "admin_user_json_enable",
@@ -971,13 +961,6 @@ defmodule Maxio.Compat.ExternalSmoke do
         user_name,
         %{"accessKey" => user_name, "status" => "success"}
       ),
-      local_step(
-        "admin_user_json_s3_reenabled",
-        s3_probe,
-        {:probe, :success},
-        "admin_user_json_lifecycle",
-        "JSON fixture credential works after re-enable"
-      ),
       json_user_step(
         "admin_user_json_info_reenabled",
         executable,
@@ -986,6 +969,13 @@ defmodule Maxio.Compat.ExternalSmoke do
         "info",
         user_name,
         %{"accessKey" => user_name, "status" => "enabled"}
+      ),
+      local_step(
+        "admin_user_json_s3_reenabled",
+        s3_probe,
+        {:probe, :success},
+        "admin_user_json_lifecycle",
+        "JSON fixture credential works after re-enable"
       ),
       json_user_step(
         "admin_user_json_remove",
@@ -1175,6 +1165,13 @@ defmodule Maxio.Compat.ExternalSmoke do
       {:expected_failure, _exit_status, expected_stderr_values} ->
         verify_step({:output_contains, expected_stderr_values}, stderr)
 
+      {:expected_streams, _exit_status, expected_stdout, expected_stderr} ->
+        if output == expected_stdout and stderr == expected_stderr do
+          :ok
+        else
+          {:error, "external_smoke_stream_mismatch", "stdout/stderr did not exactly match"}
+        end
+
       other ->
         verify_step(other, output)
     end
@@ -1182,6 +1179,8 @@ defmodule Maxio.Compat.ExternalSmoke do
 
   defp expected_exit_status({:expected_failure, exit_status, _expected_stderr_values}),
     do: exit_status
+
+  defp expected_exit_status({:expected_streams, exit_status, _stdout, _stderr}), do: exit_status
 
   defp expected_exit_status(_verify), do: 0
 
@@ -1205,11 +1204,18 @@ defmodule Maxio.Compat.ExternalSmoke do
   end
 
   defp verify_step({:probe, expected}, output) do
-    with {:ok, %{"status" => status}} <- Jason.decode(output) do
-      case expected do
-        :success when status in 200..299 -> :ok
-        :rejected when is_integer(status) and status not in 200..299 -> :ok
-        _other -> {:error, "external_smoke_s3_probe_failed", "unexpected S3 probe status"}
+    with {:ok, %{"status" => status, "code" => code, "message" => message}} <-
+           Jason.decode(output) do
+      case {expected, status, code, message} do
+        {:success, success_status, _code, _message} when success_status in 200..299 ->
+          :ok
+
+        {:rejected, 403, "InvalidAccessKeyId",
+         "The AWS access key ID that you provided does not exist in our records."} ->
+          :ok
+
+        _other ->
+          {:error, "external_smoke_s3_probe_failed", "unexpected S3 probe status"}
       end
     else
       _other -> {:error, "external_smoke_s3_probe_failed", "invalid S3 probe evidence"}
@@ -1229,6 +1235,14 @@ defmodule Maxio.Compat.ExternalSmoke do
       :ok
     else
       {:error, "external_smoke_body_mismatch", "downloaded body mismatch"}
+    end
+  end
+
+  defp verify_step({:output_exact, expected}, output) when is_binary(output) do
+    if output == expected do
+      :ok
+    else
+      {:error, "external_smoke_output_mismatch", "mc output did not exactly match"}
     end
   end
 
@@ -1419,6 +1433,15 @@ defmodule Maxio.Compat.ExternalSmoke do
       {"MC_HOST_maxiocompat",
        endpoint_with_userinfo(config.endpoint, config.access_key, config.secret_key)}
     ]
+  end
+
+  defp human_user_info(user_name, status) do
+    "AccessKey: #{user_name}\nStatus: #{status}\nPolicyName: \nMemberOf: []"
+  end
+
+  defp no_such_user_stderr(user_name) do
+    "mc: <ERROR> Unable to remove #{user_name}. " <>
+      "The specified user does not exist. (Specified user does not exist)."
   end
 
   defp boto3_env(config, paths) do

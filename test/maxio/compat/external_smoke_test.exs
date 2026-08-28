@@ -232,13 +232,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     Process.put(:mc_calls, [])
 
     command_runner = fn command, args, opts ->
-      ["--config-dir", config_dir | raw_args] = args
-
-      {json?, [subcommand | command_args]} =
-        case raw_args do
-          ["--json" | rest] -> {true, rest}
-          rest -> {false, rest}
-        end
+      {config_dir, json?, [subcommand | command_args]} = parse_mc_args(args, opts)
 
       Process.put(:mc_calls, [{command, args, opts} | Process.get(:mc_calls)])
 
@@ -281,7 +275,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
                  do: "disabled",
                  else: "enabled"
 
-            {"AccessKey: #{user_name}\nStatus: #{status}\nsuper-secret test-access", "", 0}
+            {human_user_info(user_name, status), "", 0}
           end
 
         subcommand == "admin" and
@@ -368,14 +362,14 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "admin_policy_list",
              "admin_policy_info",
              "admin_user_list",
-             "admin_user_human_s3_enabled",
              "admin_user_info",
+             "admin_user_human_s3_enabled",
              "admin_user_human_disable",
-             "admin_user_human_s3_disabled",
              "admin_user_human_info_disabled",
+             "admin_user_human_s3_disabled",
              "admin_user_human_enable",
-             "admin_user_human_s3_reenabled",
              "admin_user_human_info_reenabled",
+             "admin_user_human_s3_reenabled",
              "admin_user_human_remove",
              "admin_user_human_remove_again",
              "admin_user_human_remove_root",
@@ -385,14 +379,14 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              "delete_object",
              "delete_bucket",
              "admin_user_fixture_cleanup_human",
-             "admin_user_json_s3_enabled",
              "admin_user_json_info_enabled",
+             "admin_user_json_s3_enabled",
              "admin_user_json_disable",
-             "admin_user_json_s3_disabled",
              "admin_user_json_info_disabled",
+             "admin_user_json_s3_disabled",
              "admin_user_json_enable",
-             "admin_user_json_s3_reenabled",
              "admin_user_json_info_reenabled",
+             "admin_user_json_s3_reenabled",
              "admin_user_json_remove",
              "admin_user_fixture_cleanup_json"
            ]
@@ -418,11 +412,9 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     Enum.each(calls, fn {command, args, opts} ->
       assert command == "mc.exe"
-      assert Enum.take(args, 2) == ["--config-dir", config_dir]
       refute Enum.any?(args, &String.contains?(&1, "super-secret"))
 
-      if "test-access" in args,
-        do: assert(Enum.slice(args, 2, 3) == ["admin", "user", "remove"])
+      if "test-access" in args, do: assert(admin_user_action(args) == "remove")
 
       env = Keyword.fetch!(opts, :env)
 
@@ -431,6 +423,16 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
       assert mc_host =~ "test-access"
       assert mc_host =~ "super-secret"
+
+      if "--json" in args do
+        assert ["--json", "admin", "user" | _rest] = args
+
+        assert {"MC_CONFIG_DIR", ^config_dir} =
+                 Enum.find(env, &(elem(&1, 0) == "MC_CONFIG_DIR"))
+      else
+        assert Enum.take(args, 2) == ["--config-dir", config_dir]
+      end
+
       assert_loopback_bypass(opts, "127.0.0.1")
     end)
 
@@ -506,16 +508,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     assert_received {:admin_user_info, ^fixture_user}
     assert_received {:admin_fixture_cleaned, ^fixture_user}
 
-    assert [
-             "--config-dir",
-             ^config_dir,
-             "--json",
-             "admin",
-             "user",
-             "info",
-             "maxiocompat",
-             json_fixture_user
-           ] = elem(Enum.at(calls, 24), 1)
+    assert ["--json", "admin", "user", "info", "maxiocompat", json_fixture_user] =
+             elem(Enum.at(calls, 24), 1)
 
     assert json_fixture_user != fixture_user
     assert_received {:admin_fixture_created, ^json_fixture_user}
@@ -536,16 +530,8 @@ defmodule Maxio.Compat.ExternalSmokeTest do
              |> Enum.any?(&(&1 == ["admin", "user", "add"]))
            end)
 
-    assert [
-             "--config-dir",
-             ^config_dir,
-             "--json",
-             "admin",
-             "user",
-             "remove",
-             "maxiocompat",
-             ^json_fixture_user
-           ] = elem(Enum.at(calls, 29), 1)
+    assert ["--json", "admin", "user", "remove", "maxiocompat", ^json_fixture_user] =
+             elem(Enum.at(calls, 29), 1)
 
     refute File.exists?(config_dir)
     refute File.exists?(Path.dirname(config_dir))
@@ -557,9 +543,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     user_runner = successful_mc_runner()
 
     runner = fn command, args, opts ->
-      ["--config-dir", _config_dir | raw_args] = args
-      command_args = Enum.drop_while(raw_args, &(&1 == "--json"))
-      [subcommand | command_args] = command_args
+      {_config_dir, _json?, [subcommand | command_args]} = parse_mc_args(args, opts)
 
       if admin_user_command?(args) do
         user_runner.(command, args, opts)
@@ -627,12 +611,198 @@ defmodule Maxio.Compat.ExternalSmokeTest do
            end)
   end
 
+  test "mc JSON admin user commands use exact prefix-first argv and isolate config through env" do
+    Process.put(:json_mc_calls, [])
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      if "--json" in args do
+        Process.put(:json_mc_calls, [{command, args, opts} | Process.get(:json_mc_calls)])
+      end
+
+      base_runner.(command, args, opts)
+    end
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    assert entry["status"] == "ok"
+    json_calls = Process.get(:json_mc_calls) |> Enum.reverse()
+    assert length(json_calls) == 6
+
+    Enum.each(json_calls, fn {"mc.exe", args, opts} ->
+      assert ["--json", "admin", "user" | _rest] = args
+      refute "--config-dir" in args
+
+      assert {"MC_CONFIG_DIR", config_dir} =
+               opts
+               |> Keyword.fetch!(:env)
+               |> Enum.find(&(elem(&1, 0) == "MC_CONFIG_DIR"))
+
+      assert Path.basename(config_dir) == "mc-config"
+    end)
+  end
+
+  test "human and JSON user lifecycles interleave info and S3 probes in the pinned order" do
+    Process.put(:admin_lifecycle_trace, [])
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      case admin_user_action(args) do
+        action when action in ["info", "disable", "enable", "remove"] ->
+          append_lifecycle_trace({:mc, json_mode?(args), action})
+
+        _other ->
+          :ok
+      end
+
+      base_runner.(command, args, opts)
+    end
+
+    s3_probe = fn ->
+      status = Process.get(:admin_fixture_status)
+      append_lifecycle_trace({:s3, status})
+
+      case status do
+        :disabled -> disabled_probe()
+        :removed -> disabled_probe()
+        _other -> %{status: 200, code: nil, message: nil}
+      end
+    end
+
+    opts = Keyword.put(fixture_opts(self()), :s3_probe, s3_probe)
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: opts
+      )
+
+    assert entry["status"] == "ok"
+
+    lifecycle =
+      Process.get(:admin_lifecycle_trace)
+      |> Enum.reverse()
+      |> Enum.filter(fn
+        {:mc, _json?, action} when action in ["info", "disable", "enable"] -> true
+        {:s3, _status} -> true
+        _other -> false
+      end)
+
+    expected_one_mode = [
+      {:mc, :json_mode, "info"},
+      {:s3, :enabled},
+      {:mc, :json_mode, "disable"},
+      {:mc, :json_mode, "info"},
+      {:s3, :disabled},
+      {:mc, :json_mode, "enable"},
+      {:mc, :json_mode, "info"},
+      {:s3, :enabled}
+    ]
+
+    assert lifecycle ==
+             Enum.map(expected_one_mode, &put_json_mode(&1, false)) ++
+               Enum.map(expected_one_mode, &put_json_mode(&1, true))
+  end
+
+  test "human info rejects contradictory status text instead of substring matching" do
+    runner = successful_mc_runner(admin_user_info: {"Status: enabled\nStatus: disabled", 0})
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    assert entry["status"] == "blocked"
+    assert hd(entry["blockers"])["step"] == "admin_user_info"
+  end
+
+  test "human repeated remove rejects any extra stderr text" do
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      case base_runner.(command, args, opts) do
+        {"", stderr, 1} when is_binary(stderr) -> {"", stderr <> "\nEXTRA", 1}
+        other -> other
+      end
+    end
+
+    [entry] =
+      @config
+      |> Map.put(:clients, ["minio_mc"])
+      |> ExternalSmoke.run(
+        executable_finder: fn "mc" -> "mc.exe" end,
+        command_runner: runner,
+        tmp_root_fun: &tmp_root/0,
+        admin_user_fixture_opts: fixture_opts(self())
+      )
+
+    assert entry["status"] == "blocked"
+    assert hd(entry["blockers"])["step"] == "admin_user_human_remove_again"
+  end
+
+  for {label, evidence} <- [
+        server_error: %{status: 500, code: "InvalidAccessKeyId", message: "internal"},
+        wrong_status: %{status: 401, code: "InvalidAccessKeyId", message: "unauthorized"},
+        missing_code: %{status: 403, code: nil, message: "missing"},
+        wrong_code: %{status: 403, code: "AccessDenied", message: "denied"},
+        wrong_message: %{
+          status: 403,
+          code: "InvalidAccessKeyId",
+          message: "wrong disabled credential classification"
+        }
+      ] do
+    @invalid_disabled_probe evidence
+    test "disabled S3 probe rejects #{label} evidence" do
+      invalid = @invalid_disabled_probe
+
+      s3_probe = fn ->
+        if Process.get(:admin_fixture_status) == :disabled do
+          invalid
+        else
+          %{status: 200, code: nil, message: nil}
+        end
+      end
+
+      opts = Keyword.put(fixture_opts(self()), :s3_probe, s3_probe)
+
+      [entry] =
+        @config
+        |> Map.put(:clients, ["minio_mc"])
+        |> ExternalSmoke.run(
+          executable_finder: fn "mc" -> "mc.exe" end,
+          command_runner: successful_mc_runner(),
+          tmp_root_fun: &tmp_root/0,
+          admin_user_fixture_opts: opts
+        )
+
+      assert entry["status"] == "blocked"
+      assert hd(entry["blockers"])["step"] == "admin_user_human_s3_disabled"
+    end
+  end
+
   test "failed first mc creation does not clean resources that were never created" do
     owner = self()
     json_runner = successful_mc_runner()
 
     runner = fn command, args, opts ->
-      ["--config-dir", _config_dir, subcommand | _command_args] = args
+      {_config_dir, _json?, [subcommand | _command_args]} = parse_mc_args(args, opts)
 
       cond do
         "--json" in args ->
@@ -684,7 +854,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     json_runner = successful_mc_runner()
 
     command_runner = fn command, args, opts ->
-      ["--config-dir", _config_dir, subcommand | command_args] = args
+      {_config_dir, _json?, [subcommand | command_args]} = parse_mc_args(args, opts)
 
       if "--json" in args do
         json_runner.(command, args, opts)
@@ -1114,8 +1284,16 @@ defmodule Maxio.Compat.ExternalSmokeTest do
   end
 
   defp admin_user_action(args) do
-    index = Enum.find_index(args, &(&1 == "admin"))
-    Enum.at(args, index + 2)
+    case Enum.find_index(args, &(&1 == "admin")) do
+      nil ->
+        nil
+
+      index ->
+        case Enum.slice(args, index, 3) do
+          ["admin", "user", action] -> action
+          _other -> nil
+        end
+    end
   end
 
   defp fixture_opts(owner, cleanup_result \\ :ok) do
@@ -1130,10 +1308,10 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       end,
       s3_probe: fn ->
         case Process.get(:admin_fixture_status) do
-          :enabled -> %{status: 200, code: nil}
-          :disabled -> %{status: 403, code: "InvalidAccessKeyId"}
-          :removed -> %{status: 403, code: "InvalidAccessKeyId"}
-          _other -> %{status: nil, code: "probe_not_configured"}
+          :enabled -> %{status: 200, code: nil, message: nil}
+          :disabled -> disabled_probe()
+          :removed -> disabled_probe()
+          _other -> %{status: nil, code: "probe_not_configured", message: nil}
         end
       end,
       cleanup_user: fn name ->
@@ -1143,18 +1321,29 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     ]
   end
 
+  defp disabled_probe do
+    %{
+      status: 403,
+      code: "InvalidAccessKeyId",
+      message: "The AWS access key ID that you provided does not exist in our records."
+    }
+  end
+
+  defp json_mode?(args), do: "--json" in args
+
+  defp append_lifecycle_trace(value) do
+    Process.put(:admin_lifecycle_trace, [value | Process.get(:admin_lifecycle_trace, [])])
+  end
+
+  defp put_json_mode({:mc, :json_mode, action}, json?), do: {:mc, json?, action}
+  defp put_json_mode(other, _json?), do: other
+
   defp successful_mc_runner(opts \\ []) do
     admin_user_list = Keyword.get(opts, :admin_user_list)
-    admin_user_info = Keyword.get(opts, :admin_user_info, {"Status: enabled", 0})
+    admin_user_info = Keyword.get(opts, :admin_user_info)
 
-    fn _command, args, _command_opts ->
-      ["--config-dir", _config_dir | raw_args] = args
-
-      {json?, [subcommand | command_args]} =
-        case raw_args do
-          ["--json" | rest] -> {true, rest}
-          rest -> {false, rest}
-        end
+    fn _command, args, command_opts ->
+      {_config_dir, json?, [subcommand | command_args]} = parse_mc_args(args, command_opts)
 
       user_name = Process.get(:admin_fixture_user)
 
@@ -1194,14 +1383,17 @@ defmodule Maxio.Compat.ExternalSmokeTest do
             {Jason.encode!(%{"accessKey" => target_name, "status" => status}, pretty: true), 0}
           else
             case admin_user_info do
-              {output, status} when status == 0 ->
-                lifecycle_status =
+              nil ->
+                status =
                   if target_name != @config.access_key and
                        Process.get(:admin_fixture_status) == :disabled,
-                     do: "Status: disabled",
-                     else: output
+                     do: "disabled",
+                     else: "enabled"
 
-                {"AccessKey: #{target_name}\n#{lifecycle_status}", status}
+                {human_user_info(target_name, status), 0}
+
+              {output, status} when status == 0 ->
+                {"AccessKey: #{target_name}\n#{output}", status}
 
               failure ->
                 failure
@@ -1245,6 +1437,28 @@ defmodule Maxio.Compat.ExternalSmokeTest do
           {"ok", 0}
       end
     end
+  end
+
+  defp parse_mc_args(args, opts) do
+    {config_dir, remaining_args} =
+      case args do
+        ["--config-dir", config_dir | rest] ->
+          {config_dir, rest}
+
+        rest ->
+          env = Keyword.fetch!(opts, :env)
+          {"MC_CONFIG_DIR", config_dir} = Enum.find(env, &(elem(&1, 0) == "MC_CONFIG_DIR"))
+          {config_dir, rest}
+      end
+
+    case remaining_args do
+      ["--json" | rest] -> {config_dir, true, rest}
+      rest -> {config_dir, false, rest}
+    end
+  end
+
+  defp human_user_info(user_name, status) do
+    "AccessKey: #{user_name}\nStatus: #{status}\nPolicyName: \nMemberOf: []"
   end
 
   defp tmp_root do

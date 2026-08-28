@@ -352,6 +352,9 @@ defmodule Maxio.Admin.PolicyEndpointTest do
     secret = "admin-policy-secret-#{suffix}-long-enough"
     arn = "arn:aws:iam:::user/#{access_key}"
 
+    assert {:ok, _created} = IAM.create_minio_user_strict(access_key, secret, "active")
+    _ = :sys.get_state(Maxio.Cluster.CacheInvalidator)
+
     :ok =
       CredentialStore.put_access_key(%{
         access_key: access_key,

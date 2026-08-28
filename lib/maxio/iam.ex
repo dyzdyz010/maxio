@@ -5569,17 +5569,25 @@ defmodule Maxio.IAM do
         lock_principal_policy_quota!(principal_arn)
 
         with :ok <- validate_inline_policy_quota(principal_arn, name, policy_chars, quota_chars),
-             :ok <- put_principal_policy(principal_arn, name, json) do
+             :ok <- Store.put_principal_policy_without_notify(principal_arn, name, json) do
           :ok
         else
           {:error, reason} -> Repo.rollback({:error, reason})
         end
       end)
       |> case do
-        {:ok, :ok} -> :ok
-        {:error, {:error, :malformed}} -> {:error, :malformed_policy_document}
-        {:error, {:error, reason}} -> {:error, reason}
-        {:error, reason} -> {:error, reason}
+        {:ok, :ok} ->
+          Notify.broadcast({:principal_policy_changed, principal_arn})
+          :ok
+
+        {:error, {:error, :malformed}} ->
+          {:error, :malformed_policy_document}
+
+        {:error, {:error, reason}} ->
+          {:error, reason}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     else
       # `validate_inline_policy_document/1` 唯一的失败原因就是 `:malformed`

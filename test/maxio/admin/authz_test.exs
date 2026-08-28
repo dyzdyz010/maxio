@@ -12,6 +12,7 @@ defmodule Maxio.Admin.AuthzTest do
 
   alias Maxio.Admin.Authz
   alias Maxio.Auth.CredentialStore
+  alias Maxio.IAM
   alias Maxio.Policy.{Statement, Store}
   alias Maxio.Test.SigV4Request
 
@@ -22,6 +23,11 @@ defmodule Maxio.Admin.AuthzTest do
   defp conn, do: SigV4Request.anon_conn(:get, "/minio/admin/v3/info")
 
   defp put_key do
+    assert {:ok, _created} =
+             IAM.create_minio_user_strict(@ak, "admin-authz-secret", "active")
+
+    _ = :sys.get_state(Maxio.Cluster.CacheInvalidator)
+
     :ok =
       CredentialStore.put_access_key(%{
         access_key: @ak,
