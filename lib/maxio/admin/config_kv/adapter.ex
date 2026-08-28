@@ -10,15 +10,18 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
   @safe_command ~r/\A[a-z0-9][a-z0-9_.-]{0,63}(?: [a-z0-9][a-z0-9_.-]{0,63}(?:=[A-Za-z0-9_.:+\/-]{0,128})?)*\z/
   @sensitive_marker ~r/(?:secret|password|token|credential|access[_-]?key|private|cipher|plaintext|root[_-]?user)/i
 
-  @type reason ::
+  @type adapter_reason ::
           :access_denied
           | :config_bad_json
           | :config_generic
           | :config_not_found
           | :invalid_argument
+          | {:config_store_unavailable, atom()}
+
+  @type reason ::
+          adapter_reason()
           | {:config_generic, String.t()}
           | {:config_not_found, String.t()}
-          | {:config_store_unavailable, atom()}
 
   @type error_evidence :: %{
           required(:reason) => reason(),
@@ -27,9 +30,11 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
           required(:stage) => :parser | :exposure | :type | :database
         }
 
+  @type error_result :: {:error, adapter_reason()} | {:error, error_evidence()}
+
   @spec get(String.t(), keyword()) ::
           {:ok, %{plaintext: iodata(), subsystem: atom(), keys: [atom()]}}
-          | {:error, reason()}
+          | error_result()
   def get(wire_subsystem, opts \\ [])
 
   def get(wire_subsystem, opts) when is_binary(wire_subsystem) and is_list(opts) do
@@ -89,7 +94,7 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
     end
   end
 
-  @spec set(String.t(), keyword()) :: {:ok, map()} | {:error, reason()}
+  @spec set(String.t(), keyword()) :: {:ok, map()} | error_result()
   def set(plaintext, opts \\ [])
 
   def set(plaintext, opts) when is_binary(plaintext) and is_list(opts) do
@@ -100,7 +105,7 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
 
   def set(_plaintext, _opts), do: {:error, :invalid_argument}
 
-  @spec reset(String.t(), keyword()) :: {:ok, map()} | {:error, reason()}
+  @spec reset(String.t(), keyword()) :: {:ok, map()} | error_result()
   def reset(plaintext, opts \\ [])
 
   def reset(plaintext, opts) when is_binary(plaintext) and is_list(opts) do
@@ -244,10 +249,9 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
           :exposure
         )
 
-      {:error, {:reset_key, :unknown_key, wire_key, index}} ->
+      {:error, {:reset_key, :unknown_key, wire_key, _index}} ->
         description = safe_not_found_reason(wire_key)
-        adapter_reason = if index == 0, do: :config_not_found, else: description
-        adapter_error(adapter_reason, description, context, :exposure)
+        adapter_error(:config_not_found, description, context, :exposure)
     end
   end
 
