@@ -26,6 +26,7 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
   @get_path "#{@base}/get-config-kv"
   @set_path "#{@base}/set-config-kv"
   @reset_path "#{@base}/del-config-kv"
+  @help_path "#{@base}/help-config-kv"
   @root_secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
   @access_denied "Access Denied."
@@ -173,7 +174,7 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
   end
 
-  test "wrong methods, v4, adjacent, help, export and history paths remain authenticated 501" do
+  test "wrong methods, v4, adjacent, export and history paths remain authenticated 501" do
     # Catches an over-broad prefix dispatch that accidentally claims a neighboring or explicitly
     # deferred Admin API while wiring the three exact triples.
     cases = [
@@ -182,7 +183,9 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
       {:put, @reset_path, %{}},
       {:get, "/minio/admin/v4/get-config-kv", %{}},
       {:get, @get_path <> "/extra", %{}},
-      {:get, "#{@base}/help-config-kv", %{}},
+      {:post, @help_path, %{"subSys" => "", "key" => ""}},
+      {:get, @help_path <> "/extra", %{"subSys" => "", "key" => ""}},
+      {:get, "/minio/admin/v4/help-config-kv", %{"subSys" => "", "key" => ""}},
       {:get, "#{@base}/config", %{}},
       {:put, "#{@base}/config", %{}},
       {:get, "#{@base}/list-config-history-kv", %{"count" => "10"}},
@@ -208,6 +211,238 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
         path,
         request_id
       )
+    end
+  end
+
+  test "help exact route returns plaintext ordered JSON and never reads or mutates state" do
+    before_rows = Repo.aggregate(RuntimeConfig, :count)
+    before_audits = Repo.aggregate(RuntimeConfigAudit, :count)
+
+    request =
+      :get
+      |> SigV4Request.signed_conn(@help_path,
+        query: %{"subSys" => "", "key" => ""},
+        headers: [{"x-request-id", "req-config-help-entity"}],
+        region: ""
+      )
+      |> attach_body_read_probe()
+
+    assert get_req_header(request, "content-length") == []
+    assert get_req_header(request, "transfer-encoding") == []
+    assert get_req_header(request, "content-type") == []
+
+    response = Endpoint.call(request, Endpoint.init([]))
+    refute_received :body_reader_called
+
+    expected =
+      ~s({"subSys":"","description":"","multipleTargets":false,"keysHelp":[{"key":"s3","description":"Maxio extension: configure s3.clock_skew_ms.","optional":false,"type":"","multipleTargets":false},{"key":"listing","description":"Maxio extension: configure listing.sql_hard_limit.","optional":false,"type":"","multipleTargets":false},{"key":"prometheus_metrics","description":"Maxio extension: configure prometheus_metrics.public.","optional":false,"type":"","multipleTargets":false}]}) <>
+        "\n"
+
+    assert response.status == 200
+    assert response.resp_body == expected
+    assert get_resp_header(response, "content-type") == ["application/json"]
+    assert get_resp_header(response, "content-length") == [Integer.to_string(byte_size(expected))]
+    assert get_resp_header(response, "transfer-encoding") == []
+    assert get_resp_header(response, "content-encoding") == []
+    assert get_resp_header(response, "x-minio-config-applied") == []
+    refute response.resp_body =~ @root_secret
+    refute response.resp_body =~ @caller_secret_sentinel
+    assert Repo.aggregate(RuntimeConfig, :count) == before_rows
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == before_audits
+  end
+
+  test "help preserves missing-versus-empty query precedence before authorization" do
+    {access_key, secret, _arn} = put_action_key(nil)
+
+    for {query, suffix} <- [
+          {%{}, "both"},
+          {%{"subSys" => ""}, "key"},
+          {%{"key" => ""}, "subsystem"}
+        ] do
+      request_id = "req-config-help-missing-#{suffix}"
+
+      response =
+        signed(:get, @help_path,
+          query: query,
+          access_key: access_key,
+          secret: secret,
+          headers: [{"x-request-id", request_id}],
+          region: ""
+        )
+
+      assert_admin_error(
+        response,
+        426,
+        "XMinioAdminVersionMismatch",
+        "This 'admin' API is not supported by server in 'maxio'",
+        @help_path,
+        request_id
+      )
+
+      assert_help_error_framing(response)
+    end
+
+    denied =
+      signed(:get, @help_path,
+        query: %{"subSys" => "s3:target", "key" => ""},
+        access_key: access_key,
+        secret: secret,
+        headers: [{"x-request-id", "req-config-help-denied-before-target"}],
+        region: ""
+      )
+
+    assert_admin_error(
+      denied,
+      403,
+      "AccessDenied",
+      @access_denied,
+      @help_path,
+      "req-config-help-denied-before-target"
+    )
+
+    assert_help_error_framing(denied)
+  end
+
+  test "help uses ConfigUpdate identity authorization and keeps STS and bucket-policy grants closed" do
+    {allowed_key, allowed_secret, _arn} = put_action_key("admin:ConfigUpdate")
+
+    allowed =
+      signed(:get, @help_path,
+        query: %{"subSys" => "s3", "key" => "clock_skew_ms"},
+        access_key: allowed_key,
+        secret: allowed_secret,
+        region: ""
+      )
+
+    assert allowed.status == 200
+    assert allowed.resp_body =~ ~s("type":"integer in 0..3600000")
+
+    {:ok, session_boundary} =
+      Statement.parse_identity_policy(
+        Jason.encode!(%{
+          "Version" => "2012-10-17",
+          "Statement" => %{
+            "Effect" => "Allow",
+            "Action" => "s3:GetObject",
+            "Resource" => "arn:aws:s3:::session-boundary/*"
+          }
+        })
+      )
+
+    {sts_key, sts_secret, _arn} =
+      put_action_key("admin:ConfigUpdate",
+        principal_extra: %{session_policy_statements: session_boundary}
+      )
+
+    sts =
+      signed(:get, @help_path,
+        query: %{"subSys" => "", "key" => ""},
+        access_key: sts_key,
+        secret: sts_secret,
+        region: ""
+      )
+
+    assert_denied(sts)
+
+    {bucket_key, bucket_secret, bucket_arn} = put_action_key(nil)
+
+    :ok =
+      PolicyStore.put_bucket_policy(
+        unique_name("config-help-bucket"),
+        Jason.encode!(%{
+          "Version" => "2012-10-17",
+          "Statement" => %{
+            "Effect" => "Allow",
+            "Principal" => %{"AWS" => bucket_arn},
+            "Action" => "admin:ConfigUpdate",
+            "Resource" => "*"
+          }
+        })
+      )
+
+    bucket =
+      signed(:get, @help_path,
+        query: %{"subSys" => "", "key" => ""},
+        access_key: bucket_key,
+        secret: bucket_secret,
+        region: ""
+      )
+
+    assert_denied(bucket)
+  end
+
+  test "help target unknown forbidden hidden and env errors use exact public framing" do
+    cases = [
+      {%{"subSys" => "s3:target", "key" => ""}, 400, "XMinioAdminInvalidArgument",
+       "Invalid arguments specified."},
+      {%{"subSys" => "absent", "key" => ""}, 400, "XMinioConfigError",
+       "unknown sub-system absent"},
+      {%{"subSys" => "s3", "key" => "absent"}, 400, "XMinioConfigError",
+       "unknown key absent for sub-system s3"},
+      {%{"subSys" => "s3", "key" => "root_password"}, 403, "AccessDenied", @access_denied},
+      {%{"subSys" => "cluster", "key" => "deployment_id"}, 400, "XMinioConfigError",
+       "Configuration specified is invalid"},
+      {%{"subSys" => "s3", "key" => "clock_skew_ms", "env" => ""}, 400, "XMinioConfigError",
+       "unknown key clock_skew_ms for sub-system s3"}
+    ]
+
+    for {{query, status, code, message}, index} <- Enum.with_index(cases, 1) do
+      request_id = "req-config-help-error-#{index}"
+
+      response =
+        signed(:get, @help_path,
+          query: query,
+          headers: [{"x-request-id", request_id}],
+          region: ""
+        )
+
+      assert_admin_error(response, status, code, message, @help_path, request_id)
+      assert_help_error_framing(response)
+
+      refute response.resp_body =~ "root_password"
+      refute response.resp_body =~ "deployment_id"
+      refute response.resp_body =~ @root_secret
+    end
+  end
+
+  test "help env is a presence flag and success logs contain only safe projection metadata" do
+    original_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: original_level) end)
+    owner = self()
+
+    log =
+      capture_log([level: :info], fn ->
+        response =
+          signed(:get, @help_path,
+            query: %{"subSys" => "s3", "key" => "", "env" => "false"},
+            headers: [{"x-request-id", "req-config-help-env-log"}],
+            region: ""
+          )
+
+        send(owner, {:help_env_response, response})
+      end)
+
+    assert_receive {:help_env_response, response}
+    assert response.status == 200
+    assert Jason.decode!(response.resp_body)["keysHelp"] == []
+
+    for fragment <- [
+          "action=admin_config_help",
+          "admin_action=admin_config_help",
+          "required_action=admin:ConfigUpdate",
+          "config_subsystem=s3",
+          "config_key_count=0",
+          "config_changed_count=0",
+          "request_id=req-config-help-env-log",
+          "principal_arn=arn:aws:iam:::root",
+          "auth_type=header"
+        ] do
+      assert log =~ fragment
+    end
+
+    for secret <- [@root_secret, @caller_secret_sentinel, "Authorization", "env=false"] do
+      refute log =~ secret
     end
   end
 
@@ -1377,6 +1612,19 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
              "RequestId" => request_id,
              "HostId" => ""
            }
+  end
+
+  defp assert_help_error_framing(conn) do
+    assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+
+    assert get_resp_header(conn, "content-length") == [
+             Integer.to_string(byte_size(conn.resp_body))
+           ]
+
+    assert get_resp_header(conn, "transfer-encoding") == []
+    assert get_resp_header(conn, "content-encoding") == []
+    assert get_resp_header(conn, "x-minio-config-applied") == []
+    refute String.ends_with?(conn.resp_body, "\n")
   end
 
   defp header_value(nil), do: []

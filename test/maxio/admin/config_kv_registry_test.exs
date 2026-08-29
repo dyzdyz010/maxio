@@ -4,6 +4,7 @@ defmodule Maxio.Admin.ConfigKV.RegistryTest do
   import Maxio.Admin.ConfigKV.Registry,
     only: [entries: 0, exposed_subsystem: 1, classify_path: 2]
 
+  alias Maxio.Admin.ConfigKV.Registry
   alias Maxio.Config.Schema
 
   @expected_entries [
@@ -37,6 +38,45 @@ defmodule Maxio.Admin.ConfigKV.RegistryTest do
     # Catches a registry that is derived from an unordered map, accidentally exposes another
     # runtime setting, or changes a wire-to-core mapping without a deliberate protocol change.
     assert entries() == @expected_entries
+  end
+
+  test "one ordered registry declaration exposes exact stable subsystem and key help metadata" do
+    # Catches a second help-only catalog drifting from the S5 exposure registry, an unordered
+    # projection, or Schema prose/default/runtime values leaking into the public protocol.
+    expected = [
+      {"s3", "Maxio extension: configure s3.clock_skew_ms.", "clock_skew_ms",
+       "Maximum allowed SigV4 header-signature clock skew in milliseconds; applied to the next authentication request."},
+      {"listing", "Maxio extension: configure listing.sql_hard_limit.", "sql_hard_limit",
+       "Hard upper bound on rows fetched by one SQL-backed listing operation; applied to the next listing request."},
+      {"prometheus_metrics", "Maxio extension: configure prometheus_metrics.public.", "public",
+       "Allow unauthenticated access to the Prometheus metrics endpoint; enable only behind a trusted network or proxy."}
+    ]
+
+    assert Enum.map(Registry.subsystems(), fn subsystem ->
+             assert subsystem.multiple_targets? == false
+             assert length(subsystem.entries) == 1
+             [entry] = subsystem.entries
+             assert entry.optional? == true
+             assert entry.multiple_targets? == false
+             assert entry.sensitive? == false
+
+             {subsystem.wire_subsystem, subsystem.description, entry.wire_key, entry.description}
+           end) == expected
+
+    for subsystem <- Registry.subsystems() do
+      assert Registry.classify_subsystem(subsystem.wire_subsystem) == {:ok, subsystem}
+    end
+  end
+
+  test "subsystem classification fails closed before unknown and never interns wire atoms" do
+    for subsystem <- Schema.forbidden_subsystems() do
+      assert Registry.classify_subsystem(to_string(subsystem)) == {:error, :forbidden}
+    end
+
+    unique = "untrusted_subsystem_" <> Integer.to_string(System.unique_integer([:positive]))
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unique) end
+    assert Registry.classify_subsystem(unique) == {:error, :unknown_subsystem}
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unique) end
   end
 
   test "every exposed wire entry names a real writable Schema key guarded by a real Config consumer" do

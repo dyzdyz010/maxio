@@ -7,6 +7,7 @@ defmodule Mix.Tasks.MaxioAdminConfigTest do
   alias Maxio.Config
   alias Maxio.Config.{RuntimeConfig, RuntimeConfigAudit, Store}
   alias Mix.Tasks.Maxio.Admin.Config.Get, as: AdminGet
+  alias Mix.Tasks.Maxio.Admin.Config.Help, as: AdminHelp
   alias Mix.Tasks.Maxio.Admin.Config.Reset, as: AdminReset
   alias Mix.Tasks.Maxio.Admin.Config.Set, as: AdminSet
 
@@ -21,6 +22,67 @@ defmodule Mix.Tasks.MaxioAdminConfigTest do
     end)
 
     {:ok, task_supervisor: task_supervisor}
+  end
+
+  test "HELP renders exact shared JSON for zero one two args and env presence" do
+    top =
+      ~s({"subSys":"","description":"","multipleTargets":false,"keysHelp":[{"key":"s3","description":"Maxio extension: configure s3.clock_skew_ms.","optional":false,"type":"","multipleTargets":false},{"key":"listing","description":"Maxio extension: configure listing.sql_hard_limit.","optional":false,"type":"","multipleTargets":false},{"key":"prometheus_metrics","description":"Maxio extension: configure prometheus_metrics.public.","optional":false,"type":"","multipleTargets":false}]}) <>
+        "\n"
+
+    s3 =
+      ~s({"subSys":"s3","description":"Maxio extension: configure s3.clock_skew_ms.","multipleTargets":false,"keysHelp":[{"key":"clock_skew_ms","description":"Maximum allowed SigV4 header-signature clock skew in milliseconds; applied to the next authentication request.","optional":true,"type":"integer in 0..3600000","multipleTargets":false}]}) <>
+        "\n"
+
+    assert capture_io(fn -> run_task(AdminHelp, []) end) == top
+    assert capture_io(fn -> run_task(AdminHelp, ["s3"]) end) == s3
+    assert capture_io(fn -> run_task(AdminHelp, ["s3", "clock_skew_ms"]) end) == s3
+
+    assert capture_io(fn -> run_task(AdminHelp, ["--env", "s3"]) end) ==
+             ~s({"subSys":"s3","description":"Maxio extension: configure s3.clock_skew_ms.","multipleTargets":false,"keysHelp":[]}) <>
+               "\n"
+  end
+
+  test "HELP option arity and projection failures use a fixed redacted vocabulary" do
+    usage = "usage: mix maxio.admin.config.help [--env] [subsystem [key]]"
+
+    for args <- [["--unknown"], ["s3", "clock_skew_ms", "extra"]] do
+      {message, output} = capture_mix_error(fn -> run_task(AdminHelp, args) end)
+      assert message == usage
+      assert output == ""
+    end
+
+    for {args, expected} <- [
+          {["s3:target"], "configuration help request is invalid"},
+          {["s3", "root_password"], "configuration help path is not exposed"},
+          {["absent"], "configuration help entry was not found"},
+          {["s3", "absent"], "configuration help entry was not found"}
+        ] do
+      {message, output} = capture_mix_error(fn -> run_task(AdminHelp, args) end)
+      assert message == expected
+      assert output == ""
+      refute message =~ "root_password"
+      refute message =~ "absent"
+      refute output =~ "root_password"
+    end
+  end
+
+  test "HELP never enters the Config CLI boot path or creates runtime and audit rows" do
+    before_rows = Repo.aggregate(RuntimeConfig, :count)
+    before_audits = Repo.aggregate(RuntimeConfigAudit, :count)
+
+    :erlang.trace(self(), true, [:call])
+    :erlang.trace_pattern({Maxio.Config.CLI, :boot, 0}, true, [])
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Maxio.Config.CLI, :boot, 0}, false, [])
+      :erlang.trace(self(), false, [:call])
+    end)
+
+    output = capture_io(fn -> run_task(AdminHelp, []) end)
+    assert String.ends_with?(output, "\n")
+    refute_received {:trace, _pid, :call, {Maxio.Config.CLI, :boot, []}}
+    assert Repo.aggregate(RuntimeConfig, :count) == before_rows
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == before_audits
   end
 
   test "GET writes each exposed subsystem as exact redacted KVS bytes" do

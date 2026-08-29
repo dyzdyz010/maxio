@@ -848,6 +848,133 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     refute Enum.any?(events, &String.contains?(Map.get(&1, :stdout, ""), "restart"))
   end
 
+  test "mc human and JSON config help stages use exact native branch argv and fixture bytes" do
+    owner = self()
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      case config_help_call(args, opts) do
+        {:ok, mode, branch, expected_stdout} ->
+          send(owner, {:config_help_call, mode, branch, command, args, expected_stdout})
+          {expected_stdout, "", 0}
+
+        :not_help ->
+          base_runner.(command, args, opts)
+      end
+    end
+
+    entry = run_config_lifecycle(runner, successful_config_metrics_probe())
+    calls = config_help_calls()
+
+    assert entry["status"] == "ok"
+
+    assert Enum.map(calls, fn {mode, branch, command, args, _stdout} ->
+             {mode, branch, command, args}
+           end) == [
+             {:human, :get_alias, "mc.exe", ["admin", "config", "get", "maxiocompat"]},
+             {:human, :reset_alias, "mc.exe", ["admin", "config", "reset", "maxiocompat"]},
+             {:human, :set_subsystem, "mc.exe", ["admin", "config", "set", "maxiocompat", "s3"]},
+             {:human, :set_key, "mc.exe",
+              ["admin", "config", "set", "maxiocompat", "s3", "clock_skew_ms"]},
+             {:json, :get_alias, "mc.exe",
+              ["--json", "admin", "config", "get", "maxiocompatjson"]},
+             {:json, :reset_alias, "mc.exe",
+              ["--json", "admin", "config", "reset", "maxiocompatjson"]},
+             {:json, :set_subsystem, "mc.exe",
+              ["--json", "admin", "config", "set", "maxiocompatjson", "s3"]},
+             {:json, :set_key, "mc.exe",
+              [
+                "--json",
+                "admin",
+                "config",
+                "set",
+                "maxiocompatjson",
+                "s3",
+                "clock_skew_ms"
+              ]}
+           ]
+
+    fixture = config_help_fixture()
+
+    for {mode, branch, _command, _args, stdout} <- calls do
+      transcript =
+        case {mode, branch} do
+          {:human, branch} when branch in [:get_alias, :reset_alias] ->
+            fixture["expected_transcripts"]["top_level_human"]
+
+          {:json, branch} when branch in [:get_alias, :reset_alias] ->
+            fixture["expected_transcripts"]["top_level_global_json"]
+
+          {:human, _branch} ->
+            fixture["expected_transcripts"]["s3_subsystem_or_key_human"]
+
+          {:json, _branch} ->
+            fixture["expected_transcripts"]["s3_subsystem_or_key_global_json"]
+        end
+
+      assert stdout == transcript["stdout_utf8"]
+      assert byte_size(stdout) == transcript["byte_length"]
+      assert :crypto.hash(:sha256, stdout) |> Base.encode16(case: :lower) == transcript["sha256"]
+    end
+
+    help_steps =
+      Enum.filter(entry["steps"], &String.starts_with?(&1["scenario"], "admin_config_help_"))
+
+    assert length(help_steps) == 8
+
+    for step <- help_steps do
+      assert step["status"] == "ok"
+      assert step["expected_evidence"] == "fixture_expected"
+      assert step["observed_evidence"] == "fake_observed"
+      refute step["observed_evidence"] == "live_pass"
+    end
+  end
+
+  test "a config help failure is the primary blocker without a help-specific mutation cleanup" do
+    owner = self()
+    base_runner = successful_mc_runner()
+
+    runner = fn command, args, opts ->
+      case config_help_call(args, opts) do
+        {:ok, :human, :get_alias, expected_stdout} ->
+          send(owner, {:failed_config_help_call, command, args, expected_stdout})
+          {"injected help failure", "help stderr", 37}
+
+        {:ok, mode, branch, expected_stdout} ->
+          send(owner, {:config_help_call_after_failure, mode, branch, args})
+          {expected_stdout, "", 0}
+
+        :not_help ->
+          send(owner, {:non_help_call_after_failure, args})
+          base_runner.(command, args, opts)
+      end
+    end
+
+    entry = run_config_lifecycle(runner, successful_config_metrics_probe())
+
+    assert_received {:failed_config_help_call, "mc.exe",
+                     ["admin", "config", "get", "maxiocompat"], _expected_stdout}
+
+    assert entry["status"] == "blocked"
+    assert [primary | _rest] = entry["blockers"]
+    assert primary["reason"] == "external_smoke_step_failed"
+    assert primary["step"] == "admin_config_help_human_get_alias"
+
+    refute_received {:config_help_call_after_failure, :human, :reset_alias, _args}
+    refute_received {:config_help_call_after_failure, :human, :set_subsystem, _args}
+    refute_received {:config_help_call_after_failure, :human, :set_key, _args}
+
+    # The only reset allowed after the read-only help failure is the pre-existing lifecycle
+    # safety cleanup. There is no new help-specific key/value mutation or cleanup command.
+    resets =
+      collect_received_non_help_calls()
+      |> Enum.filter(fn args -> "reset" in args end)
+
+    assert Enum.all?(resets, fn args ->
+             Enum.take(Enum.reverse(args), 2) == ["public", "prometheus_metrics"]
+           end)
+  end
+
   test "mc JSON config lifecycle keeps prefix-first argv compact bytes and independent state" do
     run_ref = make_ref()
     {runner, metrics_probe} = config_lifecycle_harness(self(), run_ref)
@@ -3258,6 +3385,84 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     |> Jason.decode!()
     |> Jason.encode!(pretty: true)
     |> Kernel.<>("\n")
+  end
+
+  defp config_help_call(args, opts) do
+    {_config_dir, json?, command} = parse_mc_args(args, opts)
+    mode = if json?, do: :json, else: :human
+
+    branch =
+      case command do
+        ["admin", "config", "get", alias_name]
+        when alias_name in ["maxiocompat", "maxiocompatjson"] ->
+          :get_alias
+
+        ["admin", "config", "reset", alias_name]
+        when alias_name in ["maxiocompat", "maxiocompatjson"] ->
+          :reset_alias
+
+        ["admin", "config", "set", alias_name, "s3"]
+        when alias_name in ["maxiocompat", "maxiocompatjson"] ->
+          :set_subsystem
+
+        ["admin", "config", "set", alias_name, "s3", "clock_skew_ms"]
+        when alias_name in ["maxiocompat", "maxiocompatjson"] ->
+          :set_key
+
+        _other ->
+          nil
+      end
+
+    if branch do
+      fixture = config_help_fixture()
+
+      transcript_key =
+        case {mode, branch} do
+          {:human, branch} when branch in [:get_alias, :reset_alias] -> "top_level_human"
+          {:json, branch} when branch in [:get_alias, :reset_alias] -> "top_level_global_json"
+          {:human, _branch} -> "s3_subsystem_or_key_human"
+          {:json, _branch} -> "s3_subsystem_or_key_global_json"
+        end
+
+      {:ok, mode, branch, fixture["expected_transcripts"][transcript_key]["stdout_utf8"]}
+    else
+      :not_help
+    end
+  end
+
+  defp config_help_fixture do
+    __DIR__
+    |> Path.join("../../fixtures/minio_admin_config_help_s6/mc_help_dispatch.json")
+    |> Path.expand()
+    |> File.read!()
+    |> Jason.decode!()
+  end
+
+  defp config_help_calls(calls \\ []) do
+    receive do
+      {:config_help_call, mode, branch, command, args, stdout} ->
+        config_help_calls([{mode, branch, command, args, stdout} | calls])
+    after
+      0 -> Enum.reverse(calls)
+    end
+  end
+
+  defp collect_received_non_help_calls(calls \\ []) do
+    receive do
+      {:non_help_call_after_failure, args} ->
+        collect_received_non_help_calls([args | calls])
+    after
+      0 -> Enum.reverse(calls)
+    end
+  end
+
+  defp successful_config_metrics_probe do
+    counter = start_supervised!({Agent, fn -> 0 end})
+    expected = [403, 200, 403, 403, 200, 403]
+
+    fn _url, _opts ->
+      Agent.get_and_update(counter, fn index -> {Enum.fetch!(expected, index), index + 1} end)
+    end
   end
 
   defp tmp_root do

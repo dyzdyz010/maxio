@@ -74,7 +74,9 @@ defmodule Maxio.Admin.PlugTest do
           {:put, "/minio/admin/v3/del-config-kv", %{}},
           {:get, "/minio/admin/v4/get-config-kv", %{}},
           {:get, "/minio/admin/v3/get-config-kv/extra", %{}},
-          {:get, "/minio/admin/v3/help-config-kv", %{}},
+          {:post, "/minio/admin/v3/help-config-kv", %{"subSys" => "", "key" => ""}},
+          {:get, "/minio/admin/v4/help-config-kv", %{"subSys" => "", "key" => ""}},
+          {:get, "/minio/admin/v3/help-config-kv/extra", %{"subSys" => "", "key" => ""}},
           {:get, "/minio/admin/v3/config", %{}},
           {:get, "/minio/admin/v3/list-config-history-kv", %{"count" => "10"}},
           {:delete, "/minio/admin/v3/clear-config-history-kv",
@@ -94,6 +96,7 @@ defmodule Maxio.Admin.PlugTest do
     # Catches route matching, missing-key classification, or mutation framing moving above auth.
     for {method, path} <- [
           {:get, "/minio/admin/v3/get-config-kv"},
+          {:get, "/minio/admin/v3/help-config-kv"},
           {:put, "/minio/admin/v3/set-config-kv"},
           {:delete, "/minio/admin/v3/del-config-kv"}
         ] do

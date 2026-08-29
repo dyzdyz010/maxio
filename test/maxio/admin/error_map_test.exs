@@ -176,6 +176,32 @@ defmodule Maxio.Admin.ErrorMapTest do
     end
   end
 
+  test "Config help preserves only safe unknown-key descriptions with a separately safe subsystem" do
+    safe =
+      ErrorMap.from_reason({:config_generic, "unknown key clock_skew_ms for sub-system s3"})
+
+    assert safe.code == "XMinioConfigError"
+    assert safe.http_status == 400
+    assert safe.message == "unknown key clock_skew_ms for sub-system s3"
+
+    unsafe_descriptions = [
+      "unknown key root_password for sub-system s3",
+      "unknown key clock_skew_ms for sub-system credential_store",
+      "unknown key credential for sub-system s3",
+      "unknown key clock_skew_ms for sub-system SECRETCONFIGKVSENTINEL",
+      "unknown key bad/control for sub-system s3",
+      "unknown key clock_skew_ms for sub-system bad/control"
+    ]
+
+    for description <- unsafe_descriptions do
+      error = ErrorMap.from_reason({:config_generic, description})
+      assert error.code == "XMinioConfigError"
+      assert error.http_status == 400
+      assert error.message == "Configuration specified is invalid"
+      refute error.message =~ description
+    end
+  end
+
   test "maps policy absence and invalid documents or names to exact MinIO admin errors" do
     assert %{code: "XMinioAdminNoSuchPolicy", http_status: 404} =
              ErrorMap.from_reason(:not_found)
