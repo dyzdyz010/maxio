@@ -295,6 +295,77 @@ defmodule Maxio.Config.CoordinatorTest do
              )
   end
 
+  test "legacy expected versions accept registered siblings and check their locked snapshot" do
+    owner = self()
+
+    validator = fn candidate ->
+      send(owner, {:legacy_sibling_candidate, candidate})
+      :ok
+    end
+
+    accepted =
+      mutate([{:set, :left, 10}],
+        expected_versions: %{right: nil},
+        validator: validator,
+        request_id: "req-legacy-sibling-accepted"
+      )
+
+    accepted_observations = ConfigBatchFailureRepo.observations()
+
+    candidate =
+      receive do
+        {:legacy_sibling_candidate, candidate} -> candidate
+      after
+        0 -> :validator_not_called
+      end
+
+    insert_runtime!(:right, 7, version: 3, previous_value: 6)
+    before_conflict = {runtime_snapshot(), audit_snapshot()}
+    ConfigBatchFailureRepo.clear!()
+
+    conflict =
+      mutate([{:set, :left, 11}],
+        expected_versions: %{right: nil},
+        request_id: "req-legacy-sibling-conflict"
+      )
+
+    conflict_observations = ConfigBatchFailureRepo.observations()
+    after_conflict = {runtime_snapshot(), audit_snapshot()}
+
+    assert {:ok,
+            %{
+              subsystem: :batch_fixture,
+              changed_keys: [:left],
+              outcomes: %{left: %{changed?: true, value: 10, version: 1}}
+            }} = accepted
+
+    assert accepted_observations.transactions == 1
+    assert accepted_observations.advisory_locks == 1
+    assert candidate == %{left: 10, right: nil}
+    assert conflict == {:error, :config_version_conflict}
+    assert conflict_observations.transactions == 1
+    assert conflict_observations.advisory_locks == 1
+    assert after_conflict == before_conflict
+  end
+
+  test "legacy expected versions reject unknown or other-subsystem siblings before transaction" do
+    results =
+      for expected_versions <- [%{missing: nil}, %{shared: nil}] do
+        ConfigBatchFailureRepo.clear!()
+        result = mutate([{:set, :left, 10}], expected_versions: expected_versions)
+        {result, ConfigBatchFailureRepo.observations()}
+      end
+
+    Enum.each(results, fn {result, observations} ->
+      assert match?({:error, _reason}, result)
+      assert observations == %{transactions: 0, query_calls: 0, advisory_locks: 0}
+    end)
+
+    assert length(results) == 2
+    assert runtime_snapshot() == []
+    assert audit_snapshot() == []
+  end
+
   defp mutate(operations, extra_opts \\ []) do
     opts =
       [

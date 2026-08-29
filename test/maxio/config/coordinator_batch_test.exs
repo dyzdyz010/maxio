@@ -205,16 +205,22 @@ defmodule Maxio.Config.CoordinatorBatchTest do
              ]
            } = result
 
-    assert result.outcomes[{:listing, :sql_hard_limit}] == %{
+    changed_reset = result.outcomes[{:listing, :sql_hard_limit}]
+    no_op_reset = result.outcomes[{:prometheus_metrics, :public}]
+    changed_set = result.outcomes[{:s3, :clock_skew_ms}]
+
+    assert changed_reset == %{
              operation: :reset,
              changed?: true,
              version: nil,
-             value: nil,
              applied: :hot
            }
 
-    assert result.outcomes[{:prometheus_metrics, :public}].changed? == false
-    assert result.outcomes[{:s3, :clock_skew_ms}].version == 1
+    assert no_op_reset.changed? == false
+    assert changed_set.version == 1
+    refute Map.has_key?(changed_reset, :value)
+    refute Map.has_key?(no_op_reset, :value)
+    refute Map.has_key?(changed_set, :value)
 
     assert runtime_rows() == [
              {"archive_orphan", "private_value", %{"v" => "ORPHAN-MUST-STAY"}, 9},
@@ -311,8 +317,10 @@ defmodule Maxio.Config.CoordinatorBatchTest do
              ])
 
     assert direct.changed_paths == [{:batch_alpha, :shared}, {:batch_omega, :shared}]
-    assert direct.outcomes[{:batch_alpha, :shared}].value == 111
-    assert direct.outcomes[{:batch_omega, :shared}].value == 222
+    assert direct.outcomes[{:batch_alpha, :shared}].version == 1
+    assert direct.outcomes[{:batch_omega, :shared}].version == 1
+    refute Map.has_key?(direct.outcomes[{:batch_alpha, :shared}], :value)
+    refute Map.has_key?(direct.outcomes[{:batch_omega, :shared}], :value)
 
     assert {:ok, facade} =
              apply(Config, :mutate_many, [
@@ -327,15 +335,22 @@ defmodule Maxio.Config.CoordinatorBatchTest do
              ])
 
     assert facade.outcomes[{:batch_alpha, :shared}].version == 2
-    assert facade.outcomes[{:batch_alpha, :shared}].value == 333
     assert facade.outcomes[{:batch_omega, :shared}].version == 2
-    assert facade.outcomes[{:batch_omega, :shared}].value == 444
+    refute Map.has_key?(facade.outcomes[{:batch_alpha, :shared}], :value)
+    refute Map.has_key?(facade.outcomes[{:batch_omega, :shared}], :value)
+
+    assert runtime_rows() == [
+             {"batch_alpha", "shared", %{"v" => 333}, 2},
+             {"batch_omega", "shared", %{"v" => 444}, 2}
+           ]
   end
 
   test "malformed batch options fail before a transaction and untouched validators are rejected" do
     cases = [
       [expected_versions: %{sql_hard_limit: nil}],
       [expected_versions: %{{:listing, :sql_hard_limit} => -1}],
+      [expected_versions: %{{:listing, :unregistered_sibling} => nil}],
+      [expected_versions: %{{:s3, :clock_skew_ms} => nil}],
       [validators: %{listing: :not_a_function}],
       [validators: %{s3: fn _candidate -> :ok end}],
       [source: :admin_api]
@@ -351,6 +366,57 @@ defmodule Maxio.Config.CoordinatorBatchTest do
       assert runtime_rows() == []
       assert audit_rows() == []
     end
+  end
+
+  test "unknown subsystem with an empty operation group fails before transaction or advisory lock" do
+    result = mutate_many([{:batch_absent, []}])
+    observations = ConfigBatchFailureRepo.observations()
+
+    assert observations == %{transactions: 0, query_calls: 0, advisory_locks: 0}
+    assert {:error, {:unknown_config_subsystem, :batch_absent}} = result
+    assert runtime_rows() == []
+    assert audit_rows() == []
+  end
+
+  test "batch expected versions accept registered siblings and check their locked snapshot" do
+    accepted =
+      mutate_many(
+        [{:batch_fixture, [{:set, :left, 10}]}],
+        schema: ConfigBatchSchema,
+        expected_versions: %{{:batch_fixture, :right} => nil},
+        request_id: "req-batch-sibling-accepted"
+      )
+
+    accepted_observations = ConfigBatchFailureRepo.observations()
+
+    insert_runtime!(:batch_fixture, :right, 7, version: 3)
+    before_conflict = database_snapshot()
+    ConfigBatchFailureRepo.clear!()
+
+    conflict =
+      mutate_many(
+        [{:batch_fixture, [{:set, :left, 11}]}],
+        schema: ConfigBatchSchema,
+        expected_versions: %{{:batch_fixture, :right} => nil},
+        request_id: "req-batch-sibling-conflict"
+      )
+
+    conflict_observations = ConfigBatchFailureRepo.observations()
+    after_conflict = database_snapshot()
+
+    assert {:ok,
+            %{
+              touched_subsystems: [:batch_fixture],
+              changed_paths: [{:batch_fixture, :left}],
+              outcomes: %{{:batch_fixture, :left} => %{changed?: true, version: 1}}
+            }} = accepted
+
+    assert accepted_observations.transactions == 1
+    assert accepted_observations.advisory_locks == 1
+    assert conflict == {:error, :config_version_conflict}
+    assert conflict_observations.transactions == 1
+    assert conflict_observations.advisory_locks == 1
+    assert after_conflict == before_conflict
   end
 
   test "one stale path version conflicts the whole batch with zero writes" do
