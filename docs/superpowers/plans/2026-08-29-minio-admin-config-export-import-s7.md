@@ -248,8 +248,8 @@
   ```
 
 - [ ] **Step 5: Write purity/redaction RED.** invalid UTF-8、`Schema.parse/3` invalid raw scalar、sensitive prefix 都在
-  mutation fake 被调用前
-  失败；错误 evidence 只有 stage/subsystem/key_count，不含 submitted value。
+  mutation fake 被调用前失败；错误 evidence 只有 closed-vocabulary safe `reason` 加 stage/subsystem/key_count，绝不含
+  submitted value 或 dynamic secret；`reason` 映射必须消费 Task 1 已冻结矩阵。
 
 - [ ] **Step 6: Run tests and confirm RED.** Run:
 

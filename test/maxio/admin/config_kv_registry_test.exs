@@ -40,6 +40,58 @@ defmodule Maxio.Admin.ConfigKV.RegistryTest do
     assert entries() == @expected_entries
   end
 
+  test "public archive paths preserve the exact registry order" do
+    # Catches deriving the archive projection from Schema/map/DB enumeration, which can reorder or
+    # silently expand the bounded S7 public surface. The checked seam must accept the production
+    # registry, and arity zero must not bypass that same checked result.
+    expected_paths = [
+      {:s3, :clock_skew_ms},
+      {:listing, :sql_hard_limit},
+      {:prometheus_metrics, :public}
+    ]
+
+    assert {:ok, checked_paths} = Registry.public_paths(@expected_entries)
+    assert checked_paths == expected_paths
+    assert Registry.public_paths() == checked_paths
+
+    assert Enum.all?(entries(), &(&1.sensitive? == false))
+  end
+
+  test "checked public paths fail closed instead of filtering unsafe injected entries" do
+    # Catches an archive advertised as complete silently omitting an entry after registry drift.
+    # These three entries exercise the independent sensitive, hidden and forbidden boundaries.
+    unsafe_entries = [
+      %{
+        wire_subsystem: "s3",
+        wire_key: "clock_skew_ms",
+        core_subsystem: :s3,
+        core_key: :clock_skew_ms,
+        sensitive?: true,
+        order: 0
+      },
+      %{
+        wire_subsystem: "cluster",
+        wire_key: "deployment_id",
+        core_subsystem: :cluster,
+        core_key: :deployment_id,
+        sensitive?: false,
+        order: 0
+      },
+      %{
+        wire_subsystem: "s3",
+        wire_key: "root_password",
+        core_subsystem: :s3,
+        core_key: :root_password,
+        sensitive?: false,
+        order: 0
+      }
+    ]
+
+    for unsafe <- unsafe_entries do
+      assert {:error, _reason} = Registry.public_paths(@expected_entries ++ [unsafe])
+    end
+  end
+
   test "one ordered registry declaration exposes exact stable subsystem and key help metadata" do
     # Catches a second help-only catalog drifting from the S5 exposure registry, an unordered
     # projection, or Schema prose/default/runtime values leaking into the public protocol.

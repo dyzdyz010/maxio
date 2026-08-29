@@ -2,7 +2,10 @@ defmodule Maxio.Admin.ConfigKV.ParserTest do
   use ExUnit.Case, async: true
 
   import Maxio.Admin.ConfigKV.Parser, only: [parse_set: 2, parse_reset: 1, render: 2]
+
   import Maxio.Admin.ConfigKV.Registry, only: [entries: 0]
+
+  alias Maxio.Admin.ConfigKV.Parser
 
   test "set scanner skips LF comments and blank lines while sanitizing only outer whitespace and quotes" do
     # Catches a line splitter that treats comments as settings, loses LF-separated input, or
@@ -61,6 +64,43 @@ defmodule Maxio.Admin.ConfigKV.ParserTest do
                 wire_subsystem: "s3",
                 patches: [{"clock_skew_ms", "1000"}, {"clock_skew_ms", "2000"}]
               }}
+  end
+
+  test "document parser preserves physical line order across public subsystems" do
+    # Catches reusing the S5 one-subsystem reducer, losing physical line evidence, or folding
+    # duplicate patches before the archive replacement planner applies last-line-wins.
+    plaintext =
+      "# pinned comment\n\n" <>
+        "s3 clock_skew_ms=\"1000\"\n" <>
+        "listing sql_hard_limit='100000'\n" <>
+        "s3 clock_skew_ms=2000\n" <>
+        "prometheus_metrics public=\"true\"\n"
+
+    assert Parser.parse_document(plaintext, entries()) ==
+             {:ok,
+              [
+                %{line: 3, wire_subsystem: "s3", patches: [{"clock_skew_ms", "1000"}]},
+                %{
+                  line: 4,
+                  wire_subsystem: "listing",
+                  patches: [{"sql_hard_limit", "100000"}]
+                },
+                %{line: 5, wire_subsystem: "s3", patches: [{"clock_skew_ms", "2000"}]},
+                %{
+                  line: 6,
+                  wire_subsystem: "prometheus_metrics",
+                  patches: [{"public", "true"}]
+                }
+              ]}
+  end
+
+  test "legacy S5 set remains a one-subsystem command over the shared document scanner" do
+    # Catches the new archive parser accidentally broadening set-config-kv to cross-subsystem
+    # writes even though the document parser itself must accept the same ordered input.
+    plaintext = "s3 clock_skew_ms=1000\nlisting sql_hard_limit=100000\n"
+
+    assert {:ok, [_s3, _listing]} = Parser.parse_document(plaintext, entries())
+    assert parse_set(plaintext, entries()) == {:error, :bad_json}
   end
 
   test "an invalid first raw scalar remains deferred when a valid later line overwrites it" do
