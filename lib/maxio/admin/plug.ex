@@ -68,7 +68,7 @@ defmodule Maxio.Admin.Plug do
   @behaviour Plug
   @config_update_action "admin:ConfigUpdate"
   @config_kv_test_build Mix.env() == :test
-  @config_failure_stages [:parser, :exposure, :type, :database]
+  @config_failure_stages [:parser, :exposure, :type, :database, :postcommit]
 
   @impl true
   def init(opts), do: opts
@@ -135,6 +135,8 @@ defmodule Maxio.Admin.Plug do
   defp dispatch(conn, "GET", "/minio/admin/v3/help-config-kv"), do: help_config_kv(conn)
   defp dispatch(conn, "PUT", "/minio/admin/v3/set-config-kv"), do: set_config_kv(conn)
   defp dispatch(conn, "DELETE", "/minio/admin/v3/del-config-kv"), do: reset_config_kv(conn)
+  defp dispatch(conn, "GET", "/minio/admin/v3/config"), do: export_config(conn)
+  defp dispatch(conn, "PUT", "/minio/admin/v3/config"), do: import_config(conn)
 
   defp dispatch(conn, "PUT", "/minio/admin/v3/add-canned-policy"),
     do: create_policy(conn)
@@ -259,6 +261,60 @@ defmodule Maxio.Admin.Plug do
 
   defp set_config_kv(conn), do: mutate_config_kv(conn, :set)
   defp reset_config_kv(conn), do: mutate_config_kv(conn, :reset)
+
+  defp export_config(conn) do
+    action = config_action(:export)
+
+    with_config_kv_boundary(conn, action, fn ->
+      authorize_and_run(conn, @config_update_action, action, fn conn ->
+        export_config_authorized(conn)
+      end)
+    end)
+  end
+
+  defp export_config_authorized(conn) do
+    with {:ok, caller_secret} <- signing_secret(conn),
+         {:ok, access_key_id} <- exact_actor_access_key_id(conn),
+         {:ok, plaintext} <- Adapter.export_config(config_kv_options(conn, access_key_id)) do
+      ciphertext = Request.encrypt!(caller_secret, plaintext)
+      log_config_export(conn, access_key_id)
+      send_config_ciphertext(conn, ciphertext)
+    else
+      {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+      {:error, :missing_actor_access_key} -> render_error(conn, Error.new(:internal_error))
+      {:error, evidence} -> render_config_adapter_error(conn, :export, evidence)
+    end
+  end
+
+  defp import_config(conn) do
+    action = config_action(:import)
+
+    with_config_kv_boundary(conn, action, fn ->
+      authorize_and_run(conn, @config_update_action, action, fn conn ->
+        import_config_authorized(conn)
+      end)
+    end)
+  end
+
+  defp import_config_authorized(conn) do
+    with {:ok, caller_secret} <- signing_secret(conn),
+         {:ok, access_key_id} <- exact_actor_access_key_id(conn) do
+      {conn, plaintext} = Request.read_encrypted!(conn, caller_secret)
+      opts = config_kv_options(conn, access_key_id)
+
+      case Adapter.import_config(plaintext, opts) do
+        {:ok, mutation} ->
+          log_config_import(conn, access_key_id, mutation)
+          config_archive_mutation_success(conn)
+
+        {:error, evidence} ->
+          render_config_adapter_error(conn, :import, evidence)
+      end
+    else
+      {:error, :missing_signing_secret} -> render_error(conn, Error.new(:internal_error))
+      {:error, :missing_actor_access_key} -> render_error(conn, Error.new(:internal_error))
+    end
+  end
 
   defp mutate_config_kv(conn, operation) do
     action = config_action(operation)
@@ -760,7 +816,7 @@ defmodule Maxio.Admin.Plug do
        when is_binary(action) and
               is_binary(subsystem) and is_integer(key_count) and key_count >= 0 and
               stage in @config_failure_stages do
-    err = config_adapter_error(reason)
+    err = config_adapter_error(reason, action)
 
     Log.warn("admin config request failed",
       action: action,
@@ -782,8 +838,12 @@ defmodule Maxio.Admin.Plug do
   defp render_config_evidence_error(conn, action, _invalid_evidence),
     do: render_config_unexpected_failure(conn, action)
 
-  defp config_adapter_error(:access_denied), do: config_access_denied_error()
-  defp config_adapter_error(reason), do: ErrorMap.from_reason(reason)
+  defp config_adapter_error(:access_denied, action)
+       when action in ["config_export", "config_import"],
+       do: Error.new(:access_denied)
+
+  defp config_adapter_error(:access_denied, _action), do: config_access_denied_error()
+  defp config_adapter_error(reason, _action), do: ErrorMap.from_reason(reason)
 
   defp with_config_kv_boundary(conn, action, callback) do
     try do
@@ -882,6 +942,50 @@ defmodule Maxio.Admin.Plug do
     )
   end
 
+  defp log_config_export(conn, access_key_id) do
+    Log.info("admin config archive projected",
+      action: config_action(:export),
+      admin_action: config_action(:export),
+      required_action: @config_update_action,
+      config_subsystem: "listing,prometheus_metrics,s3",
+      config_key_count: 3,
+      config_changed_count: 0,
+      request_id: request_id(conn),
+      principal_arn: principal_arn(conn),
+      access_key_id: access_key_id,
+      auth_type: conn.assigns[:auth_type]
+    )
+  end
+
+  defp log_config_import(conn, access_key_id, mutation) do
+    Log.info("admin config archive committed",
+      action: config_action(:import),
+      admin_action: config_action(:import),
+      required_action: @config_update_action,
+      config_subsystem: safe_subsystems(Map.get(mutation, :touched_subsystems, [])),
+      config_changed_count: Map.get(mutation, :changed_count, 0),
+      decision: "committed=#{Map.get(mutation, :committed?, false)}",
+      config_local_reload: config_local_reload_metadata(Map.get(mutation, :local_reload)),
+      config_broadcast: config_broadcast_metadata(Map.get(mutation, :broadcast)),
+      config_attention: Map.get(mutation, :attention?, false),
+      request_id: request_id(conn),
+      principal_arn: principal_arn(conn),
+      access_key_id: access_key_id,
+      auth_type: conn.assigns[:auth_type]
+    )
+  end
+
+  defp safe_subsystems(subsystems) when is_list(subsystems) do
+    subsystems
+    |> Enum.filter(&(&1 in [:listing, :prometheus_metrics, :s3]))
+    |> Enum.map(&Atom.to_string/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.join(",")
+  end
+
+  defp safe_subsystems(_subsystems), do: ""
+
   defp mutation_apply_modes_text(mutation) do
     case mutation_apply_modes(mutation) do
       [] -> "none"
@@ -914,6 +1018,8 @@ defmodule Maxio.Admin.Plug do
   defp config_action(:help), do: "admin_config_help"
   defp config_action(:set), do: "admin_config_set"
   defp config_action(:reset), do: "admin_config_reset"
+  defp config_action(:export), do: "config_export"
+  defp config_action(:import), do: "config_import"
 
   defp log_user_mutation(conn, admin_action, result) do
     affected = Map.get(result, :affected, %{})
@@ -1128,6 +1234,8 @@ defmodule Maxio.Admin.Plug do
   defp send_config_ciphertext(conn, body) do
     conn
     |> delete_resp_header("transfer-encoding")
+    |> delete_resp_header("content-encoding")
+    |> delete_resp_header("x-minio-config-applied")
     |> put_resp_header("content-type", "application/json")
     |> put_resp_header("content-length", body |> IO.iodata_length() |> Integer.to_string())
     |> send_resp(200, body)
@@ -1158,6 +1266,17 @@ defmodule Maxio.Admin.Plug do
     conn
     |> delete_resp_header("content-type")
     |> delete_resp_header("transfer-encoding")
+    |> put_resp_header("content-length", "0")
+    |> send_resp(200, "")
+    |> halt()
+  end
+
+  defp config_archive_mutation_success(conn) do
+    conn
+    |> delete_resp_header("content-type")
+    |> delete_resp_header("transfer-encoding")
+    |> delete_resp_header("content-encoding")
+    |> delete_resp_header("x-minio-config-applied")
     |> put_resp_header("content-length", "0")
     |> send_resp(200, "")
     |> halt()

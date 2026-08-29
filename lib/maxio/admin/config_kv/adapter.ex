@@ -1,11 +1,12 @@
 defmodule Maxio.Admin.ConfigKV.Adapter do
   @moduledoc false
 
-  alias Maxio.Admin.ConfigKV.{Parser, Registry}
+  alias Maxio.Admin.ConfigKV.{Archive, Parser, Registry}
   alias Maxio.Config
   alias Maxio.Config.Schema
 
   @error_evidence_option :return_error_evidence
+  @archive_failure_stages [:parser, :exposure, :type, :database, :postcommit]
   @safe_identifier ~r/\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\z/
   @safe_command ~r/\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?: [A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:=[A-Za-z0-9_.:+\/-]{0,128})?)*\z/
   @sensitive_marker ~r/(?:secret|password|token|credential|access[_-]?key|private|cipher|plaintext|root[_-]?user)/i
@@ -27,7 +28,7 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
           required(:reason) => reason(),
           required(:subsystem) => String.t(),
           required(:key_count) => non_neg_integer(),
-          required(:stage) => :parser | :exposure | :type | :database
+          required(:stage) => :parser | :exposure | :type | :database | :postcommit
         }
 
   @type error_result :: {:error, adapter_reason()} | {:error, error_evidence()}
@@ -44,6 +45,31 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
   end
 
   def get(_wire_subsystem, _opts), do: {:error, :invalid_argument}
+
+  @spec export_config(keyword()) :: {:ok, binary()} | error_result()
+  def export_config(opts \\ [])
+
+  def export_config(opts) when is_list(opts) do
+    opts
+    |> Keyword.delete(@error_evidence_option)
+    |> Archive.export()
+    |> archive_result()
+    |> finalize_result(opts)
+  end
+
+  def export_config(_opts), do: {:error, :invalid_argument}
+
+  @spec import_config(binary(), keyword()) :: {:ok, map()} | error_result()
+  def import_config(plaintext, opts \\ [])
+
+  def import_config(plaintext, opts) when is_binary(plaintext) and is_list(opts) do
+    plaintext
+    |> Archive.import_config(Keyword.delete(opts, @error_evidence_option))
+    |> archive_result()
+    |> finalize_result(opts)
+  end
+
+  def import_config(_plaintext, _opts), do: {:error, :invalid_argument}
 
   defp do_get(wire_subsystem, opts) do
     with :ok <- reject_target(wire_subsystem),
@@ -401,6 +427,82 @@ defmodule Maxio.Admin.ConfigKV.Adapter do
   defp mutation_failure_stage(:invalid_argument), do: :parser
   defp mutation_failure_stage({:config_store_unavailable, _reason}), do: :database
   defp mutation_failure_stage(_reason), do: :database
+
+  defp archive_result({:ok, _result} = success), do: success
+
+  defp archive_result({:error, evidence}) do
+    case safe_archive_evidence(evidence) do
+      {:ok, safe_evidence} ->
+        {:adapter_error, archive_adapter_reason(safe_evidence.reason), safe_evidence}
+
+      :error ->
+        context = evidence_context("unknown", 0)
+        reason = {:config_store_unavailable, :operation_failed}
+
+        adapter_error(reason, reason, context, :database)
+    end
+  end
+
+  defp safe_archive_evidence(
+         %{reason: reason, stage: stage, subsystem: subsystem, key_count: key_count} = evidence
+       )
+       when stage in @archive_failure_stages and is_binary(subsystem) and is_integer(key_count) and
+              key_count >= 0 do
+    safe_evidence = %{
+      reason: safe_archive_reason(reason),
+      stage: stage,
+      subsystem: safe_config_label(subsystem),
+      key_count: key_count
+    }
+
+    {:ok, maybe_project_archive_subsystem(safe_evidence, evidence)}
+  end
+
+  defp safe_archive_evidence(_evidence), do: :error
+
+  defp safe_archive_reason(reason)
+       when reason in [
+              :access_denied,
+              :config_bad_json,
+              :config_generic,
+              :config_not_found,
+              :invalid_argument
+            ],
+       do: reason
+
+  defp safe_archive_reason({:config_store_unavailable, reason}) when is_atom(reason),
+    do: {:config_store_unavailable, reason}
+
+  defp safe_archive_reason(_reason), do: {:config_store_unavailable, :operation_failed}
+
+  defp maybe_project_archive_subsystem(
+         %{reason: :config_generic, stage: :exposure, subsystem: subsystem} = evidence,
+         _archive_evidence
+       )
+       when subsystem != "unknown" do
+    cond do
+      not safe_identifier?(subsystem) ->
+        %{evidence | subsystem: "unknown"}
+
+      Registry.classify_subsystem(subsystem) == {:error, :unknown_subsystem} ->
+        %{evidence | reason: {:config_unknown_subsystem, subsystem}}
+
+      match?({:ok, _entries}, Registry.classify_subsystem(subsystem)) ->
+        %{
+          evidence
+          | reason: {:config_generic, "sub-system '#{subsystem}' cannot have empty keys"}
+        }
+
+      true ->
+        %{evidence | subsystem: "unknown"}
+    end
+  end
+
+  defp maybe_project_archive_subsystem(evidence, _archive_evidence), do: evidence
+
+  defp archive_adapter_reason({:config_unknown_subsystem, _subsystem}), do: :config_generic
+  defp archive_adapter_reason({:config_store_unavailable, _reason} = reason), do: reason
+  defp archive_adapter_reason(reason), do: reason
 
   defp adapter_error(adapter_reason, public_reason, context, stage) do
     {:adapter_error, adapter_reason,

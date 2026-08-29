@@ -6,6 +6,7 @@ defmodule Maxio.Admin.ConfigKV.Archive do
   alias Maxio.Config.Schema
 
   @test_config_injection Mix.env() == :test
+  @safe_identifier ~r/\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\z/
   @sensitive_marker ~r/(?:secret|password|token|credential|access[_-]?key|private|cipher|plaintext|root[_-]?user)/i
 
   @type operation :: {:set, atom(), term()} | {:reset, atom()}
@@ -43,6 +44,7 @@ defmodule Maxio.Admin.ConfigKV.Archive do
 
     with true <- String.valid?(plaintext),
          {:ok, _paths} <- Registry.public_paths(entries),
+         :ok <- validate_document_syntax(plaintext),
          :ok <- preflight_exposure(plaintext, entries),
          {:ok, lines} <- parse_document(plaintext, entries),
          {:ok, folded} <- fold_document(lines),
@@ -111,6 +113,33 @@ defmodule Maxio.Admin.ConfigKV.Archive do
       {:error, _reason} ->
         {:error, evidence(:config_bad_json, :parser, "unknown", 0)}
     end
+  end
+
+  # The public Parser resolves registered keys while it tokenizes. Archive import
+  # has a stricter staged contract: document syntax is decided before any path is
+  # classified as public, hidden, forbidden, or unknown. Keep this first pass
+  # deliberately registry-neutral; the exposure pass and Parser remain the
+  # authoritative path and scalar decoders afterwards.
+  defp validate_document_syntax(plaintext) do
+    plaintext
+    |> String.split("\n")
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
+    |> Enum.reduce_while(:ok, fn line, :ok ->
+      case String.split(line, ~r/\s+/u, parts: 2) do
+        [_wire_subsystem, fields] ->
+          if Regex.match?(~r/\A[^\s=]+=/u, fields) do
+            {:cont, :ok}
+          else
+            {:halt, {:error, evidence(:config_bad_json, :parser, "unknown", 0)}}
+          end
+
+        [_wire_subsystem] ->
+          # A subsystem-only line is lexically complete. Exposure decides
+          # whether it is a target/unknown/empty-key command at the next stage.
+          {:cont, :ok}
+      end
+    end)
   end
 
   defp fold_document(lines) do
@@ -231,7 +260,7 @@ defmodule Maxio.Admin.ConfigKV.Archive do
     key_count = length(markers)
 
     if classify_identifiers(wire_subsystem, field_identifiers(fields)) == :access_denied do
-      {:error, evidence(:access_denied, :exposure, wire_subsystem, key_count)}
+      {:error, evidence(:access_denied, :exposure, "unknown", key_count)}
     else
       case markers do
         [] ->
@@ -245,7 +274,7 @@ defmodule Maxio.Admin.ConfigKV.Archive do
 
           case classify_identifiers(wire_subsystem, field_identifiers(prefix)) do
             :access_denied ->
-              {:error, evidence(:access_denied, :exposure, wire_subsystem, key_count)}
+              {:error, evidence(:access_denied, :exposure, "unknown", key_count)}
 
             _other ->
               {:error, evidence(:config_bad_json, :exposure, wire_subsystem, key_count)}
@@ -257,10 +286,15 @@ defmodule Maxio.Admin.ConfigKV.Archive do
   defp preflight_unknown_subsystem(wire_subsystem, fields) do
     classification = classify_identifiers(wire_subsystem, field_identifiers(fields))
 
-    if classification == :access_denied do
-      {:error, evidence(:access_denied, :exposure, "unknown", 0)}
-    else
-      {:error, evidence(:config_generic, :exposure, "unknown", 0)}
+    cond do
+      classification == :access_denied ->
+        {:error, evidence(:access_denied, :exposure, "unknown", 0)}
+
+      classification == :unknown and safe_identifier?(wire_subsystem) ->
+        {:error, evidence(:config_generic, :exposure, wire_subsystem, 0)}
+
+      true ->
+        {:error, evidence(:config_generic, :exposure, "unknown", 0)}
     end
   end
 
@@ -283,7 +317,7 @@ defmodule Maxio.Admin.ConfigKV.Archive do
   end
 
   defp classify_identifiers(wire_subsystem, wire_keys) do
-    Enum.reduce_while(wire_keys, :unknown, fn wire_key, _classification ->
+    Enum.reduce_while(wire_keys, :unknown, fn wire_key, classification ->
       cond do
         sensitive_identifier?(wire_key) ->
           {:halt, :access_denied}
@@ -292,12 +326,15 @@ defmodule Maxio.Admin.ConfigKV.Archive do
           case Registry.classify_path(wire_subsystem, wire_key) do
             {:error, :forbidden} -> {:halt, :access_denied}
             {:error, :wire_hidden} -> {:cont, :hidden}
-            {:error, :unknown_key} -> {:cont, :unknown}
-            {:ok, _entry} -> {:cont, :public}
+            {:error, :unknown_key} -> {:cont, classification}
+            {:ok, _entry} -> {:cont, preserve_hidden(classification, :public)}
           end
       end
     end)
   end
+
+  defp preserve_hidden(:hidden, _classification), do: :hidden
+  defp preserve_hidden(_previous, classification), do: classification
 
   defp exposure_evidence(:forbidden, subsystem, key_count),
     do: evidence(:access_denied, :exposure, safe_public_subsystem(subsystem), key_count)
@@ -364,6 +401,9 @@ defmodule Maxio.Admin.ConfigKV.Archive do
 
   defp sensitive_identifier?(identifier) when is_binary(identifier),
     do: Regex.match?(@sensitive_marker, identifier)
+
+  defp safe_identifier?(identifier) when is_binary(identifier),
+    do: Regex.match?(@safe_identifier, identifier) and not sensitive_identifier?(identifier)
 
   defp evidence(reason, stage, subsystem, key_count) do
     %{reason: reason, stage: stage, subsystem: subsystem, key_count: max(key_count, 0)}

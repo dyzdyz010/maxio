@@ -545,7 +545,7 @@ defmodule Maxio.Admin.ConfigExportImportEndpointTest do
     {plaintext, [scalar]}
   end
 
-  defp capture_archive_put_log(opts, submitted_values) do
+  defp capture_archive_put_log(opts, submitted_values, leak_opts \\ []) do
     original_level = Logger.level()
     Logger.configure(level: :info)
     on_exit(fn -> Logger.configure(level: original_level) end)
@@ -571,7 +571,12 @@ defmodule Maxio.Admin.ConfigExportImportEndpointTest do
       [Keyword.get(opts, :secret, @root_secret)]
     )
 
-    for protected <- [plaintext, inspect(plaintext)] ++ submitted_values do
+    protected_plaintext =
+      if Keyword.get(leak_opts, :allow_plaintext_as_safe_identifier, false),
+        do: [inspect(plaintext)],
+        else: [plaintext, inspect(plaintext)]
+
+    for protected <- protected_plaintext ++ submitted_values do
       refute log =~ protected
       refute response.resp_body =~ protected
     end
@@ -807,6 +812,71 @@ defmodule Maxio.Admin.ConfigExportImportEndpointTest do
     end
   end
 
+  test "a safe unknown subsystem on a later line keeps its exact public projection" do
+    scalar = "LATER-UNKNOWN-#{System.unique_integer([:positive, :monotonic])}"
+    plaintext = "s3 clock_skew_ms=1000\nabsent value=#{scalar}"
+    request_id = "req-config-archive-later-safe-unknown"
+
+    {response, log} =
+      capture_archive_put_log(
+        [
+          plaintext: plaintext,
+          mutation_response: flunk_response(),
+          request_id: request_id
+        ],
+        ["value", scalar]
+      )
+
+    assert_condition(response, "unknown_subsystem")
+    assert log =~ "action=config_import"
+    assert log =~ "request_id=#{request_id}"
+    assert log =~ "config_subsystem=absent"
+    refute_received {:mutate_many, _groups, _opts}
+  end
+
+  test "a subsystem-only safe unknown does not require a key for its exact public projection" do
+    request_id = "req-config-archive-subsystem-only-safe-unknown"
+
+    {response, log} =
+      capture_archive_put_log(
+        [
+          plaintext: "absent",
+          mutation_response: flunk_response(),
+          request_id: request_id
+        ],
+        [],
+        allow_plaintext_as_safe_identifier: true
+      )
+
+    assert_condition(response, "unknown_subsystem")
+    assert log =~ "action=config_import"
+    assert log =~ "request_id=#{request_id}"
+    assert log =~ "config_subsystem=absent"
+    refute_received {:mutate_many, _groups, _opts}
+  end
+
+  test "hidden forbidden and unsafe identifiers stay generic and never echo submitted data" do
+    cases = [
+      {"wire_hidden_path", "cluster", "deployment_id"},
+      {"forbidden_or_sensitive_path", "s3", "root_password"},
+      {"forbidden_or_sensitive_path", "s3", "credential_probe"}
+    ]
+
+    for {condition_id, subsystem, key} <- cases do
+      scalar = "GENERIC-GUARD-#{System.unique_integer([:positive, :monotonic])}"
+      plaintext = "#{subsystem} #{key}=#{scalar}"
+
+      {response, _log} =
+        capture_archive_put_log(
+          [plaintext: plaintext, mutation_response: flunk_response()],
+          [key, scalar]
+        )
+
+      assert_condition(response, condition_id)
+      refute_received {:mutate_many, _groups, _opts}
+    end
+  end
+
   test "import framing requires one decimal Content-Length and rejects every Transfer-Encoding" do
     valid = encrypted!(@root_secret, @fresh_archive)
 
@@ -952,7 +1022,11 @@ defmodule Maxio.Admin.ConfigExportImportEndpointTest do
           body: ciphertext,
           headers: [{"content-length", Integer.to_string(ciphertext_size)}],
           region: "",
-          archive_test_opts: [mutation_response: {:ok, committed_result()}]
+          archive_test_opts: [
+            config: __MODULE__,
+            test_pid: self(),
+            mutation_response: {:ok, committed_result()}
+          ]
         )
 
       case expected do

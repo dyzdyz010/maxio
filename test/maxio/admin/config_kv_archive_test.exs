@@ -117,11 +117,11 @@ defmodule Maxio.Admin.ConfigKV.ArchiveTest do
     # configuration coordinator before the complete replacement document is classified.
     cases = [
       {"s3:secondary clock_skew_ms=1000", :invalid_argument, "unknown", 0},
-      {"absent value=1", :config_generic, "unknown", 0},
+      {"absent value=SAFE-UNKNOWN-VALUE-SENTINEL", :config_generic, "absent", 0},
       {"s3 absent=1", :config_generic, "s3", 0},
       {"cluster deployment_id=HIDDEN-VALUE-SENTINEL", :config_generic, "unknown", 0},
-      {"s3 root_password=FORBIDDEN-VALUE-SENTINEL", :access_denied, "s3", 0},
-      {"legacy_orphan old_key=ORPHAN-VALUE-SENTINEL", :config_generic, "unknown", 0},
+      {"s3 root_password=FORBIDDEN-VALUE-SENTINEL", :access_denied, "unknown", 0},
+      {"legacy_orphan old_key=ORPHAN-VALUE-SENTINEL", :config_generic, "legacy_orphan", 0},
       {"s3 absent=1 clock_skew_ms=1000", :config_bad_json, "s3", 1}
     ]
 
@@ -137,15 +137,46 @@ defmodule Maxio.Admin.ConfigKV.ArchiveTest do
     end
   end
 
+  test "subsystem-only safe unknown uses the frozen four-key exposure evidence" do
+    assert {:error, evidence} = Archive.decode_and_plan("absent")
+    assert Map.keys(evidence) |> Enum.sort() == [:key_count, :reason, :stage, :subsystem]
+
+    assert evidence == %{
+             reason: :config_generic,
+             stage: :exposure,
+             subsystem: "absent",
+             key_count: 0
+           }
+  end
+
+  test "later-line safe unknown wins after a valid line without exposing its command" do
+    unknown_line = "absent value=LATER-LINE-SCALAR-SENTINEL"
+    plaintext = "s3 clock_skew_ms=1000\n#{unknown_line}"
+
+    assert {:error, evidence} = Archive.decode_and_plan(plaintext)
+    assert Map.keys(evidence) |> Enum.sort() == [:key_count, :reason, :stage, :subsystem]
+
+    assert evidence == %{
+             reason: :config_generic,
+             stage: :exposure,
+             subsystem: "absent",
+             key_count: 0
+           }
+
+    refute inspect(evidence) =~ "value"
+    refute inspect(evidence) =~ "LATER-LINE-SCALAR-SENTINEL"
+    refute inspect(evidence) =~ unknown_line
+  end
+
   test "invalid UTF-8 raw type and sensitive prefixes fail closed without submitted values" do
     # Catches unsafe string processing, Schema.parse/3 bypass, a forbidden/sensitive suffix being
     # swallowed into a public scalar, over-broad rejection of an ordinary suffix, or evidence that
     # reflects a submitted value while claiming the mutation never began.
     cases = [
       {"s3 clock_skew_ms=1000 root_password=SECRET-SENTINEL", :exposure, :access_denied,
-       "SECRET-SENTINEL", "s3", 1},
+       "SECRET-SENTINEL", "unknown", 1},
       {"s3 clock_skew_ms=1000 secret_token=SECRET-SENTINEL", :exposure, :access_denied,
-       "SECRET-SENTINEL", "s3", 1},
+       "SECRET-SENTINEL", "unknown", 1},
       {"s3 clock_skew_ms=1000 absent=UNKNOWN-SUFFIX-SENTINEL", :type, :config_bad_json,
        "UNKNOWN-SUFFIX-SENTINEL", "s3", 1},
       {<<"s3 clock_skew_ms=UTF8-VALUE-SENTINEL", 255>>, :parser, :config_bad_json,
