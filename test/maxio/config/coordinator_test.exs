@@ -243,12 +243,56 @@ defmodule Maxio.Config.CoordinatorTest do
 
   test "synthetic coordinator keys never enter the production schema or wire registry" do
     # Catches a test fixture accidentally becoming a user-visible or production-writable setting.
-    refute Map.has_key?(Schema.entries(), {:batch_fixture, :left})
-    refute Map.has_key?(Schema.entries(), {:batch_fixture, :right})
+    for path <- ConfigBatchSchema.keys() do
+      refute Map.has_key?(Schema.entries(), path)
+    end
 
     refute Enum.any?(Registry.entries(), fn entry ->
-             entry.core_subsystem == :batch_fixture
+             entry.core_subsystem in [:batch_alpha, :batch_fixture, :batch_omega]
            end)
+  end
+
+  test "legacy wrapper preserves expected-version validator and checkpoint shapes exactly" do
+    owner = self()
+
+    validator = fn candidate ->
+      send(owner, {:legacy_candidate, candidate})
+      :ok
+    end
+
+    checkpoint = fn phase ->
+      send(owner, {:legacy_checkpoint, phase})
+      :ok
+    end
+
+    assert {:ok,
+            %{
+              subsystem: :listing,
+              changed_keys: [:sql_hard_limit],
+              outcomes: %{sql_hard_limit: %{version: 1, changed?: true}}
+            } = result} =
+             Config.mutate_subsystem(
+               :listing,
+               [{:set, :sql_hard_limit, 808}],
+               source: "admin_api",
+               expected_versions: %{sql_hard_limit: nil},
+               validator: validator,
+               checkpoint: checkpoint
+             )
+
+    refute Map.has_key?(result, :touched_subsystems)
+    refute Map.has_key?(result, :changed_subsystems)
+    refute Map.has_key?(result.outcomes, {:listing, :sql_hard_limit})
+    assert_receive {:legacy_checkpoint, :after_advisory_lock}
+    refute_receive {:legacy_checkpoint, _batch_only_phase}
+    assert_receive {:legacy_candidate, %{sql_hard_limit: 808}}
+    refute_receive {:legacy_candidate, _second_call}
+
+    assert {:ok, %{version: 2}} =
+             Config.set(:listing, :sql_hard_limit, 809,
+               source: "admin_api",
+               expected_version: 1
+             )
   end
 
   defp mutate(operations, extra_opts \\ []) do

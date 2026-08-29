@@ -2,6 +2,12 @@ defmodule Maxio.Test.ConfigBatchSchema do
   @moduledoc false
 
   @entries %{
+    {:batch_alpha, :shared} => %{
+      type: {:integer, 0, 10_000},
+      apply: :hot,
+      env_var: nil,
+      doc: "Coordinator-only same-name fixture key in the alpha subsystem."
+    },
     {:batch_fixture, :left} => %{
       type: {:integer, 0, 10_000},
       apply: :hot,
@@ -13,6 +19,12 @@ defmodule Maxio.Test.ConfigBatchSchema do
       apply: :hot,
       env_var: nil,
       doc: "Coordinator-only right fixture key."
+    },
+    {:batch_omega, :shared} => %{
+      type: {:integer, 0, 10_000},
+      apply: :hot,
+      env_var: nil,
+      doc: "Coordinator-only same-name fixture key in the omega subsystem."
     }
   }
 
@@ -69,7 +81,7 @@ defmodule Maxio.Test.ConfigBatchSchema do
   # Coordinator postcommit dependencies are inert for synthetic rows: production Store cannot
   # decode test-only keys, and these callbacks are never assertions or behavior under test.
   def load_all!(_opts \\ []),
-    do: %{aggregate: "batch-fixture", orphan_config_keys: [], subsystems: 1}
+    do: %{aggregate: "batch-fixture", orphan_config_keys: [], subsystems: 3}
 
   def broadcast(_event), do: :ok
   def broadcast_checked(_event), do: :ok

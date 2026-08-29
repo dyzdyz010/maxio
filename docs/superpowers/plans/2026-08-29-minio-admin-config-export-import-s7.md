@@ -282,6 +282,7 @@
 - Modify: `test/maxio/config/coordinator_postcommit_test.exs`
 - Modify: `test/maxio/config/coordinator_concurrency_test.exs`
 - Modify: `test/maxio/config/store_batch_event_test.exs`
+- Modify: `test/support/config_batch_schema.ex`
 
 **Interfaces:**
 
@@ -289,9 +290,9 @@
 - Produces: RED contract for `Config.authoritative_snapshot/2`、`Config.mutate_many/2`、
   `Coordinator.mutate_many/2` and origin-aware batch invalidation。
 
-- [ ] **Step 1: Write one-snapshot RED.** Repo fake records query count and returns all selected rows in one response。
-  Assert one SELECT, sorted explicit paths, typed fallback/runtime/source/version map, corrupt registered value fails closed and
-  orphan is neither requested nor returned。
+- [ ] **Step 1: Write one-snapshot RED.** Attach telemetry to the real Repo and capture normalized SQL、ordered params and result
+  `num_rows`。Assert one authoritative SELECT, sorted explicit path params, typed fallback/runtime/source/version map, corrupt
+  registered value fails closed and orphan is neither requested nor returned。
 
   ```elixir
   assert {:ok, snapshot} = Config.authoritative_snapshot(Registry.public_paths(), repo: repo)
@@ -300,8 +301,8 @@
   assert snapshot[{:s3, :clock_skew_ms}].source in [:runtime, :fallback]
   ```
 
-- [ ] **Step 2: Write lock-order RED.** Batch Repo fake records each advisory SQL and first row read；assert all sorted
-  subsystem locks precede the first SELECT/FOR UPDATE。Add checkpoints
+- [ ] **Step 2: Write lock-order RED.** Use real Repo telemetry to capture each advisory-lock SQL/ordered lock param、subsequent
+  SELECT/FOR UPDATE SQL/params and result `num_rows`；assert all sorted subsystem lock params precede the first row read。Add checkpoints
   `{:after_advisory_lock, subsystem}` and `:before_first_row_read` to make ordering observable。另断言 legacy
   `mutate_subsystem/3` checkpoint callback 仍只收到原有 `:after_advisory_lock` 调用且次数/顺序不变；batch-only phase 不得
   泄漏给 legacy callback。
@@ -311,8 +312,9 @@
 
 - [ ] **Step 4: Write semantic and option-shape RED.** Cover explicit fallback absent→v1 set audit、omitted existing→reset audit、
   same set and absent reset no-op、shared string source `"admin_api"`/principal/access_key/request_id、stable changed_paths/outcomes
-  and hidden/orphan preservation。Batch `expected_versions` 必须是 `%{{subsystem, key} => version_or_nil}`；构造两个
-  subsystem 同名 key 证明无冲突。`validators` 必须是 `%{subsystem => fun}`，每个只收到本 subsystem candidate 且恰好
+  and hidden/orphan preservation。Batch `expected_versions` 必须是 `%{{subsystem, key} => version_or_nil}`；在
+  `test/support/config_batch_schema.ex` 定义两个 subsystem 都合法注册的同名 key，并用它证明 path-keyed versions/outcomes
+  无冲突。`validators` 必须是 `%{subsystem => fun}`，每个只收到本 subsystem candidate 且恰好
   一次。Legacy expected_version/key-map/validator wrapper 必须无损转换并保留 S5 result shape；atom source 必须拒绝。
 
 - [ ] **Step 5: Write concurrency RED without sleeps.** Use coordinator checkpoints/messages and `Task.async` to hold the first
@@ -357,7 +359,7 @@
 - [ ] **Step 10: Commit RED checkpoint.** Run:
 
   ```powershell
-  git add test/maxio/config/config_test.exs test/maxio/config/coordinator_batch_test.exs test/maxio/config/coordinator_batch_concurrency_test.exs test/maxio/config/coordinator_test.exs test/maxio/config/coordinator_postcommit_test.exs test/maxio/config/coordinator_concurrency_test.exs test/maxio/config/store_batch_event_test.exs
+  git add test/maxio/config/config_test.exs test/maxio/config/coordinator_batch_test.exs test/maxio/config/coordinator_batch_concurrency_test.exs test/maxio/config/coordinator_test.exs test/maxio/config/coordinator_postcommit_test.exs test/maxio/config/coordinator_concurrency_test.exs test/maxio/config/store_batch_event_test.exs test/support/config_batch_schema.ex
   git commit -m "test(config): specify atomic multi subsystem mutations"
   ```
 

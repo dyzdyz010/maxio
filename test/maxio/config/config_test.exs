@@ -136,6 +136,41 @@ defmodule Maxio.ConfigTest do
       assert is_atom(safe_reason)
       refute Atom.to_string(safe_reason) =~ "111"
     end
+
+    test "batch facade does not leak tuple-keyed outcomes through scalar set and reset" do
+      assert {:ok, %{outcomes: outcomes}} =
+               apply(Config, :mutate_many, [
+                 [
+                   {:listing, [{:set, :sql_hard_limit, 515}]},
+                   {:s3, [{:set, :clock_skew_ms, 616}]}
+                 ],
+                 [source: "admin_api", request_id: "req-config-facade-batch"]
+               ])
+
+      assert outcomes[{:listing, :sql_hard_limit}].version == 1
+      assert outcomes[{:s3, :clock_skew_ms}].version == 1
+
+      assert {:ok,
+              %{
+                operation: :set,
+                changed?: false,
+                value: 515,
+                version: 1,
+                applied: :hot
+              } = scalar} = Config.set(:listing, :sql_hard_limit, 515, source: "admin_api")
+
+      refute Map.has_key?(scalar, {:listing, :sql_hard_limit})
+      refute Map.has_key?(scalar, :outcomes)
+
+      assert {:ok,
+              %{
+                operation: :reset,
+                changed?: true,
+                value: nil,
+                version: nil,
+                applied: :hot
+              }} = Config.reset(:listing, :sql_hard_limit, source: "admin_api")
+    end
   end
 
   describe "白名单与禁止清单（D3 / §4）" do

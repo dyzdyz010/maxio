@@ -55,6 +55,21 @@ defmodule Maxio.Config.CoordinatorConcurrencyTest do
              "SELECT pg_advisory_xact_lock(1297638214, hashtext($1))"
   end
 
+  test "legacy writer exposes only its original checkpoint phase" do
+    owner = self()
+
+    checkpoint = fn phase ->
+      send(owner, {:legacy_checkpoint_phase, phase})
+      :ok
+    end
+
+    assert {:ok, %{subsystem: :listing, changed_keys: [:sql_hard_limit]}} =
+             mutate(:listing, [{:set, :sql_hard_limit, 43}], checkpoint: checkpoint)
+
+    assert_receive {:legacy_checkpoint_phase, :after_advisory_lock}
+    refute_receive {:legacy_checkpoint_phase, _batch_phase}
+  end
+
   test "same-subsystem batch and old single-key writer serialize", %{
     task_supervisor: task_supervisor
   } do

@@ -289,6 +289,190 @@ defmodule Maxio.Config.CoordinatorPostcommitTest do
     assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
   end
 
+  test "changed multi-subsystem facade reloads once and broadcasts one origin-aware batch event" do
+    assert {:ok, result} =
+             mutate_many([
+               {:s3, [{:set, :clock_skew_ms, 7_001}]},
+               {:listing, [{:set, :sql_hard_limit, 7_002}]},
+               {:prometheus_metrics, [{:reset, :public}]}
+             ])
+
+    assert %{
+             committed?: true,
+             touched_subsystems: [:listing, :prometheus_metrics, :s3],
+             changed_subsystems: [:listing, :s3],
+             changed_count: 2,
+             changed_paths: [
+               {:listing, :sql_hard_limit},
+               {:s3, :clock_skew_ms}
+             ],
+             local_reload: :ok,
+             broadcast: :ok,
+             attention?: false
+           } = result
+
+    assert [reload] = ConfigPostcommitStore.observations().reload_calls
+    assert reload.commit.transaction_open? == false
+
+    assert reload.opts[:reason] ==
+             {:write_batch,
+              [
+                {:listing, :sql_hard_limit},
+                {:s3, :clock_skew_ms}
+              ]}
+
+    assert [event] = ConfigPostcommitNotify.observations().checked_calls
+
+    assert {:config_changed_batch,
+            %{
+              origin: %{node: node_name, instance: instance},
+              epoch: epoch,
+              subsystems: [:listing, :s3]
+            }} = event
+
+    assert node_name == node()
+    assert is_binary(instance) and byte_size(instance) > 0
+    assert is_integer(epoch) and epoch > 0
+    assert ConfigPostcommitNotify.observations().legacy_calls == []
+    assert ConfigPostcommitStore.observations().attention_calls == []
+  end
+
+  test "successive changed batches keep one Store instance and strictly increase event epoch" do
+    assert {:ok, %{changed_count: 1}} =
+             mutate_many([{:listing, [{:set, :sql_hard_limit, 7_401}]}])
+
+    assert {:ok, %{changed_count: 1}} =
+             mutate_many([{:listing, [{:set, :sql_hard_limit, 7_402}]}])
+
+    assert [first_event, second_event] = ConfigPostcommitNotify.observations().checked_calls
+
+    assert {:config_changed_batch,
+            %{origin: %{instance: instance}, epoch: first_epoch, subsystems: [:listing]}} =
+             first_event
+
+    assert {:config_changed_batch,
+            %{origin: %{instance: ^instance}, epoch: second_epoch, subsystems: [:listing]}} =
+             second_event
+
+    assert second_epoch > first_epoch
+    assert event_kinds(dependency_events()) == [:reload, :checked, :reload, :checked]
+    assert length(ConfigPostcommitStore.observations().reload_calls) == 2
+    assert ConfigPostcommitNotify.observations().legacy_calls == []
+  end
+
+  test "batch reload failure remains committed, still broadcasts, and records safe plural attention" do
+    ConfigPostcommitStore.configure(reload: {:raise, "BATCH-PRIVATE-RELOAD-DETAIL"})
+
+    assert {:ok, result} =
+             mutate_many([
+               {:listing, [{:set, :sql_hard_limit, 7_501}]},
+               {:s3, [{:set, :clock_skew_ms, 7_502}]}
+             ])
+
+    assert %{
+             committed?: true,
+             changed_count: 2,
+             local_reload: {:error, :reload_failed},
+             broadcast: :ok,
+             attention?: true
+           } = result
+
+    assert event_kinds(dependency_events()) == [:reload, :checked, :attention]
+    assert [_batch_event] = ConfigPostcommitNotify.observations().checked_calls
+
+    assert ConfigPostcommitStore.observations().attention_calls == [
+             %{
+               subsystems: [:listing, :s3],
+               changed_paths: [
+                 {:listing, :sql_hard_limit},
+                 {:s3, :clock_skew_ms}
+               ],
+               local_reload: {:error, :reload_failed},
+               broadcast: :ok
+             }
+           ]
+
+    assert Repo.aggregate(RuntimeConfig, :count) == 2
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == 2
+    refute inspect(result, limit: :infinity) =~ "BATCH-PRIVATE-RELOAD-DETAIL"
+  end
+
+  test "global batch no-op touches subsystems but invokes no postcommit dependency" do
+    insert_runtime!(7_101)
+    ConfigPostcommitStore.reset_observations()
+    ConfigPostcommitNotify.reset_observations()
+
+    assert {:ok, result} =
+             mutate_many([
+               {:listing, [{:set, :sql_hard_limit, 7_101}]},
+               {:prometheus_metrics, [{:reset, :public}]}
+             ])
+
+    assert %{
+             committed?: true,
+             touched_subsystems: [:listing, :prometheus_metrics],
+             changed_subsystems: [],
+             changed_paths: [],
+             changed_count: 0,
+             local_reload: :not_needed,
+             broadcast: :not_needed,
+             attention?: false
+           } = result
+
+    assert dependency_events() == []
+    assert ConfigPostcommitStore.observations().reload_calls == []
+    assert ConfigPostcommitStore.observations().attention_calls == []
+    assert ConfigPostcommitNotify.observations() == %{checked_calls: [], legacy_calls: []}
+  end
+
+  test "batch broadcast failure stays committed and records only safe path names and statuses" do
+    ConfigPostcommitNotify.configure(
+      checked: {:return, {:error, {:transport, "BATCH-PRIVATE-TRANSPORT-DETAIL"}}}
+    )
+
+    assert {:ok, result} =
+             mutate_many([
+               {:listing, [{:set, :sql_hard_limit, 7_201}]},
+               {:s3, [{:set, :clock_skew_ms, 7_202}]}
+             ])
+
+    assert %{
+             committed?: true,
+             changed_subsystems: [:listing, :s3],
+             changed_paths: [
+               {:listing, :sql_hard_limit},
+               {:s3, :clock_skew_ms}
+             ],
+             local_reload: :ok,
+             broadcast: {:error, :broadcast_failed},
+             attention?: true
+           } = result
+
+    assert ConfigPostcommitStore.observations().attention_calls == [
+             %{
+               subsystems: [:listing, :s3],
+               changed_paths: [
+                 {:listing, :sql_hard_limit},
+                 {:s3, :clock_skew_ms}
+               ],
+               local_reload: :ok,
+               broadcast: {:error, :broadcast_failed}
+             }
+           ]
+
+    refute inspect(result, limit: :infinity) =~ "BATCH-PRIVATE-TRANSPORT-DETAIL"
+  end
+
+  test "legacy facade keeps exactly one legacy reload reason and event with no batch event" do
+    assert {:ok, %{subsystem: :listing, outcomes: %{sql_hard_limit: _outcome}}} =
+             mutate(7_301)
+
+    assert [reload] = ConfigPostcommitStore.observations().reload_calls
+    assert reload.opts[:reason] == {:write, :listing, [:sql_hard_limit]}
+    assert ConfigPostcommitNotify.observations().checked_calls == [{:config_changed, :listing}]
+    assert ConfigPostcommitNotify.observations().legacy_calls == []
+  end
+
   for {label, trigger, recorder_outcome, expected_record} <- [
         {"reload failure then recorder raise", :reload,
          {:raise,
@@ -361,6 +545,21 @@ defmodule Maxio.Config.CoordinatorPostcommitTest do
       |> Keyword.merge(extra_opts)
 
     Config.mutate_subsystem(:listing, [{:set, :sql_hard_limit, value}], opts)
+  end
+
+  defp mutate_many(groups) do
+    apply(Config, :mutate_many, [
+      groups,
+      [
+        source: "admin_api",
+        principal_arn: "arn:aws:iam:::root",
+        access_key_id: "AKIA-POSTCOMMIT-BATCH-S7",
+        request_id: "req-postcommit-batch-s7",
+        repo: ConfigBatchFailureRepo,
+        store: ConfigPostcommitStore,
+        notify: ConfigPostcommitNotify
+      ]
+    ])
   end
 
   defp mutate_batch_fixture(left, right) do
