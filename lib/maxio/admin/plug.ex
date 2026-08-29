@@ -62,7 +62,7 @@ defmodule Maxio.Admin.Plug do
   }
 
   alias Maxio.Auth.SigningSecret
-  alias Maxio.Admin.ConfigKV.{Adapter, Request}
+  alias Maxio.Admin.ConfigKV.{Adapter, Help, Request}
   alias Maxio.S3.{Error, Log, PipelineOrderError, RawPath, ReservedNamespace}
 
   @behaviour Plug
@@ -132,6 +132,7 @@ defmodule Maxio.Admin.Plug do
   defp dispatch(conn, "GET", "/minio/admin/v3/info"), do: server_info(conn)
 
   defp dispatch(conn, "GET", "/minio/admin/v3/get-config-kv"), do: get_config_kv(conn)
+  defp dispatch(conn, "GET", "/minio/admin/v3/help-config-kv"), do: help_config_kv(conn)
   defp dispatch(conn, "PUT", "/minio/admin/v3/set-config-kv"), do: set_config_kv(conn)
   defp dispatch(conn, "DELETE", "/minio/admin/v3/del-config-kv"), do: reset_config_kv(conn)
 
@@ -215,6 +216,44 @@ defmodule Maxio.Admin.Plug do
 
       {:error, evidence} ->
         render_config_adapter_error(conn, :get, evidence)
+    end
+  end
+
+  defp help_config_kv(conn) do
+    action = config_action(:help)
+
+    with_config_kv_boundary(conn, action, fn ->
+      conn = fetch_query_params(conn)
+
+      if Map.has_key?(conn.query_params, "subSys") and Map.has_key?(conn.query_params, "key") do
+        authorize_and_run(conn, @config_update_action, action, fn conn ->
+          help_config_kv_authorized(
+            conn,
+            conn.query_params["subSys"],
+            conn.query_params["key"]
+          )
+        end)
+      else
+        render_error(conn, ErrorMap.from_reason(:admin_version_mismatch))
+      end
+    end)
+  end
+
+  defp help_config_kv_authorized(conn, subsystem, key) do
+    env_only? = Map.has_key?(conn.query_params, "env")
+
+    with {:ok, access_key_id} <- exact_actor_access_key_id(conn) do
+      case Help.project(subsystem, key, env_only?) do
+        {:ok, result} ->
+          log_config_help(conn, access_key_id, result)
+          send_config_help(conn, result)
+
+        {:error, evidence} ->
+          render_config_evidence_error(conn, config_action(:help), evidence)
+      end
+    else
+      {:error, :missing_actor_access_key} ->
+        render_config_unexpected_failure(conn, config_action(:help))
     end
   end
 
@@ -710,18 +749,22 @@ defmodule Maxio.Admin.Plug do
     defp config_kv_test_options(_conn), do: []
   end
 
-  defp render_config_adapter_error(
+  defp render_config_adapter_error(conn, operation, evidence),
+    do: render_config_evidence_error(conn, config_action(operation), evidence)
+
+  defp render_config_evidence_error(
          conn,
-         operation,
+         action,
          %{reason: reason, subsystem: subsystem, key_count: key_count, stage: stage}
        )
-       when is_binary(subsystem) and is_integer(key_count) and key_count >= 0 and
+       when is_binary(action) and
+              is_binary(subsystem) and is_integer(key_count) and key_count >= 0 and
               stage in @config_failure_stages do
     err = config_adapter_error(reason)
 
     Log.warn("admin config request failed",
-      action: config_action(operation),
-      admin_action: config_action(operation),
+      action: action,
+      admin_action: action,
       required_action: @config_update_action,
       config_subsystem: subsystem,
       config_key_count: key_count,
@@ -736,8 +779,8 @@ defmodule Maxio.Admin.Plug do
     render_error(conn, err)
   end
 
-  defp render_config_adapter_error(conn, operation, _invalid_evidence),
-    do: render_config_unexpected_failure(conn, config_action(operation))
+  defp render_config_evidence_error(conn, action, _invalid_evidence),
+    do: render_config_unexpected_failure(conn, action)
 
   defp config_adapter_error(:access_denied), do: config_access_denied_error()
   defp config_adapter_error(reason), do: ErrorMap.from_reason(reason)
@@ -767,7 +810,7 @@ defmodule Maxio.Admin.Plug do
       required_action: @config_update_action,
       config_subsystem: "unknown",
       config_key_count: 0,
-      config_failure_stage: :database,
+      config_failure_stage: config_unexpected_failure_stage(action),
       code: err.code,
       status: err.http_status,
       request_id: request_id(conn),
@@ -777,6 +820,9 @@ defmodule Maxio.Admin.Plug do
 
     render_error(conn, err)
   end
+
+  defp config_unexpected_failure_stage("admin_config_help"), do: :exposure
+  defp config_unexpected_failure_stage(_action), do: :database
 
   defp log_config_transport_failure(conn, action, err) do
     Log.warn("admin config transport failed",
@@ -798,6 +844,24 @@ defmodule Maxio.Admin.Plug do
   defp config_transport_failure_stage(%Error{code: "XAmzContentSHA256Mismatch"}), do: :hash
   defp config_transport_failure_stage(%Error{code: "XMinioAdminConfigBadJSON"}), do: :transport
   defp config_transport_failure_stage(_err), do: :transport
+
+  defp log_config_help(conn, access_key_id, result) do
+    action = config_action(:help)
+
+    Log.info("admin config help projected",
+      action: action,
+      admin_action: action,
+      required_action: @config_update_action,
+      config_subsystem: result.subsystem,
+      config_key_count: result.key_count,
+      config_changed_count: 0,
+      request_id: request_id(conn),
+      principal_arn: principal_arn(conn),
+      access_key_id: access_key_id,
+      auth_type: conn.assigns[:auth_type],
+      surface: conn.assigns[:maxio_surface]
+    )
+  end
 
   defp log_config_mutation(conn, action, access_key_id, mutation) do
     Log.info("admin config mutation committed",
@@ -847,6 +911,7 @@ defmodule Maxio.Admin.Plug do
   defp config_broadcast_metadata(_result), do: :failed
 
   defp config_action(:get), do: "admin_config_get"
+  defp config_action(:help), do: "admin_config_help"
   defp config_action(:set), do: "admin_config_set"
   defp config_action(:reset), do: "admin_config_reset"
 
@@ -937,6 +1002,7 @@ defmodule Maxio.Admin.Plug do
   defp access_denied_error(admin_action)
        when admin_action in [
               "admin_config_get",
+              "admin_config_help",
               "admin_config_set",
               "admin_config_reset"
             ],
@@ -1068,6 +1134,19 @@ defmodule Maxio.Admin.Plug do
     |> halt()
   end
 
+  defp send_config_help(conn, result) do
+    body = Help.encode_line(result.wire)
+
+    conn
+    |> delete_resp_header("transfer-encoding")
+    |> delete_resp_header("content-encoding")
+    |> delete_resp_header("x-minio-config-applied")
+    |> put_resp_header("content-type", "application/json")
+    |> put_resp_header("content-length", Integer.to_string(IO.iodata_length(body)))
+    |> send_resp(200, body)
+    |> halt()
+  end
+
   defp mutation_success(conn, result) do
     conn =
       if applied_without_restart?(result) do
@@ -1147,6 +1226,7 @@ defmodule Maxio.Admin.Plug do
 
   defp raw_query_route?("GET", "/minio/admin/v3/idp/builtin/policy-entities"), do: true
   defp raw_query_route?("GET", "/minio/admin/v3/get-config-kv"), do: true
+  defp raw_query_route?("GET", "/minio/admin/v3/help-config-kv"), do: true
   defp raw_query_route?("PUT", "/minio/admin/v3/set-config-kv"), do: true
   defp raw_query_route?("DELETE", "/minio/admin/v3/del-config-kv"), do: true
   defp raw_query_route?(_method, _path), do: false
@@ -1197,9 +1277,23 @@ defmodule Maxio.Admin.Plug do
     )
 
     conn
+    |> prepare_config_help_error_response(body)
     |> put_resp_content_type("application/json")
     |> send_resp(status, body)
     |> halt()
+  end
+
+  defp prepare_config_help_error_response(conn, body) do
+    if conn.method == "GET" and
+         RawPath.decoded_path(conn) == "/minio/admin/v3/help-config-kv" do
+      conn
+      |> delete_resp_header("transfer-encoding")
+      |> delete_resp_header("content-encoding")
+      |> delete_resp_header("x-minio-config-applied")
+      |> put_resp_header("content-length", Integer.to_string(IO.iodata_length(body)))
+    else
+      conn
+    end
   end
 
   # Plug.RequestId 把 id 写进 **响应**头（并进 Logger metadata），客户端自带时才有请求头；
