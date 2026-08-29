@@ -251,6 +251,65 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert Repo.aggregate(RuntimeConfigAudit, :count) == before_audits
   end
 
+  test "real Bandit keeps Admin help success and errors plaintext when gzip is accepted" do
+    # Catches the transport adapter rewriting the explicit Admin framing after the Plug has
+    # produced it. Status and content type are asserted before Content-Encoding so a RED here
+    # proves startup, routing, authentication and signing all reached the intended handlers.
+    bandit =
+      start_supervised!(
+        {Bandit, plug: Endpoint, scheme: :http, ip: {127, 0, 0, 1}, port: 0, startup_log: false}
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    success =
+      :get
+      |> SigV4Request.signed_conn(@help_path,
+        query: %{"subSys" => "", "key" => ""},
+        headers: [
+          {"accept-encoding", "gzip"},
+          {"x-request-id", "req-config-help-bandit-root"}
+        ],
+        region: ""
+      )
+      |> raw_bandit_request(port)
+
+    denied =
+      :get
+      |> SigV4Request.anon_conn(@help_path,
+        query: %{"subSys" => "", "key" => ""},
+        headers: [
+          {"accept-encoding", "gzip"},
+          {"x-request-id", "req-config-help-bandit-anonymous"}
+        ]
+      )
+      |> raw_bandit_request(port)
+
+    expected_success =
+      ~s({"subSys":"","description":"","multipleTargets":false,"keysHelp":[{"key":"s3","description":"Maxio extension: configure s3.clock_skew_ms.","optional":false,"type":"","multipleTargets":false},{"key":"listing","description":"Maxio extension: configure listing.sql_hard_limit.","optional":false,"type":"","multipleTargets":false},{"key":"prometheus_metrics","description":"Maxio extension: configure prometheus_metrics.public.","optional":false,"type":"","multipleTargets":false}]}) <>
+        "\n"
+
+    expected_denied =
+      ~s({"Code":"AccessDenied","HostId":"","Message":"Access Denied","RequestId":"req-config-help-bandit-anonymous","Resource":"/minio/admin/v3/help-config-kv"})
+
+    assert success.status == 200
+    assert denied.status == 403
+    assert success.headers["content-type"] == ["application/json"]
+    assert denied.headers["content-type"] == ["application/json; charset=utf-8"]
+
+    assert {success.headers["content-encoding"], denied.headers["content-encoding"]} ==
+             {nil, nil}
+
+    assert {success.headers["transfer-encoding"], denied.headers["transfer-encoding"]} ==
+             {nil, nil}
+
+    assert success.headers["content-length"] == [Integer.to_string(byte_size(expected_success))]
+    assert denied.headers["content-length"] == [Integer.to_string(byte_size(expected_denied))]
+    assert success.body == expected_success
+    assert denied.body == expected_denied
+    refute String.ends_with?(denied.body, "\n")
+  end
+
   test "help preserves missing-versus-empty query precedence before authorization" do
     {access_key, secret, _arn} = put_action_key(nil)
 
@@ -1625,6 +1684,58 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert get_resp_header(conn, "content-encoding") == []
     assert get_resp_header(conn, "x-minio-config-applied") == []
     refute String.ends_with?(conn.resp_body, "\n")
+  end
+
+  defp raw_bandit_request(conn, port) do
+    target =
+      case conn.query_string do
+        "" -> conn.request_path
+        query -> conn.request_path <> "?" <> query
+      end
+
+    headers = [{"host", conn.host}, {"connection", "close"} | conn.req_headers]
+
+    request =
+      [
+        conn.method,
+        " ",
+        target,
+        " HTTP/1.1\r\n",
+        Enum.map(headers, fn {name, value} -> [name, ": ", value, "\r\n"] end),
+        "\r\n"
+      ]
+      |> IO.iodata_to_binary()
+
+    {:ok, socket} =
+      :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw], 5_000)
+
+    :ok = :gen_tcp.send(socket, request)
+    raw = recv_raw_response(socket, [])
+    :ok = :gen_tcp.close(socket)
+
+    parse_raw_response(raw)
+  end
+
+  defp recv_raw_response(socket, chunks) do
+    case :gen_tcp.recv(socket, 0, 5_000) do
+      {:ok, chunk} -> recv_raw_response(socket, [chunk | chunks])
+      {:error, :closed} -> chunks |> Enum.reverse() |> IO.iodata_to_binary()
+      {:error, reason} -> flunk("raw Bandit response failed: #{inspect(reason)}")
+    end
+  end
+
+  defp parse_raw_response(raw) do
+    [head, body] = :binary.split(raw, "\r\n\r\n")
+    [status_line | header_lines] = String.split(head, "\r\n")
+    ["HTTP/1.1", status | _reason] = String.split(status_line, " ")
+
+    headers =
+      Enum.reduce(header_lines, %{}, fn line, acc ->
+        [name, value] = String.split(line, ":", parts: 2)
+        Map.update(acc, String.downcase(name), [String.trim(value)], &[String.trim(value) | &1])
+      end)
+
+    %{status: String.to_integer(status), headers: headers, body: body}
   end
 
   defp header_value(nil), do: []

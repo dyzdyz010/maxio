@@ -34,6 +34,7 @@ defmodule Maxio.S3.Endpoint do
   plug Maxio.S3.Plugs.MinioHealth
   plug Maxio.S3.Plugs.PrometheusMetrics
   plug Maxio.S3.Plugs.SurfaceClassifier
+  plug Maxio.S3.Plugs.ResponseTransformPolicy
   plug Maxio.S3.Plugs.RequestMetrics
   plug Maxio.S3.Plugs.AccessLogDelivery
   plug Maxio.S3.Plugs.WebsiteEndpoint
