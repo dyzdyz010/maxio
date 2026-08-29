@@ -13,6 +13,13 @@ defmodule Maxio.Admin.ConfigKV.ParserTest do
              {:ok, %{wire_subsystem: "s3", patches: [{"clock_skew_ms", "900000"}]}}
   end
 
+  test "mixed quote layers are sanitized in madmin's fixed double-then-single order" do
+    # Catches treating both quote kinds as one interchangeable boundary pair. SanitizeValue first
+    # removes one double-quote layer and then one single-quote layer, without escape parsing.
+    assert parse_set(~s(s3 clock_skew_ms="'900000'"), entries()) ==
+             {:ok, %{wire_subsystem: "s3", patches: [{"clock_skew_ms", "900000"}]}}
+  end
+
   test "set parser preserves raw inner whitespace after outer quote sanitization" do
     # Catches overzealous trimming/tokenizing that would change a raw value before the typed
     # boundary has an opportunity to accept or reject it.

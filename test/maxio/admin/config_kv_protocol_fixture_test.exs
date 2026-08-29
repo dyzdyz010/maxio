@@ -176,6 +176,87 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
     "identity_*",
     "service_restart"
   ]
+  @value_sanitization %{
+    "escape_parsing" => false,
+    "mixed_quote_input" => "\"'900000'\"",
+    "operation_order" => [
+      "trim_space",
+      "trim_one_double_quote_layer",
+      "trim_one_single_quote_layer"
+    ],
+    "result" => "900000"
+  }
+  @dynamic_error_descriptions %{
+    "construction" => "fmt.Sprintf(format, vals...)",
+    "reset_missing_key" => %{
+      "description" => "key ABSENT doesn't exist",
+      "format" => "key %s doesn't exist",
+      "safe_identifier" => "ABSENT"
+    },
+    "unknown_subsystem" => %{
+      "description" => "unknown subsystem: S3",
+      "format" => "unknown subsystem: %s",
+      "safe_identifier" => "S3"
+    }
+  }
+  @unsupported_config_history_routes [
+    %{
+      "method" => "GET",
+      "path" => "/minio/admin/v3/list-config-history-kv",
+      "required_query" => %{"count" => "10"}
+    },
+    %{
+      "method" => "DELETE",
+      "path" => "/minio/admin/v3/clear-config-history-kv",
+      "required_query" => %{"restoreId" => "fixture-restore-id"}
+    },
+    %{
+      "method" => "PUT",
+      "path" => "/minio/admin/v3/restore-config-history-kv",
+      "required_query" => %{"restoreId" => "fixture-restore-id"}
+    }
+  ]
+  @field_source_map %{
+    "madmin_config_kv_wire.json.ciphertext_*,entity_matrix,applied_header,request_builder" => [
+      "madmin_del_config_kv_wire",
+      "madmin_set_config_kv_wire",
+      "madmin_get_config_kv_wire",
+      "madmin_new_request_entity_headers"
+    ],
+    "madmin_config_kv_wire.json.value_sanitization" => ["madmin_sanitize_value"],
+    "mc_config_human.json.stdout,argv,local_help_or_rejection" => [
+      "mc_config_get_rendering",
+      "mc_config_set_rendering",
+      "mc_config_reset_rendering",
+      "mc_config_get_help_branch",
+      "mc_config_set_help_branch",
+      "mc_config_reset_help_branch",
+      "mc_print_non_tty_compaction",
+      "minio_subsys_info_write_to"
+    ],
+    "mc_config_json.json.stdout,mode,argv" => [
+      "mc_config_get_rendering",
+      "mc_config_set_rendering",
+      "mc_config_reset_rendering",
+      "mc_print_non_tty_compaction",
+      "minio_subsys_info_write_to"
+    ],
+    "minio_routes_and_errors.json.errors,dynamic_error_descriptions" => [
+      "minio_config_error_construction",
+      "minio_get_unknown_subsystem_error",
+      "minio_reset_missing_key_error"
+    ],
+    "minio_routes_and_errors.json.routes,query_branches,error_precedence,same_body_reset,deliberate_deviations,unsupported_catalog_claims" =>
+      [
+        "minio_router_config_kv_routes",
+        "minio_del_config_kv_action_and_decrypt",
+        "minio_set_config_kv_action_and_decrypt",
+        "minio_get_config_kv_action"
+      ],
+    "minio_routes_and_errors.json.unsupported_config_history_routes" => [
+      "minio_router_config_history_kv_routes"
+    ]
+  }
 
   setup_all do
     fixtures =
@@ -210,6 +291,8 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
                "53d5df7f4c3a488e8df181a576c70756a64f07c6cdcb2d1fd2a2fc6f31ca1c11",
              "madmin_new_request_entity_headers" =>
                "004ac16858b362fd7705774d5881af72e2d0e4a9ed9fb7f9462b34a3eff071e0",
+             "madmin_sanitize_value" =>
+               "86a1b945b0d68b8bfd90ebc314344b5e68d2475a8d4d5511a6956f3be01a01ca",
              "madmin_set_config_kv_wire" =>
                "115e8d856da915da1a3539dc3932e3068c676dc95a1364de7a4aa4a5f86229ec",
              "mc_config_get_rendering" =>
@@ -230,13 +313,70 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
                "7c7fd960f0e2f88fad3809b1e4900d101ec139c0e9595ea36821dea3add20307",
              "minio_get_config_kv_action" =>
                "c4183540d0a0395e62932d2dac4e8276790149e4c04b4775cd0eda422cd81fc3",
+             "minio_config_error_construction" =>
+               "b2092fcdaafdd0bb7fb46837a23c6b09283d7952df69fcdfb8cda105784d2e18",
+             "minio_get_unknown_subsystem_error" =>
+               "d99057ebd1bee50d52fb7a25799124a0dae58dc73559f7f41dc90576ce3797c8",
+             "minio_reset_missing_key_error" =>
+               "e8d634def8735d6d061820c1cc11e3cdb450370577b13b6cc666afdb95ee0252",
              "minio_router_config_kv_routes" =>
                "cd7845d7e2019e47e63f5a5906c465bb160f4a9903211f0a219a705833117050",
+             "minio_router_config_history_kv_routes" =>
+               "48a2d65181d5a6f98148047d10c1fd34b1a3a4a04e1620271b0f75af4187be91",
              "minio_set_config_kv_action_and_decrypt" =>
                "80f8af1c1a2e2dc3518e86249a9a439e546f995479be29c9f2e4d1566617acb1",
              "minio_subsys_info_write_to" =>
                "3e0c076b97d4150a5d40d17279b35c8f7e18fe0e65f7915d29f7b09c9f9cf04b"
            }
+
+    assert Map.new(routes["source_excerpts"], fn {id, excerpt} ->
+             {id, excerpt["raw_file_sha256"]}
+           end) == %{
+             "madmin_del_config_kv_wire" =>
+               "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0",
+             "madmin_get_config_kv_wire" =>
+               "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0",
+             "madmin_new_request_entity_headers" =>
+               "932edaeb340bfdc9343db8f31124ea749cfc4836ab86b7196c5b2a876a9bea4e",
+             "madmin_sanitize_value" =>
+               "ea19fd427661619df7e8bdf878743186950eeeb7c94ea989481dcfcc11cf8d79",
+             "madmin_set_config_kv_wire" =>
+               "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0",
+             "mc_config_get_help_branch" =>
+               "651d9d79f8546e55ab6fe4cad7b6113c8469bf70ba08aa766815e1d80dea51a3",
+             "mc_config_get_rendering" =>
+               "651d9d79f8546e55ab6fe4cad7b6113c8469bf70ba08aa766815e1d80dea51a3",
+             "mc_config_reset_help_branch" =>
+               "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9",
+             "mc_config_reset_rendering" =>
+               "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9",
+             "mc_config_set_help_branch" =>
+               "babb2a3b100dac1f65ab9eba809a4f5d582618ce9d1afa8453335b5280df0201",
+             "mc_config_set_rendering" =>
+               "babb2a3b100dac1f65ab9eba809a4f5d582618ce9d1afa8453335b5280df0201",
+             "mc_print_non_tty_compaction" =>
+               "2797d5a0be76b4f5e06421f09069421df36883f7feee425bbb7c93d46bb2cccb",
+             "minio_config_error_construction" =>
+               "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+             "minio_del_config_kv_action_and_decrypt" =>
+               "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0",
+             "minio_get_config_kv_action" =>
+               "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0",
+             "minio_get_unknown_subsystem_error" =>
+               "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+             "minio_reset_missing_key_error" =>
+               "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+             "minio_router_config_history_kv_routes" =>
+               "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9",
+             "minio_router_config_kv_routes" =>
+               "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9",
+             "minio_set_config_kv_action_and_decrypt" =>
+               "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0",
+             "minio_subsys_info_write_to" =>
+               "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3"
+           }
+
+    assert routes["field_source_map"] == @field_source_map
 
     assert Enum.all?(routes["provenance"], fn %{"url" => url} ->
              String.starts_with?(url, "https://raw.githubusercontent.com/") and
@@ -293,6 +433,16 @@ defmodule Maxio.Admin.ConfigKVProtocolFixtureTest do
              "other_value_branch" => %{"restart" => true, "value" => "not_true"},
              "true_branch" => %{"restart" => false, "value" => "true"}
            }
+
+    assert wire["value_sanitization"] == @value_sanitization
+  end
+
+  test "fixture freezes exact dynamic descriptions and the real deferred history routes",
+       fixtures do
+    routes = fixtures["minio_routes_and_errors"]
+
+    assert routes["dynamic_error_descriptions"] == @dynamic_error_descriptions
+    assert routes["unsupported_config_history_routes"] == @unsupported_config_history_routes
   end
 
   test "fixture keeps the duplicate-reset deviation and unsupported catalog from becoming parity claims",

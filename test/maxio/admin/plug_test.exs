@@ -68,17 +68,21 @@ defmodule Maxio.Admin.PlugTest do
 
   test "Config KVS neighboring versions methods and deferred catalogs remain JSON 501" do
     # Catches prefix dispatch while adding the three exact Config KVS method/path triples.
-    for {method, path} <- [
-          {:post, "/minio/admin/v3/get-config-kv"},
-          {:get, "/minio/admin/v3/set-config-kv"},
-          {:put, "/minio/admin/v3/del-config-kv"},
-          {:get, "/minio/admin/v4/get-config-kv"},
-          {:get, "/minio/admin/v3/get-config-kv/extra"},
-          {:get, "/minio/admin/v3/help-config-kv"},
-          {:get, "/minio/admin/v3/config"},
-          {:get, "/minio/admin/v3/list-config-history"}
+    for {method, path, query} <- [
+          {:post, "/minio/admin/v3/get-config-kv", %{}},
+          {:get, "/minio/admin/v3/set-config-kv", %{}},
+          {:put, "/minio/admin/v3/del-config-kv", %{}},
+          {:get, "/minio/admin/v4/get-config-kv", %{}},
+          {:get, "/minio/admin/v3/get-config-kv/extra", %{}},
+          {:get, "/minio/admin/v3/help-config-kv", %{}},
+          {:get, "/minio/admin/v3/config", %{}},
+          {:get, "/minio/admin/v3/list-config-history-kv", %{"count" => "10"}},
+          {:delete, "/minio/admin/v3/clear-config-history-kv",
+           %{"restoreId" => "fixture-restore-id"}},
+          {:put, "/minio/admin/v3/restore-config-history-kv",
+           %{"restoreId" => "fixture-restore-id"}}
         ] do
-      conn = signed(method, path, region: "")
+      conn = signed(method, path, query: query, region: "")
 
       assert conn.status == 501
       assert content_type(conn) =~ "application/json"

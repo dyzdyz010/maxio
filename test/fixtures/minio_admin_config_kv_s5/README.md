@@ -42,6 +42,11 @@ below has a separately frozen raw-file SHA-256 and copied-excerpt SHA-256 in
 | `madmin_set_config_kv_wire` | madmin-go `4b504b82db633e978a57d49443b2be75824244c3` | `config-kv-commands.go`, `SetConfigKV`, 63-88 | `115e8d856da915da1a3539dc3932e3068c676dc95a1364de7a4aa4a5f86229ec` |
 | `madmin_get_config_kv_wire` | madmin-go `4b504b82db633e978a57d49443b2be75824244c3` | `config-kv-commands.go`, `GetConfigKV`, 90-112 | `53d5df7f4c3a488e8df181a576c70756a64f07c6cdcb2d1fd2a2fc6f31ca1c11` |
 | `madmin_new_request_entity_headers` | madmin-go `4b504b82db633e978a57d49443b2be75824244c3` | `api.go`, `newRequest`, 495-544 | `004ac16858b362fd7705774d5881af72e2d0e4a9ed9fb7f9462b34a3eff071e0` |
+| `madmin_sanitize_value` | madmin-go `4b504b82db633e978a57d49443b2be75824244c3` | `parse-config.go`, `SanitizeValue`, 201-205 | `86a1b945b0d68b8bfd90ebc314344b5e68d2475a8d4d5511a6956f3be01a01ca` |
+| `minio_config_error_construction` | MinIO `7aac2a2c5b7c882e68c1ce017d8256be2feea27f` | `internal/config/config.go`, `Error` / `Errorf`, 37-76 | `b2092fcdaafdd0bb7fb46837a23c6b09283d7952df69fcdfb8cda105784d2e18` |
+| `minio_get_unknown_subsystem_error` | MinIO `7aac2a2c5b7c882e68c1ce017d8256be2feea27f` | `internal/config/config.go`, `Config.GetSubsysInfo`, 1385-1393 | `d99057ebd1bee50d52fb7a25799124a0dae58dc73559f7f41dc90576ce3797c8` |
+| `minio_reset_missing_key_error` | MinIO `7aac2a2c5b7c882e68c1ce017d8256be2feea27f` | `internal/config/config.go`, `Config.DelKVS`, 843-850 | `e8d634def8735d6d061820c1cc11e3cdb450370577b13b6cc666afdb95ee0252` |
+| `minio_router_config_history_kv_routes` | MinIO `7aac2a2c5b7c882e68c1ce017d8256be2feea27f` | `cmd/admin-router.go`, `adminRouter`, 210-214 | `48a2d65181d5a6f98148047d10c1fd34b1a3a4a04e1620271b0f75af4187be91` |
 | `mc_print_non_tty_compaction` | mc `77f82e18b5401a65958f1619df6ebb994634bd88` | `cmd/print.go`, `printMsg`, 34-51 | `96338ddfe75ded06aeeecaa0572d236edf5904480a72492f5619382f291f4aa3` |
 | `mc_config_get_rendering` | mc `77f82e18b5401a65958f1619df6ebb994634bd88` | `cmd/admin-config-get.go`, `configGetMessage`, 74-108 | `48e2f3cad229a128306ba2dd0b0f2ed9edd06ebeabee7c69b4dfa8024f3f844f` |
 | `mc_config_get_help_branch` | mc `77f82e18b5401a65958f1619df6ebb994634bd88` | `cmd/admin-config-get.go`, `mainAdminConfigGet`, 118-147 | `a4797b0e56f8a74668fcd746bb34cf56de54eb9160998a06833fd3a13aaefba3` |
@@ -54,8 +59,11 @@ below has a separately frozen raw-file SHA-256 and copied-excerpt SHA-256 in
 
 | Fixture field(s) | Source excerpt IDs |
 | --- | --- |
-| `minio_routes_and_errors.json.routes`, `query_branches`, `error_precedence`, `errors`, `same_body_reset`, `deliberate_deviations`, `unsupported_catalog_claims` | `minio_router_config_kv_routes`, `minio_del_config_kv_action_and_decrypt`, `minio_set_config_kv_action_and_decrypt`, `minio_get_config_kv_action` |
+| `minio_routes_and_errors.json.routes`, `query_branches`, `error_precedence`, `same_body_reset`, `deliberate_deviations`, `unsupported_catalog_claims` | `minio_router_config_kv_routes`, `minio_del_config_kv_action_and_decrypt`, `minio_set_config_kv_action_and_decrypt`, `minio_get_config_kv_action` |
+| `minio_routes_and_errors.json.errors`, `dynamic_error_descriptions` | `minio_config_error_construction`, `minio_get_unknown_subsystem_error`, `minio_reset_missing_key_error` |
+| `minio_routes_and_errors.json.unsupported_config_history_routes` | `minio_router_config_history_kv_routes` |
 | `madmin_config_kv_wire.json.ciphertext_*`, `entity_matrix`, `applied_header`, `request_builder` | `madmin_del_config_kv_wire`, `madmin_set_config_kv_wire`, `madmin_get_config_kv_wire`, `madmin_new_request_entity_headers` |
+| `madmin_config_kv_wire.json.value_sanitization` | `madmin_sanitize_value` |
 | `mc_config_human.json.stdout`, `argv`, `local_help_or_rejection` | `mc_config_get_rendering`, `mc_config_set_rendering`, `mc_config_reset_rendering`, `mc_config_get_help_branch`, `mc_config_set_help_branch`, `mc_config_reset_help_branch`, `mc_print_non_tty_compaction`, `minio_subsys_info_write_to` |
 | `mc_config_json.json.stdout`, `mode`, `argv` | `mc_config_get_rendering`, `mc_config_set_rendering`, `mc_config_reset_rendering`, `mc_print_non_tty_compaction`, `minio_subsys_info_write_to` |
 

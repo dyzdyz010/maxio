@@ -15,5 +15,6 @@
     {"id": "reset_response", "method": "DELETE", "status": 200, "content_length": "0", "transfer_encoding": "absent", "content_type": "absent", "body_hex": "", "body_length": 0}
   ],
   "applied_header": {"name": "x-minio-config-applied", "true_branch": {"value": "true", "restart": false}, "missing_branch": {"value": "absent", "restart": true}, "other_value_branch": {"value": "not_true", "restart": true}},
-  "request_builder": {"EncryptData": true, "DecryptData": true, "automatic_content_type": false, "positive_content_length": "exact_ciphertext_byte_length", "zero_length_content_length": "absent"}
+  "request_builder": {"EncryptData": true, "DecryptData": true, "automatic_content_type": false, "positive_content_length": "exact_ciphertext_byte_length", "zero_length_content_length": "absent"},
+  "value_sanitization": {"operation_order": ["trim_space", "trim_one_double_quote_layer", "trim_one_single_quote_layer"], "mixed_quote_input": "\"'900000'\"", "result": "900000", "escape_parsing": false}
 }

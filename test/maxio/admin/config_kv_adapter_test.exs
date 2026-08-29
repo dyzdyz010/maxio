@@ -64,6 +64,19 @@ defmodule Maxio.Admin.ConfigKV.AdapterTest do
       end
     end
 
+    test "madmin mixed quote sanitization reaches the typed Config mutation boundary" do
+      # Catches the parser leaving the inner single quotes for Schema.parse/3 after it removes the
+      # outer double quotes.
+      assert {:ok, %{committed?: true, changed_count: 1}} =
+               Adapter.set(~s(s3 clock_skew_ms="'900000'"), mutation_opts())
+
+      assert Repo.one(
+               from row in RuntimeConfig,
+                 where: row.subsystem == "s3" and row.key == "clock_skew_ms",
+                 select: row.value
+             ) == %{"v" => 900_000}
+    end
+
     test "integer commands reject partial decimals and both out-of-range neighbors" do
       # Catches Integer.parse/1 remainder loss, clamping, or bounds checked against the wrong
       # projection. None of these invalid scalars may begin a transaction.
@@ -206,6 +219,29 @@ defmodule Maxio.Admin.ConfigKV.AdapterTest do
                Adapter.reset("s3:secondary", mutation_opts())
     end
 
+    test "a first-line target remains invalid when a later line names a forbidden path" do
+      # Catches plaintext-wide exposure preflight replacing the parser's earlier target error with
+      # AccessDenied. Both commands are evaluated before assertions so both precedence paths run.
+      results = [
+        Adapter.set(
+          "s3:secondary clock_skew_ms=1000\ns3 root_password=forbidden-value",
+          mutation_opts()
+        ),
+        Adapter.reset("s3:secondary\nstorage_backend module", mutation_opts())
+      ]
+
+      assert results == [{:error, :invalid_argument}, {:error, :invalid_argument}]
+
+      assert ConfigBatchFailureRepo.observations() == %{
+               transactions: 0,
+               query_calls: 0,
+               advisory_locks: 0
+             }
+
+      assert Repo.aggregate(RuntimeConfig, :count) == 0
+      assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+    end
+
     test "cross-subsystem and unknown-prefix safety deviations are BadJSON" do
       # Catches either unsafe parser deviation being diluted into the generic unknown response.
       assert {:error, :config_bad_json} =
@@ -245,6 +281,54 @@ defmodule Maxio.Admin.ConfigKV.AdapterTest do
       assert {:error, :config_generic} = Adapter.get("absent")
       assert {:error, :config_generic} = Adapter.set("s3 absent=1", mutation_opts())
       assert {:error, :config_generic} = Adapter.reset("absent", mutation_opts())
+    end
+
+    test "uppercase safe identifiers preserve exact evidence while unsafe identifiers stay redacted" do
+      evidence_opts = Keyword.put(mutation_opts(), :return_error_evidence, true)
+
+      safe_get = Adapter.get("S3", return_error_evidence: true)
+      safe_reset = Adapter.reset("s3 ABSENT", evidence_opts)
+
+      unsafe_gets = [
+        {"SECRETCONFIGKVSENTINEL",
+         Adapter.get("SECRETCONFIGKVSENTINEL", return_error_evidence: true)},
+        {"CONTROL\u0001MARK", Adapter.get("CONTROL\u0001MARK", return_error_evidence: true)},
+        {String.duplicate("A", 129),
+         Adapter.get(String.duplicate("A", 129), return_error_evidence: true)}
+      ]
+
+      unsafe_resets = [
+        {"SECRETCONFIGKVSENTINEL", Adapter.reset("s3 SECRETCONFIGKVSENTINEL", evidence_opts)},
+        {"CONTROL\u0001MARK", Adapter.reset("s3 CONTROL\u0001MARK", evidence_opts)},
+        {String.duplicate("A", 129),
+         Adapter.reset("s3 #{String.duplicate("A", 129)}", evidence_opts)}
+      ]
+
+      assert {:error,
+              %{
+                reason: {:config_generic, "unknown subsystem: S3"},
+                subsystem: "S3",
+                key_count: 0,
+                stage: :exposure
+              }} = safe_get
+
+      assert {:error,
+              %{
+                reason: {:config_not_found, "key ABSENT doesn't exist"},
+                subsystem: "s3",
+                key_count: 1,
+                stage: :exposure
+              }} = safe_reset
+
+      for {submitted, result} <- unsafe_gets do
+        assert {:error, %{reason: :config_generic, subsystem: "unknown"}} = result
+        refute inspect(result) =~ submitted
+      end
+
+      for {submitted, result} <- unsafe_resets do
+        assert {:error, %{reason: :config_not_found, subsystem: "s3"}} = result
+        refute inspect(result) =~ submitted
+      end
     end
   end
 

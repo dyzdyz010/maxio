@@ -16,23 +16,38 @@
     "madmin_set_config_kv_wire": {"file": "config-kv-commands.go", "lines": "63-88", "symbol": "SetConfigKV", "raw_file_sha256": "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0", "excerpt_sha256": "115e8d856da915da1a3539dc3932e3068c676dc95a1364de7a4aa4a5f86229ec"},
     "madmin_get_config_kv_wire": {"file": "config-kv-commands.go", "lines": "90-112", "symbol": "GetConfigKV", "raw_file_sha256": "4b590f9aed14fee7a5f2a3a20f062047fd15d7128de2d45cae3a0d43e156f1b0", "excerpt_sha256": "53d5df7f4c3a488e8df181a576c70756a64f07c6cdcb2d1fd2a2fc6f31ca1c11"},
     "madmin_new_request_entity_headers": {"file": "api.go", "lines": "495-544", "symbol": "newRequest", "raw_file_sha256": "932edaeb340bfdc9343db8f31124ea749cfc4836ab86b7196c5b2a876a9bea4e", "excerpt_sha256": "004ac16858b362fd7705774d5881af72e2d0e4a9ed9fb7f9462b34a3eff071e0"},
+    "madmin_sanitize_value": {"file": "parse-config.go", "lines": "201-205", "symbol": "SanitizeValue", "raw_file_sha256": "ea19fd427661619df7e8bdf878743186950eeeb7c94ea989481dcfcc11cf8d79", "excerpt_sha256": "86a1b945b0d68b8bfd90ebc314344b5e68d2475a8d4d5511a6956f3be01a01ca"},
+    "minio_config_error_construction": {"file": "internal/config/config.go", "lines": "37-76", "symbol": "Error/Errorf", "raw_file_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3", "excerpt_sha256": "b2092fcdaafdd0bb7fb46837a23c6b09283d7952df69fcdfb8cda105784d2e18"},
+    "minio_get_unknown_subsystem_error": {"file": "internal/config/config.go", "lines": "1385-1393", "symbol": "Config.GetSubsysInfo", "raw_file_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3", "excerpt_sha256": "d99057ebd1bee50d52fb7a25799124a0dae58dc73559f7f41dc90576ce3797c8"},
+    "minio_reset_missing_key_error": {"file": "internal/config/config.go", "lines": "843-850", "symbol": "Config.DelKVS", "raw_file_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3", "excerpt_sha256": "e8d634def8735d6d061820c1cc11e3cdb450370577b13b6cc666afdb95ee0252"},
+    "minio_router_config_history_kv_routes": {"file": "cmd/admin-router.go", "lines": "210-214", "symbol": "adminRouter", "raw_file_sha256": "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9", "excerpt_sha256": "48a2d65181d5a6f98148047d10c1fd34b1a3a4a04e1620271b0f75af4187be91"},
     "minio_subsys_info_write_to": {"file": "internal/config/config.go", "lines": "1447-1477", "symbol": "(*SubsysInfo).WriteTo", "raw_file_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3", "excerpt_sha256": "3e0c076b97d4150a5d40d17279b35c8f7e18fe0e65f7915d29f7b09c9f9cf04b"},
     "mc_print_non_tty_compaction": {"file": "cmd/print.go", "lines": "34-51", "symbol": "printMsg", "raw_file_sha256": "2797d5a0be76b4f5e06421f09069421df36883f7feee425bbb7c93d46bb2cccb", "excerpt_sha256": "96338ddfe75ded06aeeecaa0572d236edf5904480a72492f5619382f291f4aa3"},
     "mc_config_get_rendering": {"file": "cmd/admin-config-get.go", "lines": "74-108", "symbol": "configGetMessage", "raw_file_sha256": "651d9d79f8546e55ab6fe4cad7b6113c8469bf70ba08aa766815e1d80dea51a3", "excerpt_sha256": "48e2f3cad229a128306ba2dd0b0f2ed9edd06ebeabee7c69b4dfa8024f3f844f"},
     "mc_config_get_help_branch": {"file": "cmd/admin-config-get.go", "lines": "118-147", "symbol": "mainAdminConfigGet", "raw_file_sha256": "651d9d79f8546e55ab6fe4cad7b6113c8469bf70ba08aa766815e1d80dea51a3", "excerpt_sha256": "a4797b0e56f8a74668fcd746bb34cf56de54eb9160998a06833fd3a13aaefba3"},
     "mc_config_set_rendering": {"file": "cmd/admin-config-set.go", "lines": "67-85", "symbol": "configSetMessage", "raw_file_sha256": "babb2a3b100dac1f65ab9eba809a4f5d582618ce9d1afa8453335b5280df0201", "excerpt_sha256": "d4ded1439ba1303de5198c525123fdc8586e8546ac3a22558c40f6bd4bc6839c"},
     "mc_config_set_help_branch": {"file": "cmd/admin-config-set.go", "lines": "95-124", "symbol": "mainAdminConfigSet", "raw_file_sha256": "babb2a3b100dac1f65ab9eba809a4f5d582618ce9d1afa8453335b5280df0201", "excerpt_sha256": "a9e49de1465f0fef984c67c06a88b0e815136c63acea9b3809453da19a22ae03"},
-    "mc_config_reset_rendering": {"file": "cmd/admin-config-reset.go", "lines": "72-90", "symbol": "configResetMessage", "raw_file_sha256": "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9", "excerpt_sha256": "dd7590ee93ea4c1662462b6803dfeb1d4ea7adc307534491930405559fd94016"}
-    ,"mc_config_reset_help_branch": {"file": "cmd/admin-config-reset.go", "lines": "100-129", "symbol": "mainAdminConfigReset", "raw_file_sha256": "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9", "excerpt_sha256": "1cec7998d65c252a6e100b46e8854b3d0460db8dbf5dc9143efc9e9665af72e6"}
+    "mc_config_reset_rendering": {"file": "cmd/admin-config-reset.go", "lines": "72-90", "symbol": "configResetMessage", "raw_file_sha256": "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9", "excerpt_sha256": "dd7590ee93ea4c1662462b6803dfeb1d4ea7adc307534491930405559fd94016"},
+    "mc_config_reset_help_branch": {"file": "cmd/admin-config-reset.go", "lines": "100-129", "symbol": "mainAdminConfigReset", "raw_file_sha256": "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9", "excerpt_sha256": "1cec7998d65c252a6e100b46e8854b3d0460db8dbf5dc9143efc9e9665af72e6"}
   },
   "provenance": [
-    {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go", "meaning": "three exact v3 routes and GET key matcher"},
+    {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go", "meaning": "three exact v3 routes, GET key matcher, and three exact deferred config-history-kv routes"},
     {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-config-kv.go", "meaning": "ConfigUpdate action, envelope decrypt, error split"},
-    {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go", "meaning": "trailing SP then LF formatter"},
+    {"url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go", "meaning": "dynamic error construction, exact identifier interpolation, and trailing SP then LF formatter"},
     {"url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/config-kv-commands.go", "meaning": "encrypted client methods and applied header interpretation"},
+    {"url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/parse-config.go", "meaning": "ordered double-quote then single-quote value sanitization"},
     {"url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/api.go", "meaning": "entity request Content-Length and absent automatic Content-Type"},
     {"url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go", "meaning": "non-TTY compact JSON and one trailing LF"}
   ],
+  "field_source_map": {
+    "minio_routes_and_errors.json.routes,query_branches,error_precedence,same_body_reset,deliberate_deviations,unsupported_catalog_claims": ["minio_router_config_kv_routes", "minio_del_config_kv_action_and_decrypt", "minio_set_config_kv_action_and_decrypt", "minio_get_config_kv_action"],
+    "minio_routes_and_errors.json.errors,dynamic_error_descriptions": ["minio_config_error_construction", "minio_get_unknown_subsystem_error", "minio_reset_missing_key_error"],
+    "minio_routes_and_errors.json.unsupported_config_history_routes": ["minio_router_config_history_kv_routes"],
+    "madmin_config_kv_wire.json.ciphertext_*,entity_matrix,applied_header,request_builder": ["madmin_del_config_kv_wire", "madmin_set_config_kv_wire", "madmin_get_config_kv_wire", "madmin_new_request_entity_headers"],
+    "madmin_config_kv_wire.json.value_sanitization": ["madmin_sanitize_value"],
+    "mc_config_human.json.stdout,argv,local_help_or_rejection": ["mc_config_get_rendering", "mc_config_set_rendering", "mc_config_reset_rendering", "mc_config_get_help_branch", "mc_config_set_help_branch", "mc_config_reset_help_branch", "mc_print_non_tty_compaction", "minio_subsys_info_write_to"],
+    "mc_config_json.json.stdout,mode,argv": ["mc_config_get_rendering", "mc_config_set_rendering", "mc_config_reset_rendering", "mc_print_non_tty_compaction", "minio_subsys_info_write_to"]
+  },
   "routes": [
     {"id": "KV1", "operation": "get", "method": "GET", "path": "/minio/admin/v3/get-config-kv", "required_query": {"key": "subsystem"}, "action": "admin:ConfigUpdate", "plaintext_request": "none", "plaintext_success": "one KVS line"},
     {"id": "KV2", "operation": "set", "method": "PUT", "path": "/minio/admin/v3/set-config-kv", "required_query": {}, "action": "admin:ConfigUpdate", "plaintext_request": "subsystem key=value ...", "plaintext_success": "empty"},
@@ -51,6 +66,16 @@
     "too_large": {"status": 400, "code": "XMinioAdminConfigTooLarge"},
     "payload_hash": {"status": 400, "code": "XAmzContentSHA256Mismatch"}
   },
+  "dynamic_error_descriptions": {
+    "construction": "fmt.Sprintf(format, vals...)",
+    "unknown_subsystem": {"format": "unknown subsystem: %s", "safe_identifier": "S3", "description": "unknown subsystem: S3"},
+    "reset_missing_key": {"format": "key %s doesn't exist", "safe_identifier": "ABSENT", "description": "key ABSENT doesn't exist"}
+  },
+  "unsupported_config_history_routes": [
+    {"method": "GET", "path": "/minio/admin/v3/list-config-history-kv", "required_query": {"count": "10"}},
+    {"method": "DELETE", "path": "/minio/admin/v3/clear-config-history-kv", "required_query": {"restoreId": "fixture-restore-id"}},
+    {"method": "PUT", "path": "/minio/admin/v3/restore-config-history-kv", "required_query": {"restoreId": "fixture-restore-id"}}
+  ],
   "same_body_reset": {"body_utf8": "s3\ns3\n", "upstream": {"status": 400}, "maxio": {"status": 200, "meaning": "full_subsystem_reset_once"}, "independent_retry": {"normally_status": 200, "meaning": "successful_noop_zero_version_zero_audit_zero_postcommit"}},
   "deliberate_deviations": [
     {"id": "maxio-unauthenticated-admin-route-concealment", "status": 403},

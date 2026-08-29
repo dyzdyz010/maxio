@@ -137,6 +137,45 @@ defmodule Maxio.Admin.ErrorMapTest do
     refute unsafe.message =~ secret
   end
 
+  test "uppercase Config identifiers remain exact while unsafe dynamic descriptions fall back" do
+    generic_exact = ErrorMap.from_reason({:config_generic, "unknown subsystem: S3"})
+    not_found_exact = ErrorMap.from_reason({:config_not_found, "key ABSENT doesn't exist"})
+
+    unsafe_identifiers = [
+      "SECRETCONFIGKVSENTINEL",
+      "CONTROL\u0001MARK",
+      String.duplicate("A", 129)
+    ]
+
+    unsafe_errors =
+      Enum.flat_map(unsafe_identifiers, fn identifier ->
+        [
+          {identifier,
+           ErrorMap.from_reason({:config_generic, "unknown subsystem: #{identifier}"})},
+          {identifier,
+           ErrorMap.from_reason({:config_not_found, "key #{identifier} doesn't exist"})}
+        ]
+      end)
+
+    assert %{http_status: 400, code: "XMinioConfigError", message: "unknown subsystem: S3"} =
+             generic_exact
+
+    assert %{
+             http_status: 404,
+             code: "XMinioConfigNotFoundError",
+             message: "key ABSENT doesn't exist"
+           } = not_found_exact
+
+    for {identifier, error} <- unsafe_errors do
+      assert error.message in [
+               "Configuration specified is invalid",
+               "Configuration key/value not found"
+             ]
+
+      refute inspect(error) =~ identifier
+    end
+  end
+
   test "maps policy absence and invalid documents or names to exact MinIO admin errors" do
     assert %{code: "XMinioAdminNoSuchPolicy", http_status: 404} =
              ErrorMap.from_reason(:not_found)

@@ -121,28 +121,43 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
            ) == 0
   end
 
+  test "mixed quote sanitization crosses the encrypted endpoint into a typed mutation" do
+    # Catches a parser that removes only the outer double quotes and then rejects the remaining
+    # single-quoted integer at the typed Config boundary.
+    response = mutation(:put, @set_path, ~s(s3 clock_skew_ms="'900000'"))
+
+    assert_mutation_success(response, true)
+
+    assert Repo.one(
+             from row in RuntimeConfig,
+               where: row.subsystem == "s3" and row.key == "clock_skew_ms",
+               select: row.value
+           ) == %{"v" => 900_000}
+  end
+
   test "wrong methods, v4, adjacent, help, export and history paths remain authenticated 501" do
     # Catches an over-broad prefix dispatch that accidentally claims a neighboring or explicitly
     # deferred Admin API while wiring the three exact triples.
     cases = [
-      {:post, @get_path},
-      {:get, @set_path},
-      {:put, @reset_path},
-      {:get, "/minio/admin/v4/get-config-kv"},
-      {:get, @get_path <> "/extra"},
-      {:get, "#{@base}/help-config-kv"},
-      {:get, "#{@base}/config"},
-      {:put, "#{@base}/config"},
-      {:get, "#{@base}/list-config-history"},
-      {:delete, "#{@base}/clear-config-history"},
-      {:put, "#{@base}/restore-config-history"}
+      {:post, @get_path, %{}},
+      {:get, @set_path, %{}},
+      {:put, @reset_path, %{}},
+      {:get, "/minio/admin/v4/get-config-kv", %{}},
+      {:get, @get_path <> "/extra", %{}},
+      {:get, "#{@base}/help-config-kv", %{}},
+      {:get, "#{@base}/config", %{}},
+      {:put, "#{@base}/config", %{}},
+      {:get, "#{@base}/list-config-history-kv", %{"count" => "10"}},
+      {:delete, "#{@base}/clear-config-history-kv", %{"restoreId" => "fixture-restore-id"}},
+      {:put, "#{@base}/restore-config-history-kv", %{"restoreId" => "fixture-restore-id"}}
     ]
 
-    for {{method, path}, index} <- Enum.with_index(cases, 1) do
+    for {{method, path, query}, index} <- Enum.with_index(cases, 1) do
       request_id = "req-config-fallback-#{index}"
 
       conn =
         signed(method, path,
+          query: query,
           headers: [{"x-request-id", request_id}],
           region: ""
         )
@@ -621,6 +636,55 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
   end
 
+  test "a first-line target remains invalid when a later set or reset line is forbidden" do
+    # Catches exposure preflight replacing the parser's first target rejection with AccessDenied.
+    # Both requests are executed before assertions so both public precedence paths are exercised.
+    set_id = "req-config-target-before-forbidden-set"
+    reset_id = "req-config-target-before-forbidden-reset"
+
+    set_response =
+      mutation(
+        :put,
+        @set_path,
+        "s3:secondary clock_skew_ms=1000\ns3 root_password=forbidden-value",
+        request_id: set_id,
+        config_kv_test_opts: [repo: ConfigBatchFailureRepo]
+      )
+
+    reset_response =
+      mutation(:delete, @reset_path, "s3:secondary\nstorage_backend module",
+        request_id: reset_id,
+        config_kv_test_opts: [repo: ConfigBatchFailureRepo]
+      )
+
+    assert_admin_error(
+      set_response,
+      400,
+      "XMinioAdminInvalidArgument",
+      "Invalid arguments specified.",
+      @set_path,
+      set_id
+    )
+
+    assert_admin_error(
+      reset_response,
+      400,
+      "XMinioAdminInvalidArgument",
+      "Invalid arguments specified.",
+      @reset_path,
+      reset_id
+    )
+
+    assert ConfigBatchFailureRepo.observations() == %{
+             transactions: 0,
+             query_calls: 0,
+             advisory_locks: 0
+           }
+
+    assert Repo.aggregate(RuntimeConfig, :count) == 0
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+  end
+
   test "multi-line reset reports its later unknown key without mutating an earlier valid key" do
     # Catches Plug reconstructing reset grammar from only the first line, or Adapter opening a
     # transaction for the valid prefix before discovering the later unknown key.
@@ -702,6 +766,71 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
           else: if(operation == :set, do: @set_path, else: @reset_path)
 
       assert_admin_error(conn, status, code, message, path, request_id)
+    end
+  end
+
+  test "uppercase safe Config identifiers retain exact public descriptions" do
+    get_id = "req-config-uppercase-get"
+    reset_id = "req-config-uppercase-reset"
+
+    get_response =
+      signed(:get, @get_path,
+        query: %{"key" => "S3"},
+        headers: [{"x-request-id", get_id}],
+        region: ""
+      )
+
+    reset_response =
+      mutation(:delete, @reset_path, "s3 ABSENT", request_id: reset_id)
+
+    assert_admin_error(
+      get_response,
+      400,
+      "XMinioConfigError",
+      "unknown subsystem: S3",
+      @get_path,
+      get_id
+    )
+
+    assert_admin_error(
+      reset_response,
+      404,
+      "XMinioConfigNotFoundError",
+      "key ABSENT doesn't exist",
+      @reset_path,
+      reset_id
+    )
+  end
+
+  test "unsafe Config identifiers use catalog fallbacks without reflecting submitted bytes" do
+    identifiers = [
+      "SECRETCONFIGKVSENTINEL",
+      "CONTROL\u0001MARK",
+      String.duplicate("A", 129)
+    ]
+
+    responses =
+      identifiers
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {identifier, index} ->
+        get_id = "req-config-unsafe-get-#{index}"
+        reset_id = "req-config-unsafe-reset-#{index}"
+
+        [
+          {identifier, "Configuration specified is invalid",
+           signed(:get, @get_path,
+             query: %{"key" => identifier},
+             headers: [{"x-request-id", get_id}],
+             region: ""
+           )},
+          {identifier, "Configuration key/value not found",
+           mutation(:delete, @reset_path, "s3 #{identifier}", request_id: reset_id)}
+        ]
+      end)
+
+    for {identifier, expected_message, response} <- responses do
+      assert Jason.decode!(response.resp_body)["Message"] == expected_message
+      refute response.resp_body =~ identifier
     end
   end
 
