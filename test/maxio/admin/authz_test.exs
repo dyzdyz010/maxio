@@ -59,6 +59,24 @@ defmodule Maxio.Admin.AuthzTest do
     assert Authz.authorize(conn(), %{type: :root, arn: "arn:aws:iam:::root"}, @action) == :ok
   end
 
+  test "config archive root uses the same exact ConfigUpdate identity action" do
+    root = %{type: :root, arn: "arn:aws:iam:::root"}
+
+    assert Authz.authorize(conn(), root, @config_action) == :ok
+
+    put_key()
+
+    :ok =
+      Store.put_principal_policy(
+        @arn,
+        "config-archive-update",
+        ~s({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"admin:ConfigUpdate"}]})
+      )
+
+    assert Authz.authorize(conn(), principal(), @config_action) == :ok
+    assert {:error, _reason} = Authz.authorize(conn(), principal(), "admin:GetConfig")
+  end
+
   test "匿名 principal 是 implicit_deny（绝不靠形状推断）" do
     assert Authz.authorize(conn(), :anonymous, @action) == {:error, :implicit_deny}
   end

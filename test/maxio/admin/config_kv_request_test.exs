@@ -26,6 +26,21 @@ defmodule Maxio.Admin.ConfigKV.RequestTest do
                      )
   @oracle_ciphertext_sha256 "c95fbc75bff7166916815a3b88944eced2f63d1c6c784139916d252506f39af6"
 
+  @limits_fixture Path.expand(
+                    "../../fixtures/minio_admin_config_export_import_s7/madmin_config_archive_limits.json",
+                    __DIR__
+                  )
+  @wire_fixture Path.expand(
+                  "../../fixtures/minio_admin_config_export_import_s7/minio_config_archive_wire.json",
+                  __DIR__
+                )
+  @limits @limits_fixture |> File.read!() |> Jason.decode!()
+  @boundary_vectors @limits["boundary_vectors"]
+  @wire_conditions @wire_fixture
+                   |> File.read!()
+                   |> Jason.decode!()
+                   |> get_in(["error_map_contract", "conditions"])
+
   test "one ASCII decimal Content-Length is accepted through the inclusive maximum" do
     for {header, expected} <- [{"0", 0}, {"58", 58}, {"262272", 262_272}] do
       conn = mutation_conn(<<>>, content_length: header)
@@ -294,6 +309,143 @@ defmodule Maxio.Admin.ConfigKV.RequestTest do
     refute log =~ Base.encode16(plaintext, case: :lower)
   end
 
+  test "server response encryption helper preserves the 261975 random SIO oracle" do
+    secret = SigningSecret.new("config-archive-helper-caller-secret")
+    plaintext = :binary.copy(<<"#">>, 261_975)
+
+    first = Request.encrypt!(secret, plaintext)
+    second = Request.encrypt!(secret, plaintext)
+
+    assert byte_size(first) == 262_272
+    assert byte_size(second) == 262_272
+    refute first == second
+    assert {:ok, ^plaintext} = Envelope.decrypt(secret, first)
+
+    hash = :crypto.hash(:sha256, first) |> Base.encode16(case: :lower)
+
+    conn =
+      mutation_conn(first,
+        content_length: "262272",
+        signed_payload_sha256: hash
+      )
+
+    assert {_conn, ^plaintext} = Request.read_encrypted!(conn, secret)
+  end
+
+  test "generic_plaintext_guard_if_called_outside_valid_PUT_SIO_path gates server GET preflight" do
+    condition = wire_condition!("generic_plaintext_guard_if_called_outside_valid_PUT_SIO_path")
+
+    error =
+      assert_raise Error, fn ->
+        Request.encrypt!(
+          SigningSecret.new("config-archive-server-export-preflight-secret"),
+          :binary.copy(<<"#">>, 262_145)
+        )
+      end
+
+    assert_condition_error(error, condition)
+  end
+
+  for vector <- @boundary_vectors do
+    plaintext_bytes = vector["plaintext_bytes"]
+
+    test "fixture boundary #{plaintext_bytes} separates madmin local and server outcomes" do
+      vector = unquote(Macro.escape(vector))
+      plaintext_bytes = vector["plaintext_bytes"]
+
+      local =
+        simulate_madmin_local(plaintext_bytes, fn ->
+          send(self(), {:server_request_attempt, plaintext_bytes})
+        end)
+
+      case vector["madmin_local"] do
+        "PASS" ->
+          assert local == :attempt_request
+          assert_receive {:server_request_attempt, ^plaintext_bytes}
+
+          secret = SigningSecret.new("config-archive-boundary-caller-secret")
+          plaintext = :binary.copy(<<"#">>, plaintext_bytes)
+          assert {:ok, ciphertext} = Envelope.encrypt(secret, plaintext)
+          assert byte_size(ciphertext) == vector["ciphertext_bytes"]
+          assert byte_size(ciphertext) == sio_ciphertext_length(plaintext_bytes)
+
+          conn =
+            ciphertext
+            |> mutation_conn(
+              content_length: Integer.to_string(vector["ciphertext_bytes"]),
+              signed_payload_sha256:
+                :crypto.hash(:sha256, ciphertext) |> Base.encode16(case: :lower)
+            )
+            |> attach_body_read_probe()
+
+          case vector["minio_server"] do
+            "PASS_at_ciphertext_limit" ->
+              assert {_conn, ^plaintext} = Request.read_encrypted!(conn, secret)
+              assert_receive :body_reader_called
+
+            "XMinioAdminConfigTooLarge" ->
+              condition = wire_condition!("plaintext_over_262144")
+
+              error =
+                assert_raise Error, fn ->
+                  Request.read_encrypted!(conn, secret)
+                end
+
+              assert_condition_error(error, condition)
+              refute_received :body_reader_called
+          end
+
+        "bytes.ErrTooLarge_zero_request" ->
+          assert local == {:error, "bytes.ErrTooLarge"}
+          refute_received {:server_request_attempt, ^plaintext_bytes}
+          assert vector["minio_server"] == "not_reached"
+          assert vector["ciphertext_bytes"] == nil
+      end
+    end
+  end
+
+  test "SIO formula remains exact away from only the boundary vectors" do
+    secret = SigningSecret.new("config-archive-formula-secret")
+
+    for plaintext_bytes <- [1, 16_383, 16_384, 16_385] do
+      assert {:ok, ciphertext} =
+               Envelope.encrypt(secret, :binary.copy(<<"#">>, plaintext_bytes))
+
+      assert byte_size(ciphertext) == sio_ciphertext_length(plaintext_bytes)
+    end
+  end
+
+  defp simulate_madmin_local(plaintext_bytes, attempt_request)
+       when is_integer(plaintext_bytes) and is_function(attempt_request, 0) do
+    maximum = get_in(@limits, ["plaintext_reader", "maximum_bytes"])
+
+    if plaintext_bytes <= maximum do
+      attempt_request.()
+      :attempt_request
+    else
+      {:error, "bytes.ErrTooLarge"}
+    end
+  end
+
+  defp sio_ciphertext_length(plaintext_bytes) when plaintext_bytes >= 1 do
+    frame = @limits["sio_frame"]
+    chunk_bytes = frame["chunk_plaintext_bytes"]
+    chunks = div(plaintext_bytes + chunk_bytes - 1, chunk_bytes)
+
+    frame["prefix_bytes"] + plaintext_bytes + frame["aead_tag_bytes_per_chunk"] * chunks
+  end
+
+  defp wire_condition!(condition_id) do
+    Enum.find(@wire_conditions, &(&1["id"] == condition_id)) ||
+      flunk("fixture condition missing: #{condition_id}")
+  end
+
+  defp assert_condition_error(error, condition) do
+    assert error.http_status == Map.get(condition, "status", condition["pre_decrypt_status"])
+    assert error.code == Map.get(condition, "code", condition["pre_decrypt_code"])
+    assert error.message == Map.get(condition, "message", condition["pre_decrypt_message"])
+  end
+
   defp mutation_conn(body, opts) do
     content_length = Keyword.fetch!(opts, :content_length)
 
@@ -320,6 +472,11 @@ defmodule Maxio.Admin.ConfigKV.RequestTest do
   end
 
   defp put_content_length(conn, value), do: put_req_header(conn, "content-length", value)
+
+  defp attach_body_read_probe(conn) do
+    {_adapter, state} = conn.adapter
+    %{conn | adapter: {Maxio.Test.BodyReadProbeAdapter, {self(), state}}}
+  end
 
   defp assert_admin_error(error, code, message) do
     assert error.code == code

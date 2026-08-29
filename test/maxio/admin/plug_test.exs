@@ -77,7 +77,12 @@ defmodule Maxio.Admin.PlugTest do
           {:post, "/minio/admin/v3/help-config-kv", %{"subSys" => "", "key" => ""}},
           {:get, "/minio/admin/v4/help-config-kv", %{"subSys" => "", "key" => ""}},
           {:get, "/minio/admin/v3/help-config-kv/extra", %{"subSys" => "", "key" => ""}},
-          {:get, "/minio/admin/v3/config", %{}},
+          {:post, "/minio/admin/v3/config", %{}},
+          {:delete, "/minio/admin/v3/config", %{}},
+          {:get, "/minio/admin/v3/config/extra", %{}},
+          {:put, "/minio/admin/v3/config/extra", %{}},
+          {:get, "/minio/admin/v4/config", %{}},
+          {:put, "/minio/admin/v4/config", %{}},
           {:get, "/minio/admin/v3/list-config-history-kv", %{"count" => "10"}},
           {:delete, "/minio/admin/v3/clear-config-history-kv",
            %{"restoreId" => "fixture-restore-id"}},
@@ -98,7 +103,9 @@ defmodule Maxio.Admin.PlugTest do
           {:get, "/minio/admin/v3/get-config-kv"},
           {:get, "/minio/admin/v3/help-config-kv"},
           {:put, "/minio/admin/v3/set-config-kv"},
-          {:delete, "/minio/admin/v3/del-config-kv"}
+          {:delete, "/minio/admin/v3/del-config-kv"},
+          {:get, "/minio/admin/v3/config"},
+          {:put, "/minio/admin/v3/config"}
         ] do
       conn =
         method
