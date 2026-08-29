@@ -88,6 +88,14 @@ defmodule Maxio.Admin.ConfigKV.HelpTest do
 
     assert {:error,
             %{
+              reason: {:config_generic, "unknown sub-system absent"},
+              subsystem: "absent",
+              key_count: 0,
+              stage: :exposure
+            }} = Help.project("absent", "also_absent", false)
+
+    assert {:error,
+            %{
               reason: {:config_generic, "unknown key absent for sub-system s3"},
               subsystem: "s3",
               key_count: 0,

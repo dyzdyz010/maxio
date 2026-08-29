@@ -66,37 +66,50 @@ defmodule Maxio.Admin.ConfigKV.Help do
   end
 
   defp project_key(sub_sys, key, env_only?) do
+    case Registry.classify_subsystem(sub_sys) do
+      {:ok, subsystem} -> project_known_subsystem_key(subsystem, key, env_only?)
+      {:error, :forbidden} -> error(:access_denied, "unknown", :exposure)
+      {:error, :unknown_subsystem} -> project_unknown_subsystem_key(sub_sys, key)
+    end
+  end
+
+  defp project_known_subsystem_key(subsystem, key, env_only?) do
+    sub_sys = subsystem.wire_subsystem
+
     case Registry.classify_path(sub_sys, key) do
-      {:ok, entry} -> project_exposed_key(entry, sub_sys, key, env_only?)
+      {:ok, entry} -> project_exposed_key(subsystem, entry, key, env_only?)
       {:error, :forbidden} -> forbidden_error(sub_sys)
       {:error, :wire_hidden} -> error(:config_generic, sub_sys, :exposure)
       {:error, :unknown_key} -> unknown_key_error(sub_sys, key)
     end
   end
 
-  defp project_exposed_key(entry, sub_sys, key, env_only?) do
+  defp project_unknown_subsystem_key(sub_sys, key) do
+    case Registry.classify_path(sub_sys, key) do
+      {:error, :forbidden} -> forbidden_error(sub_sys)
+      {:error, :wire_hidden} -> error(:config_generic, sub_sys, :exposure)
+      _other -> unknown_subsystem_error(sub_sys)
+    end
+  end
+
+  defp project_exposed_key(subsystem, entry, key, env_only?) do
     cond do
       not public_entry?(entry) ->
-        error(:config_generic, sub_sys, :exposure)
+        error(:config_generic, subsystem.wire_subsystem, :exposure)
 
       env_only? and not bound_to_env?(entry) ->
-        unknown_key_error(sub_sys, key)
+        unknown_key_error(subsystem.wire_subsystem, key)
 
       true ->
-        with {:ok, subsystem} <- Registry.classify_subsystem(sub_sys) do
-          keys_help = [entry_wire(entry, env_only?)]
+        keys_help = [entry_wire(entry, env_only?)]
 
-          success(
-            help_wire(subsystem.wire_subsystem, subsystem.description, keys_help),
-            subsystem.wire_subsystem,
-            :key,
-            env_only?,
-            1
-          )
-        else
-          {:error, :forbidden} -> error(:access_denied, sub_sys, :exposure)
-          {:error, :unknown_subsystem} -> error(:config_generic, sub_sys, :exposure)
-        end
+        success(
+          help_wire(subsystem.wire_subsystem, subsystem.description, keys_help),
+          subsystem.wire_subsystem,
+          :key,
+          env_only?,
+          1
+        )
     end
   end
 
