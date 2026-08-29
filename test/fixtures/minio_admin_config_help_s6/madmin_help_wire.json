@@ -1,0 +1,104 @@
+{
+  "schema": "maxio.minio_admin_config_help_s6.madmin_wire.v1",
+  "classification": "source_derived",
+  "repository": "https://github.com/minio/madmin-go",
+  "pinned_commit": "4b504b82db633e978a57d49443b2be75824244c3",
+  "help_fields": ["subSys", "description", "multipleTargets", "keysHelp"],
+  "minio_server_raw_key_fields": ["key", "type", "description", "optional", "multipleTargets"],
+  "madmin_client_key_fields": ["key", "description", "optional", "type", "multipleTargets"],
+  "method": "GET",
+  "path": "/minio/admin/v3/help-config-kv",
+  "required_query": ["subSys", "key"],
+  "optional_presence_query": "env",
+  "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "required_headers": ["X-Amz-Content-Sha256", "Authorization"],
+  "request_absent": ["Content-Length", "Transfer-Encoding", "Content-Type", "body", "SIO"],
+  "response_transport": "plaintext_json_one_lf",
+  "unknown_fields": "rejected",
+  "sources": {
+    "madmin_structs": {
+      "source_file": "config-help-commands.go",
+      "symbol_or_range": "Help and HelpKV, lines 29-45",
+      "source_url": "https://github.com/minio/madmin-go/blob/4b504b82db633e978a57d49443b2be75824244c3/config-help-commands.go#L29-L45",
+      "raw_source_sha256": "1119bc4c5cca1861a78f28c092d1c5635cbd845a6635a5f8734f276ff0e689bd",
+      "excerpt_sha256": "d912d6e8a884228fdb03cecd45b02b40412b33f89d80f0381ec54499a595ab85"
+    },
+    "madmin_help_method": {
+      "source_file": "config-help-commands.go",
+      "symbol_or_range": "AdminClient.HelpConfigKV, lines 59-91",
+      "source_url": "https://github.com/minio/madmin-go/blob/4b504b82db633e978a57d49443b2be75824244c3/config-help-commands.go#L59-L91",
+      "raw_source_sha256": "1119bc4c5cca1861a78f28c092d1c5635cbd845a6635a5f8734f276ff0e689bd",
+      "excerpt_sha256": "307fe965c5aab8ac0c5977ac3dbb0c04d9dbd1f979bda6a327724aeff5165497"
+    },
+    "admin_url_prefix": {
+      "source_file": "api.go",
+      "symbol_or_range": "libraryAdminURLPrefix, lines 77-84",
+      "source_url": "https://github.com/minio/madmin-go/blob/4b504b82db633e978a57d49443b2be75824244c3/api.go#L77-L84",
+      "raw_source_sha256": "932edaeb340bfdc9343db8f31124ea749cfc4836ab86b7196c5b2a876a9bea4e",
+      "excerpt_sha256": "e1358a9e949987f80f358497bf8a7c37015fdc9abb4e4b658d46214bdc666918"
+    },
+    "request_and_target_url": {
+      "source_file": "api.go",
+      "symbol_or_range": "AdminClient.newRequest and makeTargetURL, lines 495-560",
+      "source_url": "https://github.com/minio/madmin-go/blob/4b504b82db633e978a57d49443b2be75824244c3/api.go#L495-L560",
+      "raw_source_sha256": "932edaeb340bfdc9343db8f31124ea749cfc4836ab86b7196c5b2a876a9bea4e",
+      "excerpt_sha256": "2d28aa3e9dd794553922b4ea56c01a28e44d56017854157339a3d00800b6f489"
+    },
+    "admin_v3": {
+      "source_file": "utils.go",
+      "symbol_or_range": "AdminAPIVersion and adminAPIPrefix, lines 37-44",
+      "source_url": "https://github.com/minio/madmin-go/blob/4b504b82db633e978a57d49443b2be75824244c3/utils.go#L37-L44",
+      "raw_source_sha256": "106fdc467376f57a7b3ab11aaddd3f03fc180d9b78f2c1f665eefd23df3b2680",
+      "excerpt_sha256": "8c2d7c958280facd35526270368d1fbc14c0c3388740885823e7c1648f54acb2"
+    },
+    "minio_server_help_kv": {
+      "repository": "https://github.com/minio/minio",
+      "pinned_commit": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+      "source_file": "internal/config/help.go",
+      "symbol_or_range": "config.HelpKV, lines 20-38",
+      "source_url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/help.go#L20-L38",
+      "raw_source_sha256": "989124ca75f5b6a19c829acf8fe0dec5c1d56945a20085c848f2b6b23c5e3c24",
+      "excerpt_sha256": "613cb080d450021257d8f94d79bb0dabf29a42f1f47848f23a35afc425408d73"
+    },
+    "minio_plaintext_encoder": {
+      "repository": "https://github.com/minio/minio",
+      "pinned_commit": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+      "source_file": "cmd/admin-handlers-config-kv.go",
+      "symbol_or_range": "adminAPIHandlers.HelpConfigKVHandler, lines 403-425",
+      "source_url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-config-kv.go#L403-L425",
+      "raw_source_sha256": "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0",
+      "excerpt_sha256": "01cd3549e4bf1753a9d7c81b65eb53d022410cb80246edef6e2e41daf46dd0da"
+    }
+  },
+  "claim_sources": {
+    "help_fields": ["madmin_structs"],
+    "minio_server_raw_key_fields": ["minio_server_help_kv"],
+    "madmin_client_key_fields": ["madmin_structs"],
+    "method_and_query": ["madmin_help_method"],
+    "path": ["madmin_help_method", "admin_url_prefix", "admin_v3", "request_and_target_url"],
+    "payload_and_signing": ["request_and_target_url"],
+    "response_and_unknown_fields": ["madmin_help_method", "minio_plaintext_encoder"]
+  },
+  "request_query_behavior": {
+    "subSys": "always_set_even_when_empty",
+    "key": "always_set_even_when_empty",
+    "env": "set_to_empty_string_only_when_envOnly_is_true"
+  },
+  "request_header_contract": {
+    "X-Amz-Content-Sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "Authorization": "SigV4 generated by signer.SignV4; fixture intentionally stores no value"
+  },
+  "request_entity_evidence": {
+    "classification": "source_derived_expected_on_wire",
+    "content_bytes_length": 0,
+    "content_length_assignment": "only when len(content) > 0",
+    "content_type_assignment": "none in HelpConfigKV/newRequest",
+    "sio": false,
+    "native_capture_required": true
+  },
+  "ordering_deviation": {
+    "maxio_direct_raw_order": "madmin_client_key_fields",
+    "differs_from_pinned_minio_server_raw_order": true,
+    "classification": "deliberate_raw_wire_ordering_deviation"
+  }
+}

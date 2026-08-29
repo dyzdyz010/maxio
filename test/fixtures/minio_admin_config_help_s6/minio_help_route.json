@@ -1,0 +1,94 @@
+{
+  "schema": "maxio.minio_admin_config_help_s6.minio_route.v1",
+  "classification": "source_derived",
+  "repository": "https://github.com/minio/minio",
+  "pinned_commit": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
+  "sources": {
+    "route": {
+      "source_file": "cmd/admin-router.go",
+      "symbol_or_range": "registerAdminRouter, lines 200-208",
+      "source_url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go#L200-L208",
+      "raw_source_sha256": "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9",
+      "excerpt_sha256": "d0e0c6fdc035ff267ec1cbe4d7f8116be1ae1001e0214eea31cdf6139933b97a"
+    },
+    "handler": {
+      "source_file": "cmd/admin-handlers-config-kv.go",
+      "symbol_or_range": "adminAPIHandlers.HelpConfigKVHandler, lines 403-425",
+      "source_url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-config-kv.go#L403-L425",
+      "raw_source_sha256": "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0",
+      "excerpt_sha256": "01cd3549e4bf1753a9d7c81b65eb53d022410cb80246edef6e2e41daf46dd0da"
+    },
+    "help_shape_and_empty": {
+      "source_file": "cmd/config-current.go",
+      "symbol_or_range": "Help and GetHelp empty-subsystem branch, lines 738-750",
+      "source_url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/config-current.go#L738-L750",
+      "raw_source_sha256": "87292bfc635e315827db852ae07f6d5e8952cb07bbf1db785bff3ab5fe0d9a7f",
+      "excerpt_sha256": "5df2bc1e697eac9d1d0499c9fa359efe079c3b3d9618c55dcf5e3f16c571cc00"
+    },
+    "help_projection": {
+      "source_file": "cmd/config-current.go",
+      "symbol_or_range": "GetHelp, lines 746-816",
+      "source_url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/config-current.go#L746-L816",
+      "raw_source_sha256": "87292bfc635e315827db852ae07f6d5e8952cb07bbf1db785bff3ab5fe0d9a7f",
+      "excerpt_sha256": "61194c7d7d7a3e1b4a0e2bc733a98b8812341745da74426b41e9c27c63e74e1f"
+    },
+    "server_help_kv": {
+      "source_file": "internal/config/help.go",
+      "symbol_or_range": "config.HelpKV, lines 20-38",
+      "source_url": "https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/help.go#L20-L38",
+      "raw_source_sha256": "989124ca75f5b6a19c829acf8fe0dec5c1d56945a20085c848f2b6b23c5e3c24",
+      "excerpt_sha256": "613cb080d450021257d8f94d79bb0dabf29a42f1f47848f23a35afc425408d73"
+    }
+  },
+  "claims": {
+    "route": {
+      "method": "GET",
+      "path": "/minio/admin/v3/help-config-kv",
+      "required_query": ["subSys", "key"],
+      "empty_values_match": true,
+      "enabled_when_config_ops_disabled": true,
+      "source_ids": ["route"]
+    },
+    "authorization": {
+      "action": "admin:ConfigUpdate",
+      "source_ids": ["handler"]
+    },
+    "handler": {
+      "query_values_from": "mux.Vars",
+      "env_expression": "_, envOnly := r.Form[\"env\"]",
+      "projection_call": "GetHelp(subSys, key, envOnly)",
+      "success_encoder": "json.NewEncoder(w).Encode(rd)",
+      "success_transport": "plaintext_json_one_lf",
+      "sio_envelope": false,
+      "source_ids": ["handler"]
+    },
+    "empty_subsystem": {
+      "returns_top_level_catalog": true,
+      "ignores_nonempty_key": true,
+      "ignores_env_only": true,
+      "source_ids": ["help_shape_and_empty"]
+    },
+    "target": {
+      "pinned_minio_behavior": "split subsystem at the first colon and project the base subsystem",
+      "maxio_s6_behavior": "reject every nonempty subsystem containing a colon",
+      "maxio_classification": "deliberate_deviation",
+      "source_ids": ["help_projection"]
+    },
+    "env_projection": {
+      "pinned_source_behavior": "when envOnly is true, synthesize MINIO_<SUBSYSTEM>_<KEY> names",
+      "maxio_s6_behavior": "do not synthesize unbound environment names",
+      "maxio_classification": "deliberate_repair_deviation",
+      "source_ids": ["help_projection"]
+    },
+    "server_raw_help_kv_order": {
+      "fields": ["key", "type", "description", "optional", "multipleTargets"],
+      "source_ids": ["server_help_kv"]
+    }
+  },
+  "verify_at_impl": {
+    "id": "V-H1",
+    "question": "Does pinned MinIO populate r.Form for no env, env, env=, and env=false before this handler?",
+    "reason": "HelpConfigKVHandler reads r.Form directly and does not call ParseForm in the pinned function.",
+    "source_ids": ["handler"]
+  }
+}

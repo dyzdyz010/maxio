@@ -1,0 +1,119 @@
+{
+  "schema": "maxio.minio_admin_config_help_s6.mc_dispatch.v1",
+  "classification": "source_derived",
+  "repository": "https://github.com/minio/mc",
+  "pinned_commit": "77f82e18b5401a65958f1619df6ebb994634bd88",
+  "get_alias_only": ["help-config-kv", "subSys=", "key="],
+  "reset_alias_only": ["help-config-kv", "subSys=", "key="],
+  "set_subsystem_without_equals": ["help-config-kv", "subSys=s3", "key="],
+  "set_key_without_equals": ["help-config-kv", "subSys=s3", "key=clock_skew_ms"],
+  "sources": {
+    "get_branch": {
+      "source_file": "cmd/admin-config-get.go",
+      "symbol_or_range": "mainAdminConfigGet, lines 118-146",
+      "source_url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-get.go#L118-L146",
+      "raw_source_sha256": "651d9d79f8546e55ab6fe4cad7b6113c8469bf70ba08aa766815e1d80dea51a3",
+      "excerpt_sha256": "84bf6bdd1c99fbc08407513db8f533f940089eba155bbd1ef411f961c401617f"
+    },
+    "reset_branch": {
+      "source_file": "cmd/admin-config-reset.go",
+      "symbol_or_range": "mainAdminConfigReset, lines 101-131",
+      "source_url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-reset.go#L101-L131",
+      "raw_source_sha256": "2713ebb31a413dd1150e328698f38dea04d9f4010d7cb86d9ee58bd87da1a1d9",
+      "excerpt_sha256": "90528c82516b1e4aa588eda99a38c003879fc38d4f3a846991d748aa2da2c596"
+    },
+    "set_branch": {
+      "source_file": "cmd/admin-config-set.go",
+      "symbol_or_range": "mainAdminConfigSet, lines 103-129",
+      "source_url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-set.go#L103-L129",
+      "raw_source_sha256": "babb2a3b100dac1f65ab9eba809a4f5d582618ce9d1afa8453335b5280df0201",
+      "excerpt_sha256": "d3d98a58fdcef10b058dfb6b14fac7dba6046289b8de4d52933b9e1cfb8cd675"
+    },
+    "renderer": {
+      "source_file": "cmd/admin-config-help.go",
+      "symbol_or_range": "HelpTmpl and configHelpMessage, lines 31-83",
+      "source_url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-help.go#L31-L83",
+      "raw_source_sha256": "0c46fe275e62a8ba8ee20639cf12c8c1a783160cdea8a9f8ae6ff184e0b9db08",
+      "excerpt_sha256": "7f9b8b17eed5e16e436c1f74d9947c3accc959ae87ed66734f82250233d37461"
+    },
+    "print_message": {
+      "source_file": "cmd/print.go",
+      "symbol_or_range": "message and printMsg, lines 28-51",
+      "source_url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go#L28-L51",
+      "raw_source_sha256": "2797d5a0be76b4f5e06421f09069421df36883f7feee425bbb7c93d46bb2cccb",
+      "excerpt_sha256": "994ae6150ee7955784061721c091e869d20f05eeb1aeedffe1049a8468416425"
+    },
+    "non_tty_json": {
+      "source_file": "cmd/globals.go",
+      "symbol_or_range": "setGlobalsFromContext, lines 126-145",
+      "source_url": "https://github.com/minio/mc/blob/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/globals.go#L126-L145",
+      "raw_source_sha256": "9f0e7bdc05a3143e46a40420c1f0c901103c4e647c83fbb729810497894ec114",
+      "excerpt_sha256": "dc95e484791540962f1bf2034ca54108ff161f6019255c04cf7f84601401b218"
+    }
+  },
+  "dispatch_claims": {
+    "get_alias_only": {
+      "condition": "len(ctx.Args()) == 1",
+      "madmin_call": "HelpConfigKV(ctx, \"\", \"\", false)",
+      "mutation_call": false,
+      "source_ids": ["get_branch"]
+    },
+    "reset_alias_only": {
+      "condition": "len(ctx.Args()) == 1",
+      "madmin_call": "HelpConfigKV(ctx, \"\", \"\", ctx.Bool(\"env\"))",
+      "delete_call": false,
+      "source_ids": ["reset_branch"]
+    },
+    "set_without_equals": {
+      "condition": "input does not contain madmin.KvSeparator",
+      "madmin_call": "HelpConfigKV(ctx, args.Get(1), args.Get(2), ctx.Bool(\"env\"))",
+      "set_call": false,
+      "source_ids": ["set_branch"]
+    }
+  },
+  "rendering_claims": {
+    "human": "HelpTmpl through tabwriter.NewWriter(&s, 1, 8, 2, ' ', 0)",
+    "json": "configHelpMessage marshaled with status then help; redirected non-TTY global --json is compacted",
+    "stdout_termination": "printMsg trims an existing LF and console.Println appends one LF",
+    "source_ids": ["renderer", "print_message", "non_tty_json"]
+  },
+  "expected_transcripts": {
+    "top_level_human": {
+      "classification": "source_derived_expected_not_live",
+      "stdout_utf8": "KEYS:\ns3                  Maxio extension: configure s3.clock_skew_ms.\nlisting             Maxio extension: configure listing.sql_hard_limit.\nprometheus_metrics  Maxio extension: configure prometheus_metrics.public.\n",
+      "byte_length": 216,
+      "sha256": "f5506a090c713948fd621afd5e7a398185ea4654f53a9a85306668df80a4a327"
+    },
+    "top_level_global_json": {
+      "classification": "source_derived_expected_not_live",
+      "stdout_utf8": "{\"status\":\"success\",\"help\":{\"subSys\":\"\",\"description\":\"\",\"multipleTargets\":false,\"keysHelp\":[{\"key\":\"s3\",\"description\":\"Maxio extension: configure s3.clock_skew_ms.\",\"optional\":false,\"type\":\"\",\"multipleTargets\":false},{\"key\":\"listing\",\"description\":\"Maxio extension: configure listing.sql_hard_limit.\",\"optional\":false,\"type\":\"\",\"multipleTargets\":false},{\"key\":\"prometheus_metrics\",\"description\":\"Maxio extension: configure prometheus_metrics.public.\",\"optional\":false,\"type\":\"\",\"multipleTargets\":false}]}}\n",
+      "byte_length": 507,
+      "sha256": "567963b2fcda09af400ac86ce4a49690a19e71841bbc43ef2cdda8e766600267"
+    },
+    "s3_subsystem_or_key_human": {
+      "classification": "source_derived_expected_not_live",
+      "stdout_utf8": "KEY:\ns3  Maxio extension: configure s3.clock_skew_ms.\n\nARGS:\nclock_skew_ms  (integer in 0..3600000)  Maximum allowed SigV4 header-signature clock skew in milliseconds; applied to the next authentication request.\n",
+      "byte_length": 212,
+      "sha256": "90533b765bc5a3c4552a64df699f2bcbf02c223aa6d0df209be07825c094c7f2"
+    },
+    "s3_subsystem_or_key_global_json": {
+      "classification": "source_derived_expected_not_live",
+      "stdout_utf8": "{\"status\":\"success\",\"help\":{\"subSys\":\"s3\",\"description\":\"Maxio extension: configure s3.clock_skew_ms.\",\"multipleTargets\":false,\"keysHelp\":[{\"key\":\"clock_skew_ms\",\"description\":\"Maximum allowed SigV4 header-signature clock skew in milliseconds; applied to the next authentication request.\",\"optional\":true,\"type\":\"integer in 0..3600000\",\"multipleTargets\":false}]}}\n",
+      "byte_length": 364,
+      "sha256": "bf5d2b382920e2389d7e463230bc97e056fddb6ce60ad2124bc4a03836fc1333"
+    }
+  },
+  "command_to_transcript": {
+    "get_alias_only": ["top_level_human", "top_level_global_json"],
+    "reset_alias_only": ["top_level_human", "top_level_global_json"],
+    "set_subsystem_without_equals": ["s3_subsystem_or_key_human", "s3_subsystem_or_key_global_json"],
+    "set_key_without_equals": ["s3_subsystem_or_key_human", "s3_subsystem_or_key_global_json"]
+  },
+  "verify_at_impl": {
+    "id": "V-H2",
+    "status": "VERIFY",
+    "required_capture": "pinned native mc, redirected non-TTY, NO_COLOR, human and global --json",
+    "must_freeze": ["stdout", "stderr", "exit", "tabwriter spacing", "LF versus Windows CRLF", "JSON wrapper field order"],
+    "source_derived_transcripts_close_verify": false
+  }
+}
