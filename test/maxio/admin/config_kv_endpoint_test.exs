@@ -13,6 +13,7 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
   alias Maxio.Policy.Statement
   alias Maxio.Policy.Store, as: PolicyStore
   alias Maxio.S3.Endpoint
+  alias Maxio.S3.Plugs.ResponseTransformPolicy
 
   alias Maxio.Test.{
     ConfigBatchFailureRepo,
@@ -251,10 +252,10 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert Repo.aggregate(RuntimeConfigAudit, :count) == before_audits
   end
 
-  test "real Bandit keeps Admin help success and errors plaintext when gzip is accepted" do
+  test "real Bandit keeps path-style Admin responses untransformed when gzip is accepted" do
     # Catches the transport adapter rewriting the explicit Admin framing after the Plug has
-    # produced it. Status and content type are asserted before Content-Encoding so a RED here
-    # proves startup, routing, authentication and signing all reached the intended handlers.
+    # produced it. Status and content type are asserted before Content-Encoding so a RED proves
+    # startup, routing, authentication and signing all reached the intended handlers.
     bandit =
       start_supervised!(
         {Bandit, plug: Endpoint, scheme: :http, ip: {127, 0, 0, 1}, port: 0, startup_log: false}
@@ -285,6 +286,31 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
       )
       |> raw_bandit_request(port)
 
+    adjacent_path = @help_path <> "/extra"
+
+    adjacent =
+      :get
+      |> SigV4Request.signed_conn(adjacent_path,
+        headers: [
+          {"accept-encoding", "gzip"},
+          {"x-request-id", "req-config-help-bandit-adjacent"}
+        ],
+        region: ""
+      )
+      |> raw_bandit_request(port)
+
+    s5_get =
+      :get
+      |> SigV4Request.signed_conn(@get_path,
+        query: %{"key" => "s3"},
+        headers: [
+          {"accept-encoding", "gzip"},
+          {"x-request-id", "req-config-get-bandit-root"}
+        ],
+        region: ""
+      )
+      |> raw_bandit_request(port)
+
     expected_success =
       ~s({"subSys":"","description":"","multipleTargets":false,"keysHelp":[{"key":"s3","description":"Maxio extension: configure s3.clock_skew_ms.","optional":false,"type":"","multipleTargets":false},{"key":"listing","description":"Maxio extension: configure listing.sql_hard_limit.","optional":false,"type":"","multipleTargets":false},{"key":"prometheus_metrics","description":"Maxio extension: configure prometheus_metrics.public.","optional":false,"type":"","multipleTargets":false}]}) <>
         "\n"
@@ -292,22 +318,81 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     expected_denied =
       ~s({"Code":"AccessDenied","HostId":"","Message":"Access Denied","RequestId":"req-config-help-bandit-anonymous","Resource":"/minio/admin/v3/help-config-kv"})
 
+    expected_adjacent =
+      ~s({"Code":"NotImplemented","HostId":"","Message":"The MinIO admin API endpoint /minio/admin/v3/help-config-kv/extra is not implemented by maxio.","RequestId":"req-config-help-bandit-adjacent","Resource":"/minio/admin/v3/help-config-kv/extra"})
+
     assert success.status == 200
     assert denied.status == 403
+    assert adjacent.status == 501
+    assert s5_get.status == 200
     assert success.headers["content-type"] == ["application/json"]
     assert denied.headers["content-type"] == ["application/json; charset=utf-8"]
+    assert adjacent.headers["content-type"] == ["application/json; charset=utf-8"]
+    assert s5_get.headers["content-type"] == ["application/json"]
 
-    assert {success.headers["content-encoding"], denied.headers["content-encoding"]} ==
-             {nil, nil}
+    assert {
+             success.headers["content-encoding"],
+             denied.headers["content-encoding"],
+             adjacent.headers["content-encoding"],
+             s5_get.headers["content-encoding"]
+           } == {nil, nil, nil, nil}
 
-    assert {success.headers["transfer-encoding"], denied.headers["transfer-encoding"]} ==
-             {nil, nil}
+    assert {
+             success.headers["transfer-encoding"],
+             denied.headers["transfer-encoding"],
+             adjacent.headers["transfer-encoding"],
+             s5_get.headers["transfer-encoding"]
+           } == {nil, nil, nil, nil}
 
     assert success.headers["content-length"] == [Integer.to_string(byte_size(expected_success))]
     assert denied.headers["content-length"] == [Integer.to_string(byte_size(expected_denied))]
+    assert adjacent.headers["content-length"] == [Integer.to_string(byte_size(expected_adjacent))]
+    assert s5_get.headers["content-length"] == [Integer.to_string(byte_size(s5_get.body))]
     assert success.body == expected_success
     assert denied.body == expected_denied
+    assert adjacent.body == expected_adjacent
+
+    assert {:ok, "s3 clock_skew_ms=900000 \n"} =
+             Envelope.decrypt(SigningSecret.new(@root_secret), s5_get.body)
+
     refute String.ends_with?(denied.body, "\n")
+    refute String.ends_with?(adjacent.body, "\n")
+  end
+
+  test "response transforms are disabled only for the path-style Admin surface" do
+    # Catches route-specific no-transform logic that misses adjacent/S5 Admin responses, or an
+    # over-broad path check that changes vhost objects, ordinary S3, IAM or STS responses.
+    cases = [
+      {:admin_help, :get, @help_path, :admin, :path, true},
+      {:admin_s5_get, :get, @get_path, :admin, :path, true},
+      {:admin_adjacent, :get, @help_path <> "/extra", :admin, :path, true},
+      {:vhost_same_path, :get, @help_path, :s3, :virtual_host, false},
+      {:ordinary_s3, :get, "/bucket/key", :s3, :path, false},
+      {:iam_query, :post, "/?Action=ListUsers&Version=2010-05-08", :s3, :path, false},
+      {:sts_query, :post, "/?Action=AssumeRole&Version=2011-06-15", :s3, :path, false}
+    ]
+
+    observed =
+      Enum.map(cases, fn {label, method, path, surface, address_style, _expected} ->
+        response =
+          method
+          |> Plug.Test.conn(path)
+          |> assign(:maxio_surface, surface)
+          |> assign(:s3_address_style, address_style)
+          |> ResponseTransformPolicy.call(ResponseTransformPolicy.init([]))
+          |> send_resp(200, "boundary")
+
+        no_transform? =
+          response
+          |> get_resp_header("cache-control")
+          |> Enum.flat_map(&Plug.Conn.Utils.list/1)
+          |> Enum.member?("no-transform")
+
+        {label, no_transform?}
+      end)
+
+    expected = Enum.map(cases, fn {label, _, _, _, _, expected} -> {label, expected} end)
+    assert observed == expected
   end
 
   test "help preserves missing-versus-empty query precedence before authorization" do
