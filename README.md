@@ -1009,6 +1009,12 @@ MinIO v3 Config KVS 兼容面严格限于以下路由：
 `env=`、`env=false` 都表示 env-only。该路由要求 `admin:ConfigUpdate`，成功响应是 plaintext compact
 JSON 加一个 LF，不使用 madmin SIO。
 
+为保持 Admin plaintext JSON 与 encrypted SIO 的 exact wire framing，S3 Endpoint 在
+`SurfaceClassifier` 后使用 `ResponseTransformPolicy`，仅为 path-style 且分类为 `:admin` 的响应合并
+`Cache-Control: no-transform`，阻止 Bandit 在 Plug 返回后压缩响应。普通 S3、vhost 下同一路径、
+IAM/STS、health/metrics 不受该策略影响；Config Parser/Adapter/Request/Envelope、Config/Schema 与
+migrations 也没有因此改变。
+
 对 mc 暴露的只有三个 **Maxio 扩展键**：`s3.clock_skew_ms`、
 `listing.sql_hard_limit`、`prometheus_metrics.public`；它们不是 MinIO 官方 config catalog 的同名替代。
 同一 subsystem 的 set/reset 会先验证完整候选配置，再在一个数据库事务内原子写 runtime rows 与
@@ -1032,9 +1038,11 @@ opt-in external smoke 会分别用 human 与全局 `--json` mc alias 执行完�
 `403 → set true → 200 → reset public → 403`，而不是只验证控制面回显。fake runner 只证明协议与
 取证编排；只有对隔离、已运行 Maxio endpoint 的 opt-in 执行才是活体结果。
 
-新增 help 分支的 argv 与 transcript 当前是 pinned 源码推导的 fixture expectation；自动化结果只标记为
-`fixture_expected` / `fake_observed`，证明 fake runner 观察到了 exact native branch argv。尚未取得 pinned
-native strict-live PASS，因此不得把这些 source-derived/fake 证据写成 `live_pass` 或活体兼容结论。
+tracked external-smoke 中 help 分支的 argv 与 transcript 仍是 pinned 源码推导的 fixture expectation；
+自动化结果只标记为 `fixture_expected` / `fake_observed`，证明 fake runner 观察到了 exact native branch
+argv，本身不是 live 证据。另行执行的 Task 9 strict-live 在 implementation SHA `04e6a10` 上取得
+V-H2 pinned native mc 8/8 与 V-H1 4/4；这只证明该固定版本、固定探针矩阵通过，不代表 MinIO Admin
+Config 完整 catalog、targets 或其它未实现 surface 的全面兼容。
 
 CLI：
 

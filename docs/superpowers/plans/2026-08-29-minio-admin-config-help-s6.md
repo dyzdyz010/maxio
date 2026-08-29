@@ -10,7 +10,10 @@ official-catalog 扩张。
 **Architecture:** `ConfigKV.Registry` 是唯一有序 wire catalog，`Config.Schema` 是 type/env
 binding 唯一真相；新建纯 `ConfigKV.Help` 投影并编码 exact madmin JSON+LF。
 Admin Plug 只做 exact route/query/auth/log/framing，Mix CLI 与 ExternalSmoke 共用该边界；
-Parser/Adapter/Request/Config/Repo/core pipeline 不改。
+Parser/Adapter/Request/Envelope/Config/Schema/migrations 不改。strict-live 发现并经独立评审接受的唯一
+S3 Endpoint transport exception，是在 `SurfaceClassifier` 后接入 Admin-only
+`ResponseTransformPolicy`，为 path-style `:admin` 响应合并 `Cache-Control: no-transform`，防止
+Bandit post-Plug 压缩 Admin JSON/SIO。
 
 **Tech Stack:** Elixir, Plug/Bandit, Phoenix endpoint tests, Jason ordered JSON, ExUnit, Mix tasks,
 pinned MinIO/madmin-go/mc source fixtures, native `mc` strict live.
@@ -44,7 +47,9 @@ pinned MinIO/madmin-go/mc source fixtures, native `mc` strict live.
 - 不暴露 secret/deployment identity/backend binding/hidden/forbidden/full Schema/official MinIO
   catalog。
 - 不修改 `ConfigKV.Parser`、`Adapter`、`Request`、Envelope、Config/Schema behavior/defaults、
-  Coordinator、Store、Repo、migration、S3/SigV4/Authz core pipeline 或 logger metadata allowlist。
+  Coordinator、Store、Repo、migration 或 logger metadata allowlist。唯一允许的 S3 Endpoint transport
+  exception 是 `SurfaceClassifier` 后的 `ResponseTransformPolicy`：只命中 path-style `:admin`，普通
+  S3、vhost 同路径、IAM/STS、health/metrics 以及 SigV4/Authz/dispatch 业务语义必须保持不变。
 - 开发中只跑 focused tests/compile/changed-file format/diff check；整个 coherent batch 在最终
   只跑一次 `mix precommit`。
 - S5 fixture 是历史快照，不得改写它当时的 help unsupported 记录。
@@ -783,7 +788,10 @@ may change in this task.
 - [ ] **Step 2: Lane E architecture/security review.** Audit Registry as single ordered exposure source,
   Schema-only type/env, no defaults/runtime values, fail-closed sensitive/forbidden/hidden handling, no atom
   creation, Help purity/no Repo/Config, narrow ErrorMap, safe structured logs, zero body read and unchanged
-  Parser/Adapter/Request/Envelope/core pipeline/migrations.
+  Parser/Adapter/Request/Envelope/Config/Schema/migrations. Also audit the live-discovered transport exception:
+  `ResponseTransformPolicy` is immediately after `SurfaceClassifier`, adds/merges
+  `Cache-Control: no-transform` only for path-style `:admin`, and leaves ordinary S3, vhost same-path requests,
+  IAM/STS and health/metrics unchanged.
 
 - [ ] **Step 3: Both reviewers issue severity-ranked verdicts.** Completion requires zero Critical/Important.
   A review that only says “looks good” without file/contract evidence is invalid.
@@ -796,6 +804,9 @@ may change in this task.
   ```
 
   Lane C task-reviews the fix, then both Lane D/E re-review the amended whole range.
+  The only accepted S3 Endpoint transport correction may touch `lib/maxio/s3/endpoint.ex` and
+  `lib/maxio/s3/plugs/response_transform_policy.ex`; it must remain the classifier-gated Admin-only policy
+  above and must not move help projection/auth/framing into the S3 request pipeline.
 
 - [ ] **Step 5: Invalidate stale evidence correctly.** Any fixture/test/V-H1/V-H2 correction after Task 9
   invalidates and must rerun the affected pinned-MinIO/native-mc live probe and comparison. Any production
@@ -941,5 +952,7 @@ may change in this task.
 - 不新增 migration、Repo query、transaction、advisory lock、audit、broadcast、reconcile 或多节点
   state machine。
 - 不让 Help/Plug/Mix 复制 Parser/Adapter/Request/Config 逻辑，不对 user input 造 atom。
-- 不修改 S3 Endpoint、SigV4、Authz core pipeline 或 logger metadata allowlist。
+- 除 `SurfaceClassifier` 后接入 Admin-only `ResponseTransformPolicy` 的 transport exception 外，不修改
+  S3 Endpoint/SigV4/Authz 的业务路由或语义；普通 S3、vhost 同路径、IAM/STS、health/metrics
+  保持不变，也不修改 logger metadata allowlist。
 - 不实现 Mix human renderer，不把 fake/source-derived transcript 冒充 pinned live evidence。

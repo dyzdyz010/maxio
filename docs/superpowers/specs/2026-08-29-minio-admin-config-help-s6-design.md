@@ -129,9 +129,16 @@ identifier 判定的公开输入，或 `"unknown"`；敏感/非法原文不得�
 
 ### 3.3 HTTP 与 CLI
 
-`Maxio.Admin.Plug` 只新增 exact dispatch/handler，不改 S3 Endpoint、SigV4、Authz 或 core
-request pipeline。handler 负责 query presence、授权、结构化日志与 response framing；
-投影及 JSON 字节由 Help 负责。
+`Maxio.Admin.Plug` 只新增 exact dispatch/handler；handler 负责 query presence、授权、结构化日志与
+response framing，投影及 JSON 字节由 Help 负责。strict-live 暴露并经 Task 10 独立评审接受的唯一
+S3 Endpoint transport exception 是：`Maxio.S3.Endpoint` 在 `SurfaceClassifier` 之后接入
+`ResponseTransformPolicy`。它只对 classifier 已标记为 `:admin` 且 address style 为 `:path` 的请求
+注册 `before_send`，在响应上合并 `Cache-Control: no-transform`，防止 Bandit 在 Plug 返回后压缩
+Admin JSON/SIO，从而破坏 exact plaintext/encrypted framing。
+
+这个 transport policy 覆盖 path-style Admin surface，而不是 help route 专用分支。普通 S3、vhost 下
+同一路径（仍分类为 `:s3`）、IAM/STS、health/metrics 均不受影响；SigV4/Authz/dispatch 的业务顺序与
+语义不变。`ConfigKV.Parser`、`Adapter`、`Request`、Envelope、Config/Schema 与 migrations 仍不改。
 
 `mix maxio.admin.config.help [--env] [subsystem [key]]` 直接调用同一 Help 接口，
 并把 exact JSON+LF 写到 stdout。该任务不调用 `Maxio.Config.CLI.boot/0`，因此
@@ -344,7 +351,8 @@ key/subsystem 必须各自通过现有 safe identifier 与 sensitive-marker 过�
 所有错误继续使用现有 Admin `ErrorView`：compact JSON 且恒有 `Code`、`Message`、
 `Resource`、`RequestId`、`HostId` 五字段，不加 LF，不加 SIO。Error response
 framing 固定为 `Content-Type: application/json; charset=utf-8`、`Content-Length` 精确等于
-compact JSON 字节数、无 `Transfer-Encoding`、无 `Content-Encoding`。S6 不创建
+compact JSON 字节数、无 `Transfer-Encoding`、无 `Content-Encoding`，并由 Admin-only transport
+policy 合并 `Cache-Control: no-transform`。S6 不创建
 help 专用 error renderer，不改这份现有 Admin error contract。
 
 ## 9. Request/response framing
@@ -365,6 +373,7 @@ help 专用 error renderer，不改这份现有 Admin error contract。
 - `Content-Type: application/json`。
 - `Content-Length` 显式等于 JSON+LF 字节数。
 - 删除 `Transfer-Encoding` 与 `Content-Encoding`。
+- `Cache-Control` 含 `no-transform`，阻止 Bandit 在 Plug 返回后压缩响应。
 - 不加 `x-minio-config-applied`。
 - 不压缩，不加 SIO envelope。
 
@@ -477,7 +486,9 @@ Maxio success Content-Type/CL/TE/CE 已在本设计中作为稳定 deliberate fr
 - 不暴露 secrets、deployment identity、backend bindings 或 hidden/forbidden Schema 项。
 - 不新增 env binding、default 字段或 runtime value 投影。
 - 不访问 Repo，不新增 migration、transaction、lock、audit、broadcast 或多节点协调。
-- 不修改 S3 Endpoint、SigV4、Authz core pipeline 或 logger metadata allowlist。
+- 除 `SurfaceClassifier` 后的 Admin-only `ResponseTransformPolicy` transport exception 外，不修改
+  S3 Endpoint/SigV4/Authz 的业务路由或语义；普通 S3、vhost 同路径、IAM/STS、health/metrics
+  保持不变，也不修改 logger metadata allowlist。
 - 不在 Mix CLI 复制 mc human renderer。
 - 不把 source fixture、fake runner 或 expected transcript 冒充 strict-live evidence。
 
@@ -496,5 +507,7 @@ S6 只在以下条件全部满足时完成：
 - 所有 code/test/README 结论稳定后只跑一次最终 `mix precommit`；其后如修改
   code/test，旧门禁立即失效；
 - STATUS 由独立 closeout lane 只按实际证据更新，并通过 STATUS-only review；
-- diff 无 Parser/Adapter/Request/Envelope/Config/Schema behavior/Repo/migration/core pipeline 变更；
+- diff 无 Parser/Adapter/Request/Envelope/Config/Schema behavior/Repo/migration 变更；S3 Endpoint
+  变更严格限于 `SurfaceClassifier` 后接入 Admin-only `ResponseTransformPolicy`，且普通 S3、vhost
+  同路径、IAM/STS、health/metrics 行为证据保持不变；
 - clean worktree 经 `--ff-only` 集成，feature/master 两个 ref 原子 push。
