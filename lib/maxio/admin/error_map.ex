@@ -185,6 +185,13 @@ defmodule Maxio.Admin.ErrorMap do
   defp safe_config_description?("unknown sub-system " <> command),
     do: safe_command?(command)
 
+  defp safe_config_description?("unknown key " <> rest) do
+    case :binary.split(rest, " for sub-system ") do
+      [key, subsystem] -> safe_identifier?(key) and safe_identifier?(subsystem)
+      _other -> false
+    end
+  end
+
   defp safe_config_description?("sub-system '" <> rest) do
     suffix = "' cannot have empty keys"
 
