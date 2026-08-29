@@ -1,0 +1,71 @@
+{
+  "schema": "maxio.madmin_config_archive_limits.v1",
+  "fixture_id": "madmin-config-archive-limits-s7-v1",
+  "pins": {
+    "madmin_go": "4b504b82db633e978a57d49443b2be75824244c3",
+    "sio_go_version": "v0.3.1",
+    "sio_go_commit": "a455d2cd8fcacdfe18557d117db15c0629fb7e2c"
+  },
+  "verification_item": {
+    "id": "W1",
+    "definition": "madmin local plaintext limits and SIO frame-length formula",
+    "implementation_gate": "PASS_SOURCE_VERIFIED",
+    "live_reverification": "pending_non_decisional_Task_11"
+  },
+  "plaintext_reader": {
+    "evidence_class": "source_verified",
+    "maximum_bytes": 262144,
+    "empty": {"client_result": "io.EOF", "http_request_count": 0},
+    "one_through_maximum": {"client_result": "encrypt_and_attempt_request"},
+    "maximum_plus_one_or_more": {"client_result": "bytes.ErrTooLarge", "http_request_count": 0}
+  },
+  "sio_frame": {
+    "evidence_class": "source_verified",
+    "positive_plaintext_formula": "41+n+16*ceil(n/16384)",
+    "domain": "integer n >= 1",
+    "prefix_bytes": 41,
+    "prefix_parts": {"salt": 32, "algorithm_id": 1, "nonce": 8},
+    "chunk_plaintext_bytes": 16384,
+    "aead_tag_bytes_per_chunk": 16,
+    "zero_plaintext_note": "sio-go Overhead(0) is 16, but madmin SetConfig returns io.EOF before EncryptData, so no zero-byte request exists",
+    "fixed_ciphertext_bytes_or_sha_forbidden": true
+  },
+  "boundary_vectors": [
+    {
+      "evidence_class": "source_verified",
+      "plaintext_bytes": 261975,
+      "chunk_count": 16,
+      "ciphertext_bytes": 262272,
+      "madmin_local": "PASS",
+      "minio_server": "PASS_at_ciphertext_limit"
+    },
+    {
+      "evidence_class": "source_verified",
+      "plaintext_bytes": 261976,
+      "chunk_count": 16,
+      "ciphertext_bytes": 262273,
+      "madmin_local": "PASS",
+      "minio_server": "XMinioAdminConfigTooLarge"
+    },
+    {
+      "evidence_class": "source_verified",
+      "plaintext_bytes": 262144,
+      "chunk_count": 16,
+      "ciphertext_bytes": 262441,
+      "madmin_local": "PASS",
+      "minio_server": "XMinioAdminConfigTooLarge"
+    },
+    {
+      "evidence_class": "source_verified",
+      "plaintext_bytes": 262145,
+      "ciphertext_bytes": null,
+      "madmin_local": "bytes.ErrTooLarge_zero_request",
+      "minio_server": "not_reached"
+    }
+  ],
+  "effective_native_round_trip_plaintext_maximum": 261975,
+  "implementation_decision_fields": {
+    "status": "source_verified",
+    "unresolved": []
+  }
+}
