@@ -1002,6 +1002,12 @@ MinIO v3 Config KVS 兼容面严格限于以下路由：
 - `GET /minio/admin/v3/get-config-kv?key={subsystem}`
 - `PUT /minio/admin/v3/set-config-kv`
 - `DELETE /minio/admin/v3/del-config-kv`
+- `GET /minio/admin/v3/help-config-kv?subSys={subsystem}&key={key}[&env=]`
+
+前三条 S5 get/set/reset 路由继续使用 encrypted madmin envelope，行为不变。新增 help 路由要求
+`subSys` 与 `key` 两个 query 名都存在（空值有效），可选 `env` 按参数名是否存在解释；`env`、
+`env=`、`env=false` 都表示 env-only。该路由要求 `admin:ConfigUpdate`，成功响应是 plaintext compact
+JSON 加一个 LF，不使用 madmin SIO。
 
 对 mc 暴露的只有三个 **Maxio 扩展键**：`s3.clock_skew_ms`、
 `listing.sql_hard_limit`、`prometheus_metrics.public`；它们不是 MinIO 官方 config catalog 的同名替代。
@@ -1009,10 +1015,26 @@ MinIO v3 Config KVS 兼容面严格限于以下路由：
 audit；任一键失败则整批不落库。set 为当前相同 runtime override，或 reset 一个没有 runtime
 override 的合法键，都是成功 no-op：不增加 version/audit，也不触发 reload/broadcast。
 
+help 的 top-level catalog 严格按 `s3.clock_skew_ms`、`listing.sql_hard_limit`、
+`prometheus_metrics.public` 的顺序投影这三个 Maxio extension。native mc 的
+`mc admin config get ALIAS`、`mc admin config reset ALIAS`，以及不含 `=` 的
+`mc admin config set ALIAS SUBSYSTEM [KEY]` 都走只读 help 分支；它们不写配置，也不增加 help 专用
+cleanup。Maxio 不支持 `subsystem:target`，任何 nonempty target syntax 都会被拒绝，且不会 strip target
+或伪造 target metadata。
+
+empty `subSys` 即使带 `env` 也始终返回上述有序 3-item catalog。已知 nonempty subsystem 的
+env-only 查询仍返回 subsystem metadata，但当前三项在 `Maxio.Config.Schema` 都没有 env binding，
+因此 `keysHelp: []`；Maxio 不按 wire name 合成或伪造 binding。help 同样不返回 default、当前/运行时
+value、source、secret、credential 或 backend/behaviour binding。
+
 opt-in external smoke 会分别用 human 与全局 `--json` mc alias 执行完整 lifecycle，并以匿名请求
 `/minio/v2/metrics/cluster` 证明 `prometheus_metrics.public` 的数据面状态确实为
 `403 → set true → 200 → reset public → 403`，而不是只验证控制面回显。fake runner 只证明协议与
 取证编排；只有对隔离、已运行 Maxio endpoint 的 opt-in 执行才是活体结果。
+
+新增 help 分支的 argv 与 transcript 当前是 pinned 源码推导的 fixture expectation；自动化结果只标记为
+`fixture_expected` / `fake_observed`，证明 fake runner 观察到了 exact native branch argv。尚未取得 pinned
+native strict-live PASS，因此不得把这些 source-derived/fake 证据写成 `live_pass` 或活体兼容结论。
 
 CLI：
 
@@ -1023,13 +1045,16 @@ mix maxio.config.set <subsystem> <key> <value> [--expected-version N]
 mix maxio.config.reset <subsystem> <key>
 mix maxio.config.history <subsystem> <key> [--limit N] [--json]
 mix maxio.config.status [--json] [--reconcile]      # 本节点快照 vs PG、漂移、orphan 键
+mix maxio.admin.config.help
+mix maxio.admin.config.help s3 clock_skew_ms
+mix maxio.admin.config.help --env s3
 ```
 
 `MAXIO_DEPLOYMENT_ID` 可在部署期钉住部署标识；不设时首次被读取即生成 UUIDv4 并持久化。
 
 ### 本批显式不做（文档化，绝不静默）
 
-Config KVS 的 help、全量 export/import、history list/clear/restore、命名 targets、MinIO 官方
+Config KVS 的全量 export/import、history list/clear/restore、命名 targets、MinIO 官方完整
 config catalog、任何 secret/credential/KMS/SSE/MFA 配置、storage/credential/policy backend 或
 behaviour 绑定，以及 `mc admin service restart` 均不支持；这些路径不会伪造成功。
 此外，`mc admin heal/trace/console`、Tiers / Site Replication / Batch Jobs、
