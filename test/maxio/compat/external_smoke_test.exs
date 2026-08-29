@@ -306,6 +306,7 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     command_runner = fn command, args, opts ->
       {config_dir, json?, [subcommand | command_args]} = parse_mc_args(args, opts)
+      help_call = config_help_call(args, opts)
 
       Process.put(:mc_calls, [{command, args, opts} | Process.get(:mc_calls)])
 
@@ -313,6 +314,10 @@ defmodule Maxio.Compat.ExternalSmokeTest do
       File.write!(Path.join(config_dir, "initialized-by-mc"), "temporary")
 
       cond do
+        match?({:ok, _mode, _branch, _expected_stdout}, help_call) ->
+          {:ok, _mode, _branch, expected_stdout} = help_call
+          {expected_stdout, "", 0}
+
         subcommand == "admin" and
             (Enum.take(command_args, 1) == ["group"] or
                (Enum.take(command_args, 2) in [["policy", "attach"], ["policy", "detach"]] and
@@ -2635,41 +2640,49 @@ defmodule Maxio.Compat.ExternalSmokeTest do
     base_runner = successful_mc_runner()
 
     runner = fn command, args, command_opts ->
-      {_config_dir, json?, [subcommand | command_args]} = parse_mc_args(args, command_opts)
-      mode = if json?, do: :json, else: :human
+      case config_help_call(args, command_opts) do
+        {:ok, _mode, _branch, _expected_stdout} ->
+          base_runner.(command, args, command_opts)
 
-      if subcommand == "admin" and Enum.take(command_args, 1) == ["config"] do
-        stage = next_lifecycle_stage(run_ref, mode)
+        :not_help ->
+          {_config_dir, json?, [subcommand | command_args]} =
+            parse_mc_args(args, command_opts)
 
-        {stdout, stderr, exit_status} =
-          lifecycle_command_result(
-            run_ref,
-            mode,
-            stage,
-            fail_at,
-            mutate_at,
-            cleanup_failure_mode
-          )
+          mode = if json?, do: :json, else: :human
 
-        send(owner, {
-          :config_lifecycle_event,
-          run_ref,
-          %{
-            kind: :command,
-            mode: mode,
-            stage: stage,
-            command: command,
-            args: args,
-            stdout: stdout,
-            stderr: stderr,
-            exit_status: exit_status
-          }
-        })
+          if subcommand == "admin" and Enum.take(command_args, 1) == ["config"] do
+            stage = next_lifecycle_stage(run_ref, mode)
 
-        if stage == :cleanup_reset, do: finish_lifecycle_mode(run_ref, mode)
-        {stdout, stderr, exit_status}
-      else
-        base_runner.(command, args, command_opts)
+            {stdout, stderr, exit_status} =
+              lifecycle_command_result(
+                run_ref,
+                mode,
+                stage,
+                fail_at,
+                mutate_at,
+                cleanup_failure_mode
+              )
+
+            send(owner, {
+              :config_lifecycle_event,
+              run_ref,
+              %{
+                kind: :command,
+                mode: mode,
+                stage: stage,
+                command: command,
+                args: args,
+                stdout: stdout,
+                stderr: stderr,
+                exit_status: exit_status
+              }
+            })
+
+            if stage == :cleanup_reset, do: finish_lifecycle_mode(run_ref, mode)
+            {stdout, stderr, exit_status}
+          else
+            base_runner.(command, args, command_opts)
+          end
       end
     end
 
@@ -2959,10 +2972,15 @@ defmodule Maxio.Compat.ExternalSmokeTest do
 
     fn _command, args, command_opts ->
       {_config_dir, json?, [subcommand | command_args]} = parse_mc_args(args, command_opts)
+      help_call = config_help_call(args, command_opts)
 
       user_name = Process.get(:admin_fixture_user)
 
       cond do
+        match?({:ok, _mode, _branch, _expected_stdout}, help_call) ->
+          {:ok, _mode, _branch, expected_stdout} = help_call
+          {expected_stdout, "", 0}
+
         subcommand == "ls" ->
           allowed? =
             Process.get(:admin_fixture_status) == :enabled and

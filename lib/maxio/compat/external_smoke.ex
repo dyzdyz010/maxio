@@ -734,8 +734,9 @@ defmodule Maxio.Compat.ExternalSmoke do
     metrics_url = metrics_url(config.endpoint)
     base_args = mc_config_base_args(mode)
     mc_alias = paths.mc_alias
+    help_steps = mc_config_help_steps(mode, executable, mc_alias, opts)
 
-    [
+    mutation_steps = [
       metrics_probe_step(
         mc_config_step_id(mode, :metrics_denied_before),
         metrics_url,
@@ -809,6 +810,38 @@ defmodule Maxio.Compat.ExternalSmoke do
         "anonymous metrics are denied again after reset"
       )
     ]
+
+    help_steps ++ mutation_steps
+  end
+
+  defp mc_config_help_steps(mode, executable, mc_alias, opts) do
+    base_args = mc_config_base_args(mode)
+    scenario = mc_config_help_scenario(mode)
+
+    [
+      {:get_alias, ["admin", "config", "get", mc_alias], :top_level},
+      {:reset_alias, ["admin", "config", "reset", mc_alias], :top_level},
+      {:set_subsystem, ["admin", "config", "set", mc_alias, "s3"], :s3},
+      {:set_key, ["admin", "config", "set", mc_alias, "s3", "clock_skew_ms"], :s3}
+    ]
+    |> Enum.map(fn {stage, command_args, transcript} ->
+      args = base_args ++ command_args
+
+      step(
+        mc_config_help_step_id(mode, stage),
+        executable,
+        args,
+        opts,
+        {:output_exact, mc_config_help_output(mode, transcript)},
+        scenario: scenario,
+        assertion: "native mc dispatches the #{stage} config help branch"
+      )
+      |> Map.merge(%{
+        argv: args,
+        expected_evidence: "fixture_expected",
+        observed_evidence: "fake_observed"
+      })
+    end)
   end
 
   defp mc_config_cleanup_step(mode, executable, paths, opts) do
@@ -823,7 +856,7 @@ defmodule Maxio.Compat.ExternalSmoke do
       assertion: "failed config lifecycle cleanup restores prometheus_metrics.public default"
     )
     |> Map.put(:created_by, :always)
-    |> Map.put(:failure_scenario, mc_config_scenario(mode))
+    |> Map.put(:failure_scenario, [mc_config_help_scenario(mode), mc_config_scenario(mode)])
   end
 
   defp metrics_probe_step(id, metrics_url, metrics_probe, expected, scenario, assertion) do
@@ -849,6 +882,9 @@ defmodule Maxio.Compat.ExternalSmoke do
   defp mc_config_base_args(:json), do: ["--json"]
 
   defp mc_config_scenario(mode), do: "admin_config_#{mode}_lifecycle"
+  defp mc_config_help_scenario(mode), do: "admin_config_help_#{mode}"
+
+  defp mc_config_help_step_id(mode, stage), do: "admin_config_help_#{mode}_#{stage}"
 
   defp mc_config_step_id(mode, stage) do
     suffix =
@@ -884,6 +920,28 @@ defmodule Maxio.Compat.ExternalSmoke do
 
   defp mc_config_output(:json, stage) when stage in [:set_true, :reset_public],
     do: "{\"status\":\"success\"}\n"
+
+  defp mc_config_help_output(:human, :top_level) do
+    "KEYS:\n" <>
+      "s3                  Maxio extension: configure s3.clock_skew_ms.\n" <>
+      "listing             Maxio extension: configure listing.sql_hard_limit.\n" <>
+      "prometheus_metrics  Maxio extension: configure prometheus_metrics.public.\n"
+  end
+
+  defp mc_config_help_output(:human, :s3) do
+    "KEY:\n" <>
+      "s3  Maxio extension: configure s3.clock_skew_ms.\n\n" <>
+      "ARGS:\n" <>
+      "clock_skew_ms  (integer in 0..3600000)  Maximum allowed SigV4 header-signature clock skew in milliseconds; applied to the next authentication request.\n"
+  end
+
+  defp mc_config_help_output(:json, :top_level) do
+    "{\"status\":\"success\",\"help\":{\"subSys\":\"\",\"description\":\"\",\"multipleTargets\":false,\"keysHelp\":[{\"key\":\"s3\",\"description\":\"Maxio extension: configure s3.clock_skew_ms.\",\"optional\":false,\"type\":\"\",\"multipleTargets\":false},{\"key\":\"listing\",\"description\":\"Maxio extension: configure listing.sql_hard_limit.\",\"optional\":false,\"type\":\"\",\"multipleTargets\":false},{\"key\":\"prometheus_metrics\",\"description\":\"Maxio extension: configure prometheus_metrics.public.\",\"optional\":false,\"type\":\"\",\"multipleTargets\":false}]}}\n"
+  end
+
+  defp mc_config_help_output(:json, :s3) do
+    "{\"status\":\"success\",\"help\":{\"subSys\":\"s3\",\"description\":\"Maxio extension: configure s3.clock_skew_ms.\",\"multipleTargets\":false,\"keysHelp\":[{\"key\":\"clock_skew_ms\",\"description\":\"Maximum allowed SigV4 header-signature clock skew in milliseconds; applied to the next authentication request.\",\"optional\":true,\"type\":\"integer in 0..3600000\",\"multipleTargets\":false}]}}\n"
+  end
 
   defp mc_steps(executable, config, paths, env, user_name, mc_probe, metrics_probe) do
     opts = command_opts(config, [{"MC_CONFIG_DIR", paths.mc_config_dir} | env])
@@ -2041,7 +2099,7 @@ defmodule Maxio.Compat.ExternalSmoke do
     Enum.filter(cleanup_steps, fn step ->
       created? =
         case step.created_by do
-          :always -> Map.get(step, :failure_scenario) == failed_scenario
+          :always -> failed_scenario in List.wrap(Map.get(step, :failure_scenario))
           created_by -> MapSet.member?(successful_ids, created_by)
         end
 
@@ -2151,6 +2209,9 @@ defmodule Maxio.Compat.ExternalSmoke do
       "stderr_snippet" => output_snippet(stderr, redactions)
     }
     |> maybe_put("assertion", step.assertion)
+    |> maybe_put("argv", Map.get(step, :argv))
+    |> maybe_put("expected_evidence", Map.get(step, :expected_evidence))
+    |> maybe_put("observed_evidence", Map.get(step, :observed_evidence))
   end
 
   defp verify_step(verify, output, stderr) do
