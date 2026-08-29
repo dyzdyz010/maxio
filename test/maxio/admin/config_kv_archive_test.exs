@@ -138,9 +138,16 @@ defmodule Maxio.Admin.ConfigKV.ArchiveTest do
   end
 
   test "invalid UTF-8 raw type and sensitive prefixes fail closed without submitted values" do
-    # Catches unsafe string processing, Schema.parse/3 bypass, or evidence that reflects a raw
-    # scalar/sensitive identifier while claiming the mutation never began.
+    # Catches unsafe string processing, Schema.parse/3 bypass, a forbidden/sensitive suffix being
+    # swallowed into a public scalar, over-broad rejection of an ordinary suffix, or evidence that
+    # reflects a submitted value while claiming the mutation never began.
     cases = [
+      {"s3 clock_skew_ms=1000 root_password=SECRET-SENTINEL", :exposure, :access_denied,
+       "SECRET-SENTINEL", "s3", 1},
+      {"s3 clock_skew_ms=1000 secret_token=SECRET-SENTINEL", :exposure, :access_denied,
+       "SECRET-SENTINEL", "s3", 1},
+      {"s3 clock_skew_ms=1000 absent=UNKNOWN-SUFFIX-SENTINEL", :type, :config_bad_json,
+       "UNKNOWN-SUFFIX-SENTINEL", "s3", 1},
       {<<"s3 clock_skew_ms=UTF8-VALUE-SENTINEL", 255>>, :parser, :config_bad_json,
        "UTF8-VALUE-SENTINEL", "unknown", 0},
       {"s3 clock_skew_ms=3600001", :type, :config_bad_json, "3600001", "s3", 1},

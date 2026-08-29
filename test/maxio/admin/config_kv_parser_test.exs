@@ -96,8 +96,12 @@ defmodule Maxio.Admin.ConfigKV.ParserTest do
 
   test "legacy S5 set remains a one-subsystem command over the shared document scanner" do
     # Catches the new archive parser accidentally broadening set-config-kv to cross-subsystem
-    # writes even though the document parser itself must accept the same ordered input.
+    # writes, or letting a later unknown key mask the legacy cross-subsystem precedence.
     plaintext = "s3 clock_skew_ms=1000\nlisting sql_hard_limit=100000\n"
+    later_unknown = "s3 clock_skew_ms=1\nlisting absent=1"
+
+    assert Parser.parse_set_detailed(later_unknown, entries()) == {:error, :cross_subsystem}
+    assert parse_set(later_unknown, entries()) == {:error, :bad_json}
 
     assert {:ok, [_s3, _listing]} = Parser.parse_document(plaintext, entries())
     assert parse_set(plaintext, entries()) == {:error, :bad_json}
