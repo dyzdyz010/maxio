@@ -8,8 +8,8 @@ defmodule Maxio.Admin.ErrorMap do
 
   alias Maxio.S3.Error
 
-  @safe_identifier ~r/\A[a-z0-9][a-z0-9_.:-]{0,127}\z/
-  @safe_command ~r/\A[a-z0-9][a-z0-9_.-]{0,63}(?: [a-z0-9][a-z0-9_.-]{0,63}(?:=[A-Za-z0-9_.:+\/-]{0,128})?)*\z/
+  @safe_identifier ~r/\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\z/
+  @safe_command ~r/\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?: [A-Za-z0-9][A-Za-z0-9_.-]{0,63}(?:=[A-Za-z0-9_.:+\/-]{0,128})?)*\z/
   @sensitive_marker ~r/(?:secret|password|token|credential|access[_-]?key|private|cipher|plaintext|root[_-]?user)/i
 
   @spec from_reason(term()) :: Error.t()

@@ -165,7 +165,8 @@ defmodule Maxio.Admin.ConfigKV.Parser do
   defp sanitize_value(raw_value) do
     raw_value
     |> String.trim()
-    |> String.replace(~r/\A["']|["']\z/u, "")
+    |> String.trim("\"")
+    |> String.trim("'")
   end
 
   defp merge_reset(:all, _line_reset), do: :all
