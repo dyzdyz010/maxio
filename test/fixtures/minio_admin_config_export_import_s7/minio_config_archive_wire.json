@@ -13,12 +13,217 @@
   "verification_item": {
     "id": "W2",
     "definition": "direct server ciphertext limits, HTTP framing, authorization precedence and errors",
-    "implementation_gate": "PASS_SOURCE_AND_EXISTING_CONTRACT_VERIFIED",
+    "implementation_gate": "PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED",
     "blocking_unresolved": [],
     "precedence_stage_count": 12,
     "error_condition_count": 23,
     "postcommit_outcome_contract_count": 1,
     "live_reverification": "pending_non_decisional_Task_11"
+  },
+  "evidence_taxonomy": {
+    "source_verified": {
+      "claim_scope": "upstream compatibility fact",
+      "required_evidence": "pinned official source plus raw_sha256 raw/excerpt hashes"
+    },
+    "live_verified": {
+      "claim_scope": "observed pre-implementation live fact",
+      "required_evidence": "pinned binary or server identity, OS and command, redacted artifact hash, and observed result",
+      "claimed_in_this_fixture": false
+    },
+    "existing_contract_verified": {
+      "claim_scope": "reviewed pre-S7 Maxio behavior only; never upstream parity",
+      "required_evidence": "named pre-existing fixture, test, error symbol or immutable closeout reference plus Task 6 RED lock",
+      "reviewed_baseline": "S5 implementation HEAD 17278b93ad9d0af2c51b018ca5397a9fba3378ff; STATUS records independent Lane C and Lane D approval"
+    },
+    "local_design_expected": {
+      "claim_scope": "new S7 Maxio choice or repair only; never upstream or live fact",
+      "required_evidence": "named S7 design reference plus Task 6 RED lock and independent RED review before Task 7"
+    }
+  },
+  "task6_entry_gate": {
+    "gate_result": "PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED",
+    "claim_scope": "fixture provenance completeness only; not live behavior or endpoint PASS",
+    "allowed_evidence_classes": [
+      "source_verified",
+      "live_verified",
+      "existing_contract_verified",
+      "local_design_expected"
+    ],
+    "upstream_compatibility_classes": ["source_verified", "live_verified"],
+    "local_contract_classes": ["existing_contract_verified", "local_design_expected"],
+    "inheritance_rule": "each decision leaf inherits the nearest ancestor evidence_class; list members without an inherited class must declare their own",
+    "decision_documents": {
+      "minio_config_archive_wire.json": [
+        "/routes",
+        "/caller_secret_sio",
+        "/request_builder",
+        "/http_framing",
+        "/server_ciphertext_gate",
+        "/authentication_and_authorization",
+        "/error_map_contract/precedence",
+        "/error_map_contract/precedence_assertion",
+        "/error_map_contract/conditions",
+        "/error_map_contract/contract_sources/reuse_rule",
+        "/error_map_contract/postcommit_outcome_contract",
+        "/fresh_archive"
+      ],
+      "madmin_config_archive_limits.json": ["/"]
+    },
+    "source_claims": {
+      "madmin_config_archive_limits.json#/": {
+        "claim_ids": [
+          "W1_madmin_limits_and_sio_formula",
+          "W2_route_auth_errors_and_framing"
+        ],
+        "source_ids": [
+          "madmin_config_methods",
+          "madmin_encrypt_decrypt",
+          "madmin_sio_dependency",
+          "sio_go_constants",
+          "sio_go_default_stream",
+          "sio_go_overhead",
+          "minio_config_archive_handlers",
+          "minio_ciphertext_limit"
+        ]
+      },
+      "madmin_config_archive_limits.json#/plaintext_reader": {
+        "claim_ids": ["W1_madmin_limits_and_sio_formula"],
+        "source_ids": ["madmin_config_methods"]
+      },
+      "madmin_config_archive_limits.json#/sio_frame": {
+        "claim_ids": ["W1_madmin_limits_and_sio_formula"],
+        "source_ids": [
+          "madmin_encrypt_decrypt",
+          "madmin_sio_dependency",
+          "sio_go_constants",
+          "sio_go_default_stream",
+          "sio_go_overhead"
+        ]
+      },
+      "madmin_config_archive_limits.json#/boundary_vectors/0": {
+        "claim_ids": [
+          "W1_madmin_limits_and_sio_formula",
+          "W2_route_auth_errors_and_framing"
+        ],
+        "source_ids": [
+          "madmin_config_methods",
+          "madmin_encrypt_decrypt",
+          "sio_go_constants",
+          "sio_go_default_stream",
+          "minio_config_archive_handlers",
+          "minio_ciphertext_limit"
+        ]
+      },
+      "madmin_config_archive_limits.json#/boundary_vectors/1": {
+        "claim_ids": [
+          "W1_madmin_limits_and_sio_formula",
+          "W2_route_auth_errors_and_framing"
+        ],
+        "source_ids": [
+          "madmin_config_methods",
+          "madmin_encrypt_decrypt",
+          "sio_go_constants",
+          "sio_go_default_stream",
+          "minio_config_archive_handlers",
+          "minio_ciphertext_limit"
+        ]
+      },
+      "madmin_config_archive_limits.json#/boundary_vectors/2": {
+        "claim_ids": [
+          "W1_madmin_limits_and_sio_formula",
+          "W2_route_auth_errors_and_framing"
+        ],
+        "source_ids": [
+          "madmin_config_methods",
+          "madmin_encrypt_decrypt",
+          "sio_go_constants",
+          "sio_go_default_stream",
+          "minio_config_archive_handlers",
+          "minio_ciphertext_limit"
+        ]
+      },
+      "madmin_config_archive_limits.json#/boundary_vectors/3": {
+        "claim_ids": ["W1_madmin_limits_and_sio_formula"],
+        "source_ids": ["madmin_config_methods"]
+      },
+      "minio_config_archive_wire.json#/routes/0": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": ["minio_routes"]
+      },
+      "minio_config_archive_wire.json#/routes/1": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": ["minio_routes"]
+      },
+      "minio_config_archive_wire.json#/caller_secret_sio": {
+        "claim_ids": ["W1_madmin_limits_and_sio_formula"],
+        "source_ids": [
+          "madmin_config_methods",
+          "madmin_encrypt_decrypt",
+          "sio_go_constants",
+          "sio_go_default_stream"
+        ]
+      },
+      "minio_config_archive_wire.json#/request_builder": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": ["madmin_request_builder", "madmin_transport_no_compression"]
+      },
+      "minio_config_archive_wire.json#/http_framing": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": [
+          "minio_write_response",
+          "minio_success_helpers",
+          "madmin_request_builder",
+          "madmin_transport_no_compression"
+        ]
+      },
+      "minio_config_archive_wire.json#/http_framing/upstream_admin_gzip_middleware": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": [
+          "minio_admin_middleware",
+          "minio_gzip_handler",
+          "madmin_transport_no_compression"
+        ]
+      },
+      "minio_config_archive_wire.json#/server_ciphertext_gate": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": [
+          "minio_config_archive_handlers",
+          "minio_ciphertext_limit",
+          "minio_config_errors"
+        ]
+      },
+      "minio_config_archive_wire.json#/authentication_and_authorization": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": ["minio_validate_admin_request", "minio_to_admin_api_error"]
+      },
+      "minio_config_archive_wire.json#/error_map_contract/conditions/3": {
+        "claim_ids": ["W2_route_auth_errors_and_framing"],
+        "source_ids": [
+          "minio_validate_admin_request",
+          "minio_to_admin_api_error",
+          "minio_config_errors"
+        ]
+      },
+      "minio_config_archive_wire.json#/error_map_contract/conditions/12": {
+        "claim_ids": [
+          "W1_madmin_limits_and_sio_formula",
+          "W2_route_auth_errors_and_framing"
+        ],
+        "source_ids": [
+          "madmin_config_methods",
+          "madmin_encrypt_decrypt",
+          "sio_go_constants",
+          "sio_go_default_stream",
+          "sio_go_overhead",
+          "minio_config_archive_handlers",
+          "minio_ciphertext_limit"
+        ]
+      }
+    },
+    "task6_red_lock_rule": "Task 6 RED must table-lock every precedence priority, every condition id, and every named local transport decision",
+    "task7_entry_rule": "Task 7 remains blocked until independent review confirms the Task 6 RED locks every required decision",
+    "w5_effect": "none; W5 blocks Task 8 only",
+    "unresolved": []
   },
   "routes": [
     {
@@ -87,9 +292,31 @@
       "applied_header": "absent"
     },
     "upstream_admin_gzip_middleware": {
+      "evidence_class": "source_verified",
       "present": true,
       "native_madmin_does_not_negotiate_gzip": true,
-      "maxio_deviation": "always disable transforms and emit Cache-Control no-transform"
+      "maxio_transport_repair": {
+        "existing_policy": {
+          "evidence_class": "existing_contract_verified",
+          "behavior": "path-style Admin responses emit Cache-Control no-transform",
+          "contract_reference": {
+            "kind": "baseline",
+            "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+            "test_id": "response transforms are disabled only for the path-style Admin surface"
+          }
+        },
+        "s7_exact_response_framing": {
+          "evidence_class": "local_design_expected",
+          "content_length": "exact_random_ciphertext_length",
+          "transfer_encoding": "absent",
+          "content_encoding": "absent",
+          "contract_reference": {
+            "kind": "design",
+            "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+            "section": "10.3 响应与压缩"
+          }
+        }
+      }
     }
   },
   "server_ciphertext_gate": {
@@ -173,10 +400,26 @@
       "examples": ["InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken"]
     },
     "maxio_anonymous_concealment": {
-      "evidence_class": "local_design_expected",
-      "status": 403,
-      "code": "AccessDenied",
-      "precedence": "before entity length, body read, decrypt, parse or persistence"
+      "existing_response": {
+        "evidence_class": "existing_contract_verified",
+        "status": 403,
+        "code": "AccessDenied",
+        "message": "Access Denied",
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/plug_test.exs",
+          "test_id": "anonymous Config KVS requests are denied before route query or body details"
+        }
+      },
+      "s7_auth_before_body_order": {
+        "evidence_class": "local_design_expected",
+        "precedence": "before entity length, body read, decrypt, parse or persistence",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      }
     }
   },
   "error_map_contract": {
@@ -185,23 +428,147 @@
       "existing_error_catalog": "lib/maxio/s3/error.ex",
       "existing_error_mapper": "lib/maxio/admin/error_map.ex",
       "existing_transport_boundary": "lib/maxio/admin/config_kv/request.ex",
-      "reuse_rule": "reuse existing S5 code and message bytes; do not invent XMaxio archive codes"
+      "reuse_rule": {
+        "evidence_class": "existing_contract_verified",
+        "behavior": "reuse existing S5 code and message bytes; do not invent XMaxio archive codes",
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/error_map_test.exs",
+          "test_id": "maps every S2b input error to its exact public code, status, and message"
+        }
+      }
     },
     "precedence": [
-      {"priority": 1, "stage": "authentication"},
-      {"priority": 2, "stage": "admin_ConfigUpdate_authorization"},
-      {"priority": 3, "stage": "Content-Length_and_Transfer-Encoding_framing"},
-      {"priority": 4, "stage": "actual_ciphertext_read_length"},
-      {"priority": 5, "stage": "SigV4_payload_hash"},
-      {"priority": 6, "stage": "SIO_decrypt"},
-      {"priority": 7, "stage": "UTF-8_and_plaintext_size"},
-      {"priority": 8, "stage": "document_lexical_and_syntax_parse"},
-      {"priority": 9, "stage": "target_unknown_hidden_forbidden_exposure"},
-      {"priority": 10, "stage": "scalar_and_cross_field_validation"},
-      {"priority": 11, "stage": "database_transaction_and_store"},
-      {"priority": 12, "stage": "postcommit_reload_and_broadcast"}
+      {
+        "priority": 1,
+        "stage": "authentication",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 2,
+        "stage": "admin_ConfigUpdate_authorization",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 3,
+        "stage": "Content-Length_and_Transfer-Encoding_framing",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 4,
+        "stage": "actual_ciphertext_read_length",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 5,
+        "stage": "SigV4_payload_hash",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 6,
+        "stage": "SIO_decrypt",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 7,
+        "stage": "UTF-8_and_plaintext_size",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 8,
+        "stage": "document_lexical_and_syntax_parse",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 9,
+        "stage": "target_unknown_hidden_forbidden_exposure",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 10,
+        "stage": "scalar_and_cross_field_validation",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 11,
+        "stage": "database_transaction_and_store",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      },
+      {
+        "priority": 12,
+        "stage": "postcommit_reload_and_broadcast",
+        "evidence_class": "local_design_expected",
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.1 管线顺序"
+        }
+      }
     ],
-    "precedence_assertion": "the first failing stage wins; later stages must not read, parse, expose or persist",
+    "precedence_assertion": {
+      "evidence_class": "local_design_expected",
+      "behavior": "the first failing stage wins; later stages must not read, parse, expose or persist",
+      "contract_reference": {
+        "kind": "design",
+        "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+        "section": "10.1 管线顺序"
+      }
+    },
     "conditions": [
       {
         "id": "anonymous_or_concealed_admin_authentication",
@@ -210,7 +577,11 @@
         "status": 403,
         "code": "AccessDenied",
         "message": "Access Denied",
-        "contract_reference": "S5 unauthenticated_admin_surface and Error.access_denied"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/plug_test.exs",
+          "test_id": "anonymous Config KVS requests are denied before route query or body details"
+        }
       },
       {
         "id": "invalid_access_key_authentication",
@@ -219,7 +590,11 @@
         "status": 403,
         "code": "InvalidAccessKeyId",
         "message": "The AWS access key ID that you provided does not exist in our records.",
-        "contract_reference": "existing SigV4 Error.invalid_access_key_id"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "lib/maxio/s3/error.ex",
+          "symbol": "invalid_access_key_id"
+        }
       },
       {
         "id": "signature_mismatch_authentication",
@@ -228,7 +603,11 @@
         "status": 403,
         "code": "SignatureDoesNotMatch",
         "message": "The request signature that the server calculated does not match the signature that you provided. Check your AWS secret access key and signing method.",
-        "contract_reference": "existing SigV4 Error.signature_does_not_match"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "lib/maxio/s3/error.ex",
+          "symbol": "signature_does_not_match"
+        }
       },
       {
         "id": "valid_identity_denied_ConfigUpdate",
@@ -237,7 +616,11 @@
         "status": 403,
         "code": "AccessDenied",
         "message": "Access Denied",
-        "contract_reference": "pinned validateAdminReq plus existing Error.access_denied"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/authz_test.exs",
+          "test_id": "admin:ConfigUpdate remains an exact identity-only action with deny and STS boundaries"
+        }
       },
       {
         "id": "missing_Content-Length",
@@ -246,7 +629,11 @@
         "status": 400,
         "code": "XMinioAdminConfigTooLarge",
         "message": "Configuration data provided exceeds the allowed maximum of 262272 bytes",
-        "contract_reference": "S5 maxio-exact-content-length-framing"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "mutation framing requires one concrete length, ignores Content-Type, and preserves zero"
+        }
       },
       {
         "id": "duplicate_Content-Length",
@@ -255,7 +642,11 @@
         "status": 400,
         "code": "XMinioAdminConfigTooLarge",
         "message": "Configuration data provided exceeds the allowed maximum of 262272 bytes",
-        "contract_reference": "S5 maxio-exact-content-length-framing"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "mutation framing requires one concrete length, ignores Content-Type, and preserves zero"
+        }
       },
       {
         "id": "malformed_Content-Length",
@@ -265,7 +656,11 @@
         "status": 400,
         "code": "XMinioAdminConfigTooLarge",
         "message": "Configuration data provided exceeds the allowed maximum of 262272 bytes",
-        "contract_reference": "S5 maxio-exact-content-length-framing"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "mutation framing requires one concrete length, ignores Content-Type, and preserves zero"
+        }
       },
       {
         "id": "any_Transfer-Encoding",
@@ -274,7 +669,11 @@
         "status": 400,
         "code": "XMinioAdminConfigTooLarge",
         "message": "Configuration data provided exceeds the allowed maximum of 262272 bytes",
-        "contract_reference": "S5 maxio-exact-content-length-framing"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "mutation framing requires one concrete length, ignores Content-Type, and preserves zero"
+        }
       },
       {
         "id": "actual_ciphertext_length_mismatch",
@@ -283,7 +682,11 @@
         "status": 400,
         "code": "XMinioAdminConfigBadJSON",
         "message": "JSON configuration provided is of incorrect format",
-        "contract_reference": "S5 bad_json actual read length mismatch"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "actual length, payload hash, decrypt and parser failures retain their fixed priority"
+        }
       },
       {
         "id": "SigV4_payload_hash_mismatch",
@@ -292,7 +695,11 @@
         "status": 400,
         "code": "XAmzContentSHA256Mismatch",
         "message": "The provided 'x-amz-content-sha256' header does not match what was computed.",
-        "contract_reference": "S5 payload_hash"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "actual length, payload hash, decrypt and parser failures retain their fixed priority"
+        }
       },
       {
         "id": "malformed_SIO_envelope_or_wrong_caller_secret",
@@ -301,7 +708,11 @@
         "status": 400,
         "code": "XMinioAdminConfigBadJSON",
         "message": "JSON configuration provided is of incorrect format",
-        "contract_reference": "S5 bad_json invalid SIO envelope"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "actual length, payload hash, decrypt and parser failures retain their fixed priority"
+        }
       },
       {
         "id": "invalid_UTF-8_plaintext",
@@ -310,7 +721,11 @@
         "status": 400,
         "code": "XMinioAdminConfigBadJSON",
         "message": "JSON configuration provided is of incorrect format",
-        "contract_reference": "existing ConfigKV.Request invalid UTF-8 contract"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "malformed UTF-8 is BadJSON and no plaintext rendering reaches logs"
+        }
       },
       {
         "id": "plaintext_over_262144",
@@ -322,7 +737,11 @@
         "pre_decrypt_status": 400,
         "pre_decrypt_code": "XMinioAdminConfigTooLarge",
         "pre_decrypt_message": "Configuration data provided exceeds the allowed maximum of 262272 bytes",
-        "contract_reference": "W1 SIO boundary vectors plus W2 ciphertext gate"
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.2 大小与 framing"
+        }
       },
       {
         "id": "generic_plaintext_guard_if_called_outside_valid_PUT_SIO_path",
@@ -332,7 +751,11 @@
         "status": 400,
         "code": "XMinioAdminConfigTooLarge",
         "message": "Configuration data provided exceeds the allowed maximum of 262272 bytes",
-        "contract_reference": "reuse existing Error.admin_config_too_large; no new code or message"
+        "contract_reference": {
+          "kind": "design",
+          "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+          "section": "10.2 大小与 framing"
+        }
       },
       {
         "id": "document_lexical_or_syntax_parse",
@@ -341,18 +764,37 @@
         "status": 400,
         "code": "XMinioAdminConfigBadJSON",
         "message": "JSON configuration provided is of incorrect format",
-        "contract_reference": "S5 bad_json KVS syntax/parser failure"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "actual length, payload hash, decrypt and parser failures retain their fixed priority"
+        }
       },
       {
         "id": "unknown_subsystem",
         "priority": 9,
         "evidence_class": "existing_contract_verified",
-        "representative_input": "absent value=1",
+        "representative_input": "absent value=REDACTED",
         "status": 400,
         "code": "XMinioConfigError",
-        "message": "unknown sub-system absent value=1",
-        "message_rule": "safe dynamic S5 unknown sub-system command",
-        "contract_reference": "S5 generic set unknown subsystem"
+        "message": "unknown sub-system absent",
+        "message_rule": "generic public message may identify the safe subsystem token but never repeats the submitted scalar",
+        "public_response": {
+          "status": 400,
+          "code": "XMinioConfigError",
+          "message": "unknown sub-system absent",
+          "submitted_scalar": "omitted"
+        },
+        "log_contract": {
+          "safe_fields": ["request_id", "operation", "subsystem"],
+          "submitted_scalar": "omitted",
+          "plaintext": "omitted"
+        },
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_adapter_test.exs",
+          "test_id": "unknown subsystem and unknown-only set remain generic"
+        }
       },
       {
         "id": "unknown_key",
@@ -362,7 +804,11 @@
         "status": 400,
         "code": "XMinioConfigError",
         "message": "sub-system 's3' cannot have empty keys",
-        "contract_reference": "S5 generic set unknown key"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "generic, not-found, hidden, forbidden and target errors keep distinct public contracts"
+        }
       },
       {
         "id": "unknown_prefix",
@@ -373,7 +819,11 @@
         "code": "XMinioAdminConfigBadJSON",
         "message": "JSON configuration provided is of incorrect format",
         "message_rule": "unknown key material before a later registered marker is a parser failure, not the independent unknown-subsystem projection",
-        "contract_reference": "S5 bad_json parser contract; S7 deliberate fail-closed unknown-prefix deviation"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_adapter_test.exs",
+          "test_id": "cross-subsystem and unknown-prefix safety deviations are BadJSON"
+        }
       },
       {
         "id": "named_target",
@@ -383,7 +833,11 @@
         "status": 400,
         "code": "XMinioAdminInvalidArgument",
         "message": "Invalid arguments specified.",
-        "contract_reference": "S5 explicit target invalid argument"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_adapter_test.exs",
+          "test_id": "explicit target is invalid argument for every operation"
+        }
       },
       {
         "id": "wire_hidden_path",
@@ -394,7 +848,11 @@
         "code": "XMinioConfigError",
         "message": "Configuration specified is invalid",
         "message_must_not_include": ["cluster", "deployment_id", "replacement"],
-        "contract_reference": "existing generic Error.config_error and S5 help hidden projection"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "generic, not-found, hidden, forbidden and target errors keep distinct public contracts"
+        }
       },
       {
         "id": "forbidden_or_sensitive_path",
@@ -405,7 +863,11 @@
         "code": "AccessDenied",
         "message": "Access Denied",
         "message_must_not_include": ["root_password", "redacted"],
-        "contract_reference": "S5 forbidden exposure AccessDenied"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "generic, not-found, hidden, forbidden and target errors keep distinct public contracts"
+        }
       },
       {
         "id": "scalar_or_cross_field_validation",
@@ -414,7 +876,11 @@
         "status": 400,
         "code": "XMinioAdminConfigBadJSON",
         "message": "JSON configuration provided is of incorrect format",
-        "contract_reference": "S5 bad_json typed validator failure"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "test/maxio/admin/config_kv_endpoint_test.exs",
+          "test_id": "exposure precedes scalar validation and scalar validation precedes the database"
+        }
       },
       {
         "id": "database_or_store_failure_before_commit",
@@ -423,7 +889,11 @@
         "status": 500,
         "code": "InternalError",
         "message": "An internal error occurred. Try again.",
-        "contract_reference": "existing ErrorMap config_store_unavailable"
+        "contract_reference": {
+          "kind": "baseline",
+          "file": "lib/maxio/admin/error_map.ex",
+          "symbol": "config_store_unavailable"
+        }
       }
     ],
     "postcommit_outcome_contract": {
@@ -436,12 +906,21 @@
       "http_outcome": {"status": 200, "body_bytes": 0, "applied_header": "absent"},
       "must_not_report": ["InternalError", "transaction_not_committed"],
       "observability": "record structured attention without plaintext, ciphertext, value or caller secret",
-      "contract_reference": "S7 commit-first postcommit safety design; intentionally separate from ErrorMap conditions"
+      "contract_reference": {
+        "kind": "design",
+        "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+        "section": "9.2 changed import"
+      }
     },
     "unresolved": []
   },
   "fresh_archive": {
     "evidence_class": "local_design_expected",
+    "contract_reference": {
+      "kind": "design",
+      "file": "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md",
+      "section": "4.2 稳定顺序与文本"
+    },
     "encoding": "UTF-8",
     "bytes_base64": "czMgY2xvY2tfc2tld19tcz05MDAwMDAgCmxpc3Rpbmcgc3FsX2hhcmRfbGltaXQ9MTAwMDAwIApwcm9tZXRoZXVzX21ldHJpY3MgcHVibGljPWZhbHNlIAo=",
     "utf8_escaped": "s3 clock_skew_ms=900000 \\nlisting sql_hard_limit=100000 \\nprometheus_metrics public=false \\n",
@@ -463,9 +942,10 @@
     "deferred": ["official catalog", "history endpoints", "service restart endpoint", "named targets", "secret archive", "backend bindings"]
   },
   "implementation_decision_fields": {
-    "verified_contract_evidence_class": "source_verified",
+    "upstream_contract_evidence_class": "source_verified",
+    "existing_maxio_contract_evidence_class": "existing_contract_verified",
     "fresh_archive_evidence_class": "local_design_expected",
-    "gate": "PASS_SOURCE_AND_EXISTING_CONTRACT_VERIFIED",
+    "gate": "PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED",
     "unresolved": []
   }
 }

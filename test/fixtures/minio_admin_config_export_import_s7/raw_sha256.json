@@ -226,7 +226,7 @@
   },
   "claim_sources": {
     "W1_madmin_limits_and_sio_formula": ["madmin_config_methods", "madmin_encrypt_decrypt", "madmin_sio_dependency", "sio_go_constants", "sio_go_default_stream", "sio_go_overhead"],
-    "W2_route_auth_errors_and_framing": ["minio_routes", "minio_admin_middleware", "minio_config_archive_handlers", "minio_ciphertext_limit", "minio_validate_admin_request", "minio_to_admin_api_error", "minio_write_response", "minio_success_helpers", "minio_config_errors", "madmin_request_builder", "madmin_transport_no_compression"],
+    "W2_route_auth_errors_and_framing": ["minio_routes", "minio_admin_middleware", "minio_gzip_handler", "minio_config_archive_handlers", "minio_ciphertext_limit", "minio_validate_admin_request", "minio_to_admin_api_error", "minio_write_response", "minio_success_helpers", "minio_config_errors", "madmin_request_builder", "madmin_transport_no_compression"],
     "W3_export_bytes_and_order": ["minio_catalog_registration", "minio_kv_string", "minio_target_order", "minio_export_formatter", "madmin_value_sanitization"],
     "W4_import_replacement_duplicates_unknown_history_restart": ["minio_config_archive_handlers", "minio_new_defaults", "minio_read_config", "minio_set_kvs", "minio_validate_all", "minio_history_and_current_save", "minio_put_object_save", "madmin_retry"],
     "W5_native_mc_dispatch_and_output": ["mc_export", "mc_import", "mc_print", "mc_non_tty_json"]

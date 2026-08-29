@@ -2,6 +2,8 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
   use ExUnit.Case, async: true
 
   @fixture_dir Path.expand("../../fixtures/minio_admin_config_export_import_s7", __DIR__)
+  @project_root Path.expand("../../..", __DIR__)
+  @s7_design_file "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md"
   @fixture_files [
     "minio_config_archive_wire.json",
     "madmin_config_archive_limits.json",
@@ -20,7 +22,32 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     "mc" => "77f82e18b5401a65958f1619df6ebb994634bd88",
     "sio_go" => "a455d2cd8fcacdfe18557d117db15c0629fb7e2c"
   }
-  @allowed_decision_evidence ["source_verified", "live_verified", "local_design_expected"]
+  @allowed_decision_evidence [
+    "source_verified",
+    "live_verified",
+    "existing_contract_verified",
+    "local_design_expected"
+  ]
+  @upstream_compatibility_evidence ["source_verified", "live_verified"]
+  @local_contract_evidence ["existing_contract_verified", "local_design_expected"]
+  @task6_wire_decision_roots [
+    "/routes",
+    "/caller_secret_sio",
+    "/request_builder",
+    "/http_framing",
+    "/server_ciphertext_gate",
+    "/authentication_and_authorization",
+    "/error_map_contract/precedence",
+    "/error_map_contract/precedence_assertion",
+    "/error_map_contract/conditions",
+    "/error_map_contract/contract_sources/reuse_rule",
+    "/error_map_contract/postcommit_outcome_contract",
+    "/fresh_archive"
+  ]
+  @task6_decision_documents %{
+    "minio_config_archive_wire.json" => @task6_wire_decision_roots,
+    "madmin_config_archive_limits.json" => ["/"]
+  }
   @archive_sha "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
   @error_precedence [
     %{"priority" => 1, "stage" => "authentication"},
@@ -125,8 +152,7 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
       "evidence_class" => "existing_contract_verified",
       "status" => 400,
       "code" => "XAmzContentSHA256Mismatch",
-      "message" =>
-        "The provided 'x-amz-content-sha256' header does not match what was computed.",
+      "message" => "The provided 'x-amz-content-sha256' header does not match what was computed.",
       "representative_input" => nil
     },
     %{
@@ -180,8 +206,8 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
       "evidence_class" => "existing_contract_verified",
       "status" => 400,
       "code" => "XMinioConfigError",
-      "message" => "unknown sub-system absent value=1",
-      "representative_input" => "absent value=1"
+      "message" => "unknown sub-system absent",
+      "representative_input" => "absent value=REDACTED"
     },
     %{
       "id" => "unknown_key",
@@ -300,6 +326,7 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
 
     assert archive["evidence_class"] == "local_design_expected"
     assert archive["upstream_minio_default_export_claim"] == false
+
     assert payload ==
              "s3 clock_skew_ms=900000 \n" <>
                "listing sql_hard_limit=100000 \n" <>
@@ -332,7 +359,12 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     assert sio_length(261_976, frame) == 262_273
     assert sio_length(262_144, frame) == 262_441
 
-    assert Map.take(vectors[261_975], ["chunk_count", "ciphertext_bytes", "madmin_local", "minio_server"]) == %{
+    assert Map.take(vectors[261_975], [
+             "chunk_count",
+             "ciphertext_bytes",
+             "madmin_local",
+             "minio_server"
+           ]) == %{
              "chunk_count" => 16,
              "ciphertext_bytes" => 262_272,
              "madmin_local" => "PASS",
@@ -385,7 +417,7 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     assert limits["verification_item"]["implementation_gate"] == "PASS_SOURCE_VERIFIED"
 
     assert wire["verification_item"]["implementation_gate"] ==
-             "PASS_SOURCE_AND_EXISTING_CONTRACT_VERIFIED"
+             "PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED"
 
     assert wire["verification_item"]["blocking_unresolved"] == []
 
@@ -422,6 +454,356 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     end
   end
 
+  test "Task 6 decision roots recursively reject missing unknown and unresolved provenance", %{
+    fixtures: fixtures
+  } do
+    records =
+      Enum.flat_map(@task6_decision_documents, fn {file, roots} ->
+        Enum.flat_map(roots, fn root ->
+          fixtures[file]
+          |> json_pointer!(root)
+          |> decision_leaf_records(file <> "#" <> root, nil)
+        end)
+      end)
+
+    assert records != []
+
+    assert Enum.filter(records, &is_nil(&1.evidence_class)) == []
+
+    assert Enum.filter(
+             records,
+             &(&1.evidence_class not in @allowed_decision_evidence)
+           ) == []
+
+    assert Enum.filter(records, fn record ->
+             is_binary(record.value) and String.contains?(record.value, "VERIFY-AT-IMPL")
+           end) == []
+
+    local_boundaries =
+      @task6_decision_documents
+      |> Enum.flat_map(fn {file, roots} ->
+        Enum.flat_map(roots, fn root ->
+          fixtures[file]
+          |> json_pointer!(root)
+          |> explicit_evidence_boundaries(file <> "#" <> root)
+        end)
+      end)
+      |> Enum.filter(&(&1.evidence_class in @local_contract_evidence))
+
+    all_boundaries =
+      Enum.flat_map(@task6_decision_documents, fn {file, roots} ->
+        Enum.flat_map(roots, fn root ->
+          fixtures[file]
+          |> json_pointer!(root)
+          |> explicit_evidence_boundaries(file <> "#" <> root)
+        end)
+      end)
+
+    assert Enum.filter(
+             all_boundaries,
+             &(&1.evidence_class not in @allowed_decision_evidence)
+           ) == []
+
+    assert Enum.filter(local_boundaries, fn boundary ->
+             contract_reference_error(
+               boundary.value["contract_reference"],
+               boundary.evidence_class
+             ) != nil
+           end) == []
+  end
+
+  test "Task 6 covers precedence assertion and ErrorMap reuse as referenced decision boundaries",
+       %{
+         fixtures: fixtures
+       } do
+    wire = fixtures["minio_config_archive_wire.json"]
+
+    for {pointer, evidence_class} <- [
+          {"/error_map_contract/precedence_assertion", "local_design_expected"},
+          {"/error_map_contract/contract_sources/reuse_rule", "existing_contract_verified"}
+        ] do
+      boundary = json_pointer!(wire, pointer)
+
+      assert is_map(boundary), "#{pointer} must be an explicit evidence boundary"
+      assert boundary["evidence_class"] == evidence_class, pointer
+
+      assert contract_reference_error(boundary["contract_reference"], evidence_class) == nil,
+             pointer
+    end
+  end
+
+  test "Task 6 evidence taxonomy distinguishes upstream live existing and local claims", %{
+    fixtures: fixtures
+  } do
+    taxonomy = fixtures["minio_config_archive_wire.json"]["evidence_taxonomy"]
+
+    assert taxonomy |> Map.keys() |> Enum.sort() == Enum.sort(@allowed_decision_evidence)
+
+    assert taxonomy["source_verified"] == %{
+             "claim_scope" => "upstream compatibility fact",
+             "required_evidence" => "pinned official source plus raw_sha256 raw/excerpt hashes"
+           }
+
+    assert taxonomy["live_verified"] == %{
+             "claim_scope" => "observed pre-implementation live fact",
+             "required_evidence" =>
+               "pinned binary or server identity, OS and command, redacted artifact hash, and observed result",
+             "claimed_in_this_fixture" => false
+           }
+
+    assert taxonomy["existing_contract_verified"] == %{
+             "claim_scope" => "reviewed pre-S7 Maxio behavior only; never upstream parity",
+             "required_evidence" =>
+               "named pre-existing fixture, test, error symbol or immutable closeout reference plus Task 6 RED lock",
+             "reviewed_baseline" =>
+               "S5 implementation HEAD 17278b93ad9d0af2c51b018ca5397a9fba3378ff; STATUS records independent Lane C and Lane D approval"
+           }
+
+    assert taxonomy["local_design_expected"] == %{
+             "claim_scope" => "new S7 Maxio choice or repair only; never upstream or live fact",
+             "required_evidence" =>
+               "named S7 design reference plus Task 6 RED lock and independent RED review before Task 7"
+           }
+  end
+
+  test "claimed_in_this_fixture false means no live_verified Task 6 boundary exists", %{
+    fixtures: fixtures
+  } do
+    taxonomy = fixtures["minio_config_archive_wire.json"]["evidence_taxonomy"]
+
+    if taxonomy["live_verified"]["claimed_in_this_fixture"] == false do
+      live_boundaries = task6_boundaries(fixtures, "live_verified")
+      assert length(live_boundaries) == 0, inspect(Enum.map(live_boundaries, & &1.path))
+    end
+  end
+
+  test "Task 6 local transport decisions are explicit and must be locked by RED before Task 7", %{
+    fixtures: fixtures
+  } do
+    wire = fixtures["minio_config_archive_wire.json"]
+    gate = wire["task6_entry_gate"]
+
+    assert gate["gate_result"] == "PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED"
+
+    assert gate["claim_scope"] ==
+             "fixture provenance completeness only; not live behavior or endpoint PASS"
+
+    assert gate["allowed_evidence_classes"] == @allowed_decision_evidence
+    assert gate["upstream_compatibility_classes"] == @upstream_compatibility_evidence
+    assert gate["local_contract_classes"] == @local_contract_evidence
+    assert gate["decision_documents"] == @task6_decision_documents
+
+    assert is_map(gate["source_claims"])
+
+    assert gate["unresolved"] == []
+    assert gate["w5_effect"] == "none; W5 blocks Task 8 only"
+
+    assert gate["inheritance_rule"] ==
+             "each decision leaf inherits the nearest ancestor evidence_class; list members without an inherited class must declare their own"
+
+    assert gate["task6_red_lock_rule"] ==
+             "Task 6 RED must table-lock every precedence priority, every condition id, and every named local transport decision"
+
+    assert gate["task7_entry_rule"] ==
+             "Task 7 remains blocked until independent review confirms the Task 6 RED locks every required decision"
+  end
+
+  test "source claims bind every source_verified JSON boundary to immutable claim and source ids",
+       %{
+         fixtures: fixtures
+       } do
+    bindings = fixtures["minio_config_archive_wire.json"]["task6_entry_gate"]["source_claims"]
+    boundaries = task6_boundaries(fixtures, "source_verified")
+
+    missing = Enum.reject(boundaries, &Map.has_key?(bindings, &1.path))
+    assert Enum.map(missing, & &1.path) == []
+
+    invalid =
+      for boundary <- boundaries,
+          errors = source_binding_errors(bindings[boundary.path], fixtures["raw_sha256.json"]),
+          errors != [],
+          do: %{path: boundary.path, errors: errors}
+
+    assert invalid == []
+  end
+
+  test "W1 server boundary vectors cite their MinIO server sources", %{fixtures: fixtures} do
+    required = MapSet.new(["minio_config_archive_handlers", "minio_ciphertext_limit"])
+
+    for index <- 0..2 do
+      source_ids =
+        boundary_source_ids(
+          fixtures,
+          "madmin_config_archive_limits.json#/boundary_vectors/#{index}"
+        )
+
+      assert MapSet.subset?(required, MapSet.new(source_ids)),
+             "W1 boundary_vectors/#{index} omits MinIO handler/limit provenance"
+    end
+  end
+
+  test "effective native round-trip maximum binds the W1 formula and W2 server gate", %{
+    fixtures: fixtures
+  } do
+    file = "madmin_config_archive_limits.json"
+    pointer = "/effective_native_round_trip_plaintext_maximum"
+    limits = fixtures[file]
+
+    assert json_pointer!(limits, pointer) == 261_975
+
+    boundary_path = nearest_evidence_boundary_path(limits, file, pointer, "source_verified")
+    assert boundary_path == "madmin_config_archive_limits.json#/"
+
+    binding =
+      fixtures["minio_config_archive_wire.json"]["task6_entry_gate"]["source_claims"][
+        boundary_path
+      ] || %{"claim_ids" => [], "source_ids" => []}
+
+    required_claim_ids =
+      MapSet.new([
+        "W1_madmin_limits_and_sio_formula",
+        "W2_route_auth_errors_and_framing"
+      ])
+
+    required_source_ids =
+      MapSet.new(["minio_config_archive_handlers", "minio_ciphertext_limit"])
+
+    missing = %{
+      claim_ids: MapSet.difference(required_claim_ids, MapSet.new(binding["claim_ids"])),
+      source_ids: MapSet.difference(required_source_ids, MapSet.new(binding["source_ids"]))
+    }
+
+    assert missing == %{claim_ids: MapSet.new(), source_ids: MapSet.new()}
+  end
+
+  test "W2 caller-secret SIO boundary cites madmin and sio-go sources", %{fixtures: fixtures} do
+    required =
+      MapSet.new([
+        "madmin_config_methods",
+        "madmin_encrypt_decrypt",
+        "sio_go_constants",
+        "sio_go_default_stream"
+      ])
+
+    source_ids =
+      boundary_source_ids(fixtures, "minio_config_archive_wire.json#/caller_secret_sio")
+
+    assert MapSet.subset?(required, MapSet.new(source_ids)),
+           "W2 caller_secret_sio omits madmin/sio-go provenance"
+  end
+
+  test "all 23 conditions and 12 precedence rows resolve structured contract references", %{
+    fixtures: fixtures
+  } do
+    contract = fixtures["minio_config_archive_wire.json"]["error_map_contract"]
+    rows = contract["conditions"] ++ contract["precedence"]
+
+    assert length(contract["conditions"]) == 23
+    assert length(contract["precedence"]) == 12
+
+    invalid =
+      for row <- rows,
+          error = contract_reference_error(row["contract_reference"], row["evidence_class"]),
+          error != nil,
+          do: %{id: row["id"] || row["priority"], error: error}
+
+    assert invalid == []
+  end
+
+  test "contract reference resolver accepts real anchors and rejects bogus ones" do
+    baseline = %{
+      "kind" => "baseline",
+      "file" => "test/maxio/admin/error_map_test.exs",
+      "test_id" => "maps every S2b input error to its exact public code, status, and message"
+    }
+
+    design = %{
+      "kind" => "design",
+      "file" => @s7_design_file,
+      "section" => "10.1 管线顺序"
+    }
+
+    assert contract_reference_error(baseline, "existing_contract_verified") == nil
+    assert contract_reference_error(design, "local_design_expected") == nil
+
+    refute contract_reference_error(
+             %{baseline | "test_id" => "bogus test id that does not exist"},
+             "existing_contract_verified"
+           ) == nil
+
+    refute contract_reference_error(
+             %{design | "section" => "99.99 bogus section"},
+             "local_design_expected"
+           ) == nil
+
+    refute contract_reference_error(
+             %{baseline | "file" => "test/maxio/admin/not_a_real_baseline.exs"},
+             "existing_contract_verified"
+           ) == nil
+  end
+
+  test "anonymous response reuse and S7 auth-before-body order are separate class boundaries", %{
+    fixtures: fixtures
+  } do
+    concealment =
+      fixtures["minio_config_archive_wire.json"]["authentication_and_authorization"][
+        "maxio_anonymous_concealment"
+      ]
+
+    boundaries = explicit_evidence_boundaries(concealment, "anonymous")
+
+    existing_response =
+      Enum.find(boundaries, fn boundary ->
+        boundary.evidence_class == "existing_contract_verified" and
+          Map.take(boundary.value, ["status", "code", "message"]) == %{
+            "status" => 403,
+            "code" => "AccessDenied",
+            "message" => "Access Denied"
+          }
+      end)
+
+    local_order =
+      Enum.find(boundaries, fn boundary ->
+        boundary.evidence_class == "local_design_expected" and
+          contains_text?(boundary.value, "before entity length")
+      end)
+
+    assert existing_response != nil
+    assert local_order != nil
+    refute existing_response.path == local_order.path
+    assert Map.take(local_order.value, ["status", "code", "message"]) == %{}
+  end
+
+  test "existing no-transform policy and S7 exact response framing are separate class boundaries",
+       %{
+         fixtures: fixtures
+       } do
+    repair =
+      fixtures["minio_config_archive_wire.json"]["http_framing"][
+        "upstream_admin_gzip_middleware"
+      ]["maxio_transport_repair"]
+
+    boundaries = explicit_evidence_boundaries(repair, "no-transform")
+
+    existing_policy =
+      Enum.find(boundaries, fn boundary ->
+        boundary.evidence_class == "existing_contract_verified" and
+          contains_text?(boundary.value, "no-transform")
+      end)
+
+    local_framing =
+      Enum.find(boundaries, fn boundary ->
+        boundary.evidence_class == "local_design_expected" and
+          boundary.value["content_length"] == "exact_random_ciphertext_length" and
+          boundary.value["transfer_encoding"] == "absent" and
+          boundary.value["content_encoding"] == "absent"
+      end)
+
+    assert existing_policy != nil
+    assert local_framing != nil
+    refute existing_policy.path == local_framing.path
+  end
+
   test "authorization denial remains distinct from authentication failures", %{fixtures: fixtures} do
     contract =
       fixtures["minio_config_archive_wire.json"]["authentication_and_authorization"]
@@ -434,6 +816,7 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     authentication = contract["authentication_failure"]
     assert authentication["must_not_collapse_to_AccessDenied"] == true
     assert authentication["behavior"] =~ "preserve the exact non-AccessDenied error"
+
     assert authentication["examples"] == [
              "InvalidAccessKeyId",
              "SignatureDoesNotMatch",
@@ -448,7 +831,9 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     conditions = contract["conditions"]
     ids = Enum.map(conditions, & &1["id"])
 
-    assert contract["precedence"] == @error_precedence
+    assert Enum.map(contract["precedence"], &Map.take(&1, ["priority", "stage"])) ==
+             @error_precedence
+
     assert Enum.map(contract["precedence"], & &1["priority"]) == Enum.to_list(1..12)
     assert length(conditions) == 23
     assert length(Enum.uniq(ids)) == length(ids)
@@ -472,7 +857,10 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
              "representative_input" => "s3 absent=1 clock_skew_ms=1000"
            }
 
-    assert normalized["unknown_subsystem"]["representative_input"] == "absent value=1"
+    assert normalized["unknown_subsystem"]["representative_input"] ==
+             "absent value=REDACTED"
+
+    assert normalized["unknown_subsystem"]["message"] == "unknown sub-system absent"
     assert normalized["unknown_subsystem"]["code"] == "XMinioConfigError"
     refute normalized["unknown_subsystem"] == normalized["unknown_prefix"]
 
@@ -486,19 +874,53 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     end
   end
 
-  test "priority twelve records committed postcommit attention without false rollback or HTTP failure", %{
+  test "unknown subsystem public fields never repeat the scalar token", %{
     fixtures: fixtures
   } do
+    unknown = unknown_subsystem_condition(fixtures)
+
+    protected =
+      Map.take(unknown, [
+        "message",
+        "representative_input",
+        "public_response",
+        "log_contract"
+      ])
+
+    scalar_echoes =
+      protected
+      |> flatten()
+      |> Enum.filter(fn {_path, value} ->
+        is_binary(value) and Regex.match?(~r/(?<![[:alnum:]_])1(?![[:alnum:]_])/, value)
+      end)
+
+    assert scalar_echoes == []
+  end
+
+  test "unknown subsystem fixture explicitly locks its public response and safe log contract", %{
+    fixtures: fixtures
+  } do
+    unknown = unknown_subsystem_condition(fixtures)
+
+    assert is_map(unknown["public_response"])
+    assert is_map(unknown["log_contract"])
+  end
+
+  test "priority twelve records committed postcommit attention without false rollback or HTTP failure",
+       %{
+         fixtures: fixtures
+       } do
     contract = fixtures["minio_config_archive_wire.json"]["error_map_contract"]
 
-    assert contract["postcommit_outcome_contract"] == %{
+    {reference, outcome} = Map.pop(contract["postcommit_outcome_contract"], "contract_reference")
+
+    assert outcome == %{
              "priority" => 12,
              "stage" => "postcommit_reload_and_broadcast",
              "evidence_class" => "local_design_expected",
              "error_map_failure" => false,
              "transaction_state" => "already_committed",
-             "reload_or_broadcast_failure" =>
-               "must_not_roll_back_committed_rows_or_audits",
+             "reload_or_broadcast_failure" => "must_not_roll_back_committed_rows_or_audits",
              "http_outcome" => %{
                "status" => 200,
                "body_bytes" => 0,
@@ -506,10 +928,10 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
              },
              "must_not_report" => ["InternalError", "transaction_not_committed"],
              "observability" =>
-               "record structured attention without plaintext, ciphertext, value or caller secret",
-             "contract_reference" =>
-               "S7 commit-first postcommit safety design; intentionally separate from ErrorMap conditions"
+               "record structured attention without plaintext, ciphertext, value or caller secret"
            }
+
+    assert contract_reference_error(reference, "local_design_expected") == nil
   end
 
   test "random SIO evidence never freezes ciphertext bytes or a ciphertext digest", %{
@@ -520,6 +942,7 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
 
     assert wire["caller_secret_sio"]["ciphertext_bytes_or_sha_stored"] == false
     assert wire["caller_secret_sio"]["reason"] == "salt and nonce are random"
+
     assert wire["request_builder"]["put_payload_sha256"] ==
              "sha256_of_each_random_sio_ciphertext"
 
@@ -609,6 +1032,7 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     dispatch = fixtures["mc_config_archive_dispatch.json"]
 
     assert wire["request_builder"]["authorization_or_signature_value_stored"] == false
+
     assert wire["maxio_bounded_deviations"]["secret_or_backend_binding"] ==
              "unsupported and never exported"
 
@@ -664,6 +1088,283 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
 
   defp collect_named_maps(_term, _key, acc), do: acc
 
+  defp json_pointer!(document, pointer) do
+    pointer
+    |> String.split("/", trim: true)
+    |> Enum.reduce(document, fn segment, value -> Map.fetch!(value, segment) end)
+  end
+
+  defp nearest_evidence_boundary_path(document, file, pointer, evidence_class) do
+    segments = String.split(pointer, "/", trim: true)
+
+    segments
+    |> Enum.drop(-1)
+    |> then(fn parent_segments ->
+      Enum.map(length(parent_segments)..0//-1, &Enum.take(parent_segments, &1))
+    end)
+    |> Enum.find_value(fn boundary_segments ->
+      boundary_pointer =
+        case boundary_segments do
+          [] -> "/"
+          segments -> "/" <> Enum.join(segments, "/")
+        end
+
+      case json_pointer!(document, boundary_pointer) do
+        %{"evidence_class" => ^evidence_class} -> file <> "#" <> boundary_pointer
+        _other -> nil
+      end
+    end)
+  end
+
+  defp task6_boundaries(fixtures, evidence_class) do
+    @task6_decision_documents
+    |> Enum.flat_map(fn {file, roots} ->
+      Enum.flat_map(roots, fn root ->
+        fixtures[file]
+        |> json_pointer!(root)
+        |> explicit_evidence_boundaries(file <> "#" <> root)
+      end)
+    end)
+    |> Enum.filter(&(&1.evidence_class == evidence_class))
+    |> Enum.uniq_by(& &1.path)
+  end
+
+  defp decision_leaf_records(map, path, inherited_class) when is_map(map) do
+    evidence_class = Map.get(map, "evidence_class", inherited_class)
+
+    map
+    |> Enum.reject(fn {key, _value} -> key == "evidence_class" end)
+    |> Enum.flat_map(fn {key, value} ->
+      decision_leaf_records(value, append_json_pointer(path, key), evidence_class)
+    end)
+  end
+
+  defp decision_leaf_records(list, path, inherited_class) when is_list(list) do
+    list
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {value, index} ->
+      decision_leaf_records(value, append_json_pointer(path, index), inherited_class)
+    end)
+  end
+
+  defp decision_leaf_records(value, path, evidence_class) do
+    [%{path: path, value: value, evidence_class: evidence_class}]
+  end
+
+  defp explicit_evidence_boundaries(term, path),
+    do: explicit_evidence_boundaries(term, path, [])
+
+  defp explicit_evidence_boundaries(map, path, acc) when is_map(map) do
+    acc =
+      case map do
+        %{"evidence_class" => evidence_class} ->
+          [%{path: path, evidence_class: evidence_class, value: map} | acc]
+
+        _other ->
+          acc
+      end
+
+    Enum.reduce(map, acc, fn {key, value}, nested_acc ->
+      explicit_evidence_boundaries(value, append_json_pointer(path, key), nested_acc)
+    end)
+  end
+
+  defp explicit_evidence_boundaries(list, path, acc) when is_list(list) do
+    list
+    |> Enum.with_index()
+    |> Enum.reduce(acc, fn {value, index}, nested_acc ->
+      explicit_evidence_boundaries(
+        value,
+        append_json_pointer(path, index),
+        nested_acc
+      )
+    end)
+  end
+
+  defp explicit_evidence_boundaries(_term, _path, acc), do: acc
+
+  defp append_json_pointer(path, segment) do
+    separator = if String.ends_with?(path, "#/"), do: "", else: "/"
+    path <> separator <> to_string(segment)
+  end
+
+  defp source_binding_errors(binding, integrity) when is_map(binding) do
+    claim_ids = binding["claim_ids"]
+    source_ids = binding["source_ids"]
+    claims = integrity["claim_sources"]
+    sources = integrity["sources"]
+
+    []
+    |> add_error(not non_empty_string_list?(claim_ids), :claim_ids)
+    |> add_error(not non_empty_string_list?(source_ids), :source_ids)
+    |> add_error(
+      non_empty_string_list?(claim_ids) and
+        Enum.any?(claim_ids, &(not Map.has_key?(claims, &1))),
+      :unknown_claim_id
+    )
+    |> add_error(
+      non_empty_string_list?(source_ids) and
+        Enum.any?(source_ids, &(not Map.has_key?(sources, &1))),
+      :unknown_source_id
+    )
+    |> add_error(
+      source_ids_outside_claims?(claim_ids, source_ids, claims),
+      :source_id_not_bound_by_claim_id
+    )
+    |> add_error(
+      non_empty_string_list?(source_ids) and
+        Enum.any?(source_ids, fn source_id ->
+          source = sources[source_id]
+          is_map(source) and not immutable_source_record?(source, integrity["repositories"])
+        end),
+      :mutable_or_incomplete_source_record
+    )
+  end
+
+  defp source_binding_errors(_binding, _integrity), do: [:binding_must_be_a_map]
+
+  defp source_ids_outside_claims?(claim_ids, source_ids, claims) do
+    if non_empty_string_list?(claim_ids) and non_empty_string_list?(source_ids) and
+         Enum.all?(claim_ids, &Map.has_key?(claims, &1)) do
+      claimed_source_ids =
+        claim_ids
+        |> Enum.flat_map(&claims[&1])
+        |> MapSet.new()
+
+      not MapSet.subset?(MapSet.new(source_ids), claimed_source_ids)
+    else
+      false
+    end
+  end
+
+  defp add_error(errors, true, error), do: [error | errors]
+  defp add_error(errors, false, _error), do: errors
+
+  defp non_empty_string_list?(values),
+    do: is_list(values) and values != [] and Enum.all?(values, &(is_binary(&1) and &1 != ""))
+
+  defp immutable_source_record?(source, repositories) do
+    with repository when is_map(repository) <- repositories[source["repository"]],
+         true <- Regex.match?(~r/\A[0-9a-f]{64}\z/, source["raw_source_sha256"] || ""),
+         true <- excerpt_records(source) != [],
+         true <-
+           Enum.all?(excerpt_records(source), fn excerpt ->
+             Regex.match?(~r/\A[0-9a-f]{64}\z/, excerpt["excerpt_sha256"] || "")
+           end) do
+      source["url"] == immutable_raw_url(repository, source["file"])
+    else
+      _other -> false
+    end
+  end
+
+  defp boundary_source_ids(fixtures, boundary_path) do
+    bindings = fixtures["minio_config_archive_wire.json"]["task6_entry_gate"]["source_claims"]
+
+    case bindings[boundary_path] do
+      %{"source_ids" => source_ids} when is_list(source_ids) ->
+        source_ids
+
+      _other ->
+        [file | _rest] = String.split(boundary_path, "#", parts: 2)
+
+        case bindings[file] do
+          claim_id when is_binary(claim_id) ->
+            fixtures["raw_sha256.json"]["claim_sources"][claim_id] || []
+
+          _missing ->
+            []
+        end
+    end
+  end
+
+  defp contract_reference_error(reference, evidence_class) when is_map(reference) do
+    kind = reference["kind"]
+
+    cond do
+      evidence_class == "existing_contract_verified" and kind != "baseline" ->
+        :existing_contract_requires_baseline
+
+      evidence_class == "local_design_expected" and kind != "design" ->
+        :local_design_requires_design_section
+
+      kind == "baseline" ->
+        validate_baseline_reference(reference)
+
+      kind == "design" ->
+        validate_design_reference(reference)
+
+      true ->
+        :unknown_reference_kind
+    end
+  end
+
+  defp contract_reference_error(_reference, _evidence_class),
+    do: :contract_reference_must_be_a_structured_map
+
+  defp validate_baseline_reference(reference) do
+    with {:ok, path} <- project_file(reference["file"]),
+         {:ok, contents} <- File.read(path),
+         true <- baseline_anchor_exists?(contents, reference) do
+      nil
+    else
+      _other -> :baseline_file_or_anchor_not_found
+    end
+  end
+
+  defp validate_design_reference(reference) do
+    with {:ok, path} <- project_file(reference["file"]),
+         {:ok, contents} <- File.read(path),
+         section when is_binary(section) and section != "" <- reference["section"],
+         true <- design_section_exists?(contents, section) do
+      nil
+    else
+      _other -> :design_file_or_section_not_found
+    end
+  end
+
+  defp project_file(file) when is_binary(file) and file != "" do
+    path = Path.expand(file, @project_root)
+    relative = Path.relative_to(path, @project_root)
+    inside_project? = List.first(Path.split(relative)) != ".."
+
+    if inside_project? and File.regular?(path),
+      do: {:ok, path},
+      else: :error
+  end
+
+  defp project_file(_file), do: :error
+
+  defp baseline_anchor_exists?(contents, %{"test_id" => test_id})
+       when is_binary(test_id) and test_id != "",
+       do: String.contains?(contents, ~s(test "#{test_id}"))
+
+  defp baseline_anchor_exists?(contents, %{"symbol" => symbol})
+       when is_binary(symbol) and symbol != "",
+       do: String.contains?(contents, symbol)
+
+  defp baseline_anchor_exists?(_contents, _reference), do: false
+
+  defp design_section_exists?(contents, section) do
+    Enum.any?(String.split(contents, ~r/\R/), fn line ->
+      Regex.match?(~r/^\#{1,6}\s+#{Regex.escape(section)}\s*$/, line)
+    end)
+  end
+
+  defp contains_text?(term, needle) do
+    term
+    |> flatten()
+    |> Enum.any?(fn {_path, value} ->
+      is_binary(value) and String.contains?(String.downcase(value), String.downcase(needle))
+    end)
+  end
+
+  defp unknown_subsystem_condition(fixtures) do
+    Enum.find(
+      fixtures["minio_config_archive_wire.json"]["error_map_contract"]["conditions"],
+      &(&1["id"] == "unknown_subsystem")
+    )
+  end
+
   defp production_w5_consumers do
     root = Path.expand("../../..", __DIR__)
     this_file = Path.expand(__ENV__.file)
@@ -698,13 +1399,14 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
       "status" => Map.get(condition, "status", condition["pre_decrypt_status"]),
       "code" => Map.get(condition, "code", condition["pre_decrypt_code"]),
       "message" => Map.get(condition, "message", condition["pre_decrypt_message"]),
-      "representative_input" =>
-        Map.get(condition, "representative_input", condition["inputs"])
+      "representative_input" => Map.get(condition, "representative_input", condition["inputs"])
     }
   end
 
   defp sio_length(plaintext_bytes, frame) when plaintext_bytes >= 1 do
-    chunks = div(plaintext_bytes + frame["chunk_plaintext_bytes"] - 1, frame["chunk_plaintext_bytes"])
+    chunks =
+      div(plaintext_bytes + frame["chunk_plaintext_bytes"] - 1, frame["chunk_plaintext_bytes"])
+
     frame["prefix_bytes"] + plaintext_bytes + chunks * frame["aead_tag_bytes_per_chunk"]
   end
 

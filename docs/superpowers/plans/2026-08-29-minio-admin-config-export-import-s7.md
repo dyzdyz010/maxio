@@ -33,8 +33,10 @@
 - 不新增 migration；不实现 history、restart、targets、full official catalog、secret/backend/archive job。
 - 不得由生产作者自写完成审查。Lane R=协议/fixture，Lane T=RED 测试，Lane B=生产实现，Lane C=task reviewer，Lane D/E=独立 whole-range reviewers，Lane F=验证，Lane G=strict-live，Lane H=STATUS，Lane I=集成。
 - 开发中只跑 focused tests、compile 和必要 format；在所有实现/review/live 收口后只跑一次最终成功 `mix precommit`。
-- 所有决定 RED/production 的 `VERIFY-AT-IMPL` 必须由 Task 1 或相应实现前的 fixture gate 关闭；Windows mc argv/stdin
-  与 ErrorMap 也必须先冻结。Task 11 只复验，不能首次选择实现行为。
+- 所有决定 RED/production 的字段必须由 Task 1 或相应实现前的 fixture gate 关闭。上游兼容事实只能是
+  `source_verified`/`live_verified`；经独立审查的既有 Maxio 契约或本地 S7 repair 可用
+  `existing_contract_verified`/`local_design_expected`，但必须有精确 reference 并由对应 RED 锁定。Task 11 只复验，
+  不能首次选择实现行为。Windows mc argv/stdin 的 W5 缺口只阻塞 Task 8，不误阻 Task 6。
 - 任何 accepted finding 都先由 Lane T 增加可失败回归，再由 Lane B 修复，再由 Lane C/对应 reviewer 复审。
 - 禁止跟踪 live credential、Authorization、caller secret、mc alias 文件、raw ciphertext 或未脱敏 transcript。
 
@@ -119,8 +121,11 @@
 **Interfaces:**
 
 - Consumes: pinned MinIO `7aac2a2...`、madmin-go `4b504b8...`、mc `77f82e1...` 源码与 Lane R raw captures。
-- Produces: W1–W5 的 immutable source/live facts，供所有后续 RED 使用；所有会影响实现的字段在离开 Task 1 前已
-  `source_verified` 或 `live_verified`，不产生 production behavior。
+- Produces: W1–W5 的 immutable provenance facts，供所有后续 RED 使用；上游兼容事实为
+  `source_verified`/`live_verified`，既有 Maxio/本地设计事实为带 reference 的
+  `existing_contract_verified`/`local_design_expected`。Task 1 只证明 fixture 完整性，不产生 production 或 live PASS。
+  `source_verified` 的每个显式 JSON boundary 必须由 JSON pointer 映射到非空 claim/source ids，并最终解析到 pinned
+  raw URL、raw hash 与 excerpt hash；`claimed_in_this_fixture: false` 时 Task 6 roots 中必须保持零 `live_verified`。
 
 - [ ] **Step 1: Write fixture provenance.** README 逐项记录 commit、source file/function、capture OS、命令、
   source-derived/live 分类、脱敏规则和 raw artifact SHA-256。W1–W5 固定为：W1 madmin local plaintext limits/SIO
@@ -144,19 +149,31 @@
 - [ ] **Step 3: Encode limits and replacement facts.** `madmin_config_archive_limits.json` 固定
   `encrypted_length(n)=41+n+16*ceil(n/16384)`、empty plaintext→local EOF/zero request、1..262144 通过 local check、
   262145+ local ErrTooLarge/zero request；server ciphertext CL -1 或 >262272→TooLarge，CL 0→decrypt→BadJSON；
-  plaintext 261975→ciphertext 262272/end-to-end PASS，261976→262273/server TooLarge，262144→262441/local accepted
-  but server rejected。`minio_config_archive_wire.json` 固定 blank/comment-only→full defaults、duplicate→LWW、unknown→
+  plaintext 261975→ciphertext 262272，按 pinned madmin/MinIO source 通过两端 size gate（不声称 S7 live PASS）；
+  261976→262273/server TooLarge，262144→262441/local accepted but server rejected。`minio_config_archive_wire.json` 固定
+  blank/comment-only→full defaults、duplicate→LWW、unknown→
   whole import failure、PUT 200 empty/no applied header。
 
 - [ ] **Step 4: Close native mc and ErrorMap decisions before RED.** `mc_config_archive_dispatch.json` 记录 export/import
   exact Windows argv、stdin/file transport、human/JSON stdout/stderr/exit 和固定 restart 分支。另在 wire fixture 固定
-  每个会进入 Task 6/7 的 status/code/message/priority。若 pinned source 不能决定 Windows 或 error parser 行为，Lane R
-  必须在 Task 2/6 前运行 pre-implementation live capture；仍为 `VERIFY-AT-IMPL` 时对应 RED/production task BLOCKED。
+  每个会进入 Task 6/7 的 status/code/message/priority。上游兼容字段若 pinned source 不能决定，必须在 Task 6 前做
+  pre-implementation live capture；既有 Maxio contract 必须用可解析的 `baseline` file + test id/symbol，本地 repair 必须用
+  可解析的 `design` file + section，并在 Task 6 RED 锁定。完整 error map、`precedence_assertion` 和 ErrorMap `reuse_rule`
+  都是 entry-gate decision roots，不得因 `unresolved: []` 而省略。
+  Windows native mc W5 若仍为 `VERIFY-AT-IMPL`，只 BLOCK Task 8，不 BLOCK Task 6。
 
 - [ ] **Step 5: Write fixture integrity tests.** 测试必须读取 JSON、验证 pinned hashes、禁止 mutable branch URL，
-  重算每个 raw plaintext payload SHA/length，并断言所有 implementation-decision 字段是 `source_verified` 或
-  `live_verified`；只允许不决定 RED/production 的 observation 保留带原因 `VERIFY-AT-IMPL`。SIO salt/nonce 随机，
-  fixture/test 只断言 frame length、decrypt plaintext 和错误-secret oracle，不固定 ciphertext bytes/SHA。
+  重算每个 raw plaintext payload SHA/length，并从 `task6_entry_gate.decision_documents` 递归扫描 Task 6 消费的每个 fixture/
+  JSON-pointer root（包括完整 W1 limits 文档、W2/error 与 fresh archive）的所有 decision leaf。
+  叶字段继承最近祖先 class；无继承的 list member 必须自带 class。测试拒绝 `VERIFY-AT-IMPL`、缺失/未知 class，定向覆盖
+  每个 ErrorMap condition、每个 precedence row、`precedence_assertion`、ErrorMap `reuse_rule`、anonymous concealment、
+  postcommit 与 Admin transport repair；本地 class 必须有可解析的结构化 reference。source-classified W1/W2 的每个显式
+  boundary 必须由 `source_claims["fixture.json#/pointer"]` 的非空 `claim_ids`/`source_ids` 链到
+  `raw_sha256.json.claim_sources` 与完整 immutable raw/excerpt records。anonymous 既有 response 与 S7 auth-before-body
+  ordering、既有 `no-transform` policy 与 S7 exact CL/no-TE/no-CE framing 必须拆成不同 class boundary；unknown subsystem
+  必须固定不含 submitted scalar 的 `public_response` 与 safe `log_contract`。禁止靠 `unresolved: []` 自证。SIO salt/nonce
+  随机，fixture/test 只断言 frame length、decrypt plaintext 和错误-secret oracle，
+  不固定 ciphertext bytes/SHA。
 
   ```elixir
   assert byte_size(payload) == 89
@@ -182,10 +199,11 @@
   git commit -m "test(compat): freeze config export import protocol"
   ```
 
-- [ ] **Step 8: Independent fixture review and decision gate.** Lane C checks every fact against pinned source/raw SHA，重点拒绝把
-  local-design/source-derived/fake transcript 写成 upstream/live。Review 必须列出零个仍会决定后续实现的 VERIFY，包含
-  Windows mc argv/stdin 和 ErrorMap；否则不允许进入相应 task。Accepted fixture correction commits as
-  `test(compat): correct config archive fixtures`，随后重新审查。
+- [ ] **Step 8: Independent fixture review and decision gate.** Lane C checks every upstream fact against pinned source/raw SHA，
+  every `existing_contract_verified` against the immutable S5/S6 closeout reference，and every `local_design_expected` against the
+  S7 design；重点拒绝把 local/existing/fake 写成 upstream/live。Task 6 roots 必须零 VERIFY/缺失/未知 class，且 reviewer
+  确认 local/existing 项均被列入 Task 6 RED-lock 清单。W5 Windows mc 缺口只维持 `BLOCKED_BEFORE_TASK_8`。Accepted fixture
+  correction commits as `test(compat): correct config archive fixtures`，随后重新审查。
 
 ### Task 2: Specify Archive, Registry and document parsing with RED tests
 
@@ -537,11 +555,17 @@
 - Consumes: Task 1 wire/error fixture、Task 5 Archive API。
 - Produces: RED contract for exact GET/PUT routes、caller-secret SIO、auth precedence、dual limits、empty 200/no applied header。
 
-**Entry gate:** Task 1 must have zero unresolved implementation-decision fields for HTTP errors/framing/SIO；每个 ErrorMap
-status/code/message/priority must be source/live verified before this RED task starts。
+**Entry gate:** Task 1 的 `task6_entry_gate.decision_documents` 必须覆盖 Task 6 消费的全部 fixture/root，并递归零
+`VERIFY-AT-IMPL`、零缺失 class、零未知 class。
+上游 compatibility fields 只能是 `source_verified`/`live_verified`；既有 Maxio contract 与本地 repair 可分别为
+`existing_contract_verified`/`local_design_expected`，但须分别解析到真实 baseline test/symbol 或 design section，并进入
+本 Task 的逐项 RED-lock 清单。所有显式 source boundary 必须有 JSON-pointer claim/source binding；完整 conditions、
+precedence、`precedence_assertion`、ErrorMap `reuse_rule` 均在 roots 内。该 gate 只允许开始写 RED，不是 endpoint/live
+PASS。W5 继续只 BLOCK Task 8。
 
-- [ ] **Step 1: Write route/auth RED.** Assert anonymous and action-denied calls fail before Archive/body reader；root and authorized
-  identity use `admin:ConfigUpdate`。Adjacent unsupported methods/paths keep existing structured Admin fallback。
+- [ ] **Step 1: Write route/auth RED.** 分别锁定 anonymous 的既有 `403/AccessDenied/Access Denied` response 与 S7 新增的
+  auth-before-entity-length/body ordering；assert anonymous and action-denied calls fail before Archive/body reader；root and
+  authorized identity use `admin:ConfigUpdate`。Adjacent unsupported methods/paths keep existing structured Admin fallback。
 
 - [ ] **Step 2: Write caller-secret RED.** Two credentials with distinct secrets prove GET ciphertext decrypts only with the caller
   secret and PUT ciphertext encrypted with another/root secret fails。No test logs raw secret。
@@ -550,17 +574,20 @@ status/code/message/priority must be source/live verified before this RED task s
   mismatch、payload hash、decrypt、UTF-8。Assert formula `41+n+16*ceil(n/16384)` and exact boundaries：plaintext 261975→
   ciphertext 262272 accepted/decrypted；261976→262273 rejected before decrypt；262144→262441 and therefore only client-local
   accepted/server rejected；262145+ madmin local reject。Random salt/nonce means assertions use length/framing/decrypt oracle，never
-  exact ciphertext bytes/SHA。Assert fixture error priority。
+  exact ciphertext bytes/SHA。用 table-driven RED 逐项锁定十二级 precedence priority/stage，不能只断言总体顺序。
 
 - [ ] **Step 4: Write GET response RED.** Decrypt randomized response and compare exact plaintext archive；assert ciphertext length
-  by formula、exact CL、no TE/CE、
-  Admin `Cache-Control` contains `no-transform`。Treat upstream gzhttp compression difference as deliberate Maxio repair。
+  by formula、exact CL、no TE/CE。分别锁定既有 path-style Admin `Cache-Control: no-transform` policy 与 S7 exact response
+  framing repair；不得把二者合并成一个 local claim。
 
 - [ ] **Step 5: Write PUT success RED.** Valid import returns HTTP 200、zero body、Content-Length 0 or fixture-proven equivalent、
   no TE/CE and absent `x-minio-config-applied`；Archive mutation result still proves one hot postcommit path。
 
-- [ ] **Step 6: Write safe failure/log RED.** target/unknown-prefix/hidden/forbidden、DB rollback、postcommit attention and every
-  fixture error mapping must omit plaintext value、ciphertext 和 secret。Do not assert invented `XMaxio*` codes。
+- [ ] **Step 6: Write safe failure/log RED.** 以 fixture condition `id` 为 table key，逐项锁定全部 status/code/message/priority；
+  target/unknown-prefix/hidden/forbidden、DB rollback、postcommit attention and every fixture error mapping must omit plaintext
+  value、ciphertext 和 secret。unknown-subsystem 必须逐字段锁定 generic `public_response` 与 safe `log_contract`，且任何公开/
+  日志字段不得复述 submitted scalar。另以稳定 ID 锁定拆分后的 anonymous response/order、postcommit committed outcome 与
+  Admin no-transform/exact-framing boundaries。Do not assert invented `XMaxio*` codes。
 
 - [ ] **Step 7: Run and confirm RED.** Run:
 
@@ -578,7 +605,8 @@ status/code/message/priority must be source/live verified before this RED task s
   ```
 
 - [ ] **Step 9: Independent RED review.** Lane C checks auth-before-body、caller identity isolation、all byte boundaries、empty 200/
-  no applied、no-transform 与安全错误证据。
+  no applied、no-transform 与安全错误证据，并把 fixture 中每个 precedence priority、condition id 与 named local decision
+  对应到一个可失败 RED assertion。任何漏项继续 BLOCK Task 7。
 
 ### Task 7: Implement Admin config export/import transport
 
@@ -596,6 +624,9 @@ status/code/message/priority must be source/live verified before this RED task s
 
 - Consumes: Task 5 Archive API and Task 6 RED。
 - Produces: authenticated GET/PUT `/minio/admin/v3/config` with exact bounded caller-secret SIO。
+
+**Entry gate:** Task 6 RED 已由独立 Lane C review，且逐项覆盖 fixture 的每个 precedence priority、condition id 与 named
+local transport decision；否则不得开始 production。Fixture provenance completeness 本身不能替代这道 RED coverage gate。
 
 - [ ] **Step 1: Generalize encrypted request helpers.** Add archive-neutral bounded read/encrypt helpers while keeping S5 method
   delegates。Before decrypt reject ciphertext >262272；after decrypt retain defense `byte_size(plaintext) <= 262_144`，but document

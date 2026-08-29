@@ -68,6 +68,40 @@ S7 研究 lane 已确认：
 
 上述结论必须在独立 S7 fixture 中记录源码路径、行级摘录摘要和 commit identity，不能只引用本设计文字。
 
+### 1.1 Task 6 证据 taxonomy 与机器继承规则
+
+Task 6 transport/error gate 允许且只允许四类证据：
+
+- `source_verified`：直接来自 pinned 官方源码及 `raw_sha256.json` 的 raw/excerpt hash。上游兼容事实只能使用本类或
+  `live_verified`。
+- `live_verified`：Task 6 RED 前的真实捕获，必须记录 pinned binary/server identity、OS/命令、脱敏 artifact hash 与
+  observed result；没有真实捕获就不得使用。本 S7 fixture 当前不声称任何 `live_verified`。
+- `existing_contract_verified`：S7 之前已存在、已有自动化契约并在 S5/S6 immutable closeout 中由独立 lane 审查的
+  Maxio 行为。每个使用点必须给出结构化 `contract_reference`，其 `kind: "baseline"` 必须解析到仓库内真实文件及真实
+  `test_id` 或 `symbol`；它只证明本地既有契约，不证明 upstream parity，并必须由 Task 6 RED 逐行重新锁定。
+- `local_design_expected`：S7 明确选择的 Maxio 新语义、安全加强或 transport repair。每个使用点必须给出
+  结构化 `contract_reference`，其 `kind: "design"` 必须解析到本设计的真实 section；它不是 source/live 事实，必须由
+  Task 6 RED 锁定并经独立 RED review 后才能进入 Task 7。
+
+`VERIFY-AT-IMPL`、缺失 class 与未知 class 均不得出现在 Task 6 decision roots。fixture 通过
+`task6_entry_gate.decision_documents` 枚举所有被 Task 6 消费的 fixture/JSON-pointer 根，包括完整 W1 limits 文档、W2/error
+与 fresh archive；每个 decision leaf 继承最近祖先的 `evidence_class`，但没有继承 class
+的 list member 必须自己声明。根列表明确包含完整 conditions/precedence、`precedence_assertion` 与
+`contract_sources.reuse_rule`。完整性测试递归扫描这些根，并定向检查 error conditions、十二级 precedence、匿名隐藏、
+postcommit 结果和 Admin transport repair。`source_claims` 必须以 `fixture.json#/JSON/pointer` 为 key，为每个显式
+`source_verified` boundary 列出非空 `claim_ids` 与 `source_ids`；二者必须解析到 `raw_sha256.json`，且每个 source 的 pinned
+raw URL、raw hash 和 excerpt hash 都必须完整可验。`unresolved: []` 只是扫描结果，不能作为自证。
+
+复合语义不得借一个 class 混写：anonymous 的既有 `403/AccessDenied/Access Denied` response 是
+`existing_contract_verified`，S7 的 auth-before-entity-length/body ordering 是 `local_design_expected`；path-style Admin
+`Cache-Control: no-transform` 是既有 contract，而 S7 archive response 的 exact CL、无 TE、无 CE 是本地 transport repair。
+unknown-subsystem 的公开 message 可包含安全 subsystem token，但不得复述 submitted scalar；fixture 必须同时冻结
+`public_response` 与只含安全 metadata、无 scalar/plaintext 的 `log_contract`。
+
+`PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED` 只表示 fixture provenance 足以开始写 Task 6 RED，不表示 S7 endpoint 或
+strict-live 已 PASS。Task 7 仍须等待独立 reviewer 确认 RED 已逐项锁定。W5 的 Windows native mc 动态捕获继续只阻塞
+Task 8，不阻塞 Task 6。
+
 研究 lane 还固定了以下边界：
 
 - madmin PUT 明文为空时在客户端本地返回 EOF，不发 HTTP；1..262144 bytes 会发请求；262145 bytes 及以上
@@ -82,7 +116,7 @@ S7 研究 lane 已确认：
 - Maxio 三键 hot apply，但 PUT wire 仍为 HTTP 200 空体且不发送 `x-minio-config-applied`，使 pinned mc 保持
   官方 restart 提示。
 
-以下细节在本文撰写时尚未固定，先标记为 `VERIFY-AT-IMPL`：
+以下细节在本文初稿撰写时尚未固定，曾标记为 `VERIFY-AT-IMPL`：
 
 - GET 成功响应的精确 Content-Type、随机 SIO framing/length（不包括固定 ciphertext bytes）；
 - pinned mc restart 文案的精确 human/JSON bytes；
@@ -92,9 +126,10 @@ S7 研究 lane 已确认：
 - GET 是否携带任何 entity header，以及 proxy/Bandit 对响应 framing 的实际影响；
 - Windows 原生 mc 对 stdin、stdout 或临时文件的确切命令形式。
 
-`VERIFY-AT-IMPL` 不是实现者自由选择项。凡会决定 RED/production 的细节，协议 lane 必须在对应测试/实现开始前
-用 pinned source 或 pre-implementation live 固化为 fixture；Windows mc argv/stdin 与 ErrorMap 也适用。最终
-strict-live 只复验已冻结契约，不能首次决定实现。实现 lane 只能满足已审查 fixture。
+`VERIFY-AT-IMPL` 不是实现者自由选择项。Task 6 的 transport/error 决策现由上述四类 taxonomy 逐项关闭：上游兼容
+事实仍必须是 pinned source 或 pre-implementation live；Maxio 既有/本地设计事实必须有精确 reference，并由 Task 6
+RED 锁定。Windows mc argv/stdin 仍为 W5 `VERIFY-AT-IMPL`，只阻塞 Task 8。最终 strict-live 只复验已冻结契约，
+不能首次决定实现；实现 lane 只能满足已审查 fixture 与 RED。
 
 ---
 
@@ -555,8 +590,9 @@ limit 正确。89-byte fixture 只固定 plaintext local design，不固定某�
 无 Transfer-Encoding、无 Content-Encoding。这是 deliberate transport repair，不应伪装成上游 raw server
 必然具有同样 framing。
 
-GET Content-Type/framing 和错误映射中尚未固定的精确值必须由 pre-implementation fixture 关闭
-`VERIFY-AT-IMPL` 后才可写 endpoint RED/production。实现不得猜测新的 `XMaxio*` error code。
+GET Content-Type/framing 与错误映射的精确值必须先通过 Task 6 provenance gate：upstream-compatible 字段使用
+`source_verified`/`live_verified`，既有 Maxio 行为或本地 repair 使用带 reference 的
+`existing_contract_verified`/`local_design_expected`，再由 endpoint RED 锁定。实现不得猜测新的 `XMaxio*` error code。
 
 ---
 
@@ -698,11 +734,11 @@ S7 不需要 migration：
 
 - 固定 route、action、source commit、SIO、256 KiB/262272、稳定顺序、omitted/default、duplicate patch、unknown
   failure 和 mc restart 分支。
-- 所有会决定 RED 或 production 的 `VERIFY-AT-IMPL` 必须在对应 RED/实现 task 开始前由 pinned source 或
-  pre-implementation live fixture 关闭；尤其包括 Windows native mc argv/stdin 和每个 ErrorMap status/code/message/
-  priority。无法关闭时阻塞相应实现，不能延后到最终 strict-live 首次决定。
+- Task 6 decision roots 必须递归拒绝 `VERIFY-AT-IMPL`、缺失 class 与未知 class。每个 ErrorMap condition 与 precedence
+  row 都须逐项 class；本地 class 还须有 contract reference，并由 Task 6 RED 锁定。Windows native mc argv/stdin 的
+  W5 动态缺口只阻塞 Task 8，不能误阻 Task 6，也不能延后到最终 strict-live 首次决定。
 - 最终 strict-live 只复验已经冻结的 fixture 和报告环境偏差，不承担首次选择 production contract。
-- source-derived、fixture-expected、fake-observed、live-pass 必须明确区分。
+- source-verified、existing-contract、local-design、fixture-expected、fake-observed、live-pass 必须明确区分。
 
 ### 14.2 Archive 纯测试
 
@@ -781,8 +817,9 @@ S7 不需要 migration：
 
 S7 只有同时满足以下条件才可完成：
 
-- 独立 protocol fixture review 在每个对应 RED/implementation task 前关闭全部会影响实现的
-  `VERIFY-AT-IMPL`；Windows mc argv/stdin 和 ErrorMap 不能留到最终 live；
+- 独立 protocol fixture review 在每个对应 RED/implementation task 前关闭其 decision roots：Task 6 不得含
+  `VERIFY-AT-IMPL`/缺失/未知 class，且本地 class 必须被 RED 锁定；Windows mc argv/stdin 的 W5 缺口只阻塞
+  Task 8，不能留到最终 live 首次决定；
 - 测试 lane 先提交 RED，生产实现 lane 与 reviewer 均为不同上下文；
 - 所有 task review 无 Critical/Important；
 - focused batch、compile warnings-as-errors、format 和 diff gates 通过；

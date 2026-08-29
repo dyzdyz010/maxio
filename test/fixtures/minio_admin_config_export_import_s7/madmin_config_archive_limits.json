@@ -1,6 +1,7 @@
 {
   "schema": "maxio.madmin_config_archive_limits.v1",
   "fixture_id": "madmin-config-archive-limits-s7-v1",
+  "evidence_class": "source_verified",
   "pins": {
     "madmin_go": "4b504b82db633e978a57d49443b2be75824244c3",
     "sio_go_version": "v0.3.1",

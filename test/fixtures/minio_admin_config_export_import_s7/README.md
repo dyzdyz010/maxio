@@ -23,11 +23,42 @@ at `a455d2cd8fcacdfe18557d117db15c0629fb7e2c`.
 
 ## Evidence classes
 
-- `source_verified` follows directly from pinned official source and its recorded hashes.
-- `local_design_expected` is an intentional Maxio contract, never an upstream or live fact.
-- `live_verified` is reserved for a real pinned capture. None is claimed here.
+- `source_verified` follows directly from pinned official source and its recorded raw/excerpt
+  hashes. An upstream compatibility claim may use this class or `live_verified`, never a local
+  class.
+- `live_verified` is reserved for a real pre-implementation capture with pinned binary/server
+  identity, OS/command, redacted artifact hash and observed result. None is claimed here.
+- `existing_contract_verified` is behavior already shipped and independently reviewed before S7,
+  with a named S5/S6 fixture, test, error symbol or immutable closeout reference. Each Task 6 JSON
+  boundary uses a structured `kind: baseline` reference that resolves to a real repository file and
+  test id or symbol. It proves only a Maxio contract, not upstream parity, and Task 6 RED must
+  re-lock every reused row before Task 7.
+- `local_design_expected` is an intentional S7 Maxio choice or repair with a named design/contract
+  reference. Each Task 6 JSON boundary uses a structured `kind: design` reference that resolves to
+  a real S7 design section. It is never an upstream or live fact, and Task 6 RED plus an independent
+  RED review must lock it before Task 7 production starts.
 - `VERIFY-AT-IMPL` is an honest pending observation. If it determines implementation, its named
   task gate is blocked until a pre-implementation capture closes it; Task 11 may only reverify.
+
+For Task 6, `task6_entry_gate.decision_documents` names every fixture and JSON-pointer root consumed
+by the RED, including the complete W1 limits document, the full W2 condition/precedence matrices,
+`precedence_assertion`, ErrorMap `reuse_rule`, and the fresh-archive roots. Every
+decision leaf inherits the nearest ancestor `evidence_class`. A list member with no inherited class must declare
+its own. The integrity test recursively rejects a missing class, an unknown class and any
+`VERIFY-AT-IMPL` below those roots. It also resolves the structured `contract_reference` at every
+explicit `existing_contract_verified` or `local_design_expected` boundary. This rule covers the
+entire error-condition matrix and every precedence row; an empty `unresolved` array cannot certify
+itself. `task6_entry_gate.source_claims` is keyed by explicit `fixture.json#/JSON/pointer` boundary;
+each binding has non-empty `claim_ids` and `source_ids` that resolve through
+`raw_sha256.json.claim_sources` to immutable pinned raw URLs and verifiable raw/excerpt hashes.
+Because the W1 limits document root also asserts MinIO server boundary outcomes, its root binding
+includes both the W1 madmin/SIO claim and the W2 MinIO handler/ciphertext-limit claim; child vector
+bindings do not substitute for the nearest root boundary.
+
+`PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED` means only that the fixture is complete enough for the
+independent Task 6 test author to write RED. It is not a live or endpoint behavior PASS. Task 7
+remains blocked until a separate reviewer confirms that Task 6 RED table-locks every precedence
+priority, condition id and named local transport decision.
 
 The fresh Maxio archive is stored as base64 and an escaped rendering, not as a tracked text file
 with physical trailing spaces. Tests must decode it and recompute exactly 89 bytes and SHA-256
@@ -39,19 +70,24 @@ exactly `local_design_expected`; it is not a universal MinIO default export.
 - W1 — madmin local plaintext limits and SIO frame formula. `PASS_SOURCE_VERIFIED` before endpoint
   RED: for positive `n`, encrypted length is `41+n+16*ceil(n/16384)`.
 - W2 — direct server ciphertext limits, framing, authorization precedence and errors.
-  `PASS_SOURCE_AND_EXISTING_CONTRACT_VERIFIED`: a valid SIO PUT cannot reach a post-decrypt
+  `PASS_PROVENANCE_COMPLETE_FOR_TASK_6_RED`: a valid SIO PUT cannot reach a post-decrypt
   plaintext-over-256-KiB branch because the 262272-byte ciphertext gate limits plaintext to
   261975 bytes. A defense-in-depth plaintext guard reuses the existing TooLarge contract as
-  `local_design_expected`. All other rows reuse S5/ErrorMap or pinned source. A valid identity
-  denied `admin:ConfigUpdate` receives `AccessDenied`; authentication failures retain their own
-  authentication error codes.
+  `local_design_expected`. Other rows are individually classified as pinned-source facts or
+  reviewed existing Maxio contracts. The twelve-stage precedence, auth-before-body ordering,
+  postcommit outcome and exact archive response framing are local design contracts that Task 6 RED
+  must lock. Anonymous `403/AccessDenied/Access Denied` and path-style Admin `no-transform` are
+  separately anchored existing contracts. Unknown-subsystem public/log contracts may retain a safe
+  subsystem token but must omit the submitted scalar and plaintext. A valid identity denied
+  `admin:ConfigUpdate` receives `AccessDenied`; authentication failures retain their own codes.
 - W3 — export bytes and order. `PASS_SOURCE_VERIFIED_WITH_LOCAL_DESIGN_PAYLOAD` before Archive RED.
   A deployment-specific full MinIO default export remains a non-decisional Task 11 observation.
 - W4 — import defaults, replacement, duplicates and unknown input. The upstream mechanics are
   `source_verified`; deliberate Maxio target/unknown rejection is `local_design_expected`.
 - W5 — native mc dispatch, success and restart output. `VERIFY-AT-IMPL`: exact Windows child
   argv/stdin/stdout/stderr/exit needs a pre-implementation capture, so Task 8 is blocked until it
-  is closed. It must not be deferred to Task 11 for the first decision.
+  is closed. It must not be deferred to Task 11 for the first decision, and it does not block
+  Task 6.
 
 ## Security and reproducibility
 
