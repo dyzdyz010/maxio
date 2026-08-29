@@ -77,6 +77,26 @@ defmodule Maxio.Admin.ConfigKV.AdapterTest do
              ) == %{"v" => 900_000}
     end
 
+    test "repeated same-kind quote layers are BadJSON before mutation coordination" do
+      # Catches trim-all sanitization turning either overquoted integer into a valid typed value.
+      # Both inputs run before assertions so double- and single-quote behavior is observed.
+      results = [
+        Adapter.set(~s(s3 clock_skew_ms=""900000""), mutation_opts()),
+        Adapter.set("s3 clock_skew_ms=''900000''", mutation_opts())
+      ]
+
+      assert results == [{:error, :config_bad_json}, {:error, :config_bad_json}]
+
+      assert ConfigBatchFailureRepo.observations() == %{
+               transactions: 0,
+               query_calls: 0,
+               advisory_locks: 0
+             }
+
+      assert Repo.aggregate(RuntimeConfig, :count) == 0
+      assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+    end
+
     test "integer commands reject partial decimals and both out-of-range neighbors" do
       # Catches Integer.parse/1 remainder loss, clamping, or bounds checked against the wrong
       # projection. None of these invalid scalars may begin a transaction.

@@ -135,6 +135,44 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
            ) == %{"v" => 900_000}
   end
 
+  test "encrypted overquoted integers are exact BadJSON without mutation" do
+    # Catches encrypted HTTP input reaching trim-all sanitization and persisting a typed integer.
+    # Both requests run before assertions so repeated double and single quote layers are covered.
+    cases = [
+      {~s(s3 clock_skew_ms=""900000""), "req-config-overquoted-double"},
+      {"s3 clock_skew_ms=''900000''", "req-config-overquoted-single"}
+    ]
+
+    responses =
+      Enum.map(cases, fn {plaintext, request_id} ->
+        {request_id,
+         mutation(:put, @set_path, plaintext,
+           request_id: request_id,
+           config_kv_test_opts: [repo: ConfigBatchFailureRepo]
+         )}
+      end)
+
+    for {request_id, response} <- responses do
+      assert_admin_error(
+        response,
+        400,
+        "XMinioAdminConfigBadJSON",
+        @bad_json,
+        @set_path,
+        request_id
+      )
+    end
+
+    assert ConfigBatchFailureRepo.observations() == %{
+             transactions: 0,
+             query_calls: 0,
+             advisory_locks: 0
+           }
+
+    assert Repo.aggregate(RuntimeConfig, :count) == 0
+    assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
+  end
+
   test "wrong methods, v4, adjacent, help, export and history paths remain authenticated 501" do
     # Catches an over-broad prefix dispatch that accidentally claims a neighboring or explicitly
     # deferred Admin API while wiring the three exact triples.

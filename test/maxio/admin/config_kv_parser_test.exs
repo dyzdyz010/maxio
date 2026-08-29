@@ -20,6 +20,20 @@ defmodule Maxio.Admin.ConfigKV.ParserTest do
              {:ok, %{wire_subsystem: "s3", patches: [{"clock_skew_ms", "900000"}]}}
   end
 
+  test "repeated same-kind quote layers retain one layer after one-shot sanitization" do
+    # Catches trim-all primitives that accept overquoted typed values. Each quote kind loses at
+    # most one prefix and one suffix, so one complete layer must remain for typed rejection.
+    results = [
+      parse_set(~s(s3 clock_skew_ms=""900000""), entries()),
+      parse_set("s3 clock_skew_ms=''900000''", entries())
+    ]
+
+    assert results == [
+             {:ok, %{wire_subsystem: "s3", patches: [{"clock_skew_ms", ~s("900000")}]}},
+             {:ok, %{wire_subsystem: "s3", patches: [{"clock_skew_ms", "'900000'"}]}}
+           ]
+  end
+
   test "set parser preserves raw inner whitespace after outer quote sanitization" do
     # Catches overzealous trimming/tokenizing that would change a raw value before the typed
     # boundary has an opportunity to accept or reject it.
