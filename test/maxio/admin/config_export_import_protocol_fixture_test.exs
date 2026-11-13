@@ -2,6 +2,16 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
   use ExUnit.Case, async: true
 
   @fixture_dir Path.expand("../../fixtures/minio_admin_config_export_import_s7", __DIR__)
+  @w5_entry_gate_dir Path.join(@fixture_dir, "w5_entry_gate")
+  @w5_capture_file "native_windows_fake_capture.json"
+  @w5_capture_harness_files ["capture_runner.go", "fake_server.go"]
+  @w5_artifact_harness_files ["capture_runner.go", "fake_server.go", "capture_runner_test.go"]
+  @w5_tracked_paths [
+    "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/capture_runner.go",
+    "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/fake_server.go",
+    "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/capture_runner_test.go",
+    "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/native_windows_fake_capture.json"
+  ]
   @project_root Path.expand("../../..", __DIR__)
   @s7_design_file "docs/superpowers/specs/2026-08-29-minio-admin-config-export-import-s7-design.md"
   @fixture_files [
@@ -445,13 +455,332 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
 
     assert wire["implementation_decision_fields"]["unresolved"] == []
 
-    if dispatch["verification_item"]["status"] == "VERIFY-AT-IMPL" do
-      assert dispatch["verification_item"]["implementation_gate"] == "BLOCKED_BEFORE_TASK_8"
-      assert dispatch["verification_item"]["must_not_wait_until"] == "Task_11"
-      assert dispatch["live_observation"]["task_gate"] == "Task_8_blocked_until_closed"
-      assert dispatch["live_observation"]["task_11_role"] == "reverify_only_not_first_decision"
-      assert production_w5_consumers() == []
+    assert dispatch["verification_item"]["status"] ==
+             "PASS_SOURCE_AND_WINDOWS_NATIVE_CLIENT_VERIFIED"
+
+    assert dispatch["verification_item"]["implementation_gate"] ==
+             "PASS_TASK_8_ENTRY_GATE"
+
+    assert dispatch["verification_item"]["task_11_role"] ==
+             "reverify_only_not_first_decision"
+
+    assert dispatch["live_observation"] == %{
+             "evidence_class" => "live_verified",
+             "status" => "complete_native_client_side",
+             "task_gate" => "Task_8_entry_gate_pass",
+             "task_11_role" => "reverify_only_not_first_decision"
+           }
+
+    refute contains_text?(dispatch, "VERIFY-AT-IMPL")
+  end
+
+  test "W5 freezes the pinned Windows binary, canonical argv and native stream matrix", %{
+    fixtures: fixtures
+  } do
+    dispatch = fixtures["mc_config_archive_dispatch.json"]
+
+    assert dispatch["pin"] == %{
+             "repository" => "https://github.com/minio/mc",
+             "commit" => "77f82e18b5401a65958f1619df6ebb994634bd88",
+             "version" => "DEVELOPMENT.2025-11-06T16-25-29Z",
+             "binary_sha256" =>
+               "f13d5a27903fdb17a9708a8d634c9840eaa65c92c5a1b9f8288d4d530e41e38a",
+             "binary_byte_length" => 31_587_328,
+             "runtime" => "go1.24.9 windows/amd64"
+           }
+
+    source = dispatch["source_verified_dispatch"]
+    assert source["export_syntax"] == "exactly_one_TARGET"
+    assert source["import_syntax"] == "exactly_one_TARGET"
+    assert source["import_input"] == "os.Stdin_only"
+    assert source["import_file_argument"] == false
+    assert source["temporary_file_created_by_mc"] == false
+
+    assert source["canonical_argv_after_executable"] == %{
+             "export_human" => ["--no-color", "admin", "config", "export", "ALIAS/"],
+             "export_json" => ["--json", "admin", "config", "export", "ALIAS/"],
+             "import_human" => ["--no-color", "admin", "config", "import", "ALIAS/"],
+             "import_json" => ["--json", "admin", "config", "import", "ALIAS/"]
+           }
+
+    assert source["global_json_position"]["canonical_for_Task_8"] ==
+             "root_prefix_before_admin"
+
+    assert source["global_json_position"]["native_accepted_positions"] == [
+             "root_prefix_before_admin",
+             "after_admin_before_config",
+             "after_config_before_leaf",
+             "after_leaf_before_TARGET",
+             "after_TARGET"
+           ]
+
+    launcher = dispatch["windows_launcher_contract"]
+    assert launcher["evidence_class"] == "live_verified"
+
+    assert launcher["observed_import_stdin"] ==
+             "89 raw archive bytes to child stdin followed by EOF"
+
+    assert launcher["observed_non_tty_line_endings"] == "LF_only_no_CR"
+    assert launcher["http_peer_class"] == "fake_observed"
+
+    matrix = dispatch["windows_native_stream_matrix"]
+    empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    assert matrix["export_human_success"] == %{
+             "stdout" => %{"byte_length" => 89, "sha256" => @archive_sha},
+             "stderr" => %{"byte_length" => 0, "sha256" => empty_sha},
+             "exit_code" => 0
+           }
+
+    assert matrix["import_json_success"]["stdin_byte_length"] == 89
+
+    assert matrix["import_json_success"]["stdout"] == %{
+             "byte_length" => 21,
+             "sha256" => "9a14b700bc2581383cfae352c91f00fc65439392344a2f823a9645e8546a3bde"
+           }
+
+    assert matrix["import_json_success"]["stderr"] == %{
+             "byte_length" => 0,
+             "sha256" => empty_sha
+           }
+
+    assert matrix["import_json_success"]["exit_code"] == 0
+    assert matrix["empty_stdin_client_error"]["http_request_count"] == 0
+    assert matrix["empty_stdin_client_error"]["exit_code"] == 1
+    assert matrix["extra_file_argument_usage_error"]["http_request_count"] == 0
+    assert matrix["extra_file_argument_usage_error"]["exit_code"] == 1
+    assert matrix["human_server_error"]["export_stdout"]["byte_length"] == 0
+    assert matrix["human_server_error"]["export_stderr"]["byte_length"] == 97
+    assert matrix["human_server_error"]["import_stdout"]["byte_length"] == 0
+    assert matrix["human_server_error"]["import_stderr"]["byte_length"] == 97
+    assert matrix["human_server_error"]["exit_code"] == 1
+    assert matrix["json_server_error"]["stderr_byte_length"] == 0
+    assert matrix["json_server_error"]["exit_code"] == 1
+
+    assert dispatch["source_verified_rendering"]["human_error_stream"] == "stderr"
+    assert dispatch["source_verified_rendering"]["json_error_stream"] == "stdout"
+    assert dispatch["source_verified_rendering"]["error_exit"] == 1
+
+    assert dispatch["artifact_record"]["raw_secret_or_ciphertext_retained"] == false
+    assert dispatch["artifact_record"]["raw_streams_retained"] == false
+  end
+
+  test "W5 dispatch fixes the four tracked entry-gate artifact paths", %{fixtures: fixtures} do
+    artifact = fixtures["mc_config_archive_dispatch.json"]["artifact_record"]
+
+    assert artifact["path"] == List.last(@w5_tracked_paths)
+
+    harnesses = artifact["harnesses"]
+    assert is_map(harnesses)
+    assert harnesses |> Map.keys() |> Enum.sort() == Enum.sort(@w5_artifact_harness_files)
+
+    assert Enum.all?(Enum.zip(@w5_artifact_harness_files, Enum.take(@w5_tracked_paths, 3)), fn {
+                                                                                        file,
+                                                                                        path
+                                                                                      } ->
+             record = harnesses[file]
+
+             record["path"] == path and
+               Regex.match?(~r/\A[0-9a-f]{64}\z/, record["sha256"] || "")
+           end)
+
+    assert Enum.all?(harnesses, fn {_file, record} ->
+             Regex.match?(~r/\A[0-9a-f]{64}\z/, record["sha256"] || "")
+           end)
+  end
+
+  test "W5 tracked capture and Go harness bytes match the dispatch artifact record", %{
+    fixtures: fixtures
+  } do
+    missing =
+      Enum.reject([@w5_capture_file | @w5_artifact_harness_files], fn file ->
+        File.regular?(Path.join(@w5_entry_gate_dir, file))
+      end)
+
+    assert missing == []
+
+    dispatch_record = fixtures["mc_config_archive_dispatch.json"]["artifact_record"]
+    capture_bytes = File.read!(Path.join(@w5_entry_gate_dir, @w5_capture_file))
+    capture = Jason.decode!(capture_bytes)
+
+    assert byte_size(capture_bytes) == dispatch_record["byte_length"]
+    assert sha256(capture_bytes) == dispatch_record["sha256"]
+
+    for file <- @w5_artifact_harness_files do
+      bytes = File.read!(Path.join(@w5_entry_gate_dir, file))
+      dispatch_harness = dispatch_record["harnesses"][file]
+
+      assert sha256(bytes) == dispatch_harness["sha256"], file
+
+      if file in @w5_capture_harness_files do
+        capture_harness = capture["capture_harness"][file]
+        assert sha256(bytes) == capture_harness["source_sha256"], file
+      end
     end
+  end
+
+  test "W5 tracked capture records native identity build settings toolchain and clean source tree" do
+    capture = read_w5_capture!()
+    identity = capture["native_binary"]["identity"]
+    build = capture["native_binary"]["build"]
+    source = build["source"]
+    settings = build["settings"]
+    toolchain = capture["toolchain"]
+
+    assert identity["repository"] == "https://github.com/minio/mc"
+    assert identity["commit"] == @pins["mc"]
+    assert identity["version"] == "DEVELOPMENT.2025-11-06T16-25-29Z"
+    assert identity["os"] == "windows"
+    assert identity["arch"] == "amd64"
+    assert is_integer(identity["byte_length"]) and identity["byte_length"] > 0
+    assert Regex.match?(~r/\A[0-9a-f]{64}\z/, identity["sha256"] || "")
+
+    assert build["toolchain"] == "go1.24.9"
+    assert settings["GOOS"] == "windows"
+    assert settings["GOARCH"] == "amd64"
+    assert source["vcs"] == "git"
+    assert source["revision"] == @pins["mc"]
+    assert source["clean"] == true
+    assert Regex.match?(~r/\A[0-9a-f]{40}\z/, source["tree"] || "")
+
+    assert toolchain["url"] == "https://go.dev/dl/go1.24.9.windows-amd64.zip"
+    assert is_integer(toolchain["byte_length"]) and toolchain["byte_length"] > 0
+    assert Regex.match?(~r/\A[0-9a-f]{64}\z/, toolchain["sha256"] || "")
+  end
+
+  test "every W5 native capture case locks normalized process HTTP and SIO evidence" do
+    capture = read_w5_capture!()
+    expected = w5_case_contracts()
+
+    assert capture["captures"] |> Map.keys() |> Enum.sort() ==
+             expected |> Map.keys() |> Enum.sort()
+
+    errors =
+      for {name, contract} <- expected,
+          error <- w5_case_errors(name, capture["captures"][name], contract),
+          do: {name, error}
+
+    assert errors == []
+  end
+
+  test "W5 normalized JSON errors lock decoded invariants and placeholder request IDs only" do
+    capture = read_w5_capture!()
+
+    for name <- ["export_json_error", "import_json_error"] do
+      captured = capture["captures"][name]
+      bytes = normalized_stream_bytes!(captured["stdout"])
+      decoded = Jason.decode!(bytes)
+
+      assert decoded["status"] == "error", name
+      assert normalized_request_ids(decoded) == ["<REQUEST_ID>"], name
+      assert captured["stable_invariants"]["stream"] == "stdout", name
+      assert captured["stable_invariants"]["exit_code"] == 1, name
+
+      decoded_invariants = captured["stable_invariants"]["decoded"]
+      assert is_map(decoded_invariants) and map_size(decoded_invariants) > 0, name
+
+      assert Enum.all?(decoded_invariants, fn {key, value} -> decoded[key] == value end),
+             name
+
+      refute Map.has_key?(captured, "raw_stdout_byte_length"), name
+      refute Map.has_key?(captured, "raw_stdout_sha256"), name
+      refute contains_text?(captured, "W5-REDACTED"), name
+    end
+  end
+
+  test "W5 usage capture normalizes the host config path and locks only stable invariants" do
+    capture = read_w5_capture!()
+    usage = capture["captures"]["import_extra_file_arg"]
+    stdout = normalized_stream_bytes!(usage["stdout"])
+
+    assert String.contains?(stdout, "<MC_CONFIG_DIR>")
+    assert usage["stable_invariants"] != []
+    assert Enum.all?(usage["stable_invariants"], &String.contains?(stdout, &1))
+
+    refute Regex.match?(~r/[A-Za-z]:\\Users\\/i, stdout)
+    refute Map.has_key?(usage, "raw_stdout_byte_length")
+    refute Map.has_key?(usage, "raw_stdout_sha256")
+  end
+
+  test "W5 Task 8 gate consumes normalized contracts and excludes capture-only dynamic fields", %{
+    fixtures: fixtures
+  } do
+    gate = fixtures["mc_config_archive_dispatch.json"]["verification_item"]
+
+    assert gate["task8_capture_contract"] == [
+             "normalized_argv",
+             "windows_command_line.status",
+             "stdin.byte_length",
+             "stdin.sha256",
+             "stdin.eof",
+             "stdout.normalized_bytes_base64",
+             "stdout.byte_length",
+             "stdout.sha256",
+             "stderr.normalized_bytes_base64",
+             "stderr.byte_length",
+             "stderr.sha256",
+             "exit_code",
+             "http_request_delta",
+             "classification",
+             "sio",
+             "stable_invariants"
+           ]
+
+    forbidden =
+      Enum.filter(gate["task8_capture_contract"], fn field ->
+        Regex.match?(
+          ~r/(?:raw|dynamic|host_path|request_id_value|ciphertext_(?:bytes|sha))/i,
+          field
+        )
+      end)
+
+    assert forbidden == []
+  end
+
+  test "W5 dispatch no longer freezes raw dynamic JSON or host-specific usage bytes", %{
+    fixtures: fixtures
+  } do
+    matrix = fixtures["mc_config_archive_dispatch.json"]["windows_native_stream_matrix"]
+    json_error = matrix["json_server_error"]
+    usage = matrix["extra_file_argument_usage_error"]
+
+    assert json_error["contract"] == "decoded_stable_invariants_with_normalized_request_id"
+    refute Map.has_key?(json_error, "export_stdout")
+    refute Map.has_key?(json_error, "import_stdout")
+
+    assert usage["contract"] == "normalized_usage_invariants"
+    refute Map.has_key?(usage, "stdout_observed")
+  end
+
+  test "W5 capture validators accept normalized safe evidence and reject raw dynamic material" do
+    valid = valid_w5_case_sample()
+
+    contract = %{
+      argv: valid["normalized_argv"],
+      http_delta: 1,
+      exit_code: 0,
+      stdin_length: 0,
+      sio: nil
+    }
+
+    assert w5_case_errors("sample", valid, contract) == []
+    assert forbidden_w5_material(valid) == []
+
+    unsafe =
+      valid
+      |> Map.put("raw_request_id", "W5-REDACTED")
+      |> put_in(["stdout", "raw_sha256"], String.duplicate("a", 64))
+
+    assert forbidden_w5_material(unsafe) != []
+  end
+
+  test "W5 capture cases contain no secret, authorization, signature, ciphertext, or raw IDs" do
+    capture = read_w5_capture!()
+
+    assert capture["captures"]
+           |> Enum.flat_map(fn {name, captured} ->
+             Enum.map(forbidden_w5_material(captured), &{name, &1})
+           end) == []
   end
 
   test "Task 6 decision roots recursively reject missing unknown and unresolved provenance", %{
@@ -1051,6 +1380,283 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
     assert forbidden_material_fields == []
   end
 
+  defp read_w5_capture! do
+    path = Path.join(@w5_entry_gate_dir, @w5_capture_file)
+
+    case File.read(path) do
+      {:ok, bytes} -> Jason.decode!(bytes)
+      {:error, reason} -> flunk("cannot read tracked W5 capture #{path}: #{inspect(reason)}")
+    end
+  end
+
+  defp w5_case_contracts do
+    empty = %{stdin_length: 0, sio: nil}
+    import = %{stdin_length: 89, sio: :import_archive}
+
+    %{
+      "export_human_success" =>
+        w5_contract(
+          ["--no-color", "admin", "config", "export", "ALIAS/"],
+          1,
+          0,
+          :export_archive
+        ),
+      "export_json_success" =>
+        w5_contract(
+          ["--json", "admin", "config", "export", "ALIAS/"],
+          1,
+          0,
+          :export_archive
+        ),
+      "export_json_after_admin" =>
+        w5_contract(
+          ["admin", "--json", "config", "export", "ALIAS/"],
+          1,
+          0,
+          :export_archive
+        ),
+      "export_json_after_config" =>
+        w5_contract(
+          ["admin", "config", "--json", "export", "ALIAS/"],
+          1,
+          0,
+          :export_archive
+        ),
+      "export_json_before_target" =>
+        w5_contract(
+          ["admin", "config", "export", "--json", "ALIAS/"],
+          1,
+          0,
+          :export_archive
+        ),
+      "export_json_after_target" =>
+        w5_contract(
+          ["admin", "config", "export", "ALIAS/", "--json"],
+          1,
+          0,
+          :export_archive
+        ),
+      "import_human_success" =>
+        w5_contract(["--no-color", "admin", "config", "import", "ALIAS/"], 1, 0, :archive, import),
+      "import_json_success" =>
+        w5_contract(["--json", "admin", "config", "import", "ALIAS/"], 1, 0, :archive, import),
+      "import_empty_stdin" =>
+        w5_contract(["--no-color", "admin", "config", "import", "ALIAS/"], 0, 1, nil, empty),
+      "import_extra_file_arg" =>
+        w5_contract(
+          ["--no-color", "admin", "config", "import", "ALIAS/", "config.txt"],
+          0,
+          1,
+          nil,
+          empty
+        ),
+      "export_human_error" =>
+        w5_contract(["--no-color", "admin", "config", "export", "ALIAS/"], 1, 1, nil),
+      "export_json_error" =>
+        w5_contract(["--json", "admin", "config", "export", "ALIAS/"], 1, 1, nil),
+      "import_human_error" =>
+        w5_contract(["--no-color", "admin", "config", "import", "ALIAS/"], 1, 1, :archive, import),
+      "import_json_error" =>
+        w5_contract(["--json", "admin", "config", "import", "ALIAS/"], 1, 1, :archive, import)
+    }
+  end
+
+  defp w5_contract(argv, http_delta, exit_code, sio, overrides \\ %{}) do
+    Map.merge(
+      %{
+        argv: ["mc.exe" | argv],
+        http_delta: http_delta,
+        exit_code: exit_code,
+        stdin_length: 0,
+        sio: sio
+      },
+      overrides
+    )
+  end
+
+  defp w5_case_errors(name, captured, contract) when is_map(captured) do
+    argv = captured["normalized_argv"]
+    command_line = captured["windows_command_line"]
+    stdin = captured["stdin"]
+    classification = captured["classification"]
+
+    []
+    |> add_error(argv != contract.argv, {name, :normalized_argv})
+    |> add_error(
+      windows_command_line_error(command_line, contract.argv, contract.http_delta) != nil,
+      {name, :windows_command_line}
+    )
+    |> add_error(stdin_error(stdin, contract.stdin_length) != nil, {name, :stdin})
+    |> add_error(normalized_stream_errors(captured["stdout"]) != [], {name, :stdout})
+    |> add_error(normalized_stream_errors(captured["stderr"]) != [], {name, :stderr})
+    |> add_error(captured["exit_code"] != contract.exit_code, {name, :exit_code})
+    |> add_error(
+      captured["http_request_delta"] != contract.http_delta,
+      {name, :http_request_delta}
+    )
+    |> add_error(
+      classification != %{
+        "native_process_and_stdio" => "live_verified",
+        "http_peer" => if(contract.http_delta == 1, do: "fake_observed", else: "not_reached")
+      },
+      {name, :classification}
+    )
+    |> add_error(sio_error(captured["sio"], contract.sio) != nil, {name, :sio})
+    |> Kernel.++(Enum.map(forbidden_w5_material(captured), &{name, :forbidden_material, &1}))
+    |> Enum.reverse()
+  end
+
+  defp w5_case_errors(name, _captured, _contract), do: [{name, :capture_must_be_a_map}]
+
+  defp windows_command_line_error(command_line, argv, http_delta) when is_map(command_line) do
+    case command_line["status"] do
+      "observed" ->
+        if command_line["normalized"] == Enum.join(argv, " "), do: nil, else: :wrong_command_line
+
+      "not_observed_fast_exit" ->
+        if http_delta == 0, do: nil, else: :only_local_fast_exit_may_be_unobserved
+
+      _other ->
+        :invalid_observation_status
+    end
+  end
+
+  defp windows_command_line_error(_command_line, _argv, _http_delta),
+    do: :command_line_must_be_a_map
+
+  defp stdin_error(stdin, expected_length) when is_map(stdin) do
+    expected_sha = if expected_length == 0, do: sha256(""), else: @archive_sha
+
+    if stdin == %{
+         "byte_length" => expected_length,
+         "sha256" => expected_sha,
+         "eof" => true
+       },
+       do: nil,
+       else: :stdin_contract_mismatch
+  end
+
+  defp stdin_error(_stdin, _expected_length), do: :stdin_must_be_a_map
+
+  defp normalized_stream_errors(stream) when is_map(stream) do
+    encoded = stream["normalized_bytes_base64"]
+
+    case is_binary(encoded) && Base.decode64(encoded) do
+      {:ok, bytes} ->
+        []
+        |> add_error(stream["byte_length"] != byte_size(bytes), :byte_length)
+        |> add_error(stream["sha256"] != sha256(bytes), :sha256)
+        |> add_error(
+          Enum.any?(Map.keys(stream), &Regex.match?(~r/\Araw(?:_|\z)/i, &1)),
+          :raw_stream_field
+        )
+
+      _other ->
+        [:normalized_bytes_base64]
+    end
+  end
+
+  defp normalized_stream_errors(_stream), do: [:stream_must_be_a_map]
+
+  defp normalized_stream_bytes!(stream) do
+    assert normalized_stream_errors(stream) == []
+    Base.decode64!(stream["normalized_bytes_base64"])
+  end
+
+  defp sio_error(%{"applicable" => false} = sio, nil) do
+    if map_size(sio) == 1, do: nil, else: :inapplicable_sio_has_extra_fields
+  end
+
+  defp sio_error(sio, :archive) when is_map(sio) do
+    if sio == %{
+         "applicable" => true,
+         "plaintext_byte_length" => 89,
+         "plaintext_sha256" => @archive_sha,
+         "ciphertext_byte_length" => 146,
+         "ciphertext_retained" => false
+       },
+       do: nil,
+       else: :sio_contract_mismatch
+  end
+
+  defp sio_error(_sio, _expected), do: :sio_contract_mismatch
+
+  defp normalized_request_ids(term) do
+    term
+    |> flatten()
+    |> Enum.filter(fn {path, _value} ->
+      path
+      |> String.split(".")
+      |> List.last()
+      |> String.replace(~r/[^a-z]/i, "")
+      |> String.downcase() == "requestid"
+    end)
+    |> Enum.map(&elem(&1, 1))
+  end
+
+  defp forbidden_w5_material(term) do
+    Enum.flat_map(flatten(term), fn {path, value} ->
+      field = path |> String.split(".") |> List.last()
+
+      cond do
+        Regex.match?(
+          ~r/\A(?:raw_(?:stdout|stderr|request|dynamic|request_id)|(?:stdout|stderr)\.raw_|secret_value|authorization_value|signature_value|ciphertext_(?:bytes|base64|sha256|value)|dynamic_(?:id|request_id)|request_id_(?:raw|value))/i,
+          path
+        ) ->
+          [{path, :forbidden_field}]
+
+        normalize_w5_field(field) == "requestid" and value != "<REQUEST_ID>" ->
+          [{path, :raw_request_id_value}]
+
+        is_binary(value) and
+            (String.contains?(value, "W5-REDACTED") or
+               Regex.match?(~r/(?:Authorization:\s*AWS4|AWS4-HMAC-SHA256\s+Credential=)/i, value)) ->
+          [{path, :forbidden_literal}]
+
+        true ->
+          []
+      end
+    end)
+  end
+
+  defp normalize_w5_field(field) do
+    field
+    |> String.replace(~r/[^a-z]/i, "")
+    |> String.downcase()
+  end
+
+  defp valid_w5_case_sample do
+    argv = ["mc.exe", "--json", "admin", "config", "export", "ALIAS/"]
+    stdout = ~s({"status":"success"}\n)
+
+    %{
+      "normalized_argv" => argv,
+      "windows_command_line" => %{
+        "status" => "observed",
+        "normalized" => Enum.join(argv, " ")
+      },
+      "stdin" => %{"byte_length" => 0, "sha256" => sha256(""), "eof" => true},
+      "stdout" => %{
+        "normalized_bytes_base64" => Base.encode64(stdout),
+        "byte_length" => byte_size(stdout),
+        "sha256" => sha256(stdout)
+      },
+      "stderr" => %{
+        "normalized_bytes_base64" => "",
+        "byte_length" => 0,
+        "sha256" => sha256("")
+      },
+      "exit_code" => 0,
+      "http_request_delta" => 1,
+      "classification" => %{
+        "native_process_and_stdio" => "live_verified",
+        "http_peer" => "fake_observed"
+      },
+      "sio" => %{"applicable" => false},
+      "stable_invariants" => ["status=success"]
+    }
+  end
+
   defp fixture(file) do
     @fixture_dir
     |> Path.join(file)
@@ -1363,20 +1969,6 @@ defmodule Maxio.Admin.ConfigExportImportProtocolFixtureTest do
       fixtures["minio_config_archive_wire.json"]["error_map_contract"]["conditions"],
       &(&1["id"] == "unknown_subsystem")
     )
-  end
-
-  defp production_w5_consumers do
-    root = Path.expand("../../..", __DIR__)
-    this_file = Path.expand(__ENV__.file)
-
-    (Path.wildcard(Path.join(root, "lib/**/*.ex")) ++
-       Path.wildcard(Path.join(root, "test/**/*.exs")))
-    |> Enum.reject(&(Path.expand(&1) == this_file))
-    |> Enum.filter(fn file ->
-      contents = File.read!(file)
-      String.contains?(contents, "mc_config_archive_dispatch.json")
-    end)
-    |> Enum.map(&Path.relative_to(&1, root))
   end
 
   defp excerpt_records(%{"excerpt_parts" => parts}), do: parts

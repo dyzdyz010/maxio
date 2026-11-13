@@ -205,6 +205,42 @@
       "raw_source_sha256": "9f0e7bdc05a3143e46a40420c1f0c901103c4e647c83fbb729810497894ec114",
       "excerpt_sha256": "dc95e484791540962f1bf2034ca54108ff161f6019255c04cf7f84601401b218"
     },
+    "mc_config_tree": {
+      "repository": "mc", "file": "cmd/admin-config.go", "lines": "19-43",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config.go",
+      "raw_source_sha256": "6e91d6bc5604d63e73c3a00734236bce4d9c75deea8e11d2b800aebda4042ce2",
+      "excerpt_sha256": "266ba63ab97d14a7da89f53f9cf1906ff60a4327cbd29bf895982feefb20830d"
+    },
+    "mc_global_flags": {
+      "repository": "mc", "file": "cmd/flags.go", "lines": "31-95",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/flags.go",
+      "raw_source_sha256": "1007bcecf2e0ac990ee35fabfa64e96f294f03d75ddd89b9177065720bba3995",
+      "excerpt_sha256": "1fa9b3a94187966e37344069c422a065d5e07e0d4dbed832d00b3f341b0b8ce9"
+    },
+    "mc_error_rendering": {
+      "repository": "mc", "file": "cmd/error.go", "lines": "35-119",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/error.go",
+      "raw_source_sha256": "3edf2559c4dbe5153ec1268726a85e8dca8d610369374e119e0f6429ac03e5a7",
+      "excerpt_sha256": "4e1463691d7acb22976a141cb1a4614d75e67310e6c01d41b7d7730e598d35de"
+    },
+    "mc_app_and_version": {
+      "repository": "mc", "file": "cmd/main.go", "lines": "451-536",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/main.go",
+      "raw_source_sha256": "1ca04d508bd38503d988586aece359447f69e1c18d0d8287b9cd63aec681559f",
+      "excerpt_sha256": "5bb9bcdf6207db1b41e5f51a8ebd77394a63ed747c1d2687e31bf9eee1084181"
+    },
+    "mc_build_identity": {
+      "repository": "mc", "file": "buildscripts/gen-ldflags.go", "lines": "31-120",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/buildscripts/gen-ldflags.go",
+      "raw_source_sha256": "5eefc88db0f4f5a0352f2cfd2b7e7353c2e7ab48de94fcc43e85b2dd2c653d93",
+      "excerpt_sha256": "c90469a7448515e3014692a64bcf592772885a370df8aa23c2a0682cf267a3e9"
+    },
+    "mc_go_toolchain": {
+      "repository": "mc", "file": "go.mod", "lines": "1-5",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/go.mod",
+      "raw_source_sha256": "8794dc9370eca3a8d415c007568c3db9b88af3b08f1d8c4442c555aef8a8ed2d",
+      "excerpt_sha256": "37afe28bc1e928950e9201692de837e8807b3b59e62ebca7a6952358c4216042"
+    },
     "sio_go_constants": {
       "repository": "sio_go", "file": "sio.go", "lines": "20-25",
       "url": "https://raw.githubusercontent.com/secure-io/sio-go/a455d2cd8fcacdfe18557d117db15c0629fb7e2c/sio.go",
@@ -229,6 +265,6 @@
     "W2_route_auth_errors_and_framing": ["minio_routes", "minio_admin_middleware", "minio_gzip_handler", "minio_config_archive_handlers", "minio_ciphertext_limit", "minio_validate_admin_request", "minio_to_admin_api_error", "minio_write_response", "minio_success_helpers", "minio_config_errors", "madmin_request_builder", "madmin_transport_no_compression"],
     "W3_export_bytes_and_order": ["minio_catalog_registration", "minio_kv_string", "minio_target_order", "minio_export_formatter", "madmin_value_sanitization"],
     "W4_import_replacement_duplicates_unknown_history_restart": ["minio_config_archive_handlers", "minio_new_defaults", "minio_read_config", "minio_set_kvs", "minio_validate_all", "minio_history_and_current_save", "minio_put_object_save", "madmin_retry"],
-    "W5_native_mc_dispatch_and_output": ["mc_export", "mc_import", "mc_print", "mc_non_tty_json"]
+    "W5_native_mc_dispatch_and_output": ["mc_export", "mc_import", "mc_print", "mc_non_tty_json", "mc_config_tree", "mc_global_flags", "mc_error_rendering", "mc_app_and_version", "mc_build_identity", "mc_go_toolchain"]
   }
 }

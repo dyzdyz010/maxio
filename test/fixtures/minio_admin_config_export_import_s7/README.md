@@ -26,8 +26,10 @@ at `a455d2cd8fcacdfe18557d117db15c0629fb7e2c`.
 - `source_verified` follows directly from pinned official source and its recorded raw/excerpt
   hashes. An upstream compatibility claim may use this class or `live_verified`, never a local
   class.
-- `live_verified` is reserved for a real pre-implementation capture with pinned binary/server
-  identity, OS/command, redacted artifact hash and observed result. None is claimed here.
+- `live_verified` is reserved for a real pre-implementation native-process capture with pinned
+  binary identity, OS/command, redacted artifact hash and observed result. W5 uses this class only
+  for the Windows `mc.exe` process boundary and its stdout/stderr/exit behavior. Its controlled HTTP
+  peer is separately labelled `fake_observed`; no real Maxio endpoint behavior is claimed.
 - `existing_contract_verified` is behavior already shipped and independently reviewed before S7,
   with a named S5/S6 fixture, test, error symbol or immutable closeout reference. Each Task 6 JSON
   boundary uses a structured `kind: baseline` reference that resolves to a real repository file and
@@ -84,18 +86,73 @@ exactly `local_design_expected`; it is not a universal MinIO default export.
   A deployment-specific full MinIO default export remains a non-decisional Task 11 observation.
 - W4 — import defaults, replacement, duplicates and unknown input. The upstream mechanics are
   `source_verified`; deliberate Maxio target/unknown rejection is `local_design_expected`.
-- W5 — native mc dispatch, success and restart output. `VERIFY-AT-IMPL`: exact Windows child
-  argv/stdin/stdout/stderr/exit needs a pre-implementation capture, so Task 8 is blocked until it
-  is closed. It must not be deferred to Task 11 for the first decision, and it does not block
-  Task 6.
+- W5 — native mc dispatch, success, errors and restart output.
+  `PASS_SOURCE_AND_WINDOWS_NATIVE_CLIENT_VERIFIED`: pinned source and a native Windows capture close
+  the Task 8 entry gate for exact argv, stdin-only import, no file argument, human/JSON stream and
+  exit placement, the unconditional restart branch, and canonical root-prefix `--json`. The
+  process used a controlled fake HTTP peer, so HTTP request observations are `fake_observed` and
+  Task 11 must reverify against the disposable Maxio endpoint without making a first decision.
+
+The W5 binary was built from official mc commit
+`77f82e18b5401a65958f1619df6ebb994634bd88` with official Go `1.24.9` for
+`windows/amd64`. `mc --version` reported `DEVELOPMENT.2025-11-06T16-25-29Z`; the native binary is
+31,587,328 bytes with SHA-256
+`f13d5a27903fdb17a9708a8d634c9840eaa65c92c5a1b9f8288d4d530e41e38a`. The tracked redacted
+capture is `w5_entry_gate/native_windows_fake_capture.json` (33,919 bytes, SHA-256
+`87dd14c2683c6c8004c87bb269cf037409ec75aa2a49ca44b6596f8849f3ec65`). Its tracked runner and
+fake-server source hashes are respectively
+`07283a77d161ffa5d7a6068d608a80fc5b8811ad38fbe6f2dc03eff83e9afcb7` and
+`aa6d8548837afa63719604395630fd0815a6b6a3734e7a44db60a8d72147b023`.
+
+The exact PowerShell build and capture sequence uses only official pinned source/toolchain inputs.
+The angle-bracket variables are paths, not additional inputs; generated executables remain outside
+the repository:
+
+```powershell
+$go = '<GO_1.24.9_ROOT>\bin\go.exe'
+$goZip = '<TEMP>\go1.24.9.windows-amd64.zip'
+$mcSource = '<TEMP>\maxio-s7-mc-77f82e18b540'
+$worktree = '<WORKTREE>'
+$bin = '<TEMP>\maxio-s7-mc-bin'
+$mc = "$bin\mc.exe"
+$fake = "$bin\w5-fake-server-v2.exe"
+$runner = "$bin\w5-capture-runner-v2.exe"
+$runnerSource = "$worktree\test\fixtures\minio_admin_config_export_import_s7\w5_entry_gate\capture_runner.go"
+$fakeSource = "$worktree\test\fixtures\minio_admin_config_export_import_s7\w5_entry_gate\fake_server.go"
+
+Set-Location $mcSource
+$ldflags = & $go run .\buildscripts\gen-ldflags.go
+& $go build -trimpath -tags kqueue -ldflags $ldflags -o $mc .
+& $go build -o $fake $fakeSource
+& $go build -o $runner $runnerSource
+& $go version -m $mc
+git rev-parse HEAD
+git rev-parse 'HEAD^{tree}'
+git status --porcelain
+& $runner $mc $fake $runnerSource $fakeSource $mcSource $go $goZip
+```
+
+The final runner command emits one normalized JSON document for all 14 cases. It generates the
+alias credentials internally, writes no credential to its argv, and emits no server log or raw
+transcript. The tracked artifact was promoted from that successful stdout using `apply_patch`.
+For non-fast-exit cases the runner parses the actual WMI `CommandLine` with Windows
+`CommandLineToArgvW`, normalizes it independently from the direct `os/exec` array, and aborts on any
+difference. The SIO length/plaintext records are built from the unique safe fake-server event for
+each case and checked against the pinned frame formula; they are not copied from the case table.
 
 ## Security and reproducibility
 
 No access key, caller secret, session token, Authorization value, SigV4 signature, real environment
 secret, decrypted production archive or ciphertext is tracked. SIO salt and nonce are random, so
 fixtures assert formula, length and decrypt/error-secret oracles instead of ciphertext bytes or a
-ciphertext hash. Native captures must use a disposable synthetic alias, redact sensitive material
-and destroy raw sensitive artifacts.
+ciphertext hash. The W5 runner generated credentials only in memory, isolated every
+`MC_CONFIG_DIR`, confirmed the generated credential was absent before validated cleanup, and
+retained neither raw streams nor encrypted request/response bytes. Dynamic request IDs are replaced
+in memory with `<REQUEST_ID>` and the usage default path with `<MC_CONFIG_DIR>` before safe stream
+base64, byte lengths and SHA-256 values are recorded. Windows process/stdout/stderr/exit evidence is
+`live_verified`; the controlled peer remains `fake_observed`, and Task 11 alone reverifies the real
+disposable Maxio endpoint. The recursive configuration scan propagates walk and read failures and
+therefore cannot report a successful isolation check after a partial scan.
 
 `raw_sha256.json` hashes exact `git cat-file blob COMMIT:PATH` bytes. Excerpt hashes retain the LF
 after every inclusive source line, including the final selected line; checkout newline conversion,
