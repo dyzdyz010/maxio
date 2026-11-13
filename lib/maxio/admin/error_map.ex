@@ -79,6 +79,14 @@ defmodule Maxio.Admin.ErrorMap do
     config_error_with_description(:config_not_found, description)
   end
 
+  def from_reason({:config_unknown_subsystem, subsystem}) do
+    if safe_identifier?(subsystem) do
+      Error.new(:config_error, message: "unknown sub-system #{subsystem}")
+    else
+      Error.new(:config_error)
+    end
+  end
+
   def from_reason({:config_store_unavailable, _safe_reason}), do: Error.new(:internal_error)
   def from_reason(:invalid_access_key), do: Error.new(:admin_invalid_access_key)
   def from_reason(:invalid_secret_key), do: Error.new(:admin_invalid_secret_key)

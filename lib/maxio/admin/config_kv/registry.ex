@@ -82,6 +82,24 @@ defmodule Maxio.Admin.ConfigKV.Registry do
   @spec entries() :: [map()]
   def entries, do: @entries
 
+  @spec public_paths() :: [{atom(), atom()}]
+  def public_paths do
+    case public_paths(@entries) do
+      {:ok, paths} -> paths
+      {:error, reason} -> raise "unsafe public config registry: #{reason}"
+    end
+  end
+
+  @doc false
+  @spec public_paths([map()]) :: {:ok, [{atom(), atom()}]} | {:error, atom()}
+  def public_paths(entries) when is_list(entries) do
+    entries
+    |> Enum.reduce_while({:ok, [], MapSet.new(), MapSet.new()}, &collect_public_path/2)
+    |> finish_public_paths(entries)
+  end
+
+  def public_paths(_entries), do: {:error, :registry_drift}
+
   @spec subsystems() :: [map()]
   def subsystems, do: @subsystems
 
@@ -142,5 +160,51 @@ defmodule Maxio.Admin.ConfigKV.Registry do
   defp forbidden_paths do
     Schema.forbidden_keys()
     |> MapSet.new(fn {subsystem, key} -> {Atom.to_string(subsystem), Atom.to_string(key)} end)
+  end
+
+  defp collect_public_path(entry, {:ok, paths, core_seen, wire_seen}) when is_map(entry) do
+    with false <- Map.get(entry, :sensitive?, true),
+         wire_subsystem when is_binary(wire_subsystem) <- Map.get(entry, :wire_subsystem),
+         wire_key when is_binary(wire_key) <- Map.get(entry, :wire_key),
+         core_subsystem when is_atom(core_subsystem) <- Map.get(entry, :core_subsystem),
+         core_key when is_atom(core_key) <- Map.get(entry, :core_key),
+         false <- MapSet.member?(core_seen, {core_subsystem, core_key}),
+         false <- MapSet.member?(wire_seen, {wire_subsystem, wire_key}),
+         {:ok, canonical} <- classify_path(wire_subsystem, wire_key),
+         true <- archive_entry(canonical) == archive_entry(entry) do
+      {:cont,
+       {:ok, [{core_subsystem, core_key} | paths],
+        MapSet.put(core_seen, {core_subsystem, core_key}),
+        MapSet.put(wire_seen, {wire_subsystem, wire_key})}}
+    else
+      true -> {:halt, {:error, :duplicate_public_path}}
+      {:error, :forbidden} -> {:halt, {:error, :forbidden_public_path}}
+      {:error, :wire_hidden} -> {:halt, {:error, :hidden_public_path}}
+      {:error, :unknown_key} -> {:halt, {:error, :unknown_public_path}}
+      _other -> {:halt, {:error, :registry_drift}}
+    end
+  end
+
+  defp collect_public_path(_entry, _acc), do: {:halt, {:error, :registry_drift}}
+
+  defp finish_public_paths({:ok, paths, _core_seen, _wire_seen}, entries) do
+    if entries == @entries do
+      {:ok, Enum.reverse(paths)}
+    else
+      {:error, :registry_drift}
+    end
+  end
+
+  defp finish_public_paths({:error, reason}, _entries), do: {:error, reason}
+
+  defp archive_entry(entry) do
+    Map.take(entry, [
+      :wire_subsystem,
+      :wire_key,
+      :core_subsystem,
+      :core_key,
+      :sensitive?,
+      :order
+    ])
   end
 end

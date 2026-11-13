@@ -168,9 +168,11 @@ defmodule Maxio.Config.Store do
   @pt_meta {Maxio.Config, :__meta__}
   @pt_subsystems {Maxio.Config, :__subsystems__}
   @pt_postcommit_attention {Maxio.Config, :__postcommit_attention__}
+  @pt_batch_event_identity {Maxio.Config, :__batch_event_identity__}
 
   # 写这三类 term 的**唯一**互斥点（见 moduledoc「快照与它的指纹必须一起落地」）。
   @commit_lock {__MODULE__, :__commit__}
+  @batch_identity_lock {__MODULE__, :__batch_identity__}
 
   # VERIFY-AT-IMPL V-C1：per-subsystem 大 term 写入触发的 :persistent_term 全局 GC 代价，
   # 在 maxio 的实际负载下是否可接受，尚未基准测试（需在高并发 S3 读写下做一次配置变更、
@@ -181,6 +183,7 @@ defmodule Maxio.Config.Store do
   # LISTEN/NOTIFY（V-C3，Postgrex 支持度亦未核实）。
   @default_refresh_interval_ms 30_000
   @stale_cycles_before_alarm 3
+  @recent_batch_event_limit 256
 
   @type aggregate :: %{
           count: non_neg_integer(),
@@ -224,14 +227,72 @@ defmodule Maxio.Config.Store do
   @spec loaded_subsystems() :: [atom()]
   def loaded_subsystems, do: :persistent_term.get(@pt_subsystems, [])
 
+  @doc false
+  @spec next_batch_event_identity() :: %{
+          origin: %{node: node(), instance: String.t()},
+          epoch: pos_integer()
+        }
+  def next_batch_event_identity do
+    %{instance: instance, counter: counter} = batch_event_identity()
+
+    %{
+      origin: %{node: node(), instance: instance},
+      epoch: :atomics.add_get(counter, 1, 1)
+    }
+  end
+
+  @doc false
+  @spec batch_instance_token() :: String.t()
+  def batch_instance_token, do: batch_event_identity().instance
+
+  defp batch_event_identity do
+    case :persistent_term.get(@pt_batch_event_identity, nil) do
+      nil ->
+        :global.trans(
+          {@batch_identity_lock, self()},
+          fn ->
+            case :persistent_term.get(@pt_batch_event_identity, nil) do
+              nil ->
+                identity = %{
+                  instance: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower),
+                  counter: :atomics.new(1, [])
+                }
+
+                :persistent_term.put(@pt_batch_event_identity, identity)
+                identity
+
+              identity ->
+                identity
+            end
+          end,
+          [node()]
+        )
+
+      identity ->
+        identity
+    end
+  end
+
   @doc "记录最新一条已归一化的 postcommit 收敛告警，供 status 取证。"
   @spec note_postcommit_attention(map()) :: :ok
   def note_postcommit_attention(fields) when is_map(fields) do
-    safe_record = %{
-      subsystem: safe_attention_subsystem(Map.get(fields, :subsystem)),
-      local_reload: safe_local_reload(Map.get(fields, :local_reload)),
-      broadcast: safe_broadcast(Map.get(fields, :broadcast))
-    }
+    safe_record =
+      case Map.get(fields, :subsystems) do
+        subsystems when is_list(subsystems) ->
+          %{
+            subsystems: safe_attention_subsystems(subsystems),
+            changed_paths: safe_attention_paths(Map.get(fields, :changed_paths)),
+            local_reload: safe_local_reload(Map.get(fields, :local_reload)),
+            broadcast: safe_broadcast(Map.get(fields, :broadcast))
+          }
+
+        _legacy ->
+          %{
+            subsystem: safe_attention_subsystem(Map.get(fields, :subsystem)),
+            local_reload: safe_local_reload(Map.get(fields, :local_reload)),
+            broadcast: safe_broadcast(Map.get(fields, :broadcast))
+          }
+      end
 
     put_term(@pt_postcommit_attention, safe_record)
     :ok
@@ -483,7 +544,9 @@ defmodule Maxio.Config.Store do
       load_on_boot: Keyword.get(opts, :load_on_boot, load_on_boot?()),
       subscribe: Keyword.get(opts, :subscribe, subscribe?()),
       repo: Keyword.get(opts, :repo, Maxio.Repo),
-      stale_cycles: 0
+      stale_cycles: 0,
+      recent_batch_events: MapSet.new(),
+      recent_batch_event_order: :queue.new()
     }
 
     {:ok, state, {:continue, :boot}}
@@ -529,6 +592,39 @@ defmodule Maxio.Config.Store do
       )
 
     {:noreply, state}
+  end
+
+  def handle_info({:config_changed_batch, payload}, state) when is_map(payload) do
+    case validate_batch_event(payload) do
+      {:ok, origin, epoch, subsystems} ->
+        event_id = {origin, epoch}
+
+        cond do
+          local_batch_origin?(origin) ->
+            {:noreply, state}
+
+          MapSet.member?(state.recent_batch_events, event_id) ->
+            {:noreply, state}
+
+          true ->
+            state =
+              guarded_reload(
+                state,
+                fn ->
+                  load_all!(
+                    repo: state.repo,
+                    reason: {:broadcast_batch, subsystems}
+                  )
+                end,
+                "batch broadcast"
+              )
+
+            {:noreply, remember_batch_event(state, event_id)}
+        end
+
+      :error ->
+        {:noreply, state}
+    end
   end
 
   def handle_info(:refresh, state) do
@@ -680,6 +776,76 @@ defmodule Maxio.Config.Store do
 
   defp safe_attention_subsystem(subsystem) when is_atom(subsystem), do: subsystem
   defp safe_attention_subsystem(_subsystem), do: :unknown
+
+  defp safe_attention_subsystems(subsystems) do
+    known = Schema.keys() |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+
+    subsystems
+    |> Enum.filter(&(is_atom(&1) and MapSet.member?(known, &1)))
+    |> Enum.uniq()
+    |> Enum.sort_by(&Atom.to_string/1)
+  end
+
+  defp safe_attention_paths(paths) when is_list(paths) do
+    paths
+    |> Enum.filter(fn
+      {subsystem, key} when is_atom(subsystem) and is_atom(key) ->
+        match?({:ok, _entry}, Schema.fetch(subsystem, key))
+
+      _other ->
+        false
+    end)
+    |> Enum.uniq()
+    |> Enum.sort_by(fn {subsystem, key} ->
+      {Atom.to_string(subsystem), Atom.to_string(key)}
+    end)
+  end
+
+  defp safe_attention_paths(_paths), do: []
+
+  defp validate_batch_event(
+         %{
+           origin: %{node: origin_node, instance: instance} = origin,
+           epoch: epoch,
+           subsystems: subsystems
+         } = payload
+       )
+       when is_atom(origin_node) and is_binary(instance) and byte_size(instance) > 0 and
+              is_integer(epoch) and epoch > 0 and is_list(subsystems) do
+    if map_size(payload) == 3 and map_size(origin) == 2 and subsystems != [] and
+         known_batch_subsystems?(subsystems) do
+      {:ok, origin, epoch, subsystems |> Enum.uniq() |> Enum.sort_by(&Atom.to_string/1)}
+    else
+      :error
+    end
+  end
+
+  defp validate_batch_event(_payload), do: :error
+
+  defp known_batch_subsystems?(subsystems) do
+    known = Schema.keys() |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+    Enum.all?(subsystems, &(is_atom(&1) and MapSet.member?(known, &1)))
+  end
+
+  defp local_batch_origin?(%{node: origin_node, instance: instance}) do
+    origin_node == node() and instance == batch_instance_token()
+  end
+
+  defp remember_batch_event(state, event_id) do
+    {recent, order} =
+      if MapSet.size(state.recent_batch_events) >= @recent_batch_event_limit do
+        {{:value, oldest}, remaining} = :queue.out(state.recent_batch_event_order)
+        {MapSet.delete(state.recent_batch_events, oldest), remaining}
+      else
+        {state.recent_batch_events, state.recent_batch_event_order}
+      end
+
+    %{
+      state
+      | recent_batch_events: MapSet.put(recent, event_id),
+        recent_batch_event_order: :queue.in(event_id, order)
+    }
+  end
 
   defp safe_local_reload(:ok), do: :ok
   defp safe_local_reload(:not_needed), do: :not_needed

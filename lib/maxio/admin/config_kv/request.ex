@@ -14,6 +14,7 @@ defmodule Maxio.Admin.ConfigKV.Request do
   alias Maxio.S3.{ControlBody, Error}
 
   @max_encrypted_size 262_272
+  @max_plaintext_size 262_144
   @too_large_message "Configuration data provided exceeds the allowed maximum of 262272 bytes"
   @ascii_decimal ~r/\A[0-9]+\z/
 
@@ -29,6 +30,21 @@ defmodule Maxio.Admin.ConfigKV.Request do
           {Plug.Conn.t(), String.t()}
   def read_mutation!(conn, %SigningSecret{} = caller_secret, declared_length)
       when is_integer(declared_length) and declared_length >= 0 do
+    read_encrypted!(conn, caller_secret, declared_length)
+  end
+
+  def read_mutation!(_conn, _caller_secret, _declared_length),
+    do: raise(Error.new(:internal_error))
+
+  @doc "Reads and decrypts one bounded Admin caller-secret envelope."
+  @spec read_encrypted!(Plug.Conn.t(), SigningSecret.t()) :: {Plug.Conn.t(), String.t()}
+  def read_encrypted!(conn, %SigningSecret{} = caller_secret) do
+    read_encrypted!(conn, caller_secret, declared_mutation_length!(conn))
+  end
+
+  def read_encrypted!(_conn, _caller_secret), do: raise(Error.new(:internal_error))
+
+  defp read_encrypted!(conn, caller_secret, declared_length) do
     expected_hash = authenticated_payload_hash!(conn)
 
     {conn, ciphertext, _trailers} =
@@ -45,18 +61,34 @@ defmodule Maxio.Admin.ConfigKV.Request do
     end
   end
 
-  def read_mutation!(_conn, _caller_secret, _declared_length),
-    do: raise(Error.new(:internal_error))
-
   @spec encrypt_get!(SigningSecret.t(), iodata()) :: binary()
-  def encrypt_get!(%SigningSecret{} = caller_secret, plaintext) do
+  def encrypt_get!(%SigningSecret{} = caller_secret, plaintext),
+    do: encrypt!(caller_secret, plaintext)
+
+  def encrypt_get!(_caller_secret, _plaintext), do: raise(Error.new(:internal_error))
+
+  @doc "Encrypts one bounded Admin caller-secret envelope."
+  @spec encrypt!(SigningSecret.t(), iodata()) :: binary()
+  def encrypt!(%SigningSecret{} = caller_secret, plaintext) do
+    plaintext = IO.iodata_to_binary(plaintext)
+
+    if byte_size(plaintext) > @max_plaintext_size do
+      raise Error.new(:admin_config_too_large)
+    end
+
     case Envelope.encrypt(caller_secret, plaintext) do
-      {:ok, ciphertext} -> ciphertext
-      {:error, _discarded_reason} -> raise(Error.new(:internal_error))
+      {:ok, ciphertext} when byte_size(ciphertext) <= @max_encrypted_size ->
+        ciphertext
+
+      {:ok, _ciphertext} ->
+        raise Error.new(:admin_config_too_large)
+
+      {:error, _discarded_reason} ->
+        raise Error.new(:internal_error)
     end
   end
 
-  def encrypt_get!(_caller_secret, _plaintext), do: raise(Error.new(:internal_error))
+  def encrypt!(_caller_secret, _plaintext), do: raise(Error.new(:internal_error))
 
   defp parse_declared_length!(value) when is_binary(value) do
     with true <- Regex.match?(@ascii_decimal, value),
@@ -77,10 +109,14 @@ defmodule Maxio.Admin.ConfigKV.Request do
   defp authenticated_payload_hash!(_conn), do: raise(Error.new(:internal_error))
 
   defp validate_plaintext!(conn, plaintext) when is_binary(plaintext) do
-    if String.valid?(plaintext) do
+    if byte_size(plaintext) <= @max_plaintext_size and String.valid?(plaintext) do
       {conn, plaintext}
     else
-      raise(Error.new(:admin_config_bad_json))
+      if byte_size(plaintext) > @max_plaintext_size do
+        raise Error.new(:admin_config_too_large)
+      else
+        raise Error.new(:admin_config_bad_json)
+      end
     end
   end
 

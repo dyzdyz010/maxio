@@ -1,0 +1,270 @@
+{
+  "schema": "maxio.raw_sha256.v1",
+  "fixture_id": "minio-admin-config-archive-s7-source-integrity-v1",
+  "integrity_contract": {
+    "evidence_class": "source_verified",
+    "raw_source_sha256": "SHA-256 over exact bytes from git cat-file blob at the recorded commit",
+    "excerpt_sha256": "SHA-256 over the inclusive line range, retaining LF after every selected line including the final line",
+    "checkout_bytes_authoritative": false,
+    "mutable_branch_url_allowed": false
+  },
+  "repositories": {
+    "minio": {"url": "https://github.com/minio/minio", "commit": "7aac2a2c5b7c882e68c1ce017d8256be2feea27f"},
+    "madmin_go": {"url": "https://github.com/minio/madmin-go", "commit": "4b504b82db633e978a57d49443b2be75824244c3"},
+    "mc": {"url": "https://github.com/minio/mc", "commit": "77f82e18b5401a65958f1619df6ebb994634bd88"},
+    "sio_go": {"url": "https://github.com/secure-io/sio-go", "tag": "v0.3.1", "commit": "a455d2cd8fcacdfe18557d117db15c0629fb7e2c"}
+  },
+  "sources": {
+    "minio_routes": {
+      "repository": "minio", "file": "cmd/admin-router.go", "lines": "217-223",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go",
+      "raw_source_sha256": "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9",
+      "excerpt_sha256": "17625e3030c0b79e53efe7029c1291bd694c4a7befb24b6c28f170b2ea56d19f"
+    },
+    "minio_gzip_handler": {
+      "repository": "minio", "file": "cmd/admin-router.go", "lines": "40-47",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go",
+      "raw_source_sha256": "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9",
+      "excerpt_sha256": "d390e603ed63e3b385f6e758ebb4ff1af1ebe9d89b4ceef4ec57a04d9d5c8954"
+    },
+    "minio_admin_middleware": {
+      "repository": "minio", "file": "cmd/admin-router.go", "symbol": "adminMiddleware", "lines": "89-131",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-router.go",
+      "raw_source_sha256": "4f33d9984e39f08f31274ee818856db432ac85e5ffd2fda0b154e7eb34c595a9",
+      "excerpt_sha256": "dc86de9aba5910c80ede89a544e233040be2eda47e8708e0da11028d79a157e9"
+    },
+    "minio_config_archive_handlers": {
+      "repository": "minio", "file": "cmd/admin-handlers-config-kv.go", "symbols": ["SetConfigHandler", "GetConfigHandler"], "lines": "428-527",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers-config-kv.go",
+      "raw_source_sha256": "b2741a0e9a8bf29c951b7b6adbc398655fd43683f993af16539caf1f3cbb78d0",
+      "excerpt_sha256": "5cf37db5164fca3f6ea2a7911c43f72063c09e7e3d26ba369c4484d9360619e9"
+    },
+    "minio_ciphertext_limit": {
+      "repository": "minio", "file": "cmd/admin-handlers.go", "symbol": "maxEConfigJSONSize", "lines": "68-72",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handlers.go",
+      "raw_source_sha256": "67f73e63188bf40c84de1c3228727e98c7c5ab94521b75b1ca94eeb5cd39ce5e",
+      "excerpt_sha256": "8f2552ea182cf09f06ace0853328f359b944cb3bc0ff0628406e61d44ec9b409"
+    },
+    "minio_validate_admin_request": {
+      "repository": "minio", "file": "cmd/admin-handler-utils.go", "symbol": "validateAdminReq", "lines": "37-60",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handler-utils.go",
+      "raw_source_sha256": "a1423bd1af26d0838280fffa5b87597344a94f6b01c6a512a8b0f14e5d7eb49f",
+      "excerpt_sha256": "5975cbe24b743709cc5494e8e20ca75c2141c0e22e60a60c2524aa6c44bc5d77"
+    },
+    "minio_to_admin_api_error": {
+      "repository": "minio", "file": "cmd/admin-handler-utils.go", "symbol": "toAdminAPIErr", "lines": "74-98",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/admin-handler-utils.go",
+      "raw_source_sha256": "a1423bd1af26d0838280fffa5b87597344a94f6b01c6a512a8b0f14e5d7eb49f",
+      "excerpt_sha256": "49b7456a98052bc7f7ea676adc5172dd85e71a92b719ea2a2a838ef6f1d87078"
+    },
+    "minio_write_response": {
+      "repository": "minio", "file": "cmd/api-response.go", "symbol": "writeResponse", "lines": "891-915",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/api-response.go",
+      "raw_source_sha256": "99fab1082160137a5cee2b9da361102ff98b3373bfc60d6df9b01be66549758e",
+      "excerpt_sha256": "9b84da23582002d91ec3b80fdbb05d061d7f4990ae0d24d23fbb603e9239f3cb"
+    },
+    "minio_success_helpers": {
+      "repository": "minio", "file": "cmd/api-response.go", "symbols": ["writeSuccessResponseJSON", "writeSuccessResponseHeadersOnly"], "lines": "929-954",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/api-response.go",
+      "raw_source_sha256": "99fab1082160137a5cee2b9da361102ff98b3373bfc60d6df9b01be66549758e",
+      "excerpt_sha256": "1d9f45e77665e8366c3aa7b16630ce320600b1fa2aa1bb4e2276565f73a4f2db"
+    },
+    "minio_config_errors": {
+      "repository": "minio", "file": "cmd/api-errors.go", "lines": "1420-1440",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/api-errors.go",
+      "raw_source_sha256": "12e69a17696a8bacaf10cfa52806ea9b6d44aefebad4530a17f6b16d74625081",
+      "excerpt_sha256": "cea48eb60c75b6c07ffbf639caed632fce52aed6c175219c969c6dc0288a046a"
+    },
+    "minio_catalog_registration": {
+      "repository": "minio", "file": "cmd/config-current.go", "lines": "58-245",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/config-current.go",
+      "raw_source_sha256": "87292bfc635e315827db852ae07f6d5e8952cb07bbf1db785bff3ab5fe0d9a7f",
+      "excerpt_parts": [
+        {"lines": "58-88", "excerpt_sha256": "f9433b136ab54224057e3c2b83a454f9de6628fc0827eac756815061dc8567d6"},
+        {"lines": "91-245", "excerpt_sha256": "386c429552008a27058fe852a386e02d03c9f8660b615bee5ddb67f0a1b673de"}
+      ]
+    },
+    "minio_validate_all": {
+      "repository": "minio", "file": "cmd/config-current.go", "symbol": "validateConfig", "lines": "440-462",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/config-current.go",
+      "raw_source_sha256": "87292bfc635e315827db852ae07f6d5e8952cb07bbf1db785bff3ab5fe0d9a7f",
+      "excerpt_sha256": "cf70f18dedba518551c29174a18d3acd839be25ad78c109687ba98e4fe3ad19d"
+    },
+    "minio_history_and_current_save": {
+      "repository": "minio", "file": "cmd/config.go", "lines": "47-148",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/config.go",
+      "raw_source_sha256": "6d4a6680b742a81c9793c7e08134cf84c5206e869bf5de45889776bb74ddb00a",
+      "excerpt_sha256": "1844f2d481b866aba6fb0db6c25845f2c94c4c7425f984ca85ff3cfeb5f56577"
+    },
+    "minio_put_object_save": {
+      "repository": "minio", "file": "cmd/config-common.go", "lines": "73-85",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/config-common.go",
+      "raw_source_sha256": "329a6be1e0281a9b9b64bfe054d3fa15d039c348cdbe9d22f8b0549711ca1187",
+      "excerpt_sha256": "2f167278787201fe7353a1a68fb05ac21e2e738bf8ce6826b9f2126406bebc94"
+    },
+    "minio_kv_string": {
+      "repository": "minio", "file": "internal/config/config.go", "symbol": "KV.String", "lines": "269-289",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go",
+      "raw_source_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+      "excerpt_sha256": "7ed68adffe21715c5e446c23982d55bff094fb98601f40bd35d4bb6a1c7127c5"
+    },
+    "minio_read_config": {
+      "repository": "minio", "file": "internal/config/config.go", "symbol": "Config.ReadConfig", "lines": "459-481",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go",
+      "raw_source_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+      "excerpt_sha256": "def3eb887386fadc44694895d155dc827cc85fd7c66f2e932e7df3a63d11225b"
+    },
+    "minio_new_defaults": {
+      "repository": "minio", "file": "internal/config/config.go", "symbol": "Config.New", "lines": "722-729",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go",
+      "raw_source_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+      "excerpt_sha256": "a0c1c60977d9bc644254463ef53134e97e2bbbbbc95c91756f87afc5700cd28b"
+    },
+    "minio_set_kvs": {
+      "repository": "minio", "file": "internal/config/config.go", "symbol": "Config.SetKVS", "lines": "930-1035",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go",
+      "raw_source_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+      "excerpt_sha256": "8c7942d545d6e52590b01cf2d59fdd05ac50f0896d52ca051fde250bc2459e86"
+    },
+    "minio_target_order": {
+      "repository": "minio", "file": "internal/config/config.go", "symbol": "Config.GetAvailableTargets", "lines": "1102-1155",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go",
+      "raw_source_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+      "excerpt_sha256": "ad27e7c33835acc34c7bf4a8df9967e82b23c942d4b9e74b99a892a19202c90e"
+    },
+    "minio_export_formatter": {
+      "repository": "minio", "file": "internal/config/config.go", "symbols": ["SubsysInfo", "WriteTo"], "lines": "1375-1477",
+      "url": "https://raw.githubusercontent.com/minio/minio/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/internal/config/config.go",
+      "raw_source_sha256": "902a8372c78a7fa976a8faae1aee06fedc2081d8315103ddf2801541ef0ffdb3",
+      "excerpt_sha256": "5319610083cd12da2d4cf25b5ad7612ad5f40f8c0db62b52cc7334b142911cba",
+      "write_to_excerpt": {"lines": "1447-1477", "excerpt_sha256": "3e0c076b97d4150a5d40d17279b35c8f7e18fe0e65f7915d29f7b09c9f9cf04b"}
+    },
+    "madmin_config_methods": {
+      "repository": "madmin_go", "file": "config-commands.go", "symbols": ["GetConfig", "SetConfig"], "lines": "29-84",
+      "url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/config-commands.go",
+      "raw_source_sha256": "2c2d28990b4c4ae05aabb415ffb472646048830fcb0c4e5db780ab39db2b569d",
+      "excerpt_sha256": "0d80933ff41a180104ee0230b36419d99baac8808b90c83547c41652894292f2"
+    },
+    "madmin_encrypt_decrypt": {
+      "repository": "madmin_go", "file": "encrypt.go", "symbols": ["EncryptData", "DecryptData"], "lines": "44-164",
+      "url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/encrypt.go",
+      "raw_source_sha256": "7c5921e7d766463a4b2b3717f2d066bd608a5aa69ad8846c0d5503bd9ba05a1f",
+      "excerpt_sha256": "82b3c55169c3ac55713aaf65d5e18b4c3061213a8bc9a0c8ac644c15acf41fde"
+    },
+    "madmin_sio_dependency": {
+      "repository": "madmin_go", "file": "go.mod", "lines": "16-16",
+      "url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/go.mod",
+      "raw_source_sha256": "939065688f6f066e8f3e7353c59fc97e4581111e16bc21b9bc8cfd87d85933e4",
+      "excerpt_sha256": "f7c45b130e29e42793ec5f82ebc758ac619f317ffd7c53864a6256d096d3915b"
+    },
+    "madmin_transport_no_compression": {
+      "repository": "madmin_go", "file": "transport.go", "symbol": "DefaultTransport", "lines": "28-54",
+      "url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/transport.go",
+      "raw_source_sha256": "563dc8734719129f9962404d4874ca5eafa6774b501a64437e89bd412f12b8c0",
+      "excerpt_sha256": "5de75f53cc3f7a31e4969bdf4ab4d8dbc2a685d0dd6591a9ba54c2b32145b1bf"
+    },
+    "madmin_retry": {
+      "repository": "madmin_go", "file": "api.go", "symbol": "executeMethod", "lines": "375-460",
+      "url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/api.go",
+      "raw_source_sha256": "932edaeb340bfdc9343db8f31124ea749cfc4836ab86b7196c5b2a876a9bea4e",
+      "excerpt_sha256": "ab421d1b8857a0ff248000e6d362c164851562f26c00084e753918ff4c1a22fe"
+    },
+    "madmin_request_builder": {
+      "repository": "madmin_go", "file": "api.go", "symbol": "newRequest", "lines": "495-544",
+      "url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/api.go",
+      "raw_source_sha256": "932edaeb340bfdc9343db8f31124ea749cfc4836ab86b7196c5b2a876a9bea4e",
+      "excerpt_sha256": "004ac16858b362fd7705774d5881af72e2d0e4a9ed9fb7f9462b34a3eff071e0"
+    },
+    "madmin_value_sanitization": {
+      "repository": "madmin_go", "file": "parse-config.go", "lines": "173-204",
+      "url": "https://raw.githubusercontent.com/minio/madmin-go/4b504b82db633e978a57d49443b2be75824244c3/parse-config.go",
+      "raw_source_sha256": "ea19fd427661619df7e8bdf878743186950eeeb7c94ea989481dcfcc11cf8d79",
+      "excerpt_sha256": "1b4a3d6fb04abcaa4fad75440f0fc7a8a9fd03eed5b9f1d50ea88836a8c3f029"
+    },
+    "mc_export": {
+      "repository": "mc", "file": "cmd/admin-config-export.go", "lines": "34-125",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-export.go",
+      "raw_source_sha256": "b44a25e1e9f25aef6483c7b50efb568047c91734b1586967dae2afb97805e4f0",
+      "excerpt_sha256": "72e08988362aba33fd503964e4cd341307f6be60945e7e9cd500df3c66b3d786"
+    },
+    "mc_import": {
+      "repository": "mc", "file": "cmd/admin-config-import.go", "lines": "31-108",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config-import.go",
+      "raw_source_sha256": "6db41934e4bfbbf5bd03f272e64050540787b93601fdc31c9a6e68e448843d19",
+      "excerpt_sha256": "35ea3330dd82c87d45be2355e4fba379a258afd3456590d0354e3caf9661dfba"
+    },
+    "mc_print": {
+      "repository": "mc", "file": "cmd/print.go", "symbol": "printMsg", "lines": "28-51",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/print.go",
+      "raw_source_sha256": "2797d5a0be76b4f5e06421f09069421df36883f7feee425bbb7c93d46bb2cccb",
+      "excerpt_sha256": "994ae6150ee7955784061721c091e869d20f05eeb1aeedffe1049a8468416425"
+    },
+    "mc_non_tty_json": {
+      "repository": "mc", "file": "cmd/globals.go", "symbol": "setGlobalsFromContext", "lines": "126-145",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/globals.go",
+      "raw_source_sha256": "9f0e7bdc05a3143e46a40420c1f0c901103c4e647c83fbb729810497894ec114",
+      "excerpt_sha256": "dc95e484791540962f1bf2034ca54108ff161f6019255c04cf7f84601401b218"
+    },
+    "mc_config_tree": {
+      "repository": "mc", "file": "cmd/admin-config.go", "lines": "19-43",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/admin-config.go",
+      "raw_source_sha256": "6e91d6bc5604d63e73c3a00734236bce4d9c75deea8e11d2b800aebda4042ce2",
+      "excerpt_sha256": "266ba63ab97d14a7da89f53f9cf1906ff60a4327cbd29bf895982feefb20830d"
+    },
+    "mc_global_flags": {
+      "repository": "mc", "file": "cmd/flags.go", "lines": "31-95",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/flags.go",
+      "raw_source_sha256": "1007bcecf2e0ac990ee35fabfa64e96f294f03d75ddd89b9177065720bba3995",
+      "excerpt_sha256": "1fa9b3a94187966e37344069c422a065d5e07e0d4dbed832d00b3f341b0b8ce9"
+    },
+    "mc_error_rendering": {
+      "repository": "mc", "file": "cmd/error.go", "lines": "35-119",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/error.go",
+      "raw_source_sha256": "3edf2559c4dbe5153ec1268726a85e8dca8d610369374e119e0f6429ac03e5a7",
+      "excerpt_sha256": "4e1463691d7acb22976a141cb1a4614d75e67310e6c01d41b7d7730e598d35de"
+    },
+    "mc_app_and_version": {
+      "repository": "mc", "file": "cmd/main.go", "lines": "451-536",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/cmd/main.go",
+      "raw_source_sha256": "1ca04d508bd38503d988586aece359447f69e1c18d0d8287b9cd63aec681559f",
+      "excerpt_sha256": "5bb9bcdf6207db1b41e5f51a8ebd77394a63ed747c1d2687e31bf9eee1084181"
+    },
+    "mc_build_identity": {
+      "repository": "mc", "file": "buildscripts/gen-ldflags.go", "lines": "31-120",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/buildscripts/gen-ldflags.go",
+      "raw_source_sha256": "5eefc88db0f4f5a0352f2cfd2b7e7353c2e7ab48de94fcc43e85b2dd2c653d93",
+      "excerpt_sha256": "c90469a7448515e3014692a64bcf592772885a370df8aa23c2a0682cf267a3e9"
+    },
+    "mc_go_toolchain": {
+      "repository": "mc", "file": "go.mod", "lines": "1-5",
+      "url": "https://raw.githubusercontent.com/minio/mc/77f82e18b5401a65958f1619df6ebb994634bd88/go.mod",
+      "raw_source_sha256": "8794dc9370eca3a8d415c007568c3db9b88af3b08f1d8c4442c555aef8a8ed2d",
+      "excerpt_sha256": "37afe28bc1e928950e9201692de837e8807b3b59e62ebca7a6952358c4216042"
+    },
+    "sio_go_constants": {
+      "repository": "sio_go", "file": "sio.go", "lines": "20-25",
+      "url": "https://raw.githubusercontent.com/secure-io/sio-go/a455d2cd8fcacdfe18557d117db15c0629fb7e2c/sio.go",
+      "raw_source_sha256": "818e30cfcb8f10c069f2c6e2e311c3102d40863682835fe44a468600fcd3b02f",
+      "excerpt_sha256": "2ea4908561ab5a26e9c80ddb404fc4602ab4fc32eec2bf1582353a23864ad466"
+    },
+    "sio_go_default_stream": {
+      "repository": "sio_go", "file": "sio.go", "lines": "76-79",
+      "url": "https://raw.githubusercontent.com/secure-io/sio-go/a455d2cd8fcacdfe18557d117db15c0629fb7e2c/sio.go",
+      "raw_source_sha256": "818e30cfcb8f10c069f2c6e2e311c3102d40863682835fe44a468600fcd3b02f",
+      "excerpt_sha256": "17cf56d52c205627723866ea2f14d01f07553e6aab1a31d509abca56a3f46b26"
+    },
+    "sio_go_overhead": {
+      "repository": "sio_go", "file": "sio.go", "symbol": "Stream.Overhead", "lines": "147-182",
+      "url": "https://raw.githubusercontent.com/secure-io/sio-go/a455d2cd8fcacdfe18557d117db15c0629fb7e2c/sio.go",
+      "raw_source_sha256": "818e30cfcb8f10c069f2c6e2e311c3102d40863682835fe44a468600fcd3b02f",
+      "excerpt_sha256": "9a879910778cf7a9519ddc023a9f176dbcd135f7ced135d409ec9316fe68509a"
+    }
+  },
+  "claim_sources": {
+    "W1_madmin_limits_and_sio_formula": ["madmin_config_methods", "madmin_encrypt_decrypt", "madmin_sio_dependency", "sio_go_constants", "sio_go_default_stream", "sio_go_overhead"],
+    "W2_route_auth_errors_and_framing": ["minio_routes", "minio_admin_middleware", "minio_gzip_handler", "minio_config_archive_handlers", "minio_ciphertext_limit", "minio_validate_admin_request", "minio_to_admin_api_error", "minio_write_response", "minio_success_helpers", "minio_config_errors", "madmin_request_builder", "madmin_transport_no_compression"],
+    "W3_export_bytes_and_order": ["minio_catalog_registration", "minio_kv_string", "minio_target_order", "minio_export_formatter", "madmin_value_sanitization"],
+    "W4_import_replacement_duplicates_unknown_history_restart": ["minio_config_archive_handlers", "minio_new_defaults", "minio_read_config", "minio_set_kvs", "minio_validate_all", "minio_history_and_current_save", "minio_put_object_save", "madmin_retry"],
+    "W5_native_mc_dispatch_and_output": ["mc_export", "mc_import", "mc_print", "mc_non_tty_json", "mc_config_tree", "mc_global_flags", "mc_error_rendering", "mc_app_and_version", "mc_build_identity", "mc_go_toolchain"]
+  }
+}

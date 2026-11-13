@@ -175,7 +175,7 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
     assert Repo.aggregate(RuntimeConfigAudit, :count) == 0
   end
 
-  test "wrong methods, v4, adjacent, export and history paths remain authenticated 501" do
+  test "wrong methods, v4, adjacent, and history paths remain authenticated 501" do
     # Catches an over-broad prefix dispatch that accidentally claims a neighboring or explicitly
     # deferred Admin API while wiring the three exact triples.
     cases = [
@@ -187,8 +187,6 @@ defmodule Maxio.Admin.ConfigKVEndpointTest do
       {:post, @help_path, %{"subSys" => "", "key" => ""}},
       {:get, @help_path <> "/extra", %{"subSys" => "", "key" => ""}},
       {:get, "/minio/admin/v4/help-config-kv", %{"subSys" => "", "key" => ""}},
-      {:get, "#{@base}/config", %{}},
-      {:put, "#{@base}/config", %{}},
       {:get, "#{@base}/list-config-history-kv", %{"count" => "10"}},
       {:delete, "#{@base}/clear-config-history-kv", %{"restoreId" => "fixture-restore-id"}},
       {:put, "#{@base}/restore-config-history-kv", %{"restoreId" => "fixture-restore-id"}}

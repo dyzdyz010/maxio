@@ -1,0 +1,219 @@
+{
+  "schema": "maxio.mc_config_archive_dispatch.v1",
+  "fixture_id": "mc-config-archive-dispatch-s7-v1",
+  "pin": {
+    "repository": "https://github.com/minio/mc",
+    "commit": "77f82e18b5401a65958f1619df6ebb994634bd88",
+    "version": "DEVELOPMENT.2025-11-06T16-25-29Z",
+    "binary_sha256": "f13d5a27903fdb17a9708a8d634c9840eaa65c92c5a1b9f8288d4d530e41e38a",
+    "binary_byte_length": 31587328,
+    "runtime": "go1.24.9 windows/amd64"
+  },
+  "verification_item": {
+    "id": "W5",
+    "definition": "native mc dispatch, stdin/file behavior, success output and restart branch",
+    "status": "PASS_SOURCE_AND_WINDOWS_NATIVE_CLIENT_VERIFIED",
+    "implementation_gate": "PASS_TASK_8_ENTRY_GATE",
+    "reason": "pinned source plus a pre-Task-8 Windows native process capture fixes argv, stdin-only import, stream placement, exits, global JSON placement and restart rendering",
+    "task_11_role": "reverify_only_not_first_decision",
+    "task8_capture_contract": [
+      "normalized_argv",
+      "windows_command_line.status",
+      "stdin.byte_length",
+      "stdin.sha256",
+      "stdin.eof",
+      "stdout.normalized_bytes_base64",
+      "stdout.byte_length",
+      "stdout.sha256",
+      "stderr.normalized_bytes_base64",
+      "stderr.byte_length",
+      "stderr.sha256",
+      "exit_code",
+      "http_request_delta",
+      "classification",
+      "sio",
+      "stable_invariants"
+    ]
+  },
+  "source_verified_dispatch": {
+    "evidence_class": "source_verified",
+    "export_syntax": "exactly_one_TARGET",
+    "import_syntax": "exactly_one_TARGET",
+    "export_input": "none",
+    "export_output": "stdout",
+    "import_input": "os.Stdin_only",
+    "import_file_argument": false,
+    "caller_file_transport": "redirect or pipe file bytes to child stdin; no file path is accepted by mc",
+    "temporary_file_created_by_mc": false,
+    "cleanup_performed_by_mc": false,
+    "redirected_output_permission_management_by_mc": false,
+    "canonical_argv_after_executable": {
+      "export_human": ["--no-color", "admin", "config", "export", "ALIAS/"],
+      "export_json": ["--json", "admin", "config", "export", "ALIAS/"],
+      "import_human": ["--no-color", "admin", "config", "import", "ALIAS/"],
+      "import_json": ["--json", "admin", "config", "import", "ALIAS/"]
+    },
+    "global_json_position": {
+      "canonical_for_Task_8": "root_prefix_before_admin",
+      "native_accepted_positions": [
+        "root_prefix_before_admin",
+        "after_admin_before_config",
+        "after_config_before_leaf",
+        "after_leaf_before_TARGET",
+        "after_TARGET"
+      ],
+      "runner_rule": "Task 8 uses only the root-prefix canonical argv despite the broader pinned parser acceptance"
+    }
+  },
+  "windows_launcher_contract": {
+    "evidence_class": "live_verified",
+    "status": "closed_pre_Task_8",
+    "expected_executable": "mc.exe",
+    "observed_argument_transport": "Go os/exec direct process argument array without a shell; WMIC command line matched the array for live HTTP calls",
+    "observed_import_stdin": "89 raw archive bytes to child stdin followed by EOF",
+    "observed_non_tty_line_endings": "LF_only_no_CR",
+    "observed_target": "trailing slash accepted and preserved in the human restart prompt",
+    "observed_secret_persistence": "false in every isolated MC_CONFIG_DIR scan",
+    "http_peer_class": "fake_observed",
+    "real_Maxio_endpoint": "not_required_for_Task_8_entry_gate_and_deferred_to_Task_11_reverification"
+  },
+  "expected_stdout": {
+    "fresh_export_human": {
+      "evidence_class": "local_design_expected",
+      "bytes_base64": "czMgY2xvY2tfc2tld19tcz05MDAwMDAgCmxpc3Rpbmcgc3FsX2hhcmRfbGltaXQ9MTAwMDAwIApwcm9tZXRoZXVzX21ldHJpY3MgcHVibGljPWZhbHNlIAo=",
+      "byte_length": 89,
+      "sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+    },
+    "fresh_export_json_non_tty": {
+      "evidence_class": "local_design_expected",
+      "utf8_escaped": "{\"status\":\"success\",\"value\":\"czMgY2xvY2tfc2tld19tcz05MDAwMDAgCmxpc3Rpbmcgc3FsX2hhcmRfbGltaXQ9MTAwMDAwIApwcm9tZXRoZXVzX21ldHJpY3MgcHVibGljPWZhbHNlIAo=\"}\\n",
+      "byte_length": 152,
+      "sha256": "b6d6feec2d40465c8c29a28c47220b76b2513a0b285e98b6105693cc073b9d1e"
+    },
+    "import_human_ALIAS": {
+      "evidence_class": "source_verified",
+      "utf8_escaped": "Setting new key has been successful.\\nPlease restart your server with `mc admin service restart ALIAS`.\\n",
+      "byte_length": 103,
+      "sha256": "d510f7cba50cd614303824ca1f1ce60f388a383a105f97b2f6cc3506d9ea1902",
+      "restart_prompt": "always_after_success"
+    },
+    "import_human_w5_trailing_slash_windows": {
+      "evidence_class": "live_verified",
+      "utf8_escaped": "Setting new key has been successful.\nPlease restart your server with `mc admin service restart w5/`.\n",
+      "observed_alias": "w5/",
+      "byte_length": 101,
+      "sha256": "b59471cfd9b1d2465c3b7ac9f3f0967aa814e3fe209f4da6e17f679fa7bb0717",
+      "restart_prompt": "always_after_success_and_preserves_TARGET"
+    },
+    "import_json_non_tty": {
+      "evidence_class": "source_verified",
+      "utf8_escaped": "{\"status\":\"success\"}\\n",
+      "byte_length": 21,
+      "sha256": "9a14b700bc2581383cfae352c91f00fc65439392344a2f823a9645e8546a3bde"
+    }
+  },
+  "source_verified_rendering": {
+    "evidence_class": "source_verified",
+    "export_human": "decrypted plaintext preserved; environment names may be colorized on a TTY",
+    "export_json_value": "Go []byte standard padded base64",
+    "non_tty_json": "compact one-line JSON plus one LF",
+    "print_termination": "remove at most one existing trailing LF, then Println adds one LF",
+    "import_human_restart_branch": "unconditional after SetConfig success",
+    "success_stderr_expected_from_source": "empty",
+    "human_error_stream": "stderr",
+    "json_error_stream": "stdout",
+    "error_exit": 1
+  },
+  "windows_native_stream_matrix": {
+    "evidence_class": "live_verified",
+    "export_human_success": {
+      "stdout": {"byte_length": 89, "sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"},
+      "stderr": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "exit_code": 0
+    },
+    "export_json_success": {
+      "stdout": {"byte_length": 152, "sha256": "b6d6feec2d40465c8c29a28c47220b76b2513a0b285e98b6105693cc073b9d1e"},
+      "stderr": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "exit_code": 0
+    },
+    "import_human_success_trailing_slash": {
+      "stdin_byte_length": 89,
+      "stdout": {"byte_length": 101, "sha256": "b59471cfd9b1d2465c3b7ac9f3f0967aa814e3fe209f4da6e17f679fa7bb0717"},
+      "stderr": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "exit_code": 0
+    },
+    "import_json_success": {
+      "stdin_byte_length": 89,
+      "stdout": {"byte_length": 21, "sha256": "9a14b700bc2581383cfae352c91f00fc65439392344a2f823a9645e8546a3bde"},
+      "stderr": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "exit_code": 0
+    },
+    "empty_stdin_client_error": {
+      "http_request_count": 0,
+      "stdout": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "stderr": {"byte_length": 50, "sha256": "a3800f6428f1f8251aaf19253a3222f4c0d2b78cc7266edc69d0c2263c85b4dd"},
+      "exit_code": 1
+    },
+    "extra_file_argument_usage_error": {
+      "http_request_count": 0,
+      "contract": "normalized_usage_invariants",
+      "normalization": "replace the host-specific default config path with <MC_CONFIG_DIR>",
+      "stable_invariants": ["NAME:", "USAGE:", "<MC_CONFIG_DIR>"],
+      "stderr": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "exit_code": 1
+    },
+    "human_server_error": {
+      "http_peer_class": "fake_observed",
+      "export_stdout": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "export_stderr": {"byte_length": 97, "sha256": "bd54a5910a8b7540ce17cb24079e21afecf8a823cc368fcee0336852cf4009f0"},
+      "import_stdout": {"byte_length": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      "import_stderr": {"byte_length": 97, "sha256": "3f3923b42d6b106c0cc651dc46b5ba003bd9c3b9846010b0f6ed02f251f57ec4"},
+      "stderr_stream": "mc.exe: <ERROR> prefix plus operation and server message, one LF",
+      "exit_code": 1
+    },
+    "json_server_error": {
+      "http_peer_class": "fake_observed",
+      "contract": "decoded_stable_invariants_with_normalized_request_id",
+      "stdout_stream": "compact status=error envelope, one LF; all RequestID values normalized to <REQUEST_ID>",
+      "capture_only": "normalized stream bytes, lengths and hashes are capture evidence but Task 8 consumes only decoded stable invariants and stream placement",
+      "stderr_byte_length": 0,
+      "exit_code": 1
+    }
+  },
+  "input_boundaries": {
+    "evidence_class": "source_verified",
+    "empty_stdin": {"client_result": "io.EOF", "http_request_count": 0},
+    "one_through_262144": {"client_result": "encrypt_and_attempt_request"},
+    "262145_or_more": {"client_result": "bytes.ErrTooLarge", "http_request_count": 0}
+  },
+  "live_observation": {
+    "evidence_class": "live_verified",
+    "status": "complete_native_client_side",
+    "task_gate": "Task_8_entry_gate_pass",
+    "task_11_role": "reverify_only_not_first_decision"
+  },
+  "artifact_record": {
+    "path": "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/native_windows_fake_capture.json",
+    "byte_length": 33919,
+    "sha256": "87dd14c2683c6c8004c87bb269cf037409ec75aa2a49ca44b6596f8849f3ec65",
+    "harnesses": {
+      "capture_runner.go": {
+        "path": "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/capture_runner.go",
+        "sha256": "07283a77d161ffa5d7a6068d608a80fc5b8811ad38fbe6f2dc03eff83e9afcb7"
+      },
+      "fake_server.go": {
+        "path": "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/fake_server.go",
+        "sha256": "aa6d8548837afa63719604395630fd0815a6b6a3734e7a44db60a8d72147b023"
+      }
+    },
+    "classification": "redacted live native client plus fake-observed HTTP peer",
+    "raw_secret_or_ciphertext_retained": false,
+    "raw_streams_retained": false,
+    "recorded_instead": "binary/build/toolchain identity, normalized argv and streams, byte lengths, SHA-256 values, exits, HTTP deltas and SIO length-only evidence"
+  },
+  "security": {
+    "export_can_write_unredacted_secrets_to_stdout": true,
+    "fixture_contains_real_secret_or_ciphertext": false,
+    "capture_rule": "synthetic disposable alias; redact and destroy raw sensitive artifacts"
+  }
+}

@@ -20,6 +20,12 @@ defmodule Maxio.Cluster.Notify do
           # 仅保留给迁移期旧 sender。两者都由 Store full reload，周期 digest 对账负责兜底。
           | {:config_changed, atom()}
           | {:config_changed, atom(), atom()}
+          | {:config_changed_batch,
+             %{
+               origin: %{node: node(), instance: String.t()},
+               epoch: pos_integer(),
+               subsystems: [atom()]
+             }}
 
   @doc "Phoenix.PubSub topic used for metadata invalidation events."
   @spec topic() :: String.t()

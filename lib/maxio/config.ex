@@ -179,6 +179,21 @@ defmodule Maxio.Config do
   def authoritative_effective(_subsystem, _keys, _opts),
     do: {:error, {:config_store_unavailable, :invalid_request}}
 
+  @doc "Read an explicit set of registered paths from one authoritative database snapshot."
+  @spec authoritative_snapshot([{subsystem(), key()}], keyword()) ::
+          {:ok,
+           %{
+             required({subsystem(), key()}) => %{
+               value: term(),
+               source: :runtime | :fallback,
+               version: non_neg_integer() | nil
+             }
+           }}
+          | {:error, term()}
+  def authoritative_snapshot(paths, opts \\ []) do
+    Coordinator.authoritative_snapshot(paths, opts)
+  end
+
   @doc "白名单全量的三层取证视图（`mix maxio.config.list` / Console 用）。"
   @spec list(keyword()) :: [map()]
   def list(opts \\ []) do
@@ -226,6 +241,13 @@ defmodule Maxio.Config do
           {:ok, map()} | {:error, term()}
   def mutate_subsystem(subsystem, operations, opts \\ []) do
     Coordinator.mutate_subsystem(subsystem, operations, opts)
+  end
+
+  @doc "Atomically mutate one or more subsystems through the shared advisory-lock coordinator."
+  @spec mutate_many([{subsystem(), [Coordinator.operation()]}], keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def mutate_many(groups, opts \\ []) do
+    Coordinator.mutate_many(groups, opts)
   end
 
   @doc "该键的变更审计流水，最近的在前。"

@@ -137,6 +137,28 @@ defmodule Maxio.Admin.ErrorMapTest do
     refute unsafe.message =~ secret
   end
 
+  test "config archive unknown subsystem uses the fixture generic message without scalar input" do
+    error = ErrorMap.from_reason({:config_unknown_subsystem, "absent"})
+
+    assert error.http_status == 400
+    assert error.code == "XMinioConfigError"
+    assert error.message == "unknown sub-system absent"
+
+    for unsafe_subsystem <- [
+          "root_password",
+          "SECRET-CONFIG-ARCHIVE-SENTINEL",
+          "bad/control"
+        ] do
+      unsafe = ErrorMap.from_reason({:config_unknown_subsystem, unsafe_subsystem})
+      assert unsafe.http_status == 400
+      assert unsafe.code == "XMinioConfigError"
+      assert unsafe.message == "Configuration specified is invalid"
+      refute inspect(unsafe) =~ unsafe_subsystem
+    end
+
+    refute error.code =~ "XMaxio"
+  end
+
   test "uppercase Config identifiers remain exact while unsafe dynamic descriptions fall back" do
     generic_exact = ErrorMap.from_reason({:config_generic, "unknown subsystem: S3"})
     not_found_exact = ErrorMap.from_reason({:config_not_found, "key ABSENT doesn't exist"})

@@ -3,6 +3,11 @@ defmodule Maxio.Admin.ConfigKV.Parser do
 
   @type entry :: %{required(:wire_subsystem) => String.t(), required(:wire_key) => String.t()}
   @type patch :: {String.t(), String.t()}
+  @type document_line :: %{
+          required(:line) => pos_integer(),
+          required(:wire_subsystem) => String.t(),
+          required(:patches) => [patch()]
+        }
 
   @spec parse_set(String.t(), [entry()]) ::
           {:ok, %{wire_subsystem: String.t(), patches: [patch()]}} | {:error, atom()}
@@ -31,6 +36,28 @@ defmodule Maxio.Admin.ConfigKV.Parser do
       end
     end)
     |> finish_set()
+  end
+
+  @doc false
+  @spec parse_document(String.t(), [entry()]) :: {:ok, [document_line()]} | {:error, atom()}
+  def parse_document(plaintext, entries) when is_binary(plaintext) and is_list(entries) do
+    plaintext
+    |> String.split("\n")
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, []}, fn {line, line_number}, {:ok, parsed_lines} ->
+      case parse_set_line(line, entries, nil) do
+        :skip ->
+          {:cont, {:ok, parsed_lines}}
+
+        {:ok, wire_subsystem, patches} ->
+          parsed = %{line: line_number, wire_subsystem: wire_subsystem, patches: patches}
+          {:cont, {:ok, [parsed | parsed_lines]}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> reverse_document()
   end
 
   @spec parse_reset(String.t()) ::
@@ -192,6 +219,9 @@ defmodule Maxio.Admin.ConfigKV.Parser do
     do: {:ok, %{wire_subsystem: subsystem, reset: reset}}
 
   defp finish_reset({:error, reason}), do: {:error, reason}
+
+  defp reverse_document({:ok, lines}), do: {:ok, Enum.reverse(lines)}
+  defp reverse_document({:error, reason}), do: {:error, reason}
 
   defp normalize_detailed_error({:error, :cross_subsystem}), do: {:error, :bad_json}
   defp normalize_detailed_error(result), do: result

@@ -1,0 +1,1024 @@
+{
+  "capture_date": "2026-08-29",
+  "capture_harness": {
+    "capture_runner.go": {
+      "path": "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/capture_runner.go",
+      "source_sha256": "07283a77d161ffa5d7a6068d608a80fc5b8811ad38fbe6f2dc03eff83e9afcb7"
+    },
+    "fake_server.go": {
+      "path": "test/fixtures/minio_admin_config_export_import_s7/w5_entry_gate/fake_server.go",
+      "source_sha256": "aa6d8548837afa63719604395630fd0815a6b6a3734e7a44db60a8d72147b023"
+    }
+  },
+  "captures": {
+    "export_human_error": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 1,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "request_content_length": 0,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--no-color",
+        "admin",
+        "config",
+        "export",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": false
+      },
+      "stable_invariants": [
+        "mc.exe: <ERROR>",
+        "JSON configuration provided is of incorrect format"
+      ],
+      "stderr": {
+        "byte_length": 97,
+        "normalized_bytes_base64": "bWMuZXhlOiA8RVJST1I+IFVuYWJsZSB0byBnZXQgc2VydmVyIGNvbmZpZy4gSlNPTiBjb25maWd1cmF0aW9uIHByb3ZpZGVkIGlzIG9mIGluY29ycmVjdCBmb3JtYXQuCg==",
+        "sha256": "bd54a5910a8b7540ce17cb24079e21afecf8a823cc368fcee0336852cf4009f0"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --no-color admin config export ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "export_human_success": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_content_length": 0,
+        "response_body_byte_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--no-color",
+        "admin",
+        "config",
+        "export",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "s3 clock_skew_ms=900000",
+        "listing sql_hard_limit=100000",
+        "prometheus_metrics public=false"
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 89,
+        "normalized_bytes_base64": "czMgY2xvY2tfc2tld19tcz05MDAwMDAgCmxpc3Rpbmcgc3FsX2hhcmRfbGltaXQ9MTAwMDAwIApwcm9tZXRoZXVzX21ldHJpY3MgcHVibGljPWZhbHNlIAo=",
+        "sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --no-color admin config export ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "export_json_after_admin": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_content_length": 0,
+        "response_body_byte_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "admin",
+        "--json",
+        "config",
+        "export",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "\"status\":\"success\""
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 152,
+        "normalized_bytes_base64": "eyJzdGF0dXMiOiJzdWNjZXNzIiwidmFsdWUiOiJjek1nWTJ4dlkydGZjMnRsZDE5dGN6MDVNREF3TURBZ0NteHBjM1JwYm1jZ2MzRnNYMmhoY21SZmJHbHRhWFE5TVRBd01EQXdJQXB3Y205dFpYUm9aWFZ6WDIxbGRISnBZM01nY0hWaWJHbGpQV1poYkhObElBbz0ifQo=",
+        "sha256": "b6d6feec2d40465c8c29a28c47220b76b2513a0b285e98b6105693cc073b9d1e"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "admin",
+          "--json",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe admin --json config export ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "admin",
+          "--json",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "export_json_after_config": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_content_length": 0,
+        "response_body_byte_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "admin",
+        "config",
+        "--json",
+        "export",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "\"status\":\"success\""
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 152,
+        "normalized_bytes_base64": "eyJzdGF0dXMiOiJzdWNjZXNzIiwidmFsdWUiOiJjek1nWTJ4dlkydGZjMnRsZDE5dGN6MDVNREF3TURBZ0NteHBjM1JwYm1jZ2MzRnNYMmhoY21SZmJHbHRhWFE5TVRBd01EQXdJQXB3Y205dFpYUm9aWFZ6WDIxbGRISnBZM01nY0hWaWJHbGpQV1poYkhObElBbz0ifQo=",
+        "sha256": "b6d6feec2d40465c8c29a28c47220b76b2513a0b285e98b6105693cc073b9d1e"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "admin",
+          "config",
+          "--json",
+          "export",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe admin config --json export ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "admin",
+          "config",
+          "--json",
+          "export",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "export_json_after_target": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_content_length": 0,
+        "response_body_byte_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "admin",
+        "config",
+        "export",
+        "ALIAS/",
+        "--json"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "\"status\":\"success\""
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 152,
+        "normalized_bytes_base64": "eyJzdGF0dXMiOiJzdWNjZXNzIiwidmFsdWUiOiJjek1nWTJ4dlkydGZjMnRsZDE5dGN6MDVNREF3TURBZ0NteHBjM1JwYm1jZ2MzRnNYMmhoY21SZmJHbHRhWFE5TVRBd01EQXdJQXB3Y205dFpYUm9aWFZ6WDIxbGRISnBZM01nY0hWaWJHbGpQV1poYkhObElBbz0ifQo=",
+        "sha256": "b6d6feec2d40465c8c29a28c47220b76b2513a0b285e98b6105693cc073b9d1e"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/",
+          "--json"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe admin config export ALIAS/ --json",
+        "observed_normalized": [
+          "mc.exe",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/",
+          "--json"
+        ],
+        "status": "observed"
+      }
+    },
+    "export_json_before_target": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_content_length": 0,
+        "response_body_byte_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "admin",
+        "config",
+        "export",
+        "--json",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "\"status\":\"success\""
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 152,
+        "normalized_bytes_base64": "eyJzdGF0dXMiOiJzdWNjZXNzIiwidmFsdWUiOiJjek1nWTJ4dlkydGZjMnRsZDE5dGN6MDVNREF3TURBZ0NteHBjM1JwYm1jZ2MzRnNYMmhoY21SZmJHbHRhWFE5TVRBd01EQXdJQXB3Y205dFpYUm9aWFZ6WDIxbGRISnBZM01nY0hWaWJHbGpQV1poYkhObElBbz0ifQo=",
+        "sha256": "b6d6feec2d40465c8c29a28c47220b76b2513a0b285e98b6105693cc073b9d1e"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "admin",
+          "config",
+          "export",
+          "--json",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe admin config export --json ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "admin",
+          "config",
+          "export",
+          "--json",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "export_json_error": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 1,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "request_content_length": 0,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--json",
+        "admin",
+        "config",
+        "export",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": false
+      },
+      "stable_invariants": {
+        "decoded": {
+          "status": "error"
+        },
+        "exit_code": 1,
+        "stream": "stdout"
+      },
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 350,
+        "normalized_bytes_base64": "eyJlcnJvciI6eyJjYXVzZSI6eyJlcnJvciI6eyJCdWNrZXROYW1lIjoiIiwiQ29kZSI6IlhNaW5pb0FkbWluQ29uZmlnQmFkSlNPTiIsIkhvc3RJRCI6IiIsIktleSI6IiIsIk1lc3NhZ2UiOiJKU09OIGNvbmZpZ3VyYXRpb24gcHJvdmlkZWQgaXMgb2YgaW5jb3JyZWN0IGZvcm1hdCIsIlJlZ2lvbiI6IiIsIlJlcXVlc3RJRCI6Ilx1MDAzY1JFUVVFU1RfSURcdTAwM2UifSwibWVzc2FnZSI6IkpTT04gY29uZmlndXJhdGlvbiBwcm92aWRlZCBpcyBvZiBpbmNvcnJlY3QgZm9ybWF0In0sIm1lc3NhZ2UiOiJVbmFibGUgdG8gZ2V0IHNlcnZlciBjb25maWciLCJ0eXBlIjoiZmF0YWwifSwic3RhdHVzIjoiZXJyb3IifQo=",
+        "sha256": "52ff49fd0ffe30f8133678c0f1f4bb5b04854ef6fdd3324a81a0ae8d1d29c08c"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --json admin config export ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "export_json_success": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "GET",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_content_length": 0,
+        "response_body_byte_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--json",
+        "admin",
+        "config",
+        "export",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "\"status\":\"success\""
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 152,
+        "normalized_bytes_base64": "eyJzdGF0dXMiOiJzdWNjZXNzIiwidmFsdWUiOiJjek1nWTJ4dlkydGZjMnRsZDE5dGN6MDVNREF3TURBZ0NteHBjM1JwYm1jZ2MzRnNYMmhoY21SZmJHbHRhWFE5TVRBd01EQXdJQXB3Y205dFpYUm9aWFZ6WDIxbGRISnBZM01nY0hWaWJHbGpQV1poYkhObElBbz0ifQo=",
+        "sha256": "b6d6feec2d40465c8c29a28c47220b76b2513a0b285e98b6105693cc073b9d1e"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --json admin config export ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "export",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "import_empty_stdin": {
+      "classification": {
+        "http_peer": "not_reached",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 1,
+      "http_observation": {
+        "applicable": false
+      },
+      "http_request_delta": 0,
+      "normalized_argv": [
+        "mc.exe",
+        "--no-color",
+        "admin",
+        "config",
+        "import",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": false
+      },
+      "stable_invariants": [
+        "Unable to set server config",
+        "EOF"
+      ],
+      "stderr": {
+        "byte_length": 50,
+        "normalized_bytes_base64": "bWMuZXhlOiA8RVJST1I+IFVuYWJsZSB0byBzZXQgc2VydmVyIGNvbmZpZy4gRU9GLgo=",
+        "sha256": "a3800f6428f1f8251aaf19253a3222f4c0d2b78cc7266edc69d0c2263c85b4dd"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "windows_command_line": {
+        "status": "not_observed_fast_exit"
+      }
+    },
+    "import_extra_file_arg": {
+      "classification": {
+        "http_peer": "not_reached",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 1,
+      "http_observation": {
+        "applicable": false
+      },
+      "http_request_delta": 0,
+      "normalized_argv": [
+        "mc.exe",
+        "--no-color",
+        "admin",
+        "config",
+        "import",
+        "ALIAS/",
+        "config.txt"
+      ],
+      "sio": {
+        "applicable": false
+      },
+      "stable_invariants": [
+        "NAME:",
+        "USAGE:",
+        "<MC_CONFIG_DIR>"
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 0,
+        "eof": true,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "byte_length": 1386,
+        "normalized_bytes_base64": "TkFNRToKICBtYyBhZG1pbiBjb25maWcgaW1wb3J0IC0gaW1wb3J0IG11bHRpcGxlIGNvbmZpZyBrZXlzIGZyb20gU1RESU4KClVTQUdFOgogIG1jIGFkbWluIGNvbmZpZyBpbXBvcnQgVEFSR0VUCgpGTEFHUzoKICAtLWNvbmZpZy1kaXIgdmFsdWUsIC1DIHZhbHVlICAgICBwYXRoIHRvIGNvbmZpZ3VyYXRpb24gZm9sZGVyIChkZWZhdWx0OiAiPE1DX0NPTkZJR19ESVI+IikgWyVNQ19DT05GSUdfRElSJV0KICAtLXF1aWV0LCAtcSAgICAgICAgICAgICAgICAgICAgICBkaXNhYmxlIHByb2dyZXNzIGJhciBkaXNwbGF5IFslTUNfUVVJRVQlXQogIC0tZGlzYWJsZS1wYWdlciwgLS1kcCAgICAgICAgICAgIGRpc2FibGUgbWMgaW50ZXJuYWwgcGFnZXIgYW5kIHByaW50IHRvIHJhdyBzdGRvdXQgWyVNQ19ESVNBQkxFX1BBR0VSJV0KICAtLW5vLWNvbG9yICAgICAgICAgICAgICAgICAgICAgICBkaXNhYmxlIGNvbG9yIHRoZW1lIFslTUNfTk9fQ09MT1IlXQogIC0tanNvbiAgICAgICAgICAgICAgICAgICAgICAgICAgIGVuYWJsZSBKU09OIGxpbmVzIGZvcm1hdHRlZCBvdXRwdXQgWyVNQ19KU09OJV0KICAtLWRlYnVnICAgICAgICAgICAgICAgICAgICAgICAgICBlbmFibGUgZGVidWcgb3V0cHV0IFslTUNfREVCVUclXQogIC0tcmVzb2x2ZSB2YWx1ZSAgICAgICAgICAgICAgICAgIHJlc29sdmVzIEhPU1RbOlBPUlRdIHRvIGFuIElQIGFkZHJlc3MuIEV4YW1wbGU6IG1pbmlvLmxvY2FsOjkwMDA9MTAuMTAuNzUuMSBbJU1DX1JFU09MVkUlXQogIC0taW5zZWN1cmUgICAgICAgICAgICAgICAgICAgICAgIGRpc2FibGUgU1NMIGNlcnRpZmljYXRlIHZlcmlmaWNhdGlvbiBbJU1DX0lOU0VDVVJFJV0KICAtLWxpbWl0LXVwbG9hZCB2YWx1ZSAgICAgICAgICAgICBsaW1pdHMgdXBsb2FkcyB0byBhIG1heGltdW0gcmF0ZSBpbiBLaUIvcywgTWlCL3MsIEdpQi9zLiAoZGVmYXVsdDogdW5saW1pdGVkKSBbJU1DX0xJTUlUX1VQTE9BRCVdCiAgLS1saW1pdC1kb3dubG9hZCB2YWx1ZSAgICAgICAgICAgbGltaXRzIGRvd25sb2FkcyB0byBhIG1heGltdW0gcmF0ZSBpbiBLaUIvcywgTWlCL3MsIEdpQi9zLiAoZGVmYXVsdDogdW5saW1pdGVkKSBbJU1DX0xJTUlUX0RPV05MT0FEJV0KICAtLWN1c3RvbS1oZWFkZXIgdmFsdWUsIC1IIHZhbHVlICBhZGQgY3VzdG9tIEhUVFAgaGVhZGVyIHRvIHRoZSByZXF1ZXN0LiAna2V5OnZhbHVlJyBmb3JtYXQuCiAgLS1oZWxwLCAtaCAgICAgICAgICAgICAgICAgICAgICAgc2hvdyBoZWxwCiAgCkVYQU1QTEVTOgogIDEuIEltcG9ydCB0aGUgbmV3IGxvY2FsIGNvbmZpZyBhbmQgYXBwbHkgdG8gdGhlIE1pbklPIHNlcnZlcgogICAgIEM6XD4gbWMgYWRtaW4gY29uZmlnIGltcG9ydCBwbGF5LyA8IGNvbmZpZy50eHQK",
+        "sha256": "e3332d5b2ddecc113441dd4043e72c6521fb4240b5611133af5a89205cdc7597"
+      },
+      "windows_command_line": {
+        "status": "not_observed_fast_exit"
+      }
+    },
+    "import_human_error": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 1,
+      "http_observation": {
+        "applicable": true,
+        "method": "PUT",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_body_byte_length": 146,
+        "request_content_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--no-color",
+        "admin",
+        "config",
+        "import",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "mc.exe: <ERROR>",
+        "JSON configuration provided is of incorrect format"
+      ],
+      "stderr": {
+        "byte_length": 97,
+        "normalized_bytes_base64": "bWMuZXhlOiA8RVJST1I+IFVuYWJsZSB0byBzZXQgc2VydmVyIGNvbmZpZy4gSlNPTiBjb25maWd1cmF0aW9uIHByb3ZpZGVkIGlzIG9mIGluY29ycmVjdCBmb3JtYXQuCg==",
+        "sha256": "3f3923b42d6b106c0cc651dc46b5ba003bd9c3b9846010b0f6ed02f251f57ec4"
+      },
+      "stdin": {
+        "byte_length": 89,
+        "eof": true,
+        "sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stdout": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --no-color admin config import ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "import_human_success": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "PUT",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_body_byte_length": 146,
+        "request_content_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--no-color",
+        "admin",
+        "config",
+        "import",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "Setting new key has been successful.",
+        "mc admin service restart ALIAS/"
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 89,
+        "eof": true,
+        "sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stdout": {
+        "byte_length": 104,
+        "normalized_bytes_base64": "U2V0dGluZyBuZXcga2V5IGhhcyBiZWVuIHN1Y2Nlc3NmdWwuClBsZWFzZSByZXN0YXJ0IHlvdXIgc2VydmVyIHdpdGggYG1jIGFkbWluIHNlcnZpY2UgcmVzdGFydCBBTElBUy9gLgo=",
+        "sha256": "bb27566cc9017d14298d61a3784cbb461560be8da7402fdbb05e68f0d32b3983"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --no-color admin config import ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--no-color",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "import_json_error": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 1,
+      "http_observation": {
+        "applicable": true,
+        "method": "PUT",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_body_byte_length": 146,
+        "request_content_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--json",
+        "admin",
+        "config",
+        "import",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": {
+        "decoded": {
+          "status": "error"
+        },
+        "exit_code": 1,
+        "stream": "stdout"
+      },
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 89,
+        "eof": true,
+        "sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stdout": {
+        "byte_length": 350,
+        "normalized_bytes_base64": "eyJlcnJvciI6eyJjYXVzZSI6eyJlcnJvciI6eyJCdWNrZXROYW1lIjoiIiwiQ29kZSI6IlhNaW5pb0FkbWluQ29uZmlnQmFkSlNPTiIsIkhvc3RJRCI6IiIsIktleSI6IiIsIk1lc3NhZ2UiOiJKU09OIGNvbmZpZ3VyYXRpb24gcHJvdmlkZWQgaXMgb2YgaW5jb3JyZWN0IGZvcm1hdCIsIlJlZ2lvbiI6IiIsIlJlcXVlc3RJRCI6Ilx1MDAzY1JFUVVFU1RfSURcdTAwM2UifSwibWVzc2FnZSI6IkpTT04gY29uZmlndXJhdGlvbiBwcm92aWRlZCBpcyBvZiBpbmNvcnJlY3QgZm9ybWF0In0sIm1lc3NhZ2UiOiJVbmFibGUgdG8gc2V0IHNlcnZlciBjb25maWciLCJ0eXBlIjoiZmF0YWwifSwic3RhdHVzIjoiZXJyb3IifQo=",
+        "sha256": "1928488f864c61e7df2fa8d92b283df0f794e150635c62b93d0095e3055e45a2"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --json admin config import ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    },
+    "import_json_success": {
+      "classification": {
+        "http_peer": "fake_observed",
+        "native_process_and_stdio": "live_verified"
+      },
+      "exit_code": 0,
+      "http_observation": {
+        "applicable": true,
+        "method": "PUT",
+        "path": "/minio/admin/v3/config",
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141",
+        "request_body_byte_length": 146,
+        "request_content_length": 146,
+        "transfer_encoding_count": 0
+      },
+      "http_request_delta": 1,
+      "normalized_argv": [
+        "mc.exe",
+        "--json",
+        "admin",
+        "config",
+        "import",
+        "ALIAS/"
+      ],
+      "sio": {
+        "applicable": true,
+        "ciphertext_byte_length": 146,
+        "ciphertext_retained": false,
+        "plaintext_byte_length": 89,
+        "plaintext_sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stable_invariants": [
+        "\"status\":\"success\""
+      ],
+      "stderr": {
+        "byte_length": 0,
+        "normalized_bytes_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdin": {
+        "byte_length": 89,
+        "eof": true,
+        "sha256": "c8fe86493cce0083169223b68b59e69612ceeaff7ff45721b45eb85e7eff4141"
+      },
+      "stdout": {
+        "byte_length": 21,
+        "normalized_bytes_base64": "eyJzdGF0dXMiOiJzdWNjZXNzIn0K",
+        "sha256": "9a14b700bc2581383cfae352c91f00fc65439392344a2f823a9645e8546a3bde"
+      },
+      "windows_command_line": {
+        "direct_argv_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "equals_direct_argv": true,
+        "normalized": "mc.exe --json admin config import ALIAS/",
+        "observed_normalized": [
+          "mc.exe",
+          "--json",
+          "admin",
+          "config",
+          "import",
+          "ALIAS/"
+        ],
+        "status": "observed"
+      }
+    }
+  },
+  "classification": {
+    "http_peer": "fake_observed",
+    "maxio_endpoint": "not_run_non_decisional_for_Task_8_entry_gate",
+    "native_process_and_stdio": "live_verified",
+    "task_11_role": "reverify_only"
+  },
+  "native_binary": {
+    "build": {
+      "settings": {
+        "-buildmode": "exe",
+        "-compiler": "gc",
+        "-tags": "kqueue",
+        "-trimpath": "true",
+        "CGO_ENABLED": "0",
+        "GOAMD64": "v1",
+        "GOARCH": "amd64",
+        "GOOS": "windows",
+        "vcs": "git",
+        "vcs.modified": "false",
+        "vcs.revision": "77f82e18b5401a65958f1619df6ebb994634bd88",
+        "vcs.time": "2025-11-06T16:25:29Z"
+      },
+      "source": {
+        "clean": true,
+        "revision": "77f82e18b5401a65958f1619df6ebb994634bd88",
+        "tree": "349fb45bedae9a3f9c06dbbbb4d3c975a64e3384",
+        "vcs": "git"
+      },
+      "toolchain": "go1.24.9"
+    },
+    "identity": {
+      "arch": "amd64",
+      "byte_length": 31587328,
+      "commit": "77f82e18b5401a65958f1619df6ebb994634bd88",
+      "os": "windows",
+      "repository": "https://github.com/minio/mc",
+      "sha256": "f13d5a27903fdb17a9708a8d634c9840eaa65c92c5a1b9f8288d4d530e41e38a",
+      "version": "DEVELOPMENT.2025-11-06T16-25-29Z"
+    }
+  },
+  "redaction": {
+    "credentials_generated_in_memory": true,
+    "credentials_printed_or_retained": false,
+    "dynamic_request_ids_normalized_in_memory": "<REQUEST_ID>",
+    "encrypted_request_or_response_retained": false,
+    "host_config_paths_normalized_in_memory": "<MC_CONFIG_DIR>",
+    "isolated_config_checked_before_cleanup": true,
+    "raw_streams_retained": false,
+    "request_headers_retained": false
+  },
+  "schema": "maxio.mc_config_archive_windows_capture.v2",
+  "toolchain": {
+    "byte_length": 87284095,
+    "sha256": "dce0a479fa60142aebb67e22664dfae156d4ec1dd1ab314b7a2c27d4ee59681c",
+    "url": "https://go.dev/dl/go1.24.9.windows-amd64.zip"
+  }
+}
