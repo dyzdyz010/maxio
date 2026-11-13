@@ -75,6 +75,7 @@ Maxio.S3.Dispatcher（判定表：level × method × query keys）  ← /minio/a
 ```bash
 # Git Bash
 export ERL_FLAGS="-kernel standard_io_encoding unicode"
+export PGPORT=55432                        # maxio-db 端口，见下文“本机工具链与环境”
 mix deps.get
 mix compile --warnings-as-errors
 mix format --check-formatted
@@ -88,18 +89,20 @@ iex -S mix phx.server                      # 启动 Console :4000 与 S3 :9900
 ```powershell
 # PowerShell
 $env:ERL_FLAGS = "-kernel standard_io_encoding unicode"
+$env:PGPORT = "55432"
 ```
 
 - `mix test` alias 会先 `ecto.create --quiet` + `ecto.migrate --quiet`。
 - `mix precommit` 里是 `format`（会改写文件），不是 `--check-formatted`。
-- 测试库：`maxio_test<MIX_TEST_PARTITION>`，端口读 `PGPORT`（默认 5432），user/pass = postgres/postgres。
+- 测试库：`maxio_test<MIX_TEST_PARTITION>`，端口读 `PGPORT`，user/pass = postgres/postgres。
 - 默认排除 `:distributed`（`test/test_helper.exs`）。
 
 ## 本机工具链与环境（Windows 11）
 
-- **PostgreSQL**：约定容器 `maxio-db`（postgres:16，5432，user/pass=postgres/postgres，dev 库 `maxio_dev`）。
-  容器丢失时重建：`docker run -d --name maxio-db -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16`；平时 `docker start maxio-db`。
-  `psql` 不在 PATH，用 `docker exec maxio-db psql -U postgres -d maxio_dev -c "..."`。5432 被别的项目占用时用 `PGPORT` 指向其它端口，不要动别人的容器。
+- **PostgreSQL**：容器 `maxio-db`（postgres:16，user/pass=postgres/postgres，dev 库 `maxio_dev`，test 库 `maxio_test`）。
+  本机 5432 已被其它项目占用，`maxio-db` 现映射到 **`127.0.0.1:55432`**（2026-11-12 重建：`docker run -d --name maxio-db -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:55432:5432 postgres:16`）。
+  跑 mix 时设 `PGPORT=55432`：`config/test.exs` 显式读取它，dev 由 Postgrex 默认读取 `PGPORT`（未设置时回落 5432，会连到别的项目的库）。
+  平时 `docker start maxio-db`，用完 `docker stop maxio-db`；`psql` 不在 PATH，用 `docker exec maxio-db psql -U postgres -d maxio_dev -c "..."`。不要动别的项目的容器。
 - **S3 端口**：Windows 把 TCP 9000–9099 列入 OS 保留排除段（`netsh int ipv4 show excludedportrange tcp`），绑定 9000 报 `:eacces`；
   dev 用 **9900**，prod 默认 9000，可经 `MAXIO_S3_PORT` 覆盖；需要容器内客户端直连时用 `MAXIO_S3_IP=0.0.0.0`。
 - **UDP**：dev 的 libcluster Gossip 使用 UDP 多播（端口 45892）。本机远程连接依赖 UDP 资源，多节点演练必须限定节点数与时长并在结束后关闭全部节点（见 AGENTS.md §3 资源安全）。

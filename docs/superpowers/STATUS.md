@@ -1,12 +1,23 @@
 # maxio · 项目状态（STATUS）
 
-> 单一事实来源（cross-session / 抗闪退）。最后更新：2026-08-29。
+> 单一事实来源（cross-session / 抗闪退）。最后更新：2026-11-12。
 > 设计 spec：`docs/superpowers/specs/2026-06-08-maxio-s3-foundation-design.md`（+ `_design_inputs/`）
 > 工程准则：`AGENTS.md`（先读，唯一来源）
 
 ## 项目目标
 
 用 Elixir/Phoenix 完整复刻 MinIO 的全功能、Amazon S3 兼容对象存储系统（aws-cli/boto3/mc/SDK 直连）。工程约束参考姊妹项目寰析（huanxi）。
+
+## Latest Batch Update (2026-11-12 仓库整理：分支 / 工作区收敛 + 工程准则重构)
+
+- **工程准则重构**（`f46c409`）：`AGENTS.md` 按姊妹项目 ex_mmo_cluster 重构为“只保留约束 + 索引”，新增 §2.1 系统正交、§2.2 通用设计纪律、§4 会话与代理约束；`CLAUDE.md` 改为纯指针；技术栈 / 命令 / 工具链迁至 `docs/reference/engineering/project-engineering-guide.md`，Phoenix 规则原样迁至 `docs/reference/engineering/phoenix-phx-new-guidelines.md`；移除 OMC / OMX 遗留（`.omx/notepad.md`、`/.omc/` 忽略规则、文档引用）。
+- **分支 / 工作区收敛**：9 个已并入 master 的切片分支（admin S1–S6、p1-closeout-b）及其 worktree 删除；`codex/admin-config-export-import-s7` 先提交 WIP（`45c0b38`）再以 `475624b` 合并进 master。现仅剩 master 一个分支、主工作区一个工作区。各 worktree 中被忽略的证据产物（artifacts / .superpowers / tmp，共约 276M）归档到 `artifacts/worktree-archive-20261112/<切片>/`（gitignored）。
+- **环境**：原 `maxio-db` 容器已丢失且本机 5432 被其它项目占用；重建为 `127.0.0.1:55432`，mix 命令需 `PGPORT=55432`（见工程参考）。
+- **独立验证（合并后 master `475624b`）**：`mix compile --warnings-as-errors` exit 0（`--force` 全量 591 文件 + NIF 零警告）；`mix test` 4994/4997 通过、5 excluded，3 个失败均为 S7 WIP 预期失败（见下）；`mix format --check-formatted` **失败 1 文件**（S7 WIP 测试 `config_export_import_protocol_fixture_test.exs:577-580` 缩进）。合并前基线 master `50f322a`：4860/4861（唯一失败为下述不稳定用例）。
+- **S7 当前状态（未完成）**：计划 `plans/2026-08-29-minio-admin-config-export-import-s7.md` Task 1–7 已提交（archive codec、多子系统原子配置事务、HTTP 导出 / 导入传输）；W5 entry gate WIP 未收口——`config_export_import_protocol_fixture_test.exs:568/:592` 期望 `capture_runner_test.go` 登记在 `mc_config_archive_dispatch.json` 的 `artifact_record.harnesses`，`:651` 报 10 个 export/import capture case 缺 `:sio` 证据。下一步：收口 W5 gate（补 harness 记录 / 重生 capture 证据 + format）→ Task 8–15（CLI 与 smoke RED、Mix 任务实现、批次测试、`mc` 活体与双节点取证、独立双审、`mix precommit`、STATUS 收口）。
+- **已知不稳定用例**：`test/maxio/admin/envelope_test.exs:110` 的 helper `state_contains_secret?/2` 扫描全部 ETS 表时遇到 improper list 触发 `FunctionClauseError`（`rescue ArgumentError` 接不住），依赖执行顺序；单独运行通过。待按根因修复 helper。
+- **依赖安全公告**：`mix deps.get` 报 14 个依赖有安全公告（含 `bandit 1.12.0` 多个 HIGH 级 HTTP/2 / WebSocket CVE，以及 phoenix、plug、plug_crypto、phoenix_live_view、ecto、postgrex、saxy、jose、mint、hpax 等），待评估升级。
+- **远端**：本地 master 领先 `origin/master`；origin 上 8 个已合并的 `codex/admin-*` 远端分支尚未删除——推送与删除远端分支待用户确认。
 
 ## Latest Batch Update (2026-08-29 Admin Config Help S6 closeout)
 
