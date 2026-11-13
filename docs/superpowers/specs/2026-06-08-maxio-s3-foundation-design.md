@@ -5,7 +5,7 @@
 > - **S3 API / HTTP 层与路由**：[`_design_inputs/s3_api_layer.md`](_design_inputs/s3_api_layer.md)
 > - **鉴权（SigV4）与 IAM/策略**：[`_design_inputs/auth_iam.md`](_design_inputs/auth_iam.md)
 >
-> 工程准则：`AGENTS.md`（先读）；Claude/OMC 执行细节：`CLAUDE.md`。当前状态：`STATUS.md`。
+> 工程准则：`AGENTS.md`（先读）。当前状态：`STATUS.md`。
 
 ## 1. 目标与边界
 

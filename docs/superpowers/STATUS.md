@@ -2,7 +2,7 @@
 
 > 单一事实来源（cross-session / 抗闪退）。最后更新：2026-08-29。
 > 设计 spec：`docs/superpowers/specs/2026-06-08-maxio-s3-foundation-design.md`（+ `_design_inputs/`）
-> 工程准则：`AGENTS.md`（先读）；Claude/OMC 执行细节：`CLAUDE.md`
+> 工程准则：`AGENTS.md`（先读，唯一来源）
 
 ## 项目目标
 
@@ -1597,6 +1597,8 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
 
 ## 工具链与环境（本机 Windows 11，关键教训）
 
+> 2026-11-12：本节为 2026-06 历史记录（其中 OTP 28、`C:\Users\dyz\Documents\dev\usr\Elixir\bin` 路径、dev S3 端口 9000 已过期）。现行工具链与环境以 [`docs/reference/engineering/project-engineering-guide.md`](../reference/engineering/project-engineering-guide.md) 为准。
+
 - **Elixir 1.20.0 / Erlang OTP 28** 在 `C:\Users\dyz\Documents\dev\usr\Elixir\bin`；mix / phx_new 1.8.5 / hex 已装；docker / git 可用；**psql 不在 PATH**（用 `docker exec maxio-db psql -U postgres -d maxio_dev -c "..."`）。
 - **Postgres**：专用容器 `maxio-db`（postgres:16，端口 5432，卷 `maxio_pgdata`，user/pass=postgres/postgres，db=maxio_dev）。`docker start maxio-db` 恢复。dev.exs 默认连 localhost:5432。
 - **坑1（phx.new 崩溃）**：在已存在的非空目录 `mix phx.new .` 会触发交互确认，非 TTY 下读 stdin 失败 → VM 硬崩留 `erl_crash.dump`。解法：生成到全新目录再合并（脚手架已生成，本坑已过）。
@@ -2143,6 +2145,6 @@ M7 完成「单 pool、多节点、跨节点 erasure + quorum + 锁 + heal」。
   **与设计文档的 9 条偏离，经 MinIO 源码核实 8 条是纠正设计错误**，其中最重要：`mode` 恒 `"online"` 而非映射健康面板——`cmd/admin-handlers.go` 里 `mode` 的**唯一**决定因素是对象层是否就绪，MinIO **从不用 `mode` 表达降级**（降级只在 `onlineDisks`/`servers[].state`/`drives[].state`）；且默认 FS 部署下该面板是 `"attention"`，映射过去会让健康部署长期自报降级——**反方向的不诚实**。
 - 待办（config store 的**时点条件**，下一批开工前必须处理）：㉕ **`load_all!/1` 之间无互斥**——两个并发整表装载交错可能留下「旧快照 + 新指纹」，而新指纹会让周期对账**永远满意**、静默固化旧值（与 C2 同形）。**本批不可达**（写入源只有几个独立 OS 进程的 CLI + 一次性 deployment_id 引导，凑不出第三个并发提交者），且非本轮引入。**但下一批加 Admin API 配置写端点前必须收口**：届时写入源变成同一 BEAM 内的并发 HTTP 请求进程，这条竞态立刻从「凑不着」变成常态。修法方向：把全部 `load_all!` 收口到 Store GenServer，或给 meta 加「只接受更新装载」的 CAS。
 - 待办追加（2026-08-20 config store 批新入账）：㉖ `finish_write` 改走整表装载后，**任意子系统**的一行损坏都会让 `Config.set/4` 在**事务已提交之后** raise，调用方拿到异常而非结构化 `write_error`，且广播被跳过（方向是 fail-fast、不违铁律 3，但与 `set/4` 文档「失败一律结构化错误」有出入，`@doc` 应补限定）。㉗ `README.md` 的边界声明弱于 `store.ex`——未点明指纹**不覆盖** `apply_mode`/`source`/`updated_by`/`previous_value`/时间戳，也未声明不承诺 md5 无碰撞。㉘ 指纹分隔符未转义（`subsystem`/`key` 含 `/` 或 `,` 时 fragment 有结构歧义；白名单键来自编译期 atom 永不含这两字符，能利用者必为 orphan 且已被忽略+告警；**这是结构歧义不是哈希碰撞，不在「不承诺 md5 无碰撞」的对冲范围内**）。㉙ 白名单键值损坏时，**修它的 CLI 自己也起不来**（snapshot 加载 raise → `Mix.raise`），只能裸 SQL 抢修，建议加 `--skip-snapshot` 逃生口。㉚ `DriveHealth` 对**从未探测过**的 endpoint 视为 online ⇒ 未观测的坏盘报 `"ok"`、`onlineDisks` 偏乐观，与 `:suspect → offline` 的保守方向**不一致**。㉛ **D6「禁止清单保证密钥写不进来」并不穷尽**——它挡的是已知密钥**键名**，挡不住把密钥值写进一个允许的**自由文本键**；今天风险极低（deploymentID 本就公开于 ServerInfo），但白名单一旦进入**第二个非公开自由文本键**，审计脱敏即成硬需求。㉜ `config/dev.exs` 把 formatter 设成无 `$metadata`，**dev 下所有结构化字段（含本批新增的 `config_digest`/`config_local_digest`）根本不打印**——既有约定、非本批引入，但直接削弱了本批新增的取证手段。
-- 已建立的成功模式：研究核验（官方文档/向量）→ opus planner 产出 gold-standard 计划 → 有界串行 executor（每单元强制 StructuredOutput，避免过大）→ 独立 verifier → 有界 fix → 独立 code-reviewer。通用实现 workflow 在 `.omc/workflows/implement-milestone.js`（参数化 milestone/plan_path/baseline/units）。
+- 已建立的成功模式：研究核验（官方文档/向量）→ opus planner 产出 gold-standard 计划 → 有界串行 executor（每单元强制 StructuredOutput，避免过大）→ 独立 verifier → 有界 fix → 独立 code-reviewer。
 - 审查方法学（2026-08-19 归纳，本轮多次奏效）：**变异实验是判定测试是否空转的唯一可靠手段**——本轮至少四次靠它发现「实现看起来对、测试也绿」的盲区（`release/2` 写序无测试守护、授权归一化改回原样仍全绿、purge 的 COMPLIANCE 单独路径从未执行、限频窗口独立性只写在注释里）。**审查必须自建取证环境**：一次针对会话前遗留的旧进程取证得出的结论被证伪（那是旧构建）；另一次审查自建 versioned 桶才把二维游标真正压到。**委派时须区分「我认为」与「已核实」**：本轮一次委派把过时事实（"MinIO 忽略空 continuation-token"）写成前提，执行 lane 查源码后推翻——前提应标注可信度，让下游有义务核实。
 - 工具链勘误（2026-08-18 实测）：本机为 **Erlang/OTP 29（erts-17.0.4）+ Elixir 1.20.2**，此前记录的 OTP 28 已过期。判断编译告警性质时须以此为准。
